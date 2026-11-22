@@ -150,6 +150,13 @@ pub fn mmio_write32(mmio_cap: CapId, byte_offset: u64, val: u32) -> Result<(), S
     .map(|_| ())
 }
 
+/// Translate a Ring-3 reference's virtual address in the caller's `VSpace` to its physical address
+/// for Ring-3 DMA ring programming (zero `unsafe` in Ring-3 drivers).
+pub fn virt_to_phys<T>(value: &T) -> Result<u64, SysError> {
+    let va = (value as *const T) as u64;
+    raw_syscall(SyscallNumber::VirtToPhys, va, 0, 0, 0)
+}
+
 /// Deliberately trigger a Ring-3/EL0 hardware invalid-instruction exception for crash-isolation testing.
 pub fn trigger_user_fault() -> ! {
     #[cfg(target_arch = "x86_64")]

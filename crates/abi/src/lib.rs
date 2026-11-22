@@ -126,6 +126,8 @@ pub enum SyscallNumber {
     SysInfo = 12,
     /// Capability-scoped 32-bit MMIO write `(mmio_cap_id, byte_offset, value)` for Ring-3 drivers.
     MmioWrite32 = 13,
+    /// Translate a canonical Ring-3 virtual address in the caller's `VSpace` to its physical address for DMA.
+    VirtToPhys = 14,
 }
 
 impl SyscallNumber {
@@ -145,6 +147,7 @@ impl SyscallNumber {
             11 => Some(Self::DebugRead),
             12 => Some(Self::SysInfo),
             13 => Some(Self::MmioWrite32),
+            14 => Some(Self::VirtToPhys),
             _ => None,
         }
     }

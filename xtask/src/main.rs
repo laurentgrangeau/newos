@@ -341,6 +341,8 @@ fn run_qemu(arch: Arch, expect_success_exit: bool, interactive: bool) -> Result<
                 "-display",
                 "none",
                 "-no-reboot",
+                "-global",
+                "virtio-mmio.force-legacy=false",
                 "-netdev",
                 "user,id=net0",
                 "-device",

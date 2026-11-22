@@ -14,8 +14,29 @@ use core::fmt::Write;
 use core::panic::PanicInfo;
 use newos_abi::ring::SpscRing;
 use newos_abi::{CapId, QemuExitCode, SysError};
+use newos_net::virtio::{VirtioNetDma, VirtioTransport};
 use newos_user_rt::DebugConsole;
 use shell::Shell;
+
+/// Static Ring-3 DMA rings & packet buffers (`Sync` via atomics, 100% `#![forbid(unsafe_code)]`).
+pub static VIRTIO_DMA: VirtioNetDma = VirtioNetDma::new();
+
+/// Capability-scoped MMIO + `VirtToPhys` transport for Ring-3 VirtIO drivers.
+pub struct CapVirtioTransport;
+
+impl VirtioTransport for CapVirtioTransport {
+    fn read32(&self, offset: u64) -> Result<u32, SysError> {
+        newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, offset)
+    }
+
+    fn write32(&self, offset: u64, val: u32) -> Result<(), SysError> {
+        newos_user_rt::mmio_write32(CapId::BOOTSTRAP_NET_MMIO, offset, val)
+    }
+
+    fn virt_to_phys<T>(&self, r: &T) -> Result<u64, SysError> {
+        newos_user_rt::virt_to_phys(r)
+    }
+}
 
 newos_user_rt::entry!(main);
 
@@ -137,30 +158,48 @@ fn main() -> ! {
         "[init] Ring-3 CAOS (dedup/rollback/seal) & typed `|` pipeline self-check: OK"
     );
 
-    // Ring-3 Networking: capability-scoped VirtIO-MMIO probe + pure-Rust `smoltcp` IPv4/UDP stack
+    // Ring-3 Networking: capability-scoped VirtIO 1.0+ DMA + pure-Rust `smoltcp` live ICMP ping
     let detected_nic =
         newos_net::probe_virtio_net(|off| newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, off));
     let mac = detected_nic
         .map(|n| n.mac)
         .unwrap_or([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
-    match newos_net::verify_smoltcp_ring3_stack(mac) {
-        Ok(frame_len) => {
-            if let Some(nic) = detected_nic {
+    if let Some(nic) = detected_nic {
+        match newos_net::live_virtio_icmp_ping(CapVirtioTransport, nic, &VIRTIO_DMA) {
+            Ok(res) => {
                 let _ = writeln!(
                     out,
-                    "[init] Ring-3 VirtIO-net (slot={}, v{}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}) & smoltcp ({frame_len}B frame): OK",
-                    nic.slot, nic.version, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                    "[init] Ring-3 LIVE VirtIO-net (slot={}, v{}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}) ICMP ping 10.0.2.2: OK (seq={}, rx={}, tx={})",
+                    nic.slot,
+                    nic.version,
+                    mac[0],
+                    mac[1],
+                    mac[2],
+                    mac[3],
+                    mac[4],
+                    mac[5],
+                    res.seq,
+                    res.rx_packets,
+                    res.tx_packets
                 );
-            } else {
+            }
+            Err(msg) => {
+                let _ = writeln!(out, "[init] FAIL: live VirtIO-net ICMP ping: {msg}");
+                newos_user_rt::exit(QemuExitCode::Failed);
+            }
+        }
+    } else {
+        match newos_net::verify_smoltcp_ring3_stack(mac) {
+            Ok(frame_len) => {
                 let _ = writeln!(
                     out,
                     "[init] Ring-3 smoltcp IPv4/UDP stack ({frame_len}B Ethernet frame, no_alloc, forbid_unsafe): OK"
                 );
             }
-        }
-        Err(msg) => {
-            let _ = writeln!(out, "[init] FAIL: Ring-3 smoltcp stack check: {msg}");
-            newos_user_rt::exit(QemuExitCode::Failed);
+            Err(msg) => {
+                let _ = writeln!(out, "[init] FAIL: Ring-3 smoltcp stack check: {msg}");
+                newos_user_rt::exit(QemuExitCode::Failed);
+            }
         }
     }
 

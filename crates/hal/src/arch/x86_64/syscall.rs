@@ -359,6 +359,22 @@ extern "C" fn rust_syscall_dispatch(
             let base = SYS_INFO_PACKED.load(Ordering::Acquire);
             Ok(base | ((proc_count & 0xFFFF) << 16))
         }
+        SyscallNumber::VirtToPhys => {
+            if a0 == 0 || a0 >= USER_ADDR_LIMIT {
+                Err(SysError::InvalidArgument)
+            } else {
+                use newos_kernel_core::memory::{VSpaceMapper, VirtAddr};
+                let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
+                let vspace = super::paging::X86VSpace::from_current_cr3(hhdm);
+                VirtAddr::new_canonical(a0).and_then(|va| {
+                    vspace
+                        .translate(va)
+                        .filter(|(_, flags)| flags.user)
+                        .map(|(pa, _)| pa.raw())
+                        .ok_or(SysError::InvalidArgument)
+                })
+            }
+        }
     };
 
     match result {

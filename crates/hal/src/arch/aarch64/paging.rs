@@ -74,6 +74,14 @@ impl Aarch64VSpace {
         }
     }
 
+    /// Wrap an existing L0 page-table root physical address (e.g. active `TTBR0_EL1`).
+    pub const fn from_root_phys(l0_phys: u64, hhdm_offset: u64) -> Self {
+        Self {
+            l0_phys,
+            hhdm_offset,
+        }
+    }
+
     /// Allocate a brand-new, empty EL0 `TTBR0_EL1` root L0 table (hardware-isolated from `TTBR1_EL1`).
     pub fn new_user_vspace(&self, untyped: &mut UntypedInventory) -> Result<Self, SysError> {
         let l0_frame = untyped.retype_frame()?;

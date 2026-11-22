@@ -5,12 +5,18 @@
 //!
 //! 100% `#![forbid(unsafe_code)]`, zero heap (`no_alloc`), zero network code in Ring 0.
 
+pub mod virtio;
+
 use newos_abi::SysError;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::icmp;
 use smoltcp::socket::udp::{self, PacketBuffer, PacketMetadata};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
+};
+use virtio::{VirtioNetDevice, VirtioNetDma, VirtioTransport};
 
 const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976; // "virt"
 const VIRTIO_DEVICE_NET: u32 = 1;
@@ -189,6 +195,110 @@ pub fn verify_smoltcp_ring3_stack(mac: [u8; 6]) -> Result<usize, &'static str> {
         return Err("emitted Ethernet frame source MAC mismatch");
     }
     Ok(device.len)
+}
+
+/// Result of a live Ring-3 VirtIO-net ICMP Echo Request/Reply round-trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PingResult {
+    pub seq: u16,
+    pub rx_packets: u64,
+    pub tx_packets: u64,
+}
+
+/// Bring up a live Ring-3 VirtIO 1.0+ (v2) NIC and perform a real ARP + ICMP Echo ping to `10.0.2.2`
+/// (QEMU user-mode gateway) using `smoltcp` — 100% `#![forbid(unsafe_code)]` and `no_alloc`.
+pub fn live_virtio_icmp_ping<T: VirtioTransport>(
+    transport: T,
+    nic: VirtioNetInfo,
+    dma: &VirtioNetDma,
+) -> Result<PingResult, &'static str> {
+    if nic.version < 2 {
+        return Err("VirtIO-MMIO v2 (modern) required");
+    }
+
+    let mut device = VirtioNetDevice::init(transport, nic.slot, dma)?;
+    let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(nic.mac)));
+    let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
+    iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24));
+    });
+    let _ = iface
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
+
+    let mut rx_meta = [icmp::PacketMetadata::EMPTY; 4];
+    let mut rx_data = [0u8; 256];
+    let mut tx_meta = [icmp::PacketMetadata::EMPTY; 4];
+    let mut tx_data = [0u8; 256];
+
+    let mut icmp_sock = icmp::Socket::new(
+        icmp::PacketBuffer::new(&mut rx_meta[..], &mut rx_data[..]),
+        icmp::PacketBuffer::new(&mut tx_meta[..], &mut tx_data[..]),
+    );
+    const IDENT: u16 = 0x5E14;
+    const SEQ: u16 = 1;
+    icmp_sock
+        .bind(icmp::Endpoint::Ident(IDENT))
+        .map_err(|_| "icmp bind failed")?;
+
+    let mut storage = [SocketStorage::EMPTY; 1];
+    let mut sockets = SocketSet::new(&mut storage[..]);
+    let handle = sockets.add(icmp_sock);
+
+    let gateway = IpAddress::v4(10, 0, 2, 2);
+    let payload = b"newos-ring3";
+    let echo = Icmpv4Repr::EchoRequest {
+        ident: IDENT,
+        seq_no: SEQ,
+        data: payload,
+    };
+
+    let mut sent_echo = false;
+    for step in 0..20_000i64 {
+        let now = Instant::from_millis(step);
+        let _ = iface.poll(now, &mut device, &mut sockets);
+
+        let sock = sockets.get_mut::<icmp::Socket>(handle);
+        if !sent_echo && sock.can_send() {
+            let buf = sock
+                .send(echo.buffer_len(), gateway)
+                .map_err(|_| "icmp send failed")?;
+            let mut pkt = Icmpv4Packet::new_unchecked(buf);
+            echo.emit(&mut pkt, &smoltcp::phy::ChecksumCapabilities::default());
+            sent_echo = true;
+            // Poll immediately to emit ARP / ICMP frame
+            let _ = iface.poll(now, &mut device, &mut sockets);
+        }
+
+        let sock = sockets.get_mut::<icmp::Socket>(handle);
+        if sock.can_recv()
+            && let Ok((data, _addr)) = sock.recv()
+            && let Ok(pkt) = Icmpv4Packet::new_checked(data)
+            && let Ok(Icmpv4Repr::EchoReply { ident, seq_no, .. }) =
+                Icmpv4Repr::parse(&pkt, &smoltcp::phy::ChecksumCapabilities::default())
+            && ident == IDENT
+            && seq_no == SEQ
+        {
+            return Ok(PingResult {
+                seq: seq_no,
+                rx_packets: device.rx_packets,
+                tx_packets: device.tx_packets,
+            });
+        }
+
+        // Re-send once if ARP resolved on first try and initial ICMP was queued/dropped
+        if step == 500 && device.rx_packets > 0 {
+            let sock = sockets.get_mut::<icmp::Socket>(handle);
+            if sock.can_send()
+                && let Ok(buf) = sock.send(echo.buffer_len(), gateway)
+            {
+                let mut pkt = Icmpv4Packet::new_unchecked(buf);
+                echo.emit(&mut pkt, &smoltcp::phy::ChecksumCapabilities::default());
+            }
+        }
+    }
+
+    Err("timed out waiting for ICMP EchoReply from 10.0.2.2")
 }
 
 #[cfg(test)]

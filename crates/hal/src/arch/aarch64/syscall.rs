@@ -304,6 +304,27 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             let base = SYS_INFO_PACKED.load(Ordering::Acquire);
             Ok(base | ((proc_count & 0xFFFF) << 16))
         }
+        SyscallNumber::VirtToPhys => {
+            if a0 == 0 || a0 >= USER_ADDR_LIMIT {
+                Err(SysError::InvalidArgument)
+            } else {
+                use newos_kernel_core::memory::{VSpaceMapper, VirtAddr};
+                // SAFETY: Reading active process's `ttbr0` with interrupts masked on BSP.
+                let ttbr0 = unsafe {
+                    let table = &*PROCS.get();
+                    table.procs[table.current].ttbr0
+                };
+                let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
+                let vspace = super::paging::Aarch64VSpace::from_root_phys(ttbr0, hhdm);
+                VirtAddr::new_canonical(a0).and_then(|va| {
+                    vspace
+                        .translate(va)
+                        .filter(|(_, flags)| flags.user)
+                        .map(|(pa, _)| pa.raw())
+                        .ok_or(SysError::InvalidArgument)
+                })
+            }
+        }
     };
 
     match result {

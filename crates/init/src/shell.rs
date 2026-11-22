@@ -521,8 +521,35 @@ impl Shell {
                         value: u64::from(n.version),
                         unit: "(virtio)",
                     });
-                }
-                if let Ok(frame_len) = newos_net::verify_smoltcp_ring3_stack(mac) {
+                    if toks.get(1).copied() == Some("ping") {
+                        match newos_net::live_virtio_icmp_ping(
+                            crate::CapVirtioTransport,
+                            n,
+                            &crate::VIRTIO_DMA,
+                        ) {
+                            Ok(res) => {
+                                stream.push(Record::Metric {
+                                    label: "icmp.reply.seq",
+                                    value: u64::from(res.seq),
+                                    unit: "(from 10.0.2.2)",
+                                });
+                                stream.push(Record::Metric {
+                                    label: "nic.rx.frames",
+                                    value: res.rx_packets,
+                                    unit: "frames",
+                                });
+                                stream.push(Record::Metric {
+                                    label: "nic.tx.frames",
+                                    value: res.tx_packets,
+                                    unit: "frames",
+                                });
+                            }
+                            Err(e) => {
+                                let _ = writeln!(out, "net ping: {e}");
+                            }
+                        }
+                    }
+                } else if let Ok(frame_len) = newos_net::verify_smoltcp_ring3_stack(mac) {
                     stream.push(Record::Metric {
                         label: "smoltcp.tx.frame",
                         value: frame_len as u64,
