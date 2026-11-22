@@ -34,6 +34,7 @@ pub struct BootInfo {
     pub init_module: Option<&'static [u8]>,
     pub worker_module: Option<&'static [u8]>,
     pub interactive_shell: bool,
+    pub board_rpi5: bool,
 }
 
 impl BootInfo {
@@ -345,6 +346,7 @@ mod tests {
             init_module: None,
             worker_module: None,
             interactive_shell: false,
+            board_rpi5: false,
         };
         assert_eq!(info.usable_mib(), 256);
     }

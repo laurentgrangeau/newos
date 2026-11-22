@@ -218,41 +218,55 @@ impl Aarch64Platform {
         use newos_kernel_core::memory::{PageFlags, PhysFrame, VSpaceMapper};
         let mut vspace = paging::Aarch64VSpace::from_current_ttbr1(info.hhdm_offset);
 
-        // Map PL011 MMIO (0x0900_0000 on QEMU `virt`) at a dedicated Device-nGnRnE VA in TTBR1_EL1.
-        const UART_PHYS: u64 = 0x0900_0000;
+        // Select PL011 MMIO physical base:
+        // - Raspberry Pi 5 (BCM2712 3-pin JST Debug UART): `0x10_7D00_1000`
+        // - QEMU `virt`: `0x0900_0000`
+        const QEMU_UART_PHYS: u64 = 0x0900_0000;
+        const RPI5_UART_PHYS: u64 = 0x10_7D00_1000;
         const UART_VIRT: u64 = 0xffff_b000_0000_0000;
+        let uart_phys = if info.board_rpi5 {
+            RPI5_UART_PHYS
+        } else {
+            QEMU_UART_PHYS
+        };
         if let Ok(uart_virt) = VirtAddr::new_page_aligned(UART_VIRT)
-            && let Ok(frame) = PhysFrame::from_aligned(PhysAddr::new(UART_PHYS))
+            && let Ok(frame) = PhysFrame::from_aligned(PhysAddr::new(uart_phys))
             && let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
             && vspace.map_4k(uart_virt, frame, mmio_flags, &mut info.untyped).is_ok()
         {
             serial::init_virt(UART_VIRT);
         } else {
-            serial::init_virt(info.hhdm_offset.wrapping_add(UART_PHYS));
+            serial::init_virt(info.hhdm_offset.wrapping_add(uart_phys));
         }
 
-        // Map VirtIO-MMIO window (0x0a00_0000..0x0a00_4000 on QEMU `virt`, 32 x 512B slots)
-        // at a dedicated Device-nGnRnE VA in TTBR1_EL1 for capability-scoped Ring-3 NIC drivers.
-        const VIRTIO_MMIO_PHYS: u64 = 0x0a00_0000;
-        const VIRTIO_MMIO_VIRT: u64 = 0xffff_b001_0000_0000;
-        const VIRTIO_MMIO_PAGES: u64 = 4;
-        if let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true) {
-            for p in 0..VIRTIO_MMIO_PAGES {
-                let off = p * 4096;
-                if let Ok(va) = VirtAddr::new_page_aligned(VIRTIO_MMIO_VIRT + off)
-                    && let Ok(frame) = PhysFrame::from_aligned(PhysAddr::new(VIRTIO_MMIO_PHYS + off))
-                {
-                    let _ = vspace.map_4k(va, frame, mmio_flags, &mut info.untyped);
+        // Map QEMU `virt` VirtIO-MMIO window (0x0a00_0000..0x0a00_4000) only when not on bare-metal Pi 5.
+        let net_mmio = if !info.board_rpi5 {
+            const VIRTIO_MMIO_PHYS: u64 = 0x0a00_0000;
+            const VIRTIO_MMIO_VIRT: u64 = 0xffff_b001_0000_0000;
+            const VIRTIO_MMIO_PAGES: u64 = 4;
+            if let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true) {
+                for p in 0..VIRTIO_MMIO_PAGES {
+                    let off = p * 4096;
+                    if let Ok(va) = VirtAddr::new_page_aligned(VIRTIO_MMIO_VIRT + off)
+                        && let Ok(frame) =
+                            PhysFrame::from_aligned(PhysAddr::new(VIRTIO_MMIO_PHYS + off))
+                    {
+                        let _ = vspace.map_4k(va, frame, mmio_flags, &mut info.untyped);
+                    }
                 }
             }
-        }
+            Some((
+                PhysAddr::new(VIRTIO_MMIO_PHYS),
+                VIRTIO_MMIO_VIRT,
+                VIRTIO_MMIO_PAGES * 4096,
+            ))
+        } else {
+            None
+        };
 
         set_cpu_id(0);
         install_vectors();
-        syscall::init(
-            info.hhdm_offset,
-            Some((PhysAddr::new(VIRTIO_MMIO_PHYS), VIRTIO_MMIO_VIRT, VIRTIO_MMIO_PAGES * 4096)),
-        );
+        syscall::init(info.hhdm_offset, net_mmio);
         let online_cpus = smp::bring_up_aps();
         syscall::set_sys_info(online_cpus, info.interactive_shell);
         Self {

@@ -116,10 +116,12 @@ pub fn boot_info() -> BootInfo {
         }
     }
 
-    let interactive_shell = EXEC_FILE_REQUEST
+    let cmdline = EXEC_FILE_REQUEST
         .response()
-        .map(|resp| resp.executable_file().cmdline().contains("interactive"))
-        .unwrap_or(false);
+        .map(|resp| resp.executable_file().cmdline())
+        .unwrap_or("");
+    let interactive_shell = cmdline.contains("interactive");
+    let board_rpi5 = cmdline.contains("rpi5");
 
     BootInfo {
         hhdm_offset,
@@ -131,5 +133,6 @@ pub fn boot_info() -> BootInfo {
         init_module,
         worker_module,
         interactive_shell,
+        board_rpi5,
     }
 }

@@ -59,8 +59,11 @@ fn main() -> ExitCode {
         "run" => run_qemu(arch, false, true),
         "test" => run_tests(arch),
         "host-test" => run_host_tests(),
+        "rpi5-image" => build_rpi5_image().map(|_| ()),
         _ => {
-            eprintln!("Usage: cargo xtask <build|run|test|host-test> [--arch x86_64|aarch64]");
+            eprintln!(
+                "Usage: cargo xtask <build|run|test|host-test|rpi5-image> [--arch x86_64|aarch64]"
+            );
             Ok(())
         }
     };
@@ -249,6 +252,99 @@ fn build_iso(arch: Arch, interactive: bool) -> Result<PathBuf, String> {
 
     println!("[xtask] built pure UEFI ISO ({}) {}", arch.name(), iso_path.display());
     Ok(iso_path)
+}
+
+/// Build a 64 MiB FAT32 boot image (`target/newos-rpi5.img`) + staging folder (`target/rpi5_boot/`)
+/// for Raspberry Pi 5 (16 GB, BCM2712 Cortex-A76, 3-pin JST Debug UART `0x10_7D00_1000`).
+fn build_rpi5_image() -> Result<PathBuf, String> {
+    let root = workspace_root();
+    let kernel_elf = build_kernel(&root, Arch::Aarch64)?;
+    let init_elf = build_user_elf(&root, Arch::Aarch64, "newos-init", "init")?;
+    let worker_elf = build_user_elf(&root, Arch::Aarch64, "newos-worker", "worker")?;
+    let limine_dir = ensure_limine(&root)?;
+
+    let stage = root.join("target/rpi5_boot");
+    if stage.exists() {
+        fs::remove_dir_all(&stage).map_err(|e| format!("failed to clean rpi5_boot: {e}"))?;
+    }
+    let boot_limine = stage.join("boot/limine");
+    let efi_boot = stage.join("EFI/BOOT");
+    fs::create_dir_all(&boot_limine).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&efi_boot).map_err(|e| e.to_string())?;
+
+    // Raspberry Pi 5 EDK2 UEFI config.txt (place RPI_EFI.fd alongside on the FAT32 SD card)
+    let config_txt = "\
+# NewOS Raspberry Pi 5 (16 GB) UEFI + Limine Boot Config
+arm_64bit=1
+enable_uart=1
+uart_2ndstage=1
+pciex4_reset=0
+disable_commandline_tags=2
+armstub=RPI_EFI.fd
+";
+    fs::write(stage.join("config.txt"), config_txt)
+        .map_err(|e| format!("failed to write config.txt: {e}"))?;
+
+    let limine_conf = "\
+timeout: 3
+serial: yes
+
+/NewOS (Raspberry Pi 5 - 16 GB)
+    protocol: limine
+    path: boot():/boot/newos-kernel
+    cmdline: interactive rpi5
+    module_path: boot():/boot/newos-init
+    module_path: boot():/boot/newos-worker
+";
+    fs::write(boot_limine.join("limine.conf"), limine_conf)
+        .map_err(|e| format!("failed to write limine.conf: {e}"))?;
+
+    fs::copy(&kernel_elf, stage.join("boot/newos-kernel"))
+        .map_err(|e| format!("failed to copy kernel ELF: {e}"))?;
+    fs::copy(&init_elf, stage.join("boot/newos-init"))
+        .map_err(|e| format!("failed to copy init ELF: {e}"))?;
+    fs::copy(&worker_elf, stage.join("boot/newos-worker"))
+        .map_err(|e| format!("failed to copy worker ELF: {e}"))?;
+    fs::copy(
+        limine_dir.join("BOOTAA64.EFI"),
+        efi_boot.join("BOOTAA64.EFI"),
+    )
+    .map_err(|e| format!("failed to copy BOOTAA64.EFI: {e}"))?;
+
+    // Create a 64 MiB FAT32 filesystem image using mkfs.vfat + mcopy (`dosfstools` + `mtools`)
+    let img_path = root.join("target/newos-rpi5.img");
+    let img_file = fs::File::create(&img_path).map_err(|e| format!("create img: {e}"))?;
+    img_file
+        .set_len(64 * 1024 * 1024)
+        .map_err(|e| format!("resize img: {e}"))?;
+    drop(img_file);
+
+    let img_str = img_path.to_str().ok_or("invalid img path")?;
+    let mkfs_bin = ["/usr/sbin/mkfs.vfat", "/sbin/mkfs.vfat"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+        .unwrap_or("mkfs.vfat");
+    let mut mkfs = Command::new(mkfs_bin);
+    mkfs.args(["-F", "32", "-n", "NEWOS", img_str]);
+    run_checked(&mut mkfs, "mkfs.vfat")?;
+
+    let mut mcopy = Command::new("mcopy");
+    mcopy.args([
+        "-s",
+        "-i",
+        img_str,
+        stage.join("config.txt").to_str().ok_or("bad path")?,
+        stage.join("EFI").to_str().ok_or("bad path")?,
+        stage.join("boot").to_str().ok_or("bad path")?,
+        "::/",
+    ]);
+    run_checked(&mut mcopy, "mcopy")?;
+
+    println!("[xtask] built Raspberry Pi 5 FAT32 boot image: {}", img_path.display());
+    println!("[xtask] staging directory: {}", stage.display());
+    println!("[xtask] note: copy RPI_EFI.fd (from worproject/rpi5-uefi) onto the FAT32 SD card root,");
+    println!("[xtask]       connect 3-pin JST UART debug probe at 115200 8N1, and power on!");
+    Ok(img_path)
 }
 
 fn run_host_tests() -> Result<(), String> {
