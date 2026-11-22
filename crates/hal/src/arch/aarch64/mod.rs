@@ -1,9 +1,11 @@
 //! Pure 64-bit `aarch64` HAL (ARMv8.2-A / Cortex-A76 / Raspberry Pi 5):
-//! `PL011` UART, `VBAR_EL1` vectors, `TPIDR_EL1` per-CPU, 4-level `TTBR0/TTBR1` paging, SMP, PSCI.
+//! `PL011` UART, `VBAR_EL1` vectors, `TPIDR_EL1` per-CPU, 4-level `TTBR0/TTBR1` paging,
+//! EL0 `svc #0` + `TTBR0_EL1` multi-process switching, SMP, and PSCI `SYSTEM_OFF`.
 
 pub mod paging;
 pub mod serial;
 pub mod smp;
+pub mod syscall;
 
 use core::arch::{asm, global_asm};
 use core::fmt::{self, Write};
@@ -17,7 +19,7 @@ const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 static BREAKPOINT_COUNT: AtomicU64 = AtomicU64::new(0);
 static TIMER_COUNT: AtomicU64 = AtomicU64::new(0);
 
-// Minimal 2 KiB-aligned EL1 exception vector table handling synchronous `brk #0` cleanly.
+// 2 KiB-aligned EL1 exception vector table handling EL1 `brk #0` and EL0 `svc #0` / faults.
 global_asm!(
     ".balign 2048",
     ".global __newos_aarch64_vectors",
@@ -32,8 +34,8 @@ global_asm!(
     ".balign 128", "b __newos_unhandled_el1",
     ".balign 128", "b __newos_unhandled_el1",
     ".balign 128", "b __newos_unhandled_el1",
-    // Lower EL using AArch64 (4 x 128B)
-    ".balign 128", "b __newos_unhandled_el1",
+    // Lower EL using AArch64 (4 x 128B) -> EL0 `svc #0` and EL0 fault isolation!
+    ".balign 128", "b __newos_sync_el0",
     ".balign 128", "b __newos_unhandled_el1",
     ".balign 128", "b __newos_unhandled_el1",
     ".balign 128", "b __newos_unhandled_el1",
@@ -54,7 +56,7 @@ global_asm!(
     "stp x16, x17, [sp, #-16]!",
     "stp x18, xzr, [sp, #-16]!",
     "stp x29, x30, [sp, #-16]!",
-    "bl {sync_handler}",
+    "bl {sync_el1}",
     "ldp x29, x30, [sp], #16",
     "ldp x18, xzr, [sp], #16",
     "ldp x16, x17, [sp], #16",
@@ -67,9 +69,58 @@ global_asm!(
     "ldp x2,  x3,  [sp], #16",
     "ldp x0,  x1,  [sp], #16",
     "eret",
+    // EL0 synchronous entry: save full 272-byte `TrapFrame` (`x0..x30, sp_el0, elr_el1, spsr_el1`)
+    "__newos_sync_el0:",
+    "sub sp, sp, #272",
+    "stp x0,  x1,  [sp, #0]",
+    "stp x2,  x3,  [sp, #16]",
+    "stp x4,  x5,  [sp, #32]",
+    "stp x6,  x7,  [sp, #48]",
+    "stp x8,  x9,  [sp, #64]",
+    "stp x10, x11, [sp, #80]",
+    "stp x12, x13, [sp, #96]",
+    "stp x14, x15, [sp, #112]",
+    "stp x16, x17, [sp, #128]",
+    "stp x18, x19, [sp, #144]",
+    "stp x20, x21, [sp, #160]",
+    "stp x22, x23, [sp, #176]",
+    "stp x24, x25, [sp, #192]",
+    "stp x26, x27, [sp, #208]",
+    "stp x28, x29, [sp, #224]",
+    "mrs x9,  sp_el0",
+    "stp x30, x9,  [sp, #240]",
+    "mrs x10, elr_el1",
+    "mrs x11, spsr_el1",
+    "stp x10, x11, [sp, #256]",
+    "mov x0, sp",
+    "bl {sync_el0}",
+    // Restore (possibly TTBR0-switched!) `TrapFrame` and return to EL0 via `eret`
+    "ldp x10, x11, [sp, #256]",
+    "msr elr_el1, x10",
+    "msr spsr_el1, x11",
+    "ldp x30, x9,  [sp, #240]",
+    "msr sp_el0, x9",
+    "ldp x28, x29, [sp, #224]",
+    "ldp x26, x27, [sp, #208]",
+    "ldp x24, x25, [sp, #192]",
+    "ldp x22, x23, [sp, #176]",
+    "ldp x20, x21, [sp, #160]",
+    "ldp x18, x19, [sp, #144]",
+    "ldp x16, x17, [sp, #128]",
+    "ldp x14, x15, [sp, #112]",
+    "ldp x12, x13, [sp, #96]",
+    "ldp x10, x11, [sp, #80]",
+    "ldp x8,  x9,  [sp, #64]",
+    "ldp x6,  x7,  [sp, #48]",
+    "ldp x4,  x5,  [sp, #32]",
+    "ldp x2,  x3,  [sp, #16]",
+    "ldp x0,  x1,  [sp, #0]",
+    "add sp, sp, #272",
+    "eret",
     "__newos_unhandled_el1:",
     "b __newos_unhandled_el1",
-    sync_handler = sym aarch64_sync_el1_handler,
+    sync_el1 = sym aarch64_sync_el1_handler,
+    sync_el0 = sym syscall::sync_el0_dispatch,
 );
 
 unsafe extern "C" {
@@ -86,7 +137,6 @@ extern "C" fn aarch64_sync_el1_handler() {
     }
     let ec = (esr >> 26) & 0x3F;
     if ec == 0x3C {
-        // `brk #imm` instruction (EC = 0x3C): advance ELR_EL1 past the 4-byte instruction
         BREAKPOINT_COUNT.fetch_add(1, Ordering::Release);
         // SAFETY: Advancing `ELR_EL1` by 4 skips the `brk #0` instruction cleanly.
         unsafe {
@@ -103,7 +153,7 @@ extern "C" fn aarch64_sync_el1_handler() {
 pub fn install_vectors() {
     let addr = (&raw const __newos_aarch64_vectors) as u64;
     // SAFETY: Limine enters `_start` on aarch64 with `SPSel = 0` (`SP_EL0` active, `SP_EL1 = 0`).
-    // Copy the active stack pointer into `SP_EL1` by switching `SPSel = 1`, then install `VBAR_EL1`.
+    // Switch to `SP_EL1` with the active stack pointer and install `VBAR_EL1`.
     unsafe {
         asm!(
             "mov x9, sp",
@@ -147,11 +197,7 @@ pub fn exit_qemu(code: QemuExitCode) -> ! {
     }
     // SAFETY: Invoking ARM PSCI `SYSTEM_OFF` (0x8400_0008) cleanly powers down the VM/board.
     unsafe {
-        asm!(
-            "hvc #0",
-            in("x0") PSCI_SYSTEM_OFF,
-            options(nomem, nostack),
-        );
+        asm!("hvc #0", in("x0") PSCI_SYSTEM_OFF, options(nomem, nostack));
     }
     loop {
         // SAFETY: Fallback low-power WFI loop if PSCI is unavailable.
@@ -165,7 +211,6 @@ pub struct Aarch64Platform {
     serial: serial::Pl011,
     vspace: paging::Aarch64VSpace,
     online_cpus: usize,
-    spawned_procs: usize,
 }
 
 impl Aarch64Platform {
@@ -186,18 +231,15 @@ impl Aarch64Platform {
             serial::init_virt(info.hhdm_offset.wrapping_add(UART_PHYS));
         }
 
-        let mut serial = serial::Pl011::new();
-        let _ = writeln!(serial, "[newos-aarch64] PL011 UART online (TTBR1_EL1 Device-nGnRnE)");
-
         set_cpu_id(0);
         install_vectors();
-        let _ = writeln!(serial, "[newos-aarch64] VBAR_EL1 vectors installed; starting SMP...");
+        syscall::init(info.hhdm_offset);
         let online_cpus = smp::bring_up_aps();
+        syscall::set_sys_info(online_cpus, info.interactive_shell);
         Self {
-            serial,
+            serial: serial::Pl011::new(),
             vspace,
             online_cpus,
-            spawned_procs: 0,
         }
     }
 }
@@ -216,7 +258,6 @@ impl HalPlatform for Aarch64Platform {
     }
 
     fn security_features(&self) -> CpuSecurityFeatures {
-        // ARMv8.2-A (Cortex-A76): hardware WP, UXN/PXN (NXE+SMEP), and EL1/EL0 separation
         CpuSecurityFeatures {
             wp: true,
             nxe: true,
@@ -235,16 +276,10 @@ impl HalPlatform for Aarch64Platform {
     }
 
     fn trigger_breakpoint(&mut self) {
-        let _ = writeln!(self.serial, "[newos-aarch64] testing VBAR_EL1 `brk #0`...");
         // SAFETY: `install_vectors` installed a `brk #0` handler that advances `ELR_EL1 += 4`.
         unsafe {
             asm!("brk #0", options(nomem, nostack));
         }
-        let _ = writeln!(
-            self.serial,
-            "[newos-aarch64] `brk #0` returned cleanly (count={})",
-            self.breakpoint_count()
-        );
     }
 
     fn breakpoint_count(&self) -> u64 {
@@ -252,7 +287,6 @@ impl HalPlatform for Aarch64Platform {
     }
 
     fn arm_oneshot_timer(&mut self, _ticks: u32) {
-        // Verify ARM Generic Timer virtual counter (`CNTVCT_EL0`) ticks monotonically.
         let t0: u64;
         // SAFETY: `CNTVCT_EL0` is always readable in EL1 on ARMv8.
         unsafe {
@@ -294,21 +328,15 @@ impl HalPlatform for Aarch64Platform {
 
     fn register_user_process(
         &mut self,
-        _entry: VirtAddr,
-        _user_rsp: VirtAddr,
-        _vspace_root: PhysAddr,
+        entry: VirtAddr,
+        user_rsp: VirtAddr,
+        vspace_root: PhysAddr,
     ) -> Result<usize, SysError> {
-        let pid = self.spawned_procs;
-        self.spawned_procs += 1;
-        Ok(pid)
+        syscall::register_user_process(entry.raw(), user_rsp.raw(), vspace_root.raw())
     }
 
     fn start_userspace(&mut self) -> ! {
-        let _ = writeln!(
-            self.serial,
-            "[newos-aarch64] milestone-1 bring-up (Cortex-A76 SMP, VBAR_EL1, TTBR0/TTBR1 4-level VSpace, ELF64 load): OK"
-        );
-        exit_qemu(QemuExitCode::Success)
+        syscall::start_userspace()
     }
 
     fn exit(&mut self, code: QemuExitCode) -> ! {

@@ -462,7 +462,7 @@ impl Shell {
                 }
             }
             "put" => {
-                let mut buf = [0u8; 192];
+                let mut buf = [0u8; 128];
                 let mut pos = 0usize;
                 for (i, arg) in toks[1..argc].iter().enumerate() {
                     if i > 0 && pos < buf.len() {

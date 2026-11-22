@@ -1,6 +1,6 @@
 #![no_std]
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
-#![cfg_attr(target_arch = "x86_64", feature(sync_unsafe_cell))]
+#![feature(sync_unsafe_cell)]
 
 //! Minimal, strictly audited Hardware Abstraction Layer (HAL) for NewOS.
 //!

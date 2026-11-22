@@ -9,9 +9,9 @@
 
 use newos_abi::Rights;
 
-const MAX_OBJECTS: usize = 32;
+const MAX_OBJECTS: usize = 24;
 const MAX_REFS: usize = 16;
-const MAX_BLOB_SIZE: usize = 192;
+const MAX_BLOB_SIZE: usize = 128;
 const MAX_REF_NAME: usize = 24;
 
 /// Deterministic 64-bit content address (FNV-1a 64-bit + avalanche finalizer).

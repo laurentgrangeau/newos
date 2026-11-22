@@ -11,7 +11,7 @@ use core::cell::SyncUnsafeCell;
 use core::fmt::{self, Write};
 use newos_abi::{CapId, QemuExitCode, SysError, SyscallNumber};
 
-const RECOVERY_STACK_SIZE: usize = 32 * 1024;
+const RECOVERY_STACK_SIZE: usize = 64 * 1024;
 
 #[repr(C, align(16))]
 struct RecoveryStack([u8; RECOVERY_STACK_SIZE]);
