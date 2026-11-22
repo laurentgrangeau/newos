@@ -124,11 +124,17 @@ impl InitShellHost {
                                 let _ = writeln!(out, "net ping: invalid IPv4 address '{raw}'");
                                 return;
                             } else {
-                                match newos_net::live_dns_resolve(
+                                let mut clock = newos_net::CycleClock::new(
+                                    || newos_user_rt::read_cycles().unwrap_or(0),
+                                    62_500,
+                                );
+                                match newos_net::live_dns_resolve_with_clock(
                                     CapVirtioTransport,
+                                    &mut clock,
                                     n,
                                     &cfg,
                                     raw,
+                                    5_000,
                                     &VIRTIO_DMA,
                                     &GEM_DMA,
                                 ) {
@@ -180,11 +186,17 @@ impl InitShellHost {
                         return;
                     };
                     let cfg = self.net_cfg.unwrap_or(NetConfig::QEMU_DEFAULT);
-                    match newos_net::live_dns_resolve(
+                    let mut clock = newos_net::CycleClock::new(
+                        || newos_user_rt::read_cycles().unwrap_or(0),
+                        62_500,
+                    );
+                    match newos_net::live_dns_resolve_with_clock(
                         CapVirtioTransport,
+                        &mut clock,
                         n,
                         &cfg,
                         host,
+                        5_000,
                         &VIRTIO_DMA,
                         &GEM_DMA,
                     ) {

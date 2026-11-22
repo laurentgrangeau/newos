@@ -290,15 +290,18 @@ pub fn run_dhcp_v4<D: Device>(device: &mut D, mac: [u8; 6]) -> Result<NetConfig,
     Err("DHCPv4 lease timed out")
 }
 
-/// Resolve a hostname to an IPv4 address via `smoltcp` DNS A-record query (`no_alloc`).
-pub fn run_dns_query<D: Device>(
+/// Resolve a hostname to an IPv4 address via `smoltcp` DNS A-record query using a real `NetClock`.
+pub fn run_dns_query_with_clock<D: Device, C: NetClock>(
     device: &mut D,
+    clock: &mut C,
     mac: [u8; 6],
     cfg: &NetConfig,
     hostname: &str,
+    timeout_ms: i64,
 ) -> Result<[u8; 4], &'static str> {
+    let start_ms = clock.now_millis();
     let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
-    let mut iface = Interface::new(config, device, Instant::from_millis(0));
+    let mut iface = Interface::new(config, device, Instant::from_millis(start_ms));
     iface.update_ip_addrs(|addrs| {
         let _ = addrs.push(IpCidr::new(
             IpAddress::Ipv4(Ipv4Address::from(cfg.ip)),
@@ -325,9 +328,12 @@ pub fn run_dns_query<D: Device>(
         .start_query(iface.context(), hostname, DnsQueryType::A)
         .map_err(|_| "dns start_query failed")?;
 
-    for step in 0..40_000i64 {
-        let now = Instant::from_millis(step);
-        let _ = iface.poll(now, device, &mut sockets);
+    loop {
+        let now_ms = clock.now_millis();
+        if now_ms.saturating_sub(start_ms) > timeout_ms {
+            return Err("dns query timed out");
+        }
+        let _ = iface.poll(Instant::from_millis(now_ms), device, &mut sockets);
         match sockets.get_mut::<dns::Socket>(handle).get_query_result(query) {
             Ok(addrs) => {
                 if let Some(IpAddress::Ipv4(v4)) = addrs.first() {
@@ -339,7 +345,25 @@ pub fn run_dns_query<D: Device>(
             Err(dns::GetQueryResultError::Failed) => return Err("dns query failed"),
         }
     }
-    Err("dns query timed out")
+}
+
+/// Resolve a hostname to an IPv4 address via `smoltcp` DNS A-record query (`no_alloc`).
+pub fn run_dns_query<D: Device>(
+    device: &mut D,
+    mac: [u8; 6],
+    cfg: &NetConfig,
+    hostname: &str,
+) -> Result<[u8; 4], &'static str> {
+    struct StepClock(i64);
+    impl NetClock for StepClock {
+        fn now_millis(&mut self) -> i64 {
+            let v = self.0;
+            self.0 += 1;
+            v
+        }
+    }
+    let mut clock = StepClock(0);
+    run_dns_query_with_clock(device, &mut clock, mac, cfg, hostname, 40_000)
 }
 
 /// Perform a live ARP + ICMP Echo Request/Reply round-trip to `target` over any `smoltcp` `Device`.
@@ -478,6 +502,33 @@ pub fn live_icmp_ping<T: VirtioTransport>(
         NicKind::CadenceGem(g) => {
             let mut dev = GemNetDevice::init(transport, g, gem_dma)?;
             run_icmp_ping(&mut dev, g.mac, cfg, target)
+        }
+    }
+}
+
+/// High-level live DNS A-record resolution using a real monotonic `NetClock`.
+#[allow(clippy::too_many_arguments)]
+pub fn live_dns_resolve_with_clock<T: VirtioTransport, C: NetClock>(
+    transport: T,
+    clock: &mut C,
+    nic: NicKind,
+    cfg: &NetConfig,
+    hostname: &str,
+    timeout_ms: i64,
+    virtio_dma: &VirtioNetDma,
+    gem_dma: &GemDma,
+) -> Result<[u8; 4], &'static str> {
+    match nic {
+        NicKind::Virtio(v) => {
+            if v.version < 2 {
+                return Err("VirtIO-MMIO v2 (modern) required");
+            }
+            let mut dev = VirtioNetDevice::init(transport, v.slot, virtio_dma)?;
+            run_dns_query_with_clock(&mut dev, clock, v.mac, cfg, hostname, timeout_ms)
+        }
+        NicKind::CadenceGem(g) => {
+            let mut dev = GemNetDevice::init(transport, g, gem_dma)?;
+            run_dns_query_with_clock(&mut dev, clock, g.mac, cfg, hostname, timeout_ms)
         }
     }
 }
