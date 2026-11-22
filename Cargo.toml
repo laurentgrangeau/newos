@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "xtask",
+    "crates/abi",
+    "crates/hal",
+    "crates/kernel-core",
+    "crates/kernel",
+    "crates/user-rt",
+    "crates/init",
+    "crates/worker",
+]
+default-members = [
+    "xtask",
+    "crates/abi",
+    "crates/kernel-core",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+limine = "0.6.5"
+newos-abi = { path = "crates/abi" }
+newos-hal = { path = "crates/hal" }
+newos-kernel-core = { path = "crates/kernel-core" }
+newos-user-rt = { path = "crates/user-rt" }
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,9 @@
+[package]
+name = "newos-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+newos-abi = { workspace = true }
+newos-user-rt = { workspace = true }

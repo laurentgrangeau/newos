@@ -1,0 +1,10 @@
+[package]
+name = "newos-hal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+limine = { workspace = true }
+newos-abi = { workspace = true }
+newos-kernel-core = { workspace = true }
