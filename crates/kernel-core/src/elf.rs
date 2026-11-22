@@ -10,7 +10,6 @@ const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
-const EM_X86_64: u16 = 62;
 const EM_AARCH64: u16 = 183;
 const PT_LOAD: u32 = 1;
 
@@ -80,8 +79,8 @@ fn read_u64_le(bytes: &[u8], off: usize) -> Result<u64, SysError> {
     Ok(u64::from_le_bytes(slice))
 }
 
-/// Validate and parse a 64-bit little-endian x86_64 ELF64 binary enforcing strict W^X
-/// and canonical lower-half Ring-3 addresses (`< 0x0000_8000_0000_0000`).
+/// Validate and parse a 64-bit little-endian AArch64 ELF64 binary enforcing strict W^X
+/// and canonical lower-half EL0 addresses (`< 0x0000_8000_0000_0000`).
 pub fn parse_elf64(bytes: &[u8]) -> Result<ParsedElf64, SysError> {
     if bytes.len() < 64 || bytes[0..4] != ELF_MAGIC {
         return Err(SysError::InvalidArgument);
@@ -92,12 +91,7 @@ pub fn parse_elf64(bytes: &[u8]) -> Result<ParsedElf64, SysError> {
 
     let e_type = read_u16_le(bytes, 16)?;
     let e_machine = read_u16_le(bytes, 18)?;
-    let expected_machine = if cfg!(target_arch = "aarch64") {
-        EM_AARCH64
-    } else {
-        EM_X86_64
-    };
-    if e_type != ET_EXEC || e_machine != expected_machine {
+    if e_type != ET_EXEC || e_machine != EM_AARCH64 {
         return Err(SysError::Unsupported);
     }
 

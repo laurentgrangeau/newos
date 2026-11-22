@@ -21,22 +21,14 @@ pub(crate) mod test_helpers {
     use std::collections::BTreeMap;
 
     /// Returns the ELF64 `e_machine` value expected by `newos_kernel_core::elf::parse_elf64`
-    /// on the current compilation target.
+    /// (`EM_AARCH64 = 183`, Raspberry Pi 5 16 GB).
     pub fn host_elf_machine() -> u16 {
-        if cfg!(target_arch = "aarch64") {
-            183
-        } else {
-            62
-        }
+        183
     }
 
-    /// Returns the opposite architecture's `e_machine` for negative tests.
+    /// Returns a non-AArch64 `e_machine` (`EM_X86_64 = 62`) for negative tests.
     pub fn wrong_elf_machine() -> u16 {
-        if cfg!(target_arch = "aarch64") {
-            62
-        } else {
-            183
-        }
+        62
     }
 
     /// Specification for one ELF64 program header entry.

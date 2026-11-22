@@ -598,14 +598,12 @@ fn tier1_mem_phys_frame_from_aligned_and_boot_info_usable_mib() {
     let info = BootInfo {
         hhdm_offset: 0xFFFF_8000_0000_0000,
         untyped,
-        cpu_count: 2,
-        bsp_lapic_id: 0,
-        x2apic_enabled: true,
+        cpu_count: 4,
         rsdp_addr: 0,
         init_module: None,
         worker_module: None,
         interactive_shell: false,
-        board_rpi5: false,
+        qemu_virt: false,
     };
     assert_eq!(info.usable_mib(), 3);
 }

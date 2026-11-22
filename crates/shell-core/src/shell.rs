@@ -280,13 +280,13 @@ impl RecordStream {
     pub(crate) fn retain<F: FnMut(Record) -> bool>(&mut self, mut pred: F) {
         let mut write_idx = 0usize;
         for read_idx in 0..self.len {
-            if let Some(rec) = self.items[read_idx] {
-                if pred(rec) {
-                    if write_idx != read_idx {
-                        self.items[write_idx] = Some(rec);
-                    }
-                    write_idx += 1;
+            if let Some(rec) = self.items[read_idx]
+                && pred(rec)
+            {
+                if write_idx != read_idx {
+                    self.items[write_idx] = Some(rec);
                 }
+                write_idx += 1;
             }
         }
         self.len = write_idx;
@@ -659,14 +659,12 @@ impl<H: ShellHost> Shell<H> {
                         self.host.write_debug(s);
                     }
                 }
-                0x20..=0x7E => {
-                    if len < LINE_BUF_SIZE {
-                        buf[len] = byte;
-                        len += 1;
-                        let tmp = [byte];
-                        if let Ok(s) = core::str::from_utf8(&tmp) {
-                            self.host.write_debug(s);
-                        }
+                0x20..=0x7E if len < LINE_BUF_SIZE => {
+                    buf[len] = byte;
+                    len += 1;
+                    let tmp = [byte];
+                    if let Ok(s) = core::str::from_utf8(&tmp) {
+                        self.host.write_debug(s);
                     }
                 }
                 _ => {}
@@ -739,6 +737,18 @@ impl<H: ShellHost> Shell<H> {
                 }
                 return ExecOutcome::Continue;
             }
+            "gc" => {
+                let reclaimed = self.store.gc();
+                let remaining = self.store.object_count();
+                if !silent {
+                    let mut out = self.buffered_out();
+                    let _ = writeln!(
+                        out,
+                        "gc: reclaimed {reclaimed} unreachable object(s), {remaining} live"
+                    );
+                }
+                return ExecOutcome::Continue;
+            }
             "sys" => {
                 let info = self.sys_info_cached();
                 let obj_count = self.store.object_count();
@@ -746,7 +756,7 @@ impl<H: ShellHost> Shell<H> {
                     let mut out = self.buffered_out();
                     let _ = writeln!(
                         out,
-                        "NewOS 0.1.0 x86_64 pure-seL4-microkernel (SMP={} CPUs, {} Ring-3 procs, {} CAOS objects)",
+                        "NewOS 0.1.0 aarch64 (Raspberry Pi 5 16 GB) pure-seL4-microkernel (SMP={} CPUs, {} EL0 procs, {} CAOS objects)",
                         info.online_cpus,
                         info.proc_count,
                         obj_count
@@ -1072,11 +1082,11 @@ fn eval_transform_with<H: ShellHost>(
                 return;
             };
             if let Some(Record::Object(meta)) = stream.first() {
-                if let Err(e) = store.set_ref(ref_name, meta.hash) {
-                    if !silent {
-                        let mut out = BufferedWriter::<256, _>::new(HostWriter(host));
-                        let _ = writeln!(out, "save {ref_name}: {e:?}");
-                    }
+                if let Err(e) = store.set_ref(ref_name, meta.hash)
+                    && !silent
+                {
+                    let mut out = BufferedWriter::<256, _>::new(HostWriter(host));
+                    let _ = writeln!(out, "save {ref_name}: {e:?}");
                 }
             } else if !silent {
                 let mut out = BufferedWriter::<256, _>::new(HostWriter(host));

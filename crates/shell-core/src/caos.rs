@@ -59,6 +59,7 @@ pub enum StoreError {
     InvalidName,
     ReadOnly,
     NoPreviousVersion,
+    CorruptSnapshot,
 }
 
 /// Public alias for `StoreError` per `newos-shell-core` interface contract.
@@ -370,6 +371,172 @@ impl ObjectStore {
         }
         n
     }
+
+    /// Mark-and-sweep garbage collection: reclaim all immutable blobs not reachable
+    /// from any active Ref's `target` or `prev` rollback pointer.
+    ///
+    /// Returns the number of reclaimed object slots.
+    pub fn gc(&mut self) -> usize {
+        let mut write_idx = 0usize;
+        let orig_count = self.object_count;
+        for read_idx in 0..orig_count {
+            let hash = self.blobs[read_idx].hash;
+            let reachable = self.refs[..self.ref_count]
+                .iter()
+                .any(|r| r.target == hash || r.prev == Some(hash));
+            if reachable {
+                if write_idx != read_idx {
+                    self.blobs[write_idx] = self.blobs[read_idx];
+                }
+                write_idx += 1;
+            }
+        }
+        for slot in &mut self.blobs[write_idx..orig_count] {
+            *slot = BlobSlot::EMPTY;
+        }
+        self.object_count = write_idx;
+        orig_count - write_idx
+    }
+
+    /// Serialize the entire CAOS store into a crash-safe, checksummed binary snapshot
+    /// suitable for writing to a block device (VirtIO-blk / NVMe / SD).
+    pub fn encode_snapshot(&self, out: &mut [u8]) -> Result<usize, StoreError> {
+        let mut pos = 0usize;
+        let mut push = |bytes: &[u8]| -> Result<(), StoreError> {
+            let end = pos.checked_add(bytes.len()).ok_or(StoreError::NoSpace)?;
+            if end > out.len() {
+                return Err(StoreError::NoSpace);
+            }
+            out[pos..end].copy_from_slice(bytes);
+            pos = end;
+            Ok(())
+        };
+
+        // Header: magic "CAOS" (4B) + version u8 (1B) + object_count u8 (1B) + ref_count u8 (1B) + pad (1B)
+        push(b"CAOS")?;
+        push(&[1u8, self.object_count as u8, self.ref_count as u8, 0u8])?;
+
+        for b in &self.blobs[..self.object_count] {
+            push(&b.hash.0.to_le_bytes())?;
+            push(&(b.size as u16).to_le_bytes())?;
+            push(&b.data[..b.size])?;
+        }
+
+        for r in &self.refs[..self.ref_count] {
+            push(&[r.name_len as u8, r.rights.bits()])?;
+            push(&r.name[..r.name_len])?;
+            push(&r.target.0.to_le_bytes())?;
+            push(&r.prev.map_or(0u64, |p| p.0).to_le_bytes())?;
+        }
+
+        drop(push);
+        let checksum = ObjHash::hash_bytes(&out[..pos]);
+        let end = pos.checked_add(8).ok_or(StoreError::NoSpace)?;
+        if end > out.len() {
+            return Err(StoreError::NoSpace);
+        }
+        out[pos..end].copy_from_slice(&checksum.0.to_le_bytes());
+        Ok(end)
+    }
+
+    /// Verify checksum and restore an `ObjectStore` from a serialized binary snapshot.
+    pub fn decode_snapshot(bytes: &[u8]) -> Result<Self, StoreError> {
+        if bytes.len() < 16 || &bytes[0..4] != b"CAOS" || bytes[4] != 1 {
+            return Err(StoreError::CorruptSnapshot);
+        }
+        let body_len = bytes.len() - 8;
+        let expected_crc = u64::from_le_bytes(
+            bytes[body_len..]
+                .try_into()
+                .map_err(|_| StoreError::CorruptSnapshot)?,
+        );
+        if ObjHash::hash_bytes(&bytes[..body_len]).0 != expected_crc {
+            return Err(StoreError::CorruptSnapshot);
+        }
+
+        let obj_count = bytes[5] as usize;
+        let ref_count = bytes[6] as usize;
+        if obj_count > MAX_OBJECTS || ref_count > MAX_REFS {
+            return Err(StoreError::CorruptSnapshot);
+        }
+
+        let mut pos = 8usize;
+        let mut take = |len: usize| -> Result<&[u8], StoreError> {
+            let end = pos
+                .checked_add(len)
+                .ok_or(StoreError::CorruptSnapshot)?;
+            if end > body_len {
+                return Err(StoreError::CorruptSnapshot);
+            }
+            let slice = &bytes[pos..end];
+            pos = end;
+            Ok(slice)
+        };
+
+        let mut store = Self {
+            blobs: [BlobSlot::EMPTY; MAX_OBJECTS],
+            object_count: obj_count,
+            refs: [RefSlot::EMPTY; MAX_REFS],
+            ref_count,
+        };
+
+        for b in &mut store.blobs[..obj_count] {
+            let hash = ObjHash(u64::from_le_bytes(
+                take(8)?
+                    .try_into()
+                    .map_err(|_| StoreError::CorruptSnapshot)?,
+            ));
+            let size = u16::from_le_bytes(
+                take(2)?
+                    .try_into()
+                    .map_err(|_| StoreError::CorruptSnapshot)?,
+            ) as usize;
+            if size > MAX_BLOB_SIZE {
+                return Err(StoreError::CorruptSnapshot);
+            }
+            let data = take(size)?;
+            if ObjHash::hash_bytes(data) != hash {
+                return Err(StoreError::CorruptSnapshot);
+            }
+            b.hash = hash;
+            b.size = size;
+            b.data[..size].copy_from_slice(data);
+        }
+
+        for r in &mut store.refs[..ref_count] {
+            let hdr = take(2)?;
+            let name_len = hdr[0] as usize;
+            let rights = Rights::from_bits_truncate(hdr[1]);
+            if name_len == 0 || name_len > MAX_REF_NAME {
+                return Err(StoreError::CorruptSnapshot);
+            }
+            let name = take(name_len)?;
+            let target = ObjHash(u64::from_le_bytes(
+                take(8)?
+                    .try_into()
+                    .map_err(|_| StoreError::CorruptSnapshot)?,
+            ));
+            let prev_raw = u64::from_le_bytes(
+                take(8)?
+                    .try_into()
+                    .map_err(|_| StoreError::CorruptSnapshot)?,
+            );
+            r.name[..name_len].copy_from_slice(name);
+            r.name_len = name_len;
+            r.rights = rights;
+            r.target = target;
+            r.prev = if prev_raw == 0 {
+                None
+            } else {
+                Some(ObjHash(prev_raw))
+            };
+        }
+
+        if pos != body_len {
+            return Err(StoreError::CorruptSnapshot);
+        }
+        Ok(store)
+    }
 }
 
 #[cfg(test)]
@@ -487,5 +654,56 @@ mod tests {
         assert_ne!(H_EMPTY, ObjHash::ZERO);
         assert_eq!(MOTD_HASH, ObjHash::hash_bytes(MOTD_BYTES));
         assert_eq!(GUIDE_HASH, ObjHash::hash_bytes(GUIDE_BYTES));
+    }
+
+    #[test]
+    fn gc_reclaims_unreferenced_blobs_while_preserving_rollback_targets() {
+        let mut store = ObjectStore::new();
+        let orphan = store.put(b"orphan blob").unwrap();
+        let v1 = store.put(b"version 1").unwrap();
+        let v2 = store.put(b"version 2").unwrap();
+        store.set_ref("@doc", v1).unwrap();
+        store.set_ref("@doc", v2).unwrap(); // v1 is now prev rollback target!
+
+        assert_eq!(store.object_count(), 5); // motd, guide, orphan, v1, v2
+        assert_eq!(store.gc(), 1); // only `orphan` is reclaimed
+        assert_eq!(store.object_count(), 4);
+        assert_eq!(store.get_by_hash(orphan), Err(StoreError::NotFound));
+        assert_eq!(store.get_by_hash(v1), Ok(&b"version 1"[..]));
+        assert_eq!(store.get_by_hash(v2), Ok(&b"version 2"[..]));
+
+        // Rollback still succeeds after GC, and next GC reclaims v2!
+        assert_eq!(store.rollback_ref("@doc"), Ok(v1));
+        assert_eq!(store.gc(), 1);
+        assert_eq!(store.get_by_hash(v2), Err(StoreError::NotFound));
+        assert_eq!(store.get_any("@doc"), Ok((v1, &b"version 1"[..])));
+    }
+
+    #[test]
+    fn snapshot_encode_decode_roundtrip_and_corruption_detection() {
+        let mut store = ObjectStore::new();
+        let v1 = store.put(b"alpha").unwrap();
+        let v2 = store.put(b"beta").unwrap();
+        store.set_ref("@cfg", v1).unwrap();
+        store.set_ref("@cfg", v2).unwrap();
+        store.seal_ref("@cfg").unwrap();
+
+        let mut buf = [0u8; 4096];
+        let written = store.encode_snapshot(&mut buf).unwrap();
+        let restored = ObjectStore::decode_snapshot(&buf[..written]).unwrap();
+
+        assert_eq!(restored.object_count(), store.object_count());
+        assert_eq!(restored.get_any("@motd"), store.get_any("@motd"));
+        assert_eq!(restored.get_any("@cfg"), Ok((v2, &b"beta"[..])));
+        // Sealed read-only rights preserved across persistence roundtrip
+        let mut restored = restored;
+        assert_eq!(restored.set_ref("@cfg", v1), Err(StoreError::ReadOnly));
+
+        // Single-bit corruption is detected and rejected!
+        buf[written / 2] ^= 0x01;
+        assert!(matches!(
+            ObjectStore::decode_snapshot(&buf[..written]),
+            Err(StoreError::CorruptSnapshot)
+        ));
     }
 }

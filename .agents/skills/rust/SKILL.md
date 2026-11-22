@@ -16,8 +16,7 @@ in this repository.
 - Use the Rust **nightly** toolchain with `rust-src`, `llvm-tools-preview`,
   `clippy`, and `rustfmt` installed (keep a `rust-toolchain.toml` at the repo
   root once Cargo crates are initialized).
-- Target bare-metal triples such as `x86_64-unknown-none` (or
-  `aarch64-unknown-none`) and configure `.cargo/config.toml` with:
+- Target bare-metal `aarch64-unknown-none` (`-C target-cpu=cortex-a76` for Raspberry Pi 5 16 GB BCM2712) and configure builds with:
   - `[unstable]` `build-std = ["core", "compiler_builtins", "alloc"]`
   - `build-std-features = ["compiler-builtins-mem"]`
   - Target-specific linker arguments or custom linker scripts (`-C link-arg=-T...`).
@@ -47,20 +46,11 @@ in this repository.
 
 ## 3. Running & Debugging with QEMU/KVM
 
-- Prefer headless serial output for fast iteration and agent-readable logs:
+- Prefer headless serial output on QEMU `aarch64` `virt` (`-cpu cortex-a76`) for fast iteration and agent-readable logs:
   ```bash
-  qemu-system-x86_64 \
-    -enable-kvm \
-    -serial stdio \
-    -display none \
-    -no-reboot \
-    -no-shutdown \
-    -drive format=raw,file=<image>
+  cargo xtask test
   ```
-  (Omit `-enable-kvm` if running on a host without KVM, such as macOS.)
-- **Automated kernel tests:** Use `#![feature(custom_test_frameworks)]` with
-  QEMU's `isa-debug-exit` device (`-device isa-debug-exit,iobase=0xf4,iosize=0x04`)
-  and map the exit code in `.cargo/config.toml` (`test-success-exit-code`).
+- **Raspberry Pi 5 (16 GB) boot image:** Build `target/newos-rpi5.img` via `cargo xtask rpi5-image`.
 - **GDB debugging:** Start QEMU with `-s -S` (GDB server on `:1234`, paused at
   reset) and attach with `gdb <kernel-elf> -ex "target remote :1234"`.
 - **Remote GCP dev VM (`newos-dev`):** This repo's Debian 13 + QEMU/KVM + Rust

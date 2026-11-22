@@ -18,7 +18,7 @@ pub use virtio::{VirtioNetDevice, VirtioNetDma, VirtioTransport};
 use newos_abi::SysError;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::{dhcpv4, dns, icmp};
+use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
 use smoltcp::socket::udp::{self, PacketBuffer, PacketMetadata};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
@@ -506,6 +506,183 @@ pub fn live_dns_resolve<T: VirtioTransport>(
     }
 }
 
+/// Monotonic millisecond clock source driving `smoltcp` timers and TCP retransmissions.
+pub trait NetClock {
+    fn now_millis(&mut self) -> i64;
+}
+
+/// Hardware cycle-counter-backed monotonic `NetClock` (wraps `user_rt::read_cycles()`).
+pub struct CycleClock<F: FnMut() -> u64> {
+    read_cycles: F,
+    start_cycles: u64,
+    cycles_per_ms: u64,
+}
+
+impl<F: FnMut() -> u64> CycleClock<F> {
+    pub fn new(mut read_cycles: F, cycles_per_ms: u64) -> Self {
+        let start_cycles = read_cycles();
+        Self {
+            read_cycles,
+            start_cycles,
+            cycles_per_ms: cycles_per_ms.max(1),
+        }
+    }
+}
+
+impl<F: FnMut() -> u64> NetClock for CycleClock<F> {
+    #[inline]
+    fn now_millis(&mut self) -> i64 {
+        let elapsed = (self.read_cycles)().saturating_sub(self.start_cycles);
+        (elapsed / self.cycles_per_ms) as i64
+    }
+}
+
+/// Open a live IPv4 TCP connection, send `tx_payload`, read up to `rx_out.len()` reply bytes,
+/// and close cleanly (`no_alloc`, `#![forbid(unsafe_code)]`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_tcp_exchange<D: Device, C: NetClock>(
+    device: &mut D,
+    clock: &mut C,
+    mac: [u8; 6],
+    cfg: &NetConfig,
+    remote_ip: [u8; 4],
+    remote_port: u16,
+    local_port: u16,
+    tx_payload: &[u8],
+    rx_out: &mut [u8],
+    timeout_ms: i64,
+) -> Result<usize, &'static str> {
+    let start_ms = clock.now_millis();
+    let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    let mut iface = Interface::new(config, device, Instant::from_millis(start_ms));
+    iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(
+            IpAddress::Ipv4(Ipv4Address::from(cfg.ip)),
+            cfg.prefix_len,
+        ));
+    });
+    if let Some(gw) = cfg.gateway {
+        let _ = iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::from(gw));
+    }
+
+    let mut rx_buf = [0u8; 1024];
+    let mut tx_buf = [0u8; 1024];
+    let tcp_sock = tcp::Socket::new(
+        tcp::SocketBuffer::new(&mut rx_buf[..]),
+        tcp::SocketBuffer::new(&mut tx_buf[..]),
+    );
+
+    let mut storage = [SocketStorage::EMPTY; 1];
+    let mut sockets = SocketSet::new(&mut storage[..]);
+    let handle = sockets.add(tcp_sock);
+
+    sockets
+        .get_mut::<tcp::Socket>(handle)
+        .connect(
+            iface.context(),
+            (IpAddress::Ipv4(Ipv4Address::from(remote_ip)), remote_port),
+            local_port,
+        )
+        .map_err(|_| "tcp connect failed")?;
+
+    let mut sent = 0usize;
+    let mut received = 0usize;
+    let mut closing = false;
+
+    loop {
+        let now_ms = clock.now_millis();
+        if now_ms.saturating_sub(start_ms) > timeout_ms {
+            return Err("tcp exchange timed out");
+        }
+        let _ = iface.poll(Instant::from_millis(now_ms), device, &mut sockets);
+        let sock = sockets.get_mut::<tcp::Socket>(handle);
+
+        if sent < tx_payload.len()
+            && sock.can_send()
+            && let Ok(n) = sock.send_slice(&tx_payload[sent..])
+        {
+            sent += n;
+        }
+        if sock.can_recv()
+            && received < rx_out.len()
+            && let Ok(n) = sock.recv_slice(&mut rx_out[received..])
+        {
+            received += n;
+            if received > 0 && !closing {
+                sock.close();
+                closing = true;
+            }
+        }
+        if closing && !sock.is_active() {
+            return Ok(received);
+        }
+        if !sock.may_recv() && sent == tx_payload.len() && received > 0 {
+            return Ok(received);
+        }
+        if !sock.is_open() {
+            if received > 0 || (tx_payload.is_empty() && sent == 0) {
+                return Ok(received);
+            }
+            return Err("tcp connection closed before reply");
+        }
+    }
+}
+
+/// High-level live IPv4 TCP exchange over VirtIO-net (QEMU) or RP1 Cadence GEM (Pi 5).
+#[allow(clippy::too_many_arguments)]
+pub fn live_tcp_exchange<T: VirtioTransport, C: NetClock>(
+    transport: T,
+    clock: &mut C,
+    nic: NicKind,
+    cfg: &NetConfig,
+    remote_ip: [u8; 4],
+    remote_port: u16,
+    local_port: u16,
+    tx_payload: &[u8],
+    rx_out: &mut [u8],
+    timeout_ms: i64,
+    virtio_dma: &VirtioNetDma,
+    gem_dma: &GemDma,
+) -> Result<usize, &'static str> {
+    match nic {
+        NicKind::Virtio(v) => {
+            if v.version < 2 {
+                return Err("VirtIO-MMIO v2 (modern) required");
+            }
+            let mut dev = VirtioNetDevice::init(transport, v.slot, virtio_dma)?;
+            run_tcp_exchange(
+                &mut dev,
+                clock,
+                v.mac,
+                cfg,
+                remote_ip,
+                remote_port,
+                local_port,
+                tx_payload,
+                rx_out,
+                timeout_ms,
+            )
+        }
+        NicKind::CadenceGem(g) => {
+            let mut dev = GemNetDevice::init(transport, g, gem_dma)?;
+            run_tcp_exchange(
+                &mut dev,
+                clock,
+                g.mac,
+                cfg,
+                remote_ip,
+                remote_port,
+                local_port,
+                tx_payload,
+                rx_out,
+                timeout_ms,
+            )
+        }
+    }
+}
+
 /// Parse a dotted-quad IPv4 string (`"1.1.1.1"`) without heap allocation.
 pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     let mut out = [0u8; 4];
@@ -609,5 +786,228 @@ mod tests {
         assert_eq!(parse_ipv4("10.0.2.2"), Some([10, 0, 2, 2]));
         assert_eq!(parse_ipv4("10.0.2"), None);
         assert_eq!(parse_ipv4("999.0.0.1"), None);
+    }
+
+    struct WireQueue {
+        frames: [[u8; 512]; 8],
+        lens: [usize; 8],
+        head: usize,
+        tail: usize,
+    }
+
+    impl WireQueue {
+        const fn new() -> Self {
+            Self {
+                frames: [[0; 512]; 8],
+                lens: [0; 8],
+                head: 0,
+                tail: 0,
+            }
+        }
+
+        fn push(&mut self, data: &[u8]) {
+            let next = (self.tail + 1) % 8;
+            if next != self.head {
+                let n = data.len().min(512);
+                self.frames[self.tail][..n].copy_from_slice(&data[..n]);
+                self.lens[self.tail] = n;
+                self.tail = next;
+            }
+        }
+
+        fn pop<'a>(&mut self, out: &'a mut [u8; 512]) -> Option<&'a [u8]> {
+            if self.head == self.tail {
+                return None;
+            }
+            let n = self.lens[self.head];
+            out[..n].copy_from_slice(&self.frames[self.head][..n]);
+            self.head = (self.head + 1) % 8;
+            Some(&out[..n])
+        }
+    }
+
+    struct WireEndpoint<'a> {
+        rx: &'a mut WireQueue,
+        tx: &'a mut WireQueue,
+        scratch: [u8; 512],
+    }
+
+    struct WireRx<'a> {
+        frame: &'a [u8],
+    }
+
+    impl RxToken for WireRx<'_> {
+        fn consume<R, F>(self, f: F) -> R
+        where
+            F: FnOnce(&[u8]) -> R,
+        {
+            f(self.frame)
+        }
+    }
+
+    struct WireTx<'a> {
+        tx: &'a mut WireQueue,
+    }
+
+    impl TxToken for WireTx<'_> {
+        fn consume<R, F>(self, len: usize, f: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            let mut tmp = [0u8; 512];
+            let n = len.min(tmp.len());
+            let res = f(&mut tmp[..n]);
+            self.tx.push(&tmp[..n]);
+            res
+        }
+    }
+
+    impl Device for WireEndpoint<'_> {
+        type RxToken<'a>
+            = WireRx<'a>
+        where
+            Self: 'a;
+        type TxToken<'a>
+            = WireTx<'a>
+        where
+            Self: 'a;
+
+        fn receive(&mut self, _ts: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            let frame = self.rx.pop(&mut self.scratch)?;
+            Some((WireRx { frame }, WireTx { tx: self.tx }))
+        }
+
+        fn transmit(&mut self, _ts: Instant) -> Option<Self::TxToken<'_>> {
+            Some(WireTx { tx: self.tx })
+        }
+
+        fn capabilities(&self) -> DeviceCapabilities {
+            let mut caps = DeviceCapabilities::default();
+            caps.medium = Medium::Ethernet;
+            caps.max_transmission_unit = 512;
+            caps
+        }
+    }
+
+    #[test]
+    fn smoltcp_tcp_handshake_and_echo_exchange_no_alloc() {
+        let mut c2s = WireQueue::new();
+        let mut s2c = WireQueue::new();
+
+        let client_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let server_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+
+        let mut c_iface = {
+            let mut dev = WireEndpoint {
+                rx: &mut s2c,
+                tx: &mut c2s,
+                scratch: [0; 512],
+            };
+            let mut iface = Interface::new(
+                Config::new(HardwareAddress::Ethernet(EthernetAddress(client_mac))),
+                &mut dev,
+                Instant::from_millis(0),
+            );
+            iface.update_ip_addrs(|a| {
+                let _ = a.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24));
+            });
+            iface
+        };
+
+        let mut s_iface = {
+            let mut dev = WireEndpoint {
+                rx: &mut c2s,
+                tx: &mut s2c,
+                scratch: [0; 512],
+            };
+            let mut iface = Interface::new(
+                Config::new(HardwareAddress::Ethernet(EthernetAddress(server_mac))),
+                &mut dev,
+                Instant::from_millis(0),
+            );
+            iface.update_ip_addrs(|a| {
+                let _ = a.push(IpCidr::new(IpAddress::v4(10, 0, 2, 2), 24));
+            });
+            iface
+        };
+
+        let mut c_rx = [0u8; 512];
+        let mut c_tx = [0u8; 512];
+        let mut c_storage = [SocketStorage::EMPTY; 1];
+        let mut c_sockets = SocketSet::new(&mut c_storage[..]);
+        let c_handle = c_sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut c_rx[..]),
+            tcp::SocketBuffer::new(&mut c_tx[..]),
+        ));
+
+        let mut s_rx = [0u8; 512];
+        let mut s_tx = [0u8; 512];
+        let mut s_storage = [SocketStorage::EMPTY; 1];
+        let mut s_sockets = SocketSet::new(&mut s_storage[..]);
+        let s_handle = s_sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut s_rx[..]),
+            tcp::SocketBuffer::new(&mut s_tx[..]),
+        ));
+
+        s_sockets
+            .get_mut::<tcp::Socket>(s_handle)
+            .listen(8080)
+            .unwrap();
+        c_sockets
+            .get_mut::<tcp::Socket>(c_handle)
+            .connect(c_iface.context(), (IpAddress::v4(10, 0, 2, 2), 8080), 49152)
+            .unwrap();
+
+        let mut cycles = 0u64;
+        let mut clock = CycleClock::new(
+            || {
+                cycles += 1_000;
+                cycles
+            },
+            1_000,
+        );
+
+        let mut client_sent = false;
+        let mut reply = [0u8; 64];
+        let mut reply_len = 0usize;
+
+        for _ in 0..64 {
+            let now = Instant::from_millis(clock.now_millis());
+            {
+                let mut dev = WireEndpoint {
+                    rx: &mut s2c,
+                    tx: &mut c2s,
+                    scratch: [0; 512],
+                };
+                let _ = c_iface.poll(now, &mut dev, &mut c_sockets);
+            }
+            {
+                let mut dev = WireEndpoint {
+                    rx: &mut c2s,
+                    tx: &mut s2c,
+                    scratch: [0; 512],
+                };
+                let _ = s_iface.poll(now, &mut dev, &mut s_sockets);
+            }
+
+            let cs = c_sockets.get_mut::<tcp::Socket>(c_handle);
+            if !client_sent && cs.can_send() {
+                cs.send_slice(b"hello-tcp").unwrap();
+                client_sent = true;
+            }
+            if cs.can_recv() {
+                reply_len = cs.recv_slice(&mut reply).unwrap();
+                break;
+            }
+
+            let ss = s_sockets.get_mut::<tcp::Socket>(s_handle);
+            if ss.can_recv() && ss.can_send() {
+                let mut tmp = [0u8; 64];
+                let n = ss.recv_slice(&mut tmp).unwrap();
+                ss.send_slice(&tmp[..n]).unwrap();
+            }
+        }
+
+        assert_eq!(&reply[..reply_len], b"hello-tcp");
     }
 }

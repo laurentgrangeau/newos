@@ -1,8 +1,6 @@
 //! Limine boot protocol requests and safe `no_alloc` response extraction.
 
 use limine::memmap::MEMMAP_USABLE;
-#[cfg(target_arch = "x86_64")]
-use limine::mp::MP_FLAG_X2APIC;
 use limine::request::{
     ExecutableFileRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, MpResponse,
     RsdpRequest,
@@ -11,9 +9,6 @@ use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 use newos_kernel_core::BootInfo;
 use newos_kernel_core::memory::UntypedInventory;
 
-#[cfg(target_arch = "x86_64")]
-const MP_FLAGS: u64 = MP_FLAG_X2APIC;
-#[cfg(not(target_arch = "x86_64"))]
 const MP_FLAGS: u64 = 0;
 
 // SAFETY: Limine scans the `.requests_start_marker`, `.requests`, and
@@ -80,23 +75,10 @@ pub fn boot_info() -> BootInfo {
         }
     }
 
-    let (cpu_count, bsp_lapic_id, x2apic_enabled) = MP_REQUEST
+    let cpu_count = MP_REQUEST
         .response()
-        .map(|mp| {
-            #[cfg(target_arch = "x86_64")]
-            {
-                (
-                    mp.cpus().len(),
-                    mp.bsp_lapic_id,
-                    (mp.flags & (MP_FLAG_X2APIC as u32)) != 0,
-                )
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                (mp.cpus().len(), 0, false)
-            }
-        })
-        .unwrap_or((1, 0, false));
+        .map(|mp| mp.cpus().len())
+        .unwrap_or(1);
 
     let rsdp_addr = RSDP_REQUEST
         .response()
@@ -121,18 +103,16 @@ pub fn boot_info() -> BootInfo {
         .map(|resp| resp.executable_file().cmdline())
         .unwrap_or("");
     let interactive_shell = cmdline.contains("interactive");
-    let board_rpi5 = cmdline.contains("rpi5");
+    let qemu_virt = cmdline.contains("qemu");
 
     BootInfo {
         hhdm_offset,
         untyped,
         cpu_count,
-        bsp_lapic_id,
-        x2apic_enabled,
         rsdp_addr,
         init_module,
         worker_module,
         interactive_shell,
-        board_rpi5,
+        qemu_virt,
     }
 }

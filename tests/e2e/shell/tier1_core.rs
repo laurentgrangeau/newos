@@ -158,8 +158,9 @@ fn tier1_shell_procs_and_sys() {
 
     sh.exec_line("sys");
     let out_s = sh.host_mut().take_output();
+    assert!(out_s.contains("aarch64 (Raspberry Pi 5 16 GB)"));
     assert!(out_s.contains("SMP=4 CPUs"));
-    assert!(out_s.contains("2 Ring-3 procs"));
+    assert!(out_s.contains("2 EL0 procs"));
     assert!(out_s.contains("2 CAOS objects"));
 }
 

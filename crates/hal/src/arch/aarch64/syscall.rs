@@ -6,15 +6,15 @@ use core::cell::SyncUnsafeCell;
 use core::fmt::Write;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
-use newos_abi::{CapId, QemuExitCode, Rights, SysError, SyscallNumber};
-use newos_kernel_core::cspace::CapObject;
-use newos_kernel_core::ipc::KernelIpcState;
-use newos_kernel_core::memory::PhysAddr;
+use newos_abi::{CAP_MINT_SET_BADGE, CapId, QemuExitCode, Rights, SysError, SyscallNumber};
+use newos_kernel_core::ipc::{KernelIpcState, MAX_IPC_PROCS};
+use newos_kernel_core::memory::{PageFlags, PhysAddr, UntypedInventory, VSpaceMapper, VirtAddr};
+use newos_kernel_core::sched::{DEFAULT_PRIORITY, Scheduler};
 
 use super::serial;
 
 const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
-const MAX_PROCS: usize = 4;
+const MAX_PROCS: usize = MAX_IPC_PROCS;
 const TTBR0_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 #[inline]
@@ -28,9 +28,17 @@ static NET_MMIO_PHYS: AtomicU64 = AtomicU64::new(0);
 static NET_MMIO_VIRT: AtomicU64 = AtomicU64::new(0);
 static NET_MMIO_LEN: AtomicU64 = AtomicU64::new(0);
 static SYS_INFO_PACKED: AtomicU64 = AtomicU64::new(0);
-static FAULT_RECOVERY_PC: AtomicU64 = AtomicU64::new(0);
-static FAULT_RECOVERY_SP: AtomicU64 = AtomicU64::new(0);
 static IPC_STATE: SyncUnsafeCell<KernelIpcState> = SyncUnsafeCell::new(KernelIpcState::new());
+static RUNTIME_UNTYPED: SyncUnsafeCell<UntypedInventory> =
+    SyncUnsafeCell::new(UntypedInventory::new());
+
+/// Install remaining bootstrap `UntypedInventory` for runtime `MapPage`/`UnmapPage` syscalls.
+pub fn set_untyped_inventory(untyped: UntypedInventory) {
+    // SAFETY: Called once on BSP during boot before entering EL0.
+    unsafe {
+        *RUNTIME_UNTYPED.get() = untyped;
+    }
+}
 
 /// Full EL0 register trap frame saved on `SP_EL1` by `__newos_sync_el0` (272 bytes, 16B-aligned).
 #[derive(Clone, Copy)]
@@ -64,6 +72,8 @@ struct ProcessSlot {
     ttbr0: u64,
     wait: IpcWaitState,
     wait_ep_id: u32,
+    fault_pc: u64,
+    fault_sp: u64,
     frame: TrapFrame,
 }
 
@@ -73,12 +83,15 @@ impl ProcessSlot {
         ttbr0: 0,
         wait: IpcWaitState::Runnable,
         wait_ep_id: 0,
+        fault_pc: 0,
+        fault_sp: 0,
         frame: TrapFrame::ZERO,
     };
 }
 
 struct ProcTable {
     procs: [ProcessSlot; MAX_PROCS],
+    sched: Scheduler<MAX_PROCS>,
     count: usize,
     current: usize,
 }
@@ -87,23 +100,25 @@ impl ProcTable {
     const fn new() -> Self {
         Self {
             procs: [ProcessSlot::EMPTY; MAX_PROCS],
+            sched: Scheduler::new(),
             count: 0,
             current: 0,
         }
     }
 
     #[inline]
-    fn find_next_runnable(&self, from: usize) -> Option<usize> {
+    fn pick_next_runnable(&mut self, from: usize) -> Option<usize> {
         if self.count <= 1 {
             return None;
         }
-        for offset in 1..self.count {
-            let idx = (from + offset) % self.count;
-            if self.procs[idx].active && self.procs[idx].wait == IpcWaitState::Runnable {
-                return Some(idx);
-            }
+        let _ = self.sched.schedule_next()?;
+        let next = self.sched.current_slot()?;
+        if next != from && self.procs[next].active && self.procs[next].wait == IpcWaitState::Runnable
+        {
+            Some(next)
+        } else {
+            None
         }
-        None
     }
 
     #[inline]
@@ -171,9 +186,15 @@ pub fn register_user_process(entry_pc: u64, user_sp: u64, ttbr0: u64) -> Result<
             ttbr0,
             wait: IpcWaitState::Runnable,
             wait_ep_id: 0,
+            fault_pc: 0,
+            fault_sp: 0,
             frame,
         };
+        let _ = table.sched.spawn(DEFAULT_PRIORITY);
         table.count += 1;
+        if pid > 0 {
+            let _ = (*IPC_STATE.get()).init_worker_bootstrap_caps(pid);
+        }
         Ok(pid)
     }
 }
@@ -239,8 +260,16 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
 
     if ec != 0x15 {
         // Hardware EL0 fault (e.g., `udf #0` illegal instruction EC=0x00, data/insn abort)
-        let rec_pc = FAULT_RECOVERY_PC.load(Ordering::Acquire);
-        let rec_sp = FAULT_RECOVERY_SP.load(Ordering::Acquire);
+        // SAFETY: Synchronous exception runs with interrupts masked on BSP.
+        let (cur_pid, rec_pc, rec_sp) = unsafe {
+            let table = &*PROCS.get();
+            let cur = table.current;
+            if cur < table.count {
+                (cur, table.procs[cur].fault_pc, table.procs[cur].fault_sp)
+            } else {
+                (cur, 0, 0)
+            }
+        };
         if rec_pc != 0 && rec_sp != 0 {
             let mut s = serial::Pl011::new();
             let _ = writeln!(
@@ -252,7 +281,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             unsafe {
                 let ipc = &mut *IPC_STATE.get();
                 // Signal bit 6 (invalid-instruction fault bit matching x86_64 `#UD` contract)
-                let _ = ipc.notify_signal(CapId::BOOTSTRAP_FAULT_NOTIF, 1u64 << 6);
+                let _ = ipc.notify_signal_for(cur_pid, CapId::BOOTSTRAP_FAULT_NOTIF, 1u64 << 6);
             }
             frame.elr_el1 = rec_pc;
             frame.sp_el0 = rec_sp;
@@ -278,8 +307,10 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
     let a0 = frame.x[0];
     let a1 = frame.x[1];
     let a2 = frame.x[2];
+    let a3 = frame.x[3];
     // SAFETY: EL1 synchronous handler runs with DAIF masked on BSP.
     let ipc = unsafe { &mut *IPC_STATE.get() };
+    let cur_pid = unsafe { (*PROCS.get()).current };
 
     let result: Result<u64, SysError> = match syscall {
         SyscallNumber::DebugWrite => {
@@ -296,11 +327,11 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             frame.x[0] = 0;
             frame.x[1] = next_count;
 
-            // SAFETY: Cooperative round-robin switch across runnable hardware `TTBR0_EL1` VSpaces.
+            // SAFETY: Priority + round-robin switch across runnable hardware `TTBR0_EL1` VSpaces.
             unsafe {
                 let table = &mut *PROCS.get();
                 let cur = table.current;
-                if let Some(next) = table.find_next_runnable(cur) {
+                if let Some(next) = table.pick_next_runnable(cur) {
                     table.procs[cur].frame = *frame;
                     table.current = next;
                     switch_ttbr0(table.procs[next].ttbr0, next);
@@ -317,16 +348,11 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             };
             super::exit_qemu(code)
         }
-        SyscallNumber::NotifySignal => ipc.notify_signal(CapId::new(a0), a1).map(|()| 0),
-        SyscallNumber::NotifyPoll => ipc.notify_poll(CapId::new(a0)),
+        SyscallNumber::NotifySignal => ipc.notify_signal_for(cur_pid, CapId::new(a0), a1).map(|()| 0),
+        SyscallNumber::NotifyPoll => ipc.notify_poll_for(cur_pid, CapId::new(a0)),
         SyscallNumber::IpcSend => {
-            if let Ok((ep_id, badge)) = ipc
-                .root_cspace
-                .lookup(CapId::new(a0), Rights::WRITE)
-                .and_then(|cap| match cap.object {
-                    CapObject::Endpoint { id } => Ok((id, cap.badge)),
-                    _ => Err(SysError::InvalidArgument),
-                })
+            if let Ok((ep_id, badge)) =
+                ipc.lookup_endpoint_for(cur_pid, CapId::new(a0), Rights::WRITE)
             {
                 // SAFETY: EL1 synchronous handler runs with DAIF masked on BSP.
                 let woken = unsafe {
@@ -340,6 +366,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                         table.procs[peer].frame.x[1] = pack_ipc_msg(badge, a1);
                         table.procs[peer].wait = IpcWaitState::Runnable;
                         table.procs[peer].wait_ep_id = 0;
+                        let _ = table.sched.wake_slot(peer);
                         true
                     } else {
                         false
@@ -348,23 +375,18 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 if woken {
                     Ok(0)
                 } else {
-                    ipc.ipc_send(CapId::new(a0), a1).map(|()| 0)
+                    ipc.ipc_send_for(cur_pid, CapId::new(a0), a1).map(|()| 0)
                 }
             } else {
-                ipc.ipc_send(CapId::new(a0), a1).map(|()| 0)
+                ipc.ipc_send_for(cur_pid, CapId::new(a0), a1).map(|()| 0)
             }
         }
         SyscallNumber::IpcRecv => ipc
-            .ipc_recv(CapId::new(a0))
+            .ipc_recv_for(cur_pid, CapId::new(a0))
             .map(|msg| pack_ipc_msg(msg.badge, msg.payload)),
         SyscallNumber::IpcCall => {
-            let resolved = ipc
-                .root_cspace
-                .lookup(CapId::new(a0), Rights::WRITE.union(Rights::READ))
-                .and_then(|cap| match cap.object {
-                    CapObject::Endpoint { id } => Ok((id, cap.badge)),
-                    _ => Err(SysError::InvalidArgument),
-                });
+            let resolved =
+                ipc.lookup_endpoint_for(cur_pid, CapId::new(a0), Rights::WRITE.union(Rights::READ));
             match resolved {
                 Err(e) => Err(e),
                 Ok((ep_id, badge)) => {
@@ -381,22 +403,33 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                             table.procs[server].wait_ep_id = 0;
                             table.procs[cur].wait = IpcWaitState::WaitingReply;
                             table.procs[cur].wait_ep_id = ep_id;
+                            let _ = table.sched.block_slot(cur);
+                            let _ = table.sched.wake_slot(server);
+                            table.sched.select_slot(server);
                             table.procs[cur].frame = *frame;
                             table.current = server;
                             switch_ttbr0(table.procs[server].ttbr0, server);
                             *frame = table.procs[server].frame;
                             return;
                         }
-                        if let Some(next) = table.find_next_runnable(cur) {
-                            match ipc.ipc_send(CapId::new(a0), a1) {
+                        if table.sched.ready_count() > 0 {
+                            match ipc.ipc_send_for(cur_pid, CapId::new(a0), a1) {
                                 Ok(()) => {
                                     table.procs[cur].wait = IpcWaitState::WaitingReply;
                                     table.procs[cur].wait_ep_id = ep_id;
-                                    table.procs[cur].frame = *frame;
-                                    table.current = next;
-                                    switch_ttbr0(table.procs[next].ttbr0, next);
-                                    *frame = table.procs[next].frame;
-                                    return;
+                                    let _ = table.sched.block_slot(cur);
+                                    if let Some(next) = table.pick_next_runnable(cur) {
+                                        table.procs[cur].frame = *frame;
+                                        table.current = next;
+                                        switch_ttbr0(table.procs[next].ttbr0, next);
+                                        *frame = table.procs[next].frame;
+                                        return;
+                                    }
+                                    table.procs[cur].wait = IpcWaitState::Runnable;
+                                    table.procs[cur].wait_ep_id = 0;
+                                    let _ = table.sched.wake_slot(cur);
+                                    table.sched.select_slot(cur);
+                                    Err(SysError::WouldBlock)
                                 }
                                 Err(e) => Err(e),
                             }
@@ -409,13 +442,11 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         }
         SyscallNumber::IpcReplyRecv => {
             if a2 != 0 {
-                let resolved = ipc
-                    .root_cspace
-                    .lookup(CapId::new(a0), Rights::WRITE.union(Rights::READ))
-                    .and_then(|cap| match cap.object {
-                        CapObject::Endpoint { id } => Ok((id, cap.badge)),
-                        _ => Err(SysError::InvalidArgument),
-                    });
+                let resolved = ipc.lookup_endpoint_for(
+                    cur_pid,
+                    CapId::new(a0),
+                    Rights::WRITE.union(Rights::READ),
+                );
                 match resolved {
                     Err(e) => Err(e),
                     Ok((ep_id, badge)) => {
@@ -432,6 +463,9 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                                 table.procs[client].wait_ep_id = 0;
                                 table.procs[cur].wait = IpcWaitState::WaitingRecv;
                                 table.procs[cur].wait_ep_id = ep_id;
+                                let _ = table.sched.block_slot(cur);
+                                let _ = table.sched.wake_slot(client);
+                                table.sched.select_slot(client);
                                 table.procs[cur].frame = *frame;
                                 table.current = client;
                                 switch_ttbr0(table.procs[client].ttbr0, client);
@@ -441,16 +475,23 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                             // No client parked in WaitingReply (e.g., legacy IpcSend/IpcRecv client):
                             // buffer the reply, then park in WaitingRecv instead of falling through
                             // into ipc_recv on the same endpoint (which would self-consume the reply).
-                            match ipc.ipc_send(CapId::new(a0), a1) {
+                            match ipc.ipc_send_for(cur_pid, CapId::new(a0), a1) {
                                 Ok(()) => {
-                                    if let Some(next) = table.find_next_runnable(cur) {
+                                    if table.sched.ready_count() > 0 {
                                         table.procs[cur].wait = IpcWaitState::WaitingRecv;
                                         table.procs[cur].wait_ep_id = ep_id;
-                                        table.procs[cur].frame = *frame;
-                                        table.current = next;
-                                        switch_ttbr0(table.procs[next].ttbr0, next);
-                                        *frame = table.procs[next].frame;
-                                        return;
+                                        let _ = table.sched.block_slot(cur);
+                                        if let Some(next) = table.pick_next_runnable(cur) {
+                                            table.procs[cur].frame = *frame;
+                                            table.current = next;
+                                            switch_ttbr0(table.procs[next].ttbr0, next);
+                                            *frame = table.procs[next].frame;
+                                            return;
+                                        }
+                                        table.procs[cur].wait = IpcWaitState::Runnable;
+                                        table.procs[cur].wait_ep_id = 0;
+                                        let _ = table.sched.wake_slot(cur);
+                                        table.sched.select_slot(cur);
                                     }
                                     Err(SysError::WouldBlock)
                                 }
@@ -460,31 +501,32 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                     }
                 }
             } else {
-                match ipc.ipc_recv(CapId::new(a0)) {
+                match ipc.ipc_recv_for(cur_pid, CapId::new(a0)) {
                     Ok(msg) => Ok(pack_ipc_msg(msg.badge, msg.payload)),
                     Err(SysError::WouldBlock) => {
-                        let resolved = ipc
-                            .root_cspace
-                            .lookup(CapId::new(a0), Rights::READ)
-                            .and_then(|cap| match cap.object {
-                                CapObject::Endpoint { id } => Ok(id),
-                                _ => Err(SysError::InvalidArgument),
-                            });
+                        let resolved = ipc.lookup_endpoint_for(cur_pid, CapId::new(a0), Rights::READ);
                         match resolved {
                             Err(e) => Err(e),
-                            Ok(ep_id) => {
+                            Ok((ep_id, _)) => {
                                 // SAFETY: EL1 synchronous handler runs with DAIF masked on BSP.
                                 unsafe {
                                     let table = &mut *PROCS.get();
                                     let cur = table.current;
-                                    if let Some(next) = table.find_next_runnable(cur) {
+                                    if table.sched.ready_count() > 0 {
                                         table.procs[cur].wait = IpcWaitState::WaitingRecv;
                                         table.procs[cur].wait_ep_id = ep_id;
-                                        table.procs[cur].frame = *frame;
-                                        table.current = next;
-                                        switch_ttbr0(table.procs[next].ttbr0, next);
-                                        *frame = table.procs[next].frame;
-                                        return;
+                                        let _ = table.sched.block_slot(cur);
+                                        if let Some(next) = table.pick_next_runnable(cur) {
+                                            table.procs[cur].frame = *frame;
+                                            table.current = next;
+                                            switch_ttbr0(table.procs[next].ttbr0, next);
+                                            *frame = table.procs[next].frame;
+                                            return;
+                                        }
+                                        table.procs[cur].wait = IpcWaitState::Runnable;
+                                        table.procs[cur].wait_ep_id = 0;
+                                        let _ = table.sched.wake_slot(cur);
+                                        table.sched.select_slot(cur);
                                     }
                                 }
                                 Err(SysError::WouldBlock)
@@ -500,23 +542,31 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             if a0 == 0 || a0 >= USER_ADDR_LIMIT || a1 == 0 || a1 >= USER_ADDR_LIMIT {
                 Err(SysError::InvalidArgument)
             } else {
-                FAULT_RECOVERY_PC.store(a0, Ordering::Release);
-                FAULT_RECOVERY_SP.store(a1, Ordering::Release);
+                // SAFETY: EL1 synchronous handler runs with DAIF masked on BSP.
+                unsafe {
+                    let table = &mut *PROCS.get();
+                    table.procs[cur_pid].fault_pc = a0;
+                    table.procs[cur_pid].fault_sp = a1;
+                }
                 Ok(0)
             }
         }
-        SyscallNumber::MmioRead32 => ipc.validate_mmio_read32(CapId::new(a0), a1).map(|phys| {
-            let ptr = mmio_phys_to_virt(phys.raw()) as *const u32;
-            // SAFETY: `validate_mmio_read32` verified rights, alignment, and bounds.
-            let val = unsafe { read_volatile(ptr) };
-            u64::from(val)
-        }),
-        SyscallNumber::MmioWrite32 => ipc.validate_mmio_write32(CapId::new(a0), a1).map(|phys| {
-            let ptr = mmio_phys_to_virt(phys.raw()) as *mut u32;
-            // SAFETY: `validate_mmio_write32` verified WRITE right, alignment, and bounds.
-            unsafe { write_volatile(ptr, frame.x[2] as u32) };
-            0
-        }),
+        SyscallNumber::MmioRead32 => ipc
+            .validate_mmio_read32_for(cur_pid, CapId::new(a0), a1)
+            .map(|phys| {
+                let ptr = mmio_phys_to_virt(phys.raw()) as *const u32;
+                // SAFETY: `validate_mmio_read32_for` verified rights, alignment, and bounds.
+                let val = unsafe { read_volatile(ptr) };
+                u64::from(val)
+            }),
+        SyscallNumber::MmioWrite32 => ipc
+            .validate_mmio_write32_for(cur_pid, CapId::new(a0), a1)
+            .map(|phys| {
+                let ptr = mmio_phys_to_virt(phys.raw()) as *mut u32;
+                // SAFETY: `validate_mmio_write32_for` verified WRITE right, alignment, and bounds.
+                unsafe { write_volatile(ptr, a2 as u32) };
+                0
+            }),
         SyscallNumber::DebugRead => match serial::try_read_byte() {
             Some(b) => Ok(u64::from(b)),
             None => Err(SysError::WouldBlock),
@@ -548,6 +598,123 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 })
             }
         }
+        SyscallNumber::CapMint => {
+            let rights = Rights::from_bits_truncate(a2 as u8);
+            let badge = if (a2 & CAP_MINT_SET_BADGE) != 0 {
+                Some(a3)
+            } else {
+                None
+            };
+            ipc.cap_mint_for(cur_pid, CapId::new(a0), a1 as usize, rights, badge)
+                .map(CapId::raw)
+        }
+        SyscallNumber::CapCopy => ipc
+            .cap_copy_for(cur_pid, CapId::new(a0), a1 as usize)
+            .map(CapId::raw),
+        SyscallNumber::CapMove => ipc
+            .cap_move_for(cur_pid, CapId::new(a0), a1 as usize)
+            .map(CapId::raw),
+        SyscallNumber::CapDelete => ipc.cap_delete_for(cur_pid, CapId::new(a0)).map(|()| 0),
+        SyscallNumber::CapRevoke => ipc
+            .cap_revoke_for(cur_pid, CapId::new(a0))
+            .map(|n| n as u64),
+        SyscallNumber::CapGrant => {
+            let target_pid = a0 as usize;
+            let active_count = unsafe { (*PROCS.get()).count };
+            if target_pid >= active_count {
+                Err(SysError::InvalidArgument)
+            } else {
+                let rights = Rights::from_bits_truncate(a2 as u8);
+                let badge = if (a2 & CAP_MINT_SET_BADGE) != 0 {
+                    Some(a3)
+                } else {
+                    None
+                };
+                ipc.cap_grant_between(cur_pid, target_pid, CapId::new(a1), rights, badge)
+                    .map(CapId::raw)
+            }
+        }
+        SyscallNumber::SetPriority => {
+            let target_pid = if a0 == u64::MAX { cur_pid } else { a0 as usize };
+            if target_pid != cur_pid && cur_pid != 0 {
+                Err(SysError::InsufficientRights)
+            } else if a1 > u64::from(u8::MAX) {
+                Err(SysError::InvalidArgument)
+            } else {
+                // SAFETY: EL1 synchronous handler runs with DAIF masked on BSP.
+                unsafe {
+                    let table = &mut *PROCS.get();
+                    if target_pid >= table.count {
+                        Err(SysError::InvalidArgument)
+                    } else {
+                        table.sched.set_priority(target_pid, a1 as u8).map(|()| 0)
+                    }
+                }
+            }
+        }
+        SyscallNumber::MapPage => {
+            if a0 == 0 || a0 >= USER_ADDR_LIMIT {
+                Err(SysError::InvalidArgument)
+            } else {
+                let rights = Rights::from_bits_truncate(a1 as u8);
+                let flags = PageFlags::new_wx(
+                    rights.contains(Rights::WRITE),
+                    rights.contains(Rights::EXEC),
+                    true,
+                    false,
+                );
+                match (VirtAddr::new_page_aligned(a0), flags) {
+                    (Ok(va), Ok(page_flags)) => {
+                        let ttbr0 = unsafe {
+                            let table = &*PROCS.get();
+                            table.procs[table.current].ttbr0
+                        };
+                        let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
+                        let mut vspace = super::paging::Aarch64VSpace::from_root_phys(ttbr0, hhdm);
+                        // SAFETY: EL1 synchronous handler runs with DAIF masked on BSP.
+                        let untyped = unsafe { &mut *RUNTIME_UNTYPED.get() };
+                        match untyped.retype_frame() {
+                            Ok(frame) => {
+                                vspace.zero_frame(&frame);
+                                let pa = frame.start_addr().raw();
+                                match vspace.map_4k(va, frame, page_flags, untyped) {
+                                    Ok(()) => Ok(pa),
+                                    Err(e) => Err(e),
+                                }
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    _ => Err(SysError::InvalidArgument),
+                }
+            }
+        }
+        SyscallNumber::UnmapPage => {
+            if a0 == 0 || a0 >= USER_ADDR_LIMIT {
+                Err(SysError::InvalidArgument)
+            } else {
+                match VirtAddr::new_page_aligned(a0) {
+                    Ok(va) => {
+                        let ttbr0 = unsafe {
+                            let table = &*PROCS.get();
+                            table.procs[table.current].ttbr0
+                        };
+                        let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
+                        let mut vspace = super::paging::Aarch64VSpace::from_root_phys(ttbr0, hhdm);
+                        match vspace.unmap_4k(va) {
+                            Ok(frame) => {
+                                // SAFETY: EL1 synchronous handler runs with DAIF masked on BSP.
+                                let untyped = unsafe { &mut *RUNTIME_UNTYPED.get() };
+                                let _ = untyped.reclaim_frame(frame);
+                                Ok(0)
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
     };
 
     match result {
@@ -569,6 +736,7 @@ pub fn start_userspace() -> ! {
         let table = &mut *PROCS.get();
         assert!(table.count > 0 && table.procs[0].active);
         table.current = 0;
+        table.sched.select_slot(0);
         (
             table.procs[0].ttbr0,
             table.procs[0].frame.elr_el1,

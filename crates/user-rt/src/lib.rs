@@ -1,16 +1,16 @@
 #![no_std]
 #![feature(sync_unsafe_cell)]
 
-//! Safe Ring-3 userspace runtime & syscall SDK for NewOS.
+//! Safe EL0 userspace runtime & `svc #0` syscall SDK for NewOS (Raspberry Pi 5 16 GB, `aarch64`).
 //!
-//! Confines the minimal 64-bit `syscall` assembly trampoline inside this crate so
+//! Confines the minimal 64-bit `svc #0` assembly trampoline inside this crate so
 //! all userspace services (`init`, drivers, apps) can enforce `#![forbid(unsafe_code)]`.
 
 use core::arch::asm;
 use core::cell::SyncUnsafeCell;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU64, Ordering};
-use newos_abi::{CapId, QemuExitCode, SysError, SyscallNumber};
+use newos_abi::{CAP_MINT_SET_BADGE, CapId, QemuExitCode, Rights, SysError, SyscallNumber};
 
 const DEBUG_WRITE_MAX: usize = 256;
 const SYS_INFO_UNCACHED: u64 = u64::MAX;
@@ -28,23 +28,6 @@ static SUPERVISOR_RECOVERY_STACK: SyncUnsafeCell<RecoveryStack> =
 fn raw_syscall(num: SyscallNumber, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, SysError> {
     let err: u64;
     let val: u64;
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: Executing 64-bit `syscall` in Ring 3 transfers control to `IA32_LSTAR`,
-    // returning `(err, val)` in `(rax, rdx)`.
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") num as u64 => err,
-            in("rdi") a0,
-            in("rsi") a1,
-            inlateout("rdx") a2 => val,
-            in("r10") a3,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    #[cfg(target_arch = "aarch64")]
     // SAFETY: Executing `svc #0` in EL0 traps to `VBAR_EL1`, returning `(err, val)` in `(x0, x1)`.
     unsafe {
         asm!(
@@ -221,7 +204,7 @@ pub fn ipc_reply_recv(
     Ok(unpack_ipc_msg(packed))
 }
 
-/// Read the CPU monotonic cycle counter (`rdtsc`) via syscall.
+/// Read the ARM Generic Timer virtual counter (`CNTVCT_EL0`) via syscall.
 pub fn read_cycles() -> Result<u64, SysError> {
     raw_syscall(SyscallNumber::ReadCycles, 0, 0, 0, 0)
 }
@@ -269,14 +252,113 @@ pub fn virt_to_phys<T>(value: &T) -> Result<u64, SysError> {
     raw_syscall(SyscallNumber::VirtToPhys, va, 0, 0, 0)
 }
 
-/// Deliberately trigger a Ring-3/EL0 hardware invalid-instruction exception for crash-isolation testing.
+/// Derive a capability in the caller's `CSpace` with attenuated `rights` and optional immutable `badge`.
+///
+/// Pass `dst_slot = None` to let the kernel choose the first free slot automatically.
+pub fn cap_mint(
+    src: CapId,
+    dst_slot: Option<usize>,
+    rights: Rights,
+    new_badge: Option<u64>,
+) -> Result<CapId, SysError> {
+    let (flags, badge) = match new_badge {
+        Some(b) => (u64::from(rights.bits()) | CAP_MINT_SET_BADGE, b),
+        None => (u64::from(rights.bits()), 0),
+    };
+    raw_syscall(
+        SyscallNumber::CapMint,
+        src.raw(),
+        dst_slot.unwrap_or(0) as u64,
+        flags,
+        badge,
+    )
+    .map(CapId::new)
+}
+
+/// Copy a capability verbatim inside the caller's `CSpace`.
+pub fn cap_copy(src: CapId, dst_slot: Option<usize>) -> Result<CapId, SysError> {
+    raw_syscall(
+        SyscallNumber::CapCopy,
+        src.raw(),
+        dst_slot.unwrap_or(0) as u64,
+        0,
+        0,
+    )
+    .map(CapId::new)
+}
+
+/// Move a capability to another slot inside the caller's `CSpace`, invalidating `src`.
+pub fn cap_move(src: CapId, dst_slot: Option<usize>) -> Result<CapId, SysError> {
+    raw_syscall(
+        SyscallNumber::CapMove,
+        src.raw(),
+        dst_slot.unwrap_or(0) as u64,
+        0,
+        0,
+    )
+    .map(CapId::new)
+}
+
+/// Delete a single capability slot from the caller's `CSpace`.
+pub fn cap_delete(cap: CapId) -> Result<(), SysError> {
+    raw_syscall(SyscallNumber::CapDelete, cap.raw(), 0, 0, 0).map(|_| ())
+}
+
+/// Transitively revoke all CDT descendants derived from `cap` in the caller's `CSpace`.
+pub fn cap_revoke(cap: CapId) -> Result<usize, SysError> {
+    raw_syscall(SyscallNumber::CapRevoke, cap.raw(), 0, 0, 0).map(|n| n as usize)
+}
+
+/// Map a fresh zeroed 4 KiB page at `vaddr` in the caller's `VSpace` (strict W^X enforced).
+///
+/// Returns the backing physical address of the newly mapped frame.
+pub fn map_page(vaddr: u64, rights: Rights) -> Result<u64, SysError> {
+    raw_syscall(SyscallNumber::MapPage, vaddr, u64::from(rights.bits()), 0, 0)
+}
+
+/// Unmap a 4 KiB page at `vaddr` from the caller's `VSpace` and reclaim its physical frame.
+pub fn unmap_page(vaddr: u64) -> Result<(), SysError> {
+    raw_syscall(SyscallNumber::UnmapPage, vaddr, 0, 0, 0).map(|_| ())
+}
+
+/// Set scheduling priority (`0..=255`, higher value = higher priority).
+///
+/// Pass `target_pid = None` to update the calling process's own priority.
+pub fn set_priority(target_pid: Option<usize>, priority: u8) -> Result<(), SysError> {
+    let pid_arg = target_pid.map_or(u64::MAX, |p| p as u64);
+    raw_syscall(
+        SyscallNumber::SetPriority,
+        pid_arg,
+        u64::from(priority),
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
+/// Grant an attenuated capability from the caller's `CSpace` into `target_pid`'s `CSpace`.
+pub fn cap_grant(
+    target_pid: usize,
+    src: CapId,
+    rights: Rights,
+    new_badge: Option<u64>,
+) -> Result<CapId, SysError> {
+    let (flags, badge) = match new_badge {
+        Some(b) => (u64::from(rights.bits()) | CAP_MINT_SET_BADGE, b),
+        None => (u64::from(rights.bits()), 0),
+    };
+    raw_syscall(
+        SyscallNumber::CapGrant,
+        target_pid as u64,
+        src.raw(),
+        flags,
+        badge,
+    )
+    .map(CapId::new)
+}
+
+/// Deliberately trigger an EL0 hardware invalid-instruction exception (`udf #0`) for crash-isolation testing.
 pub fn trigger_user_fault() -> ! {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: Intentionally executes `ud2` in Ring 3 for crash-isolation verification.
-    unsafe {
-        asm!("ud2", options(noreturn));
-    }
-    #[cfg(target_arch = "aarch64")]
     // SAFETY: Intentionally executes `udf #0` in EL0 for crash-isolation verification.
     unsafe {
         asm!("udf #0", options(noreturn));

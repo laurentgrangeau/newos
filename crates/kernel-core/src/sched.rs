@@ -1,6 +1,13 @@
-//! Zero-heap, `#![forbid(unsafe_code)]` priority + round-robin microkernel scheduler.
+//! Zero-heap, `#![forbid(unsafe_code)]` priority + round-robin microkernel scheduler
+//! with preemptive time-slice accounting and per-CPU SMP runqueues with work-stealing.
 
 use newos_abi::SysError;
+
+/// Default preemptive time slice in timer ticks before round-robin preemption.
+pub const DEFAULT_TIME_SLICE: u32 = 4;
+
+/// Default priority assigned to normal userspace processes.
+pub const DEFAULT_PRIORITY: u8 = 16;
 
 /// Unique kernel thread identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -21,6 +28,9 @@ pub struct ThreadControlBlock {
     pub priority: u8,
     pub state: ThreadState,
     pub yields: u64,
+    pub quantum_remaining: u32,
+    pub cpu_affinity: u8,
+    pub preemptions: u64,
 }
 
 /// Fixed-capacity, `no_alloc` priority + round-robin scheduler.
@@ -47,8 +57,13 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
         }
     }
 
-    /// Spawn a new runnable thread with `priority` (higher value = higher priority).
+    /// Spawn a new runnable thread on CPU 0 with `priority` (higher value = higher priority).
     pub fn spawn(&mut self, priority: u8) -> Result<ThreadId, SysError> {
+        self.spawn_on_cpu(priority, 0)
+    }
+
+    /// Spawn a new runnable thread with `priority` and preferred `cpu_affinity`.
+    pub fn spawn_on_cpu(&mut self, priority: u8, cpu_affinity: u8) -> Result<ThreadId, SysError> {
         for (idx, slot) in self.threads.iter_mut().enumerate() {
             if slot.is_none() {
                 let id = ThreadId(self.next_id);
@@ -58,11 +73,230 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
                     priority,
                     state: ThreadState::Ready,
                     yields: 0,
+                    quantum_remaining: DEFAULT_TIME_SLICE,
+                    cpu_affinity,
+                    preemptions: 0,
                 });
                 if idx < 64 {
                     self.ready_mask |= 1u64 << idx;
                 }
                 return Ok(id);
+            }
+        }
+        Err(SysError::OutOfMemory)
+    }
+
+    /// Return the currently executing slot index, if any.
+    #[inline]
+    pub const fn current_slot(&self) -> Option<usize> {
+        self.current
+    }
+
+    /// Inspect a thread control block by slot index.
+    #[inline]
+    pub fn tcb(&self, slot: usize) -> Option<&ThreadControlBlock> {
+        self.threads.get(slot)?.as_ref()
+    }
+
+    /// Count active (non-exited) threads managed by this runqueue.
+    pub fn active_count(&self) -> usize {
+        self.threads
+            .iter()
+            .filter(|t| matches!(t, Some(tcb) if tcb.state != ThreadState::Exited))
+            .count()
+    }
+
+    /// Count currently `Ready` (runnable, not running) threads.
+    #[inline]
+    pub fn ready_count(&self) -> usize {
+        if MAX_THREADS <= 64 {
+            self.ready_mask.count_ones() as usize
+        } else {
+            self.threads
+                .iter()
+                .filter(|t| matches!(t, Some(tcb) if tcb.state == ThreadState::Ready))
+                .count()
+        }
+    }
+
+    /// Update the priority of the thread at `slot`.
+    pub fn set_priority(&mut self, slot: usize, priority: u8) -> Result<(), SysError> {
+        let tcb = self
+            .threads
+            .get_mut(slot)
+            .and_then(Option::as_mut)
+            .ok_or(SysError::InvalidArgument)?;
+        tcb.priority = priority;
+        Ok(())
+    }
+
+    /// Transition `slot` to `Blocked` (e.g., waiting on synchronous IPC) and remove from `ready_mask`.
+    #[inline]
+    pub fn block_slot(&mut self, slot: usize) -> Result<(), SysError> {
+        let tcb = self
+            .threads
+            .get_mut(slot)
+            .and_then(Option::as_mut)
+            .ok_or(SysError::InvalidArgument)?;
+        tcb.state = ThreadState::Blocked;
+        if slot < 64 {
+            self.ready_mask &= !(1u64 << slot);
+        }
+        if self.current == Some(slot) {
+            self.current = None;
+        }
+        Ok(())
+    }
+
+    /// Wake a `Blocked` thread at `slot` back to `Ready` and mark it runnable in `ready_mask`.
+    #[inline]
+    pub fn wake_slot(&mut self, slot: usize) -> Result<(), SysError> {
+        let tcb = self
+            .threads
+            .get_mut(slot)
+            .and_then(Option::as_mut)
+            .ok_or(SysError::InvalidArgument)?;
+        if tcb.state == ThreadState::Blocked {
+            tcb.state = ThreadState::Ready;
+            if slot < 64 {
+                self.ready_mask |= 1u64 << slot;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark `slot` as `Exited` and remove it from scheduling.
+    #[inline]
+    pub fn exit_slot(&mut self, slot: usize) -> Result<(), SysError> {
+        let tcb = self
+            .threads
+            .get_mut(slot)
+            .and_then(Option::as_mut)
+            .ok_or(SysError::InvalidArgument)?;
+        tcb.state = ThreadState::Exited;
+        if slot < 64 {
+            self.ready_mask &= !(1u64 << slot);
+        }
+        if self.current == Some(slot) {
+            self.current = None;
+        }
+        Ok(())
+    }
+
+    /// Directly mark `slot` as the `Running` thread (used by direct-switch IPC fastpaths).
+    #[inline]
+    pub fn select_slot(&mut self, slot: usize) {
+        if slot >= MAX_THREADS {
+            return;
+        }
+        if let Some(prev) = self.current
+            && prev != slot
+            && let Some(prev_tcb) = &mut self.threads[prev]
+            && prev_tcb.state == ThreadState::Running
+        {
+            prev_tcb.state = ThreadState::Ready;
+            if prev < 64 {
+                self.ready_mask |= 1u64 << prev;
+            }
+        }
+        if let Some(tcb) = &mut self.threads[slot] {
+            tcb.state = ThreadState::Running;
+            tcb.quantum_remaining = DEFAULT_TIME_SLICE;
+            if slot < 64 {
+                self.ready_mask &= !(1u64 << slot);
+            }
+            self.current = Some(slot);
+        }
+    }
+
+    /// Account one hardware timer tick on the currently running thread.
+    ///
+    /// Returns `true` when the thread's quantum expires and at least one other `Ready` thread
+    /// with equal or higher priority is waiting to preempt it.
+    #[inline]
+    pub fn on_timer_tick(&mut self) -> bool {
+        let Some(cur) = self.current else {
+            return false;
+        };
+        let cur_prio = {
+            let Some(tcb) = &mut self.threads[cur] else {
+                return false;
+            };
+            if tcb.state != ThreadState::Running {
+                return false;
+            }
+            if tcb.quantum_remaining > 1 {
+                tcb.quantum_remaining -= 1;
+                return false;
+            }
+            tcb.quantum_remaining = DEFAULT_TIME_SLICE;
+            tcb.priority
+        };
+
+        let has_preemptor = self.has_ready_with_min_priority(cur_prio);
+        if has_preemptor
+            && let Some(tcb) = &mut self.threads[cur]
+        {
+            tcb.preemptions = tcb.preemptions.saturating_add(1);
+        }
+        has_preemptor
+    }
+
+    #[inline]
+    fn has_ready_with_min_priority(&self, min_priority: u8) -> bool {
+        if MAX_THREADS <= 64 {
+            let mut mask = self.ready_mask;
+            while mask != 0 {
+                let idx = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                if let Some(tcb) = &self.threads[idx]
+                    && tcb.priority >= min_priority
+                {
+                    return true;
+                }
+            }
+            false
+        } else {
+            self.threads.iter().any(|slot| {
+                matches!(slot, Some(tcb) if tcb.state == ThreadState::Ready && tcb.priority >= min_priority)
+            })
+        }
+    }
+
+    /// Steal one `Ready` thread from this runqueue (for SMP work-stealing by an idle core).
+    pub fn steal_ready(&mut self) -> Option<ThreadControlBlock> {
+        let victim_idx = if MAX_THREADS <= 64 {
+            if self.ready_mask == 0 {
+                return None;
+            }
+            self.ready_mask.trailing_zeros() as usize
+        } else {
+            self.threads
+                .iter()
+                .position(|s| matches!(s, Some(tcb) if tcb.state == ThreadState::Ready))?
+        };
+        if victim_idx < 64 {
+            self.ready_mask &= !(1u64 << victim_idx);
+        }
+        self.threads[victim_idx].take()
+    }
+
+    /// Enqueue a stolen/migrated `ThreadControlBlock` onto this CPU's runqueue.
+    pub fn enqueue_migrated(
+        &mut self,
+        mut tcb: ThreadControlBlock,
+        new_cpu: u8,
+    ) -> Result<usize, SysError> {
+        for (idx, slot) in self.threads.iter_mut().enumerate() {
+            if slot.is_none() {
+                tcb.state = ThreadState::Ready;
+                tcb.cpu_affinity = new_cpu;
+                tcb.quantum_remaining = DEFAULT_TIME_SLICE;
+                *slot = Some(tcb);
+                if idx < 64 {
+                    self.ready_mask |= 1u64 << idx;
+                }
+                return Ok(idx);
             }
         }
         Err(SysError::OutOfMemory)
@@ -136,6 +370,7 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
             }
             if let Some(tcb) = &mut self.threads[idx] {
                 tcb.state = ThreadState::Running;
+                tcb.quantum_remaining = DEFAULT_TIME_SLICE;
                 return Some(tcb.id);
             }
         }
@@ -154,6 +389,102 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
         };
         let _ = self.schedule_next();
         Some(yields)
+    }
+}
+
+/// Multi-core SMP scheduler managing per-CPU runqueues with least-loaded placement and work-stealing.
+pub struct SmpScheduler<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize> {
+    per_cpu: [Scheduler<MAX_THREADS_PER_CPU>; MAX_CPUS],
+    online_cpus: usize,
+}
+
+impl<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize>
+    SmpScheduler<MAX_CPUS, MAX_THREADS_PER_CPU>
+{
+    pub const fn new(online_cpus: usize) -> Self {
+        let clamped = if online_cpus == 0 {
+            1
+        } else if online_cpus > MAX_CPUS {
+            MAX_CPUS
+        } else {
+            online_cpus
+        };
+        Self {
+            per_cpu: [const { Scheduler::new() }; MAX_CPUS],
+            online_cpus: clamped,
+        }
+    }
+
+    #[inline]
+    pub const fn online_cpus(&self) -> usize {
+        self.online_cpus
+    }
+
+    #[inline]
+    pub fn cpu_mut(&mut self, cpu_id: usize) -> Option<&mut Scheduler<MAX_THREADS_PER_CPU>> {
+        if cpu_id < self.online_cpus {
+            Some(&mut self.per_cpu[cpu_id])
+        } else {
+            None
+        }
+    }
+
+    /// Spawn a thread on the least-loaded online CPU core, returning `(cpu_id, thread_id)`.
+    pub fn spawn_balanced(&mut self, priority: u8) -> Result<(usize, ThreadId), SysError> {
+        let mut best_cpu = 0usize;
+        let mut best_load = usize::MAX;
+        for (cpu, rq) in self.per_cpu.iter().enumerate().take(self.online_cpus) {
+            let load = rq.active_count();
+            if load < best_load {
+                best_load = load;
+                best_cpu = cpu;
+            }
+        }
+        let tid = self.per_cpu[best_cpu].spawn_on_cpu(priority, best_cpu as u8)?;
+        Ok((best_cpu, tid))
+    }
+
+    /// Schedule next thread on `cpu_id`, stealing a `Ready` thread from the busiest peer if idle.
+    pub fn schedule_or_steal(&mut self, cpu_id: usize) -> Option<ThreadId> {
+        if cpu_id >= self.online_cpus {
+            return None;
+        }
+        if let Some(tid) = self.per_cpu[cpu_id].schedule_next() {
+            return Some(tid);
+        }
+
+        // Work-stealing: find busiest peer CPU with at least 1 Ready thread.
+        let mut busiest: Option<(usize, usize)> = None;
+        for (peer, rq) in self.per_cpu.iter().enumerate().take(self.online_cpus) {
+            if peer == cpu_id {
+                continue;
+            }
+            let ready = rq.ready_count();
+            if ready > 0 && busiest.is_none_or(|(_, best)| ready > best) {
+                busiest = Some((peer, ready));
+            }
+        }
+
+        let (victim_cpu, _) = busiest?;
+        let stolen = self.per_cpu[victim_cpu].steal_ready()?;
+        if self.per_cpu[cpu_id]
+            .enqueue_migrated(stolen, cpu_id as u8)
+            .is_ok()
+        {
+            self.per_cpu[cpu_id].schedule_next()
+        } else {
+            None
+        }
+    }
+
+    /// Account a timer tick on `cpu_id`; returns `true` if `cpu_id` should preempt immediately.
+    #[inline]
+    pub fn on_timer_tick(&mut self, cpu_id: usize) -> bool {
+        if cpu_id < self.online_cpus {
+            self.per_cpu[cpu_id].on_timer_tick()
+        } else {
+            false
+        }
     }
 }
 
@@ -212,5 +543,56 @@ mod tests {
         assert_eq!(s80.schedule_next(), Some(high_64));
         assert_eq!(s80.schedule_next(), Some(high_65));
         assert_eq!(s80.schedule_next(), Some(high_64));
+    }
+
+    #[test]
+    fn timer_tick_preemption_and_block_wake_lifecycle() {
+        let mut sched = Scheduler::<8>::new();
+        let a = sched.spawn(10).unwrap();
+        let b = sched.spawn(10).unwrap();
+        let low = sched.spawn(2).unwrap();
+
+        assert_eq!(sched.schedule_next(), Some(a));
+        // Quantum is DEFAULT_TIME_SLICE (4): first 3 ticks do not preempt; 4th does.
+        for _ in 0..(DEFAULT_TIME_SLICE - 1) {
+            assert!(!sched.on_timer_tick());
+        }
+        assert!(sched.on_timer_tick());
+        assert_eq!(sched.tcb(0).unwrap().preemptions, 1);
+
+        // Preempting switches to equal-priority `b`.
+        assert_eq!(sched.schedule_next(), Some(b));
+
+        // Block `a`: now only `low` (priority 2 < 10) is Ready, so `b` should not be preempted.
+        sched.block_slot(0).unwrap();
+        for _ in 0..DEFAULT_TIME_SLICE {
+            assert!(!sched.on_timer_tick());
+        }
+
+        // Wake `a` and boost `low` above `b`: `low` wins next schedule.
+        sched.wake_slot(0).unwrap();
+        sched.set_priority(2, 20).unwrap();
+        assert_eq!(sched.schedule_next(), Some(low));
+
+        // Exit `low` removes it permanently.
+        sched.exit_slot(2).unwrap();
+        assert_eq!(sched.schedule_next(), Some(a));
+    }
+
+    #[test]
+    fn smp_scheduler_balances_and_steals_work() {
+        let mut smp = SmpScheduler::<4, 8>::new(2);
+        let (cpu0, _t0) = smp.spawn_balanced(10).unwrap();
+        let (cpu1, _t1) = smp.spawn_balanced(10).unwrap();
+        assert_ne!(cpu0, cpu1);
+
+        // Put two extra threads directly on CPU 0 and leave CPU 1 empty.
+        let mut smp2 = SmpScheduler::<4, 8>::new(2);
+        let t_a = smp2.cpu_mut(0).unwrap().spawn_on_cpu(10, 0).unwrap();
+        let t_b = smp2.cpu_mut(0).unwrap().spawn_on_cpu(10, 0).unwrap();
+        assert_eq!(smp2.schedule_or_steal(0), Some(t_a));
+        // CPU 1 has no local threads -> steals `t_b` from CPU 0!
+        assert_eq!(smp2.schedule_or_steal(1), Some(t_b));
+        assert_eq!(smp2.cpu_mut(1).unwrap().tcb(0).unwrap().cpu_affinity, 1);
     }
 }

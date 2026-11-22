@@ -27,16 +27,11 @@ apt-get install -y --no-install-recommends \
   clang \
   lld \
   llvm \
-  nasm \
   gdb \
-  qemu-system-x86 \
   qemu-system-arm \
   qemu-utils \
-  ovmf \
   qemu-efi-aarch64 \
   xorriso \
-  grub-pc-bin \
-  grub-common \
   mtools \
   dosfstools \
   libssl-dev
@@ -60,7 +55,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 export PATH="${CARGO_HOME}/bin:${PATH}"
 
 rustup component add rust-src llvm-tools-preview clippy rustfmt
-rustup target add x86_64-unknown-none aarch64-unknown-none
+rustup target add aarch64-unknown-none
 
 # Install common Rust OS-dev cargo utilities
 cargo install bootimage cargo-binutils

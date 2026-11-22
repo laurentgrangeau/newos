@@ -219,15 +219,15 @@ impl Aarch64Platform {
         let mut vspace = paging::Aarch64VSpace::from_current_ttbr1(info.hhdm_offset);
 
         // Select PL011 MMIO physical base:
-        // - Raspberry Pi 5 (BCM2712 3-pin JST Debug UART): `0x10_7D00_1000`
-        // - QEMU `virt`: `0x0900_0000`
-        const QEMU_UART_PHYS: u64 = 0x0900_0000;
+        // - Default: Raspberry Pi 5 (16 GB, BCM2712 3-pin JST Debug UART): `0x10_7D00_1000`
+        // - Local test harness (`qemu` cmdline): QEMU `virt`: `0x0900_0000`
         const RPI5_UART_PHYS: u64 = 0x10_7D00_1000;
+        const QEMU_UART_PHYS: u64 = 0x0900_0000;
         const UART_VIRT: u64 = 0xffff_b000_0000_0000;
-        let uart_phys = if info.board_rpi5 {
-            RPI5_UART_PHYS
-        } else {
+        let uart_phys = if info.qemu_virt {
             QEMU_UART_PHYS
+        } else {
+            RPI5_UART_PHYS
         };
         if let Ok(uart_virt) = VirtAddr::new_page_aligned(UART_VIRT)
             && let Ok(frame) = PhysFrame::from_aligned(PhysAddr::new(uart_phys))
@@ -240,16 +240,16 @@ impl Aarch64Platform {
         }
 
         // Map capability-scoped Network Controller MMIO window (4 pages, Device-nGnRnE):
-        // - Raspberry Pi 5 (BCM2712 + RP1 Cadence GEM Gigabit Ethernet): `0x1F_0010_0000`
-        // - QEMU `virt` (VirtIO-MMIO slots 0..31): `0x0A00_0000`
-        const QEMU_NET_MMIO_PHYS: u64 = 0x0a00_0000;
+        // - Default: Raspberry Pi 5 (BCM2712 + RP1 Cadence GEM Gigabit Ethernet): `0x1F_0010_0000`
+        // - Local test harness (`qemu` cmdline): QEMU `virt` VirtIO-MMIO slots 0..31: `0x0A00_0000`
         const RPI5_RP1_GEM_PHYS: u64 = 0x1F_0010_0000;
+        const QEMU_NET_MMIO_PHYS: u64 = 0x0a00_0000;
         const NET_MMIO_VIRT: u64 = 0xffff_b001_0000_0000;
         const NET_MMIO_PAGES: u64 = 4;
-        let net_mmio_phys = if info.board_rpi5 {
-            RPI5_RP1_GEM_PHYS
-        } else {
+        let net_mmio_phys = if info.qemu_virt {
             QEMU_NET_MMIO_PHYS
+        } else {
+            RPI5_RP1_GEM_PHYS
         };
         if let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true) {
             for p in 0..NET_MMIO_PAGES {
@@ -370,6 +370,10 @@ impl HalPlatform for Aarch64Platform {
         vspace_root: PhysAddr,
     ) -> Result<usize, SysError> {
         syscall::register_user_process(entry.raw(), user_rsp.raw(), vspace_root.raw())
+    }
+
+    fn install_runtime_untyped(&mut self, untyped: UntypedInventory) {
+        syscall::set_untyped_inventory(untyped);
     }
 
     fn start_userspace(&mut self) -> ! {

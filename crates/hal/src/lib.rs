@@ -1,8 +1,7 @@
 #![no_std]
-#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 #![feature(sync_unsafe_cell)]
 
-//! Minimal, strictly audited Hardware Abstraction Layer (HAL) for NewOS.
+//! Minimal, strictly audited Hardware Abstraction Layer (HAL) for NewOS on Raspberry Pi 5 (16 GB, BCM2712).
 //!
 //! All `unsafe` hardware/bootloader boundary code is isolated inside this crate,
 //! exposing 100% memory-safe abstractions to `newos-kernel-core` and `newos-kernel`.
@@ -16,7 +15,7 @@ use newos_kernel_core::BootInfo;
 
 pub use arch::Platform;
 
-/// Initialize early hardware (serial, GDT/TSS, IDT, per-CPU, APIC) and parse Limine boot info.
+/// Initialize early ARMv8.2-A hardware (PL011 UART, VBAR_EL1, TPIDR_EL1, SMP) and parse Limine boot info.
 pub fn early_init() -> (Platform, BootInfo) {
     arch::early_serial_init();
 

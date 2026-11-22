@@ -63,6 +63,12 @@ impl Rights {
         self.0
     }
 
+    /// Construct a `Rights` bitmask from raw bits, truncating any unknown bits.
+    #[inline]
+    pub const fn from_bits_truncate(bits: u8) -> Self {
+        Self(bits & Self::ALL.0)
+    }
+
     #[inline]
     pub const fn union(self, other: Self) -> Self {
         Self((self.0 | other.0) & Self::ALL.0)
@@ -96,7 +102,10 @@ pub enum ObjectType {
     MmioRegion = 9,
 }
 
-/// Pure 64-bit syscall numbers (`rax` on `x86_64` `syscall` instruction).
+/// Flag bit in `a2` of `SyscallNumber::CapMint` / `CapGrant` indicating `a3` carries a new badge.
+pub const CAP_MINT_SET_BADGE: u64 = 1 << 8;
+
+/// Pure 64-bit syscall numbers (`x8` on `aarch64` `svc #0` instruction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u64)]
 pub enum SyscallNumber {
@@ -132,6 +141,24 @@ pub enum SyscallNumber {
     IpcCall = 15,
     /// Synchronous fastpath IPC server loop: optionally reply `(cap_id, reply_payload, has_reply)` and wait for next request.
     IpcReplyRecv = 16,
+    /// Derive a capability in the caller's `CSpace`: `(src_cap, dst_slot_or_0, rights | flags, badge)` -> `new_cap_id`.
+    CapMint = 17,
+    /// Copy a capability verbatim in the caller's `CSpace`: `(src_cap, dst_slot_or_0)` -> `new_cap_id`.
+    CapCopy = 18,
+    /// Move a capability to another slot in the caller's `CSpace`: `(src_cap, dst_slot_or_0)` -> `new_cap_id`.
+    CapMove = 19,
+    /// Delete a single capability from the caller's `CSpace`: `(cap_id)`.
+    CapDelete = 20,
+    /// Transitively revoke all CDT descendants of `cap_id` in the caller's `CSpace` -> `revoked_count`.
+    CapRevoke = 21,
+    /// Grant an attenuated capability to another process's `CSpace`: `(target_pid, src_cap, rights | flags, badge)` -> `dst_cap_id`.
+    CapGrant = 22,
+    /// Set scheduling priority (`0..=255`, higher = higher priority): `(target_pid_or_u64_max, priority)`.
+    SetPriority = 23,
+    /// Map a fresh zeroed 4 KiB page into the caller's `VSpace` with W^X `Rights` `(vaddr, rights)` -> `phys_addr`.
+    MapPage = 24,
+    /// Unmap a 4 KiB page from the caller's `VSpace` and reclaim its physical frame `(vaddr)`.
+    UnmapPage = 25,
 }
 
 impl SyscallNumber {
@@ -154,6 +181,15 @@ impl SyscallNumber {
             14 => Some(Self::VirtToPhys),
             15 => Some(Self::IpcCall),
             16 => Some(Self::IpcReplyRecv),
+            17 => Some(Self::CapMint),
+            18 => Some(Self::CapCopy),
+            19 => Some(Self::CapMove),
+            20 => Some(Self::CapDelete),
+            21 => Some(Self::CapRevoke),
+            22 => Some(Self::CapGrant),
+            23 => Some(Self::SetPriority),
+            24 => Some(Self::MapPage),
+            25 => Some(Self::UnmapPage),
             _ => None,
         }
     }
@@ -188,9 +224,7 @@ impl SysError {
     }
 }
 
-/// Exit codes written to QEMU's `isa-debug-exit` port (`0xF4`).
-///
-/// QEMU exits with `(code << 1) | 1`, so `Success` produces process exit status `33`.
+/// Exit codes reported on PSCI `SYSTEM_OFF` shutdown (Raspberry Pi 5 & QEMU `aarch64` `virt`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum QemuExitCode {
@@ -237,13 +271,22 @@ mod tests {
             (14, SyscallNumber::VirtToPhys),
             (15, SyscallNumber::IpcCall),
             (16, SyscallNumber::IpcReplyRecv),
+            (17, SyscallNumber::CapMint),
+            (18, SyscallNumber::CapCopy),
+            (19, SyscallNumber::CapMove),
+            (20, SyscallNumber::CapDelete),
+            (21, SyscallNumber::CapRevoke),
+            (22, SyscallNumber::CapGrant),
+            (23, SyscallNumber::SetPriority),
+            (24, SyscallNumber::MapPage),
+            (25, SyscallNumber::UnmapPage),
         ];
         assert_eq!(SyscallNumber::from_u64(0), None);
         for (raw, variant) in expected_syscalls {
             assert_eq!(variant as u64, raw);
             assert_eq!(SyscallNumber::from_u64(raw), Some(variant));
         }
-        assert_eq!(SyscallNumber::from_u64(17), None);
+        assert_eq!(SyscallNumber::from_u64(26), None);
         assert_eq!(SyscallNumber::from_u64(99), None);
 
         let expected_errors = [

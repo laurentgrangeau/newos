@@ -30,13 +30,11 @@ pub struct BootInfo {
     pub hhdm_offset: u64,
     pub untyped: UntypedInventory,
     pub cpu_count: usize,
-    pub bsp_lapic_id: u32,
-    pub x2apic_enabled: bool,
     pub rsdp_addr: u64,
     pub init_module: Option<&'static [u8]>,
     pub worker_module: Option<&'static [u8]>,
     pub interactive_shell: bool,
-    pub board_rpi5: bool,
+    pub qemu_virt: bool,
 }
 
 impl BootInfo {
@@ -71,6 +69,8 @@ pub trait HalPlatform: Write {
         user_rsp: VirtAddr,
         vspace_root: PhysAddr,
     ) -> Result<usize, SysError>;
+    /// Hand remaining bootstrap `UntypedInventory` to the HAL for runtime `MapPage`/`UnmapPage` syscalls.
+    fn install_runtime_untyped(&mut self, _untyped: UntypedInventory) {}
     fn start_userspace(&mut self) -> !;
     fn exit(&mut self, code: QemuExitCode) -> !;
 }
@@ -78,20 +78,25 @@ pub trait HalPlatform: Write {
 /// Microkernel boot entry: verify Phases 1–3 + SMP, then load isolated Ring-3 `init` & `worker`.
 pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
     let sec = platform.security_features();
+    let board = if info.qemu_virt {
+        "qemu-virt-test"
+    } else {
+        "rpi5-16gb"
+    };
     let _ = writeln!(
         platform,
-        "[newos] booting pure seL4-style 64-bit Rust microkernel (arch={}, no_alloc, forbid_unsafe_core)",
+        "[newos] booting pure seL4-style 64-bit Rust microkernel (arch={}, board={}, no_alloc, forbid_unsafe_core)",
         platform.arch_name(),
+        board,
     );
     let _ = writeln!(
         platform,
-        "[newos] HHDM={:#018x}, RAM={} MiB ({} untyped regions), SMP={}/{} CPUs online, x2APIC={}, RSDP={:#x}",
+        "[newos] HHDM={:#018x}, RAM={} MiB ({} untyped regions), SMP={}/{} CPUs online, RSDP={:#x}",
         info.hhdm_offset,
         info.usable_mib(),
         info.untyped.region_count(),
         platform.online_cpus(),
         info.cpu_count,
-        info.x2apic_enabled,
         info.rsdp_addr,
     );
     let _ = writeln!(
@@ -110,11 +115,11 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
         platform.exit(QemuExitCode::Failed);
     }
 
-    // Phase 1: IDT #BP & x2APIC oneshot timer verification
+    // Phase 1: VBAR_EL1 #BRK & ARM Generic Timer verification
     let before_bp = platform.breakpoint_count();
     platform.trigger_breakpoint();
     if platform.breakpoint_count() != before_bp + 1 {
-        let _ = writeln!(platform, "[newos] FAIL: IDT #BP self-check failed");
+        let _ = writeln!(platform, "[newos] FAIL: VBAR_EL1 brk #0 self-check failed");
         platform.exit(QemuExitCode::Failed);
     }
 
@@ -127,7 +132,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
     platform.disable_interrupts();
     let _ = writeln!(
         platform,
-        "[newos] phase-1 HAL, SMP & x2APIC self-check: OK (cpus={}, bp={}, timer={})",
+        "[newos] phase-1 HAL, SMP & Generic Timer self-check: OK (cpus={}, bp={}, timer={})",
         platform.online_cpus(),
         platform.breakpoint_count(),
         platform.timer_count(),
@@ -172,7 +177,10 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
     match spawn_isolated_process(platform, "init", init_bytes, &mut info.untyped)
         .and_then(|_| spawn_isolated_process(platform, "worker", worker_bytes, &mut info.untyped))
     {
-        Ok(()) => platform.start_userspace(),
+        Ok(()) => {
+            platform.install_runtime_untyped(info.untyped);
+            platform.start_userspace()
+        }
         Err(err) => {
             let _ = writeln!(platform, "[newos] FAIL: failed to spawn Ring-3 processes: {err:?}");
             platform.exit(QemuExitCode::Failed);
@@ -192,7 +200,7 @@ fn spawn_isolated_process<P: HalPlatform>(
     let pid = platform.register_user_process(entry, user_rsp, root)?;
     let _ = writeln!(
         platform,
-        "[newos] spawned Ring-3 `{name}` (pid={pid}, cr3={:#018x}, entry={:#018x}, segs={segs})",
+        "[newos] spawned EL0 `{name}` (pid={pid}, ttbr0={:#018x}, entry={:#018x}, segs={segs})",
         root.raw(),
         entry.raw(),
     );
@@ -286,6 +294,7 @@ fn verify_phase2_memory<P: HalPlatform>(
     {
         return Err(SysError::InvalidArgument);
     }
+    let _ = untyped.reclaim_frame(reclaimed);
 
     Ok(())
 }
@@ -341,14 +350,12 @@ mod tests {
         let info = BootInfo {
             hhdm_offset: 0xffff_8000_0000_0000,
             untyped,
-            cpu_count: 2,
-            bsp_lapic_id: 0,
-            x2apic_enabled: true,
+            cpu_count: 4,
             rsdp_addr: 0x000e_0000,
             init_module: None,
             worker_module: None,
             interactive_shell: false,
-            board_rpi5: false,
+            qemu_virt: false,
         };
         assert_eq!(info.usable_mib(), 256);
     }

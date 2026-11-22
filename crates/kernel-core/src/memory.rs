@@ -8,8 +8,15 @@ use newos_abi::SysError;
 pub const PAGE_SIZE: u64 = 4096;
 pub const PAGE_MASK: u64 = PAGE_SIZE - 1;
 
-/// Maximum number of usable physical memory regions tracked at bootstrap.
-pub const MAX_UNTYPED_REGIONS: usize = 32;
+/// 2 MiB hardware superpage / huge-page size (`L2` block descriptor on `aarch64`).
+pub const HUGE_PAGE_SIZE_2M: u64 = 2 * 1024 * 1024;
+pub const HUGE_PAGE_MASK_2M: u64 = HUGE_PAGE_SIZE_2M - 1;
+
+/// Maximum number of usable physical memory regions tracked at bootstrap (sized for RPi5 16 GB UEFI maps).
+pub const MAX_UNTYPED_REGIONS: usize = 64;
+
+/// Fixed-capacity zero-heap LIFO cache for reclaimed 4 KiB physical frames.
+pub const MAX_RECLAIMED_FRAMES: usize = 64;
 
 /// 64-bit physical address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -113,6 +120,31 @@ impl PhysFrame {
     }
 }
 
+/// Owned 2 MiB physical superpage carved from an `UntypedRegion`.
+///
+/// Not `Copy`/`Clone` so huge physical frames cannot be aliased or double-mapped.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PhysFrame2M {
+    base: PhysAddr,
+}
+
+impl PhysFrame2M {
+    /// Construct an owned 2 MiB frame from a verified 2 MiB-aligned physical address.
+    #[inline]
+    pub const fn from_aligned(base: PhysAddr) -> Result<Self, SysError> {
+        if (base.raw() & HUGE_PAGE_MASK_2M) == 0 {
+            Ok(Self { base })
+        } else {
+            Err(SysError::InvalidArgument)
+        }
+    }
+
+    #[inline]
+    pub const fn start_addr(&self) -> PhysAddr {
+        self.base
+    }
+}
+
 /// Single contiguous `Untyped` physical memory region using a seL4-style monotonic watermark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UntypedRegion {
@@ -159,13 +191,16 @@ impl UntypedRegion {
     }
 }
 
-/// Fixed-capacity, zero-heap inventory of bootstrap `Untyped` physical memory regions.
+/// Fixed-capacity, zero-heap inventory of bootstrap `Untyped` physical memory regions
+/// with a bounded LIFO free-frame cache for reclaimed 4 KiB pages.
 #[derive(Debug, Clone, Copy)]
 pub struct UntypedInventory {
     regions: [UntypedRegion; MAX_UNTYPED_REGIONS],
     count: usize,
     active_region: usize,
     retyped_frames: u64,
+    reclaimed: [u64; MAX_RECLAIMED_FRAMES],
+    reclaimed_len: usize,
 }
 
 impl Default for UntypedInventory {
@@ -181,6 +216,8 @@ impl UntypedInventory {
             count: 0,
             active_region: 0,
             retyped_frames: 0,
+            reclaimed: [0; MAX_RECLAIMED_FRAMES],
+            reclaimed_len: 0,
         }
     }
 
@@ -207,6 +244,12 @@ impl UntypedInventory {
         self.retyped_frames
     }
 
+    /// Number of reclaimed 4 KiB frames currently cached for O(1) reuse.
+    #[inline]
+    pub const fn reclaimed_count(&self) -> usize {
+        self.reclaimed_len
+    }
+
     pub fn total_bytes(&self) -> u64 {
         let mut total = 0u64;
         let mut i = 0;
@@ -218,7 +261,7 @@ impl UntypedInventory {
     }
 
     pub fn remaining_bytes(&self) -> u64 {
-        let mut rem = 0u64;
+        let mut rem = (self.reclaimed_len as u64).saturating_mul(PAGE_SIZE);
         let mut i = self.active_region;
         while i < self.count {
             rem = rem.saturating_add(self.regions[i].remaining());
@@ -227,15 +270,64 @@ impl UntypedInventory {
         rem
     }
 
-    /// Carve one 4 KiB `PhysFrame` from the first `UntypedRegion` with available space.
+    /// Return an unmapped, exclusively owned 4 KiB `PhysFrame` to the LIFO reuse cache.
+    ///
+    /// Returns `true` if cached, or `false` if the bounded cache is full.
+    #[inline]
+    pub fn reclaim_frame(&mut self, frame: PhysFrame) -> bool {
+        if self.reclaimed_len >= MAX_RECLAIMED_FRAMES {
+            return false;
+        }
+        self.reclaimed[self.reclaimed_len] = frame.start_addr().raw();
+        self.reclaimed_len += 1;
+        true
+    }
+
+    /// Carve one 4 KiB `PhysFrame` — reusing a reclaimed frame first, otherwise advancing
+    /// the first `UntypedRegion` with available space.
     #[inline]
     pub fn retype_frame(&mut self) -> Result<PhysFrame, SysError> {
+        if self.reclaimed_len > 0 {
+            self.reclaimed_len -= 1;
+            let addr = self.reclaimed[self.reclaimed_len];
+            self.retyped_frames = self.retyped_frames.saturating_add(1);
+            return PhysFrame::from_aligned(PhysAddr::new(addr));
+        }
         while self.active_region < self.count {
             if let Ok(frame) = self.regions[self.active_region].retype_frame() {
                 self.retyped_frames = self.retyped_frames.saturating_add(1);
                 return Ok(frame);
             }
             self.active_region += 1;
+        }
+        Err(SysError::OutOfMemory)
+    }
+
+    /// Carve one 2 MiB-aligned `PhysFrame2M` superpage from an `UntypedRegion`.
+    ///
+    /// Any 4 KiB alignment padding skipped before the 2 MiB boundary is pushed into the
+    /// reclaimed-frame cache so it can be reused for 4 KiB allocations.
+    pub fn retype_frame_2m(&mut self) -> Result<PhysFrame2M, SysError> {
+        for i in self.active_region..self.count {
+            let cur = self.regions[i].base.saturating_add(self.regions[i].watermark);
+            let aligned = (cur.saturating_add(HUGE_PAGE_MASK_2M)) & !HUGE_PAGE_MASK_2M;
+            let pad = aligned.saturating_sub(cur);
+            let needed = pad.saturating_add(HUGE_PAGE_SIZE_2M);
+            if self.regions[i].remaining() >= needed {
+                // Recycle any 4 KiB alignment padding frames into the LIFO cache.
+                let mut p = cur;
+                while p < aligned {
+                    if let Ok(pad_frame) = PhysFrame::from_aligned(PhysAddr::new(p)) {
+                        let _ = self.reclaim_frame(pad_frame);
+                    }
+                    p += PAGE_SIZE;
+                }
+                self.regions[i].watermark += needed;
+                self.retyped_frames = self
+                    .retyped_frames
+                    .saturating_add(HUGE_PAGE_SIZE_2M / PAGE_SIZE);
+                return PhysFrame2M::from_aligned(PhysAddr::new(aligned));
+            }
         }
         Err(SysError::OutOfMemory)
     }
@@ -303,7 +395,7 @@ pub struct CpuSecurityFeatures {
 
 /// Safe, architecture-agnostic 4-level page-table interface implemented by `newos-hal`.
 pub trait VSpaceMapper {
-    /// Return the hardware root physical address of this `VSpace` (`CR3` on `x86_64`).
+    /// Return the hardware root physical address of this `VSpace` (`TTBR0_EL1` / `TTBR1_EL1` on `aarch64`).
     fn root_phys(&self) -> PhysAddr;
 
     /// Map a 4 KiB `PhysFrame` at `virt`, carving any needed intermediate page tables
@@ -321,6 +413,22 @@ pub trait VSpaceMapper {
 
     /// Unmap a 4 KiB page, flush its TLB entry, and return the reclaimed `PhysFrame`.
     fn unmap_4k(&mut self, virt: VirtAddr) -> Result<PhysFrame, SysError>;
+
+    /// Map a 2 MiB `PhysFrame2M` superpage at 2 MiB-aligned `virt`.
+    fn map_2m(
+        &mut self,
+        _virt: VirtAddr,
+        _frame: PhysFrame2M,
+        _flags: PageFlags,
+        _untyped: &mut UntypedInventory,
+    ) -> Result<(), SysError> {
+        Err(SysError::Unsupported)
+    }
+
+    /// Unmap a 2 MiB superpage, flush its TLB entry, and return the reclaimed `PhysFrame2M`.
+    fn unmap_2m(&mut self, _virt: VirtAddr) -> Result<PhysFrame2M, SysError> {
+        Err(SysError::Unsupported)
+    }
 
     /// Zero a newly retyped, exclusively owned 4 KiB physical frame.
     fn zero_frame(&self, frame: &PhysFrame);
@@ -400,5 +508,38 @@ mod tests {
         assert_eq!(inv.retype_frame().unwrap().start_addr().raw(), 0x40_1000);
         assert_eq!(inv.remaining_bytes(), 0);
         assert_eq!(inv.retyped_frames(), 5);
+    }
+
+    #[test]
+    fn frame_reclamation_reuses_freed_frames_and_carves_2m_superpages() {
+        let mut inv = UntypedInventory::new();
+        assert!(inv.push_raw_region(0x10_0000, PAGE_SIZE * 2));
+
+        let f0 = inv.retype_frame().unwrap();
+        let f0_addr = f0.start_addr();
+        let f1 = inv.retype_frame().unwrap();
+        assert_eq!(inv.retype_frame(), Err(SysError::OutOfMemory));
+        assert_eq!(inv.remaining_bytes(), 0);
+
+        // Reclaim f0 and verify O(1) LIFO reuse and updated remaining_bytes.
+        assert!(inv.reclaim_frame(f0));
+        assert_eq!(inv.reclaimed_count(), 1);
+        assert_eq!(inv.remaining_bytes(), PAGE_SIZE);
+        let reused = inv.retype_frame().unwrap();
+        assert_eq!(reused.start_addr(), f0_addr);
+        assert_eq!(inv.reclaimed_count(), 0);
+        drop(f1);
+
+        // Carve a 2 MiB superpage from an unaligned region and verify padding frames are reclaimed.
+        let mut inv2 = UntypedInventory::new();
+        assert!(inv2.push_raw_region(
+            0x20_0000 - PAGE_SIZE * 3,
+            HUGE_PAGE_SIZE_2M + PAGE_SIZE * 3
+        ));
+        let huge = inv2.retype_frame_2m().unwrap();
+        assert_eq!(huge.start_addr().raw(), 0x20_0000);
+        assert_eq!(inv2.reclaimed_count(), 3);
+        let pad = inv2.retype_frame().unwrap();
+        assert_eq!(pad.start_addr().raw(), 0x20_0000 - PAGE_SIZE);
     }
 }

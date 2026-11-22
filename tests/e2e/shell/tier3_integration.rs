@@ -37,7 +37,7 @@ fn tier3_shell_procs_and_sys_consistency_single_vs_multi_proc() {
         Some(Record::Count(0))
     ));
     sh1.exec_line("sys");
-    assert!(sh1.host_mut().take_output().contains("1 Ring-3 procs"));
+    assert!(sh1.host_mut().take_output().contains("1 EL0 procs"));
 
     let mut sh2 = Shell::new(MockShellHost::new(4, 2));
     assert!(matches!(
@@ -49,7 +49,7 @@ fn tier3_shell_procs_and_sys_consistency_single_vs_multi_proc() {
         Some(Record::Count(1))
     ));
     sh2.exec_line("sys");
-    assert!(sh2.host_mut().take_output().contains("2 Ring-3 procs"));
+    assert!(sh2.host_mut().take_output().contains("2 EL0 procs"));
 }
 
 #[test]

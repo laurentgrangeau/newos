@@ -4,7 +4,8 @@ use core::arch::asm;
 use core::ptr::{read_volatile, write_bytes, write_volatile};
 use newos_abi::SysError;
 use newos_kernel_core::memory::{
-    PAGE_SIZE, PageFlags, PhysAddr, PhysFrame, UntypedInventory, VSpaceMapper, VirtAddr,
+    HUGE_PAGE_MASK_2M, PAGE_SIZE, PageFlags, PhysAddr, PhysFrame, PhysFrame2M, UntypedInventory,
+    VSpaceMapper, VirtAddr,
 };
 
 const DESC_VALID: u64 = 1 << 0;
@@ -228,8 +229,38 @@ impl VSpaceMapper for Aarch64VSpace {
         let [i0, i1, i2, i3] = Self::indices(virt);
         let l1 = self.next_table_existing(self.l0_phys, i0)?;
         let l2 = self.next_table_existing(l1, i1)?;
-        let l3 = self.next_table_existing(l2, i2)?;
 
+        let l2_ptr = unsafe { self.table_ptr(l2).add(i2) };
+        // SAFETY: `l2` is a valid 4 KiB L2 table mapped via HHDM.
+        let l2_desc = unsafe { read_volatile(l2_ptr) };
+        if (l2_desc & DESC_VALID) == 0 {
+            return None;
+        }
+        if (l2_desc & DESC_TABLE_OR_PAGE) == 0 {
+            // Level-2 2 MiB Block descriptor
+            const DESC_2M_ADDR_MASK: u64 = 0x0000_FFFF_FFE0_0000;
+            let ap = (l2_desc >> 6) & 0b11;
+            let user = (ap & 0b01) != 0;
+            let writable = (ap & 0b10) == 0;
+            let executable = if user {
+                (l2_desc & DESC_UXN) == 0
+            } else {
+                (l2_desc & DESC_PXN) == 0
+            };
+            let phys =
+                PhysAddr::new((l2_desc & DESC_2M_ADDR_MASK) | (virt.raw() & HUGE_PAGE_MASK_2M));
+            return Some((
+                phys,
+                PageFlags {
+                    writable,
+                    executable,
+                    user,
+                    no_cache: false,
+                },
+            ));
+        }
+
+        let l3 = l2_desc & DESC_ADDR_MASK;
         let pte_ptr = unsafe { self.table_ptr(l3).add(i3) };
         // SAFETY: `l3` is a valid 4 KiB L3 page table mapped via HHDM.
         let pte = unsafe { read_volatile(pte_ptr) };
@@ -275,6 +306,81 @@ impl VSpaceMapper for Aarch64VSpace {
         unsafe { write_volatile(pte_ptr, 0) };
         tlbi_va(virt);
         PhysFrame::from_aligned(PhysAddr::new(pte & DESC_ADDR_MASK))
+    }
+
+    fn map_2m(
+        &mut self,
+        virt: VirtAddr,
+        frame: PhysFrame2M,
+        flags: PageFlags,
+        untyped: &mut UntypedInventory,
+    ) -> Result<(), SysError> {
+        if flags.writable && flags.executable {
+            return Err(SysError::InvalidArgument);
+        }
+        if (virt.raw() & HUGE_PAGE_MASK_2M) != 0 {
+            return Err(SysError::InvalidArgument);
+        }
+
+        let [i0, i1, i2, _] = Self::indices(virt);
+        let l1 = self.next_table_or_create(self.l0_phys, i0, untyped)?;
+        let l2 = self.next_table_or_create(l1, i1, untyped)?;
+
+        let desc_ptr = unsafe { self.table_ptr(l2).add(i2) };
+        // SAFETY: `l2` is a valid 4 KiB L2 table mapped via HHDM.
+        if (unsafe { read_volatile(desc_ptr) } & DESC_VALID) != 0 {
+            return Err(SysError::SlotOccupied);
+        }
+
+        // L2 Block descriptor: bit 0 = 1 (Valid), bit 1 = 0 (Block, not Table).
+        let mut desc = frame.start_addr().raw() | DESC_VALID | DESC_AF | DESC_SH_INNER;
+        if flags.no_cache {
+            desc |= device_mair_index() << 2;
+        }
+        match (flags.user, flags.writable) {
+            (false, true) => {}
+            (false, false) => desc |= DESC_AP_EL1_RO,
+            (true, true) => desc |= DESC_AP_EL0_RW | DESC_NG,
+            (true, false) => desc |= DESC_AP_EL0_RO | DESC_NG,
+        }
+        if !flags.executable {
+            desc |= DESC_PXN | DESC_UXN;
+        } else if flags.user {
+            desc |= DESC_PXN;
+        } else {
+            desc |= DESC_UXN;
+        }
+
+        // SAFETY: Installing L2 2 MiB Block descriptor and invalidating TLB for `virt`.
+        unsafe { write_volatile(desc_ptr, desc) };
+        tlbi_va(virt);
+        Ok(())
+    }
+
+    fn unmap_2m(&mut self, virt: VirtAddr) -> Result<PhysFrame2M, SysError> {
+        if (virt.raw() & HUGE_PAGE_MASK_2M) != 0 {
+            return Err(SysError::InvalidArgument);
+        }
+        let [i0, i1, i2, _] = Self::indices(virt);
+        let l1 = self
+            .next_table_existing(self.l0_phys, i0)
+            .ok_or(SysError::InvalidArgument)?;
+        let l2 = self
+            .next_table_existing(l1, i1)
+            .ok_or(SysError::InvalidArgument)?;
+
+        let desc_ptr = unsafe { self.table_ptr(l2).add(i2) };
+        // SAFETY: `l2` is a valid 4 KiB L2 table mapped via HHDM.
+        let desc = unsafe { read_volatile(desc_ptr) };
+        if (desc & (DESC_VALID | DESC_TABLE_OR_PAGE)) != DESC_VALID {
+            return Err(SysError::InvalidArgument);
+        }
+
+        // SAFETY: Clearing L2 2 MiB Block descriptor and flushing TLB reclaims superpage ownership.
+        unsafe { write_volatile(desc_ptr, 0) };
+        tlbi_va(virt);
+        const DESC_2M_ADDR_MASK: u64 = 0x0000_FFFF_FFE0_0000;
+        PhysFrame2M::from_aligned(PhysAddr::new(desc & DESC_2M_ADDR_MASK))
     }
 
     fn zero_frame(&self, frame: &PhysFrame) {
