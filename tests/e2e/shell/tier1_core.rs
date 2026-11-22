@@ -152,7 +152,7 @@ fn tier1_shell_procs_and_sys() {
     let mut sh = Shell::new(MockShellHost::new(4, 2));
     sh.exec_line("procs");
     let out_p = sh.host_mut().take_output();
-    assert!(out_p.contains("PID  RING  ISOLATION      NAME"));
+    assert!(out_p.contains("PID  EL    ISOLATION        NAME"));
     assert!(out_p.contains("init (newos-sh + CAOS)"));
     assert!(out_p.contains("worker (IPC responder)"));
 
@@ -203,7 +203,7 @@ fn tier1_shell_bench_emits_cycle_metric() {
     let mut sh = Shell::new(MockShellHost::default());
     sh.exec_line("bench");
     let out = sh.host_mut().take_output();
-    assert!(out.contains("cr3.switch.avg"));
+    assert!(out.contains("ttbr0.switch.avg"));
     assert!(out.contains("cycles"));
     assert!(sh.host().yield_syscalls >= 100);
 }

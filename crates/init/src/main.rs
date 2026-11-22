@@ -2,7 +2,7 @@
 #![no_main]
 #![forbid(unsafe_code)]
 
-//! Ring-3 Root Task (`init`), Crash Supervisor, Content-Addressed Object Store (CAOS),
+//! EL0 Root Task (`init`), Crash Supervisor, Content-Addressed Object Store (CAOS),
 //! and Post-UNIX Typed Pipeline Shell (`newos-sh`).
 //!
 //! 100% memory-safe Rust (`#![forbid(unsafe_code)]`, `no_alloc`).
@@ -15,12 +15,12 @@ use newos_net::{GemDma, NetConfig, NicKind, VirtioNetDma, VirtioTransport};
 use newos_shell_core::shell::{NullWriter, Record, RecordStream, Shell, ShellHost, SysInfo};
 use newos_user_rt::BufferedConsole;
 
-/// Static Ring-3 DMA rings & packet buffers (`Sync` via atomics, 100% `#![forbid(unsafe_code)]`).
+/// Static EL0 DMA rings & packet buffers (`Sync` via atomics, 100% `#![forbid(unsafe_code)]`).
 pub static VIRTIO_DMA: VirtioNetDma = VirtioNetDma::new();
-/// Static Ring-3 64-bit DMA rings & packet buffers for Raspberry Pi 5 RP1 Cadence GEM.
+/// Static EL0 64-bit DMA rings & packet buffers for Raspberry Pi 5 RP1 Cadence GEM.
 pub static GEM_DMA: GemDma = GemDma::new();
 
-/// Capability-scoped MMIO + `VirtToPhys` transport for Ring-3 VirtIO drivers.
+/// Capability-scoped MMIO + `VirtToPhys` transport for EL0 NIC drivers.
 pub struct CapVirtioTransport;
 
 impl VirtioTransport for CapVirtioTransport {
@@ -37,7 +37,7 @@ impl VirtioTransport for CapVirtioTransport {
     }
 }
 
-/// Ring-3 `ShellHost` adapter connecting `newos-shell-core` to `newos-user-rt` and `newos-net`.
+/// EL0 `ShellHost` adapter connecting `newos-shell-core` to `newos-user-rt` and `newos-net`.
 struct InitShellHost {
     net_cfg: Option<NetConfig>,
     cached_nic: Option<Option<NicKind>>,
@@ -273,11 +273,11 @@ impl InitShellHost {
                     }
                 }
             }
-        } else if let Ok(frame_len) = newos_net::verify_smoltcp_ring3_stack(mac) {
+        } else if let Ok(frame_len) = newos_net::verify_smoltcp_el0_stack(mac) {
             stream.push(Record::Metric {
                 label: "smoltcp.tx.frame",
                 value: frame_len as u64,
-                unit: "bytes (Ring-3 IPv4)",
+                unit: "bytes (EL0 IPv4)",
             });
         }
     }
@@ -358,7 +358,7 @@ extern "C" fn supervisor_recover() -> ! {
             if info.interactive_shell {
                 let _ = writeln!(
                     out,
-                    "[init-supervisor] recovered from Ring-3 fault (bits={:#x}) — restarting `newos-sh`!",
+                    "[init-supervisor] recovered from EL0 fault (bits={:#x}) — restarting `newos-sh`!",
                     bits
                 );
                 out.flush();
@@ -368,7 +368,7 @@ extern "C" fn supervisor_recover() -> ! {
             } else if bits == (1 << 6) {
                 let _ = writeln!(
                     out,
-                    "[init] phase-6 Ring-3 crash isolation & supervisor recovery: OK (fault_bits={:#x})",
+                    "[init] phase-6 EL0 crash isolation & supervisor recovery: OK (fault_bits={:#x})",
                     bits
                 );
                 out.flush();
@@ -403,11 +403,11 @@ fn main() -> ! {
     // Automated self-test mode (`cargo xtask test`)
     let _ = writeln!(
         out,
-        "[init] hello from Ring 3 (100% safe Rust, forbid_unsafe, isolated CR3 VSpace)!"
+        "[init] hello from EL0 (100% safe Rust, forbid_unsafe, isolated TTBR0_EL1 VSpace)!"
     );
     out.flush();
 
-    // Multi-process CR3 IPC ping-pong with isolated Ring-3 `worker` process (1-syscall `IpcCall`)
+    // Multi-process TTBR0_EL1 IPC ping-pong with isolated EL0 `worker` process (1-syscall `IpcCall`)
     const PING_PAYLOAD: u64 = 0xA110_C0DE;
     if newos_user_rt::ipc_call(CapId::BOOTSTRAP_EP, PING_PAYLOAD) != Ok((0x5E14, PING_PAYLOAD + 1)) {
         let _ = writeln!(out, "[init] FAIL: missing IPC reply from worker");
@@ -416,7 +416,7 @@ fn main() -> ! {
     }
     let _ = writeln!(
         out,
-        "[init] multi-process isolated CR3 IPC ping-pong with `worker`: OK"
+        "[init] multi-process isolated TTBR0_EL1 IPC ping-pong with `worker`: OK"
     );
 
     // 64-bit Notification coalescing + userspace SpscRing check
@@ -452,7 +452,7 @@ fn main() -> ! {
         newos_user_rt::exit(QemuExitCode::Failed);
     }
 
-    // Hardware CR3 context-switch latency benchmark
+    // Hardware TTBR0_EL1 context-switch latency benchmark
     const ROUNDTRIPS: u64 = 100;
     let t0 = newos_user_rt::read_cycles().unwrap_or(0);
     for _ in 0..ROUNDTRIPS {
@@ -462,22 +462,22 @@ fn main() -> ! {
     let avg_cycles = t1.saturating_sub(t0) / (ROUNDTRIPS * 2);
     let _ = writeln!(
         out,
-        "[init] phase-5 IPC, Notification & CR3 switch self-check: OK (~{avg_cycles} cycles/CR3-switch)"
+        "[init] phase-5 IPC, Notification & TTBR0 switch self-check: OK (~{avg_cycles} cycles/TTBR0-switch)"
     );
 
-    // Ring-3 Post-UNIX CAOS + Typed Pipeline Shell (`newos-sh`) self-check
+    // EL0 Post-UNIX CAOS + Typed Pipeline Shell (`newos-sh`) self-check
     let mut sh = Shell::new(InitShellHost::new());
     if let Err(msg) = sh.run_self_test() {
-        let _ = writeln!(out, "[init] FAIL: Ring-3 CAOS & typed pipeline self-check: {msg}");
+        let _ = writeln!(out, "[init] FAIL: EL0 CAOS & typed pipeline self-check: {msg}");
         out.flush();
         newos_user_rt::exit(QemuExitCode::Failed);
     }
     let _ = writeln!(
         out,
-        "[init] Ring-3 CAOS (dedup/rollback/seal) & typed `|` pipeline self-check: OK"
+        "[init] EL0 CAOS (dedup/rollback/seal) & typed `|` pipeline self-check: OK"
     );
 
-    // Ring-3 Networking: capability-scoped NIC (VirtIO-net or Pi 5 RP1 GEM) + live DHCPv4 + ICMP ping
+    // EL0 Networking: capability-scoped NIC (Pi 5 RP1 GEM or QEMU VirtIO-net) + live DHCPv4 + ICMP ping
     let detected_nic =
         newos_net::probe_nic(|off| newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, off));
     let mac = detected_nic
@@ -490,7 +490,7 @@ fn main() -> ! {
                 let dns = leased.dns.unwrap_or([0; 4]);
                 let _ = writeln!(
                     out,
-                    "[init] Ring-3 LIVE DHCPv4 ({}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}): ip={}.{}.{}.{}/{}, gw={}.{}.{}.{}, dns={}.{}.{}.{}",
+                    "[init] EL0 LIVE DHCPv4 ({}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}): ip={}.{}.{}.{}/{}, gw={}.{}.{}.{}, dns={}.{}.{}.{}",
                     nic.driver_name(),
                     mac[0],
                     mac[1],
@@ -526,7 +526,7 @@ fn main() -> ! {
             Ok(res) => {
                 let _ = writeln!(
                     out,
-                    "[init] Ring-3 LIVE ICMP ping {}.{}.{}.{} ({}): OK (seq={})",
+                    "[init] EL0 LIVE ICMP ping {}.{}.{}.{} ({}): OK (seq={})",
                     res.target[0],
                     res.target[1],
                     res.target[2],
@@ -542,15 +542,15 @@ fn main() -> ! {
             }
         }
     } else {
-        match newos_net::verify_smoltcp_ring3_stack(mac) {
+        match newos_net::verify_smoltcp_el0_stack(mac) {
             Ok(frame_len) => {
                 let _ = writeln!(
                     out,
-                    "[init] Ring-3 smoltcp IPv4/UDP stack ({frame_len}B Ethernet frame, no_alloc, forbid_unsafe): OK"
+                    "[init] EL0 smoltcp IPv4/UDP stack ({frame_len}B Ethernet frame, no_alloc, forbid_unsafe): OK"
                 );
             }
             Err(msg) => {
-                let _ = writeln!(out, "[init] FAIL: Ring-3 smoltcp stack check: {msg}");
+                let _ = writeln!(out, "[init] FAIL: EL0 smoltcp stack check: {msg}");
                 out.flush();
                 newos_user_rt::exit(QemuExitCode::Failed);
             }
@@ -564,10 +564,10 @@ fn main() -> ! {
         newos_user_rt::exit(QemuExitCode::Failed);
     }
 
-    // Deliberate Ring-3 hardware fault (#UD) -> supervisor recovery
+    // Deliberate EL0 hardware fault (`udf #0`) -> supervisor recovery
     let _ = writeln!(
         out,
-        "[init] triggering deliberate Ring-3 hardware fault (#UD) to verify crash isolation..."
+        "[init] triggering deliberate EL0 hardware fault (`udf #0`) to verify crash isolation..."
     );
     out.flush();
     newos_user_rt::trigger_user_fault()
@@ -575,6 +575,6 @@ fn main() -> ! {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    let _ = newos_user_rt::debug_log("[init] PANIC in Ring 3\n");
+    let _ = newos_user_rt::debug_log("[init] PANIC in EL0\n");
     newos_user_rt::exit(QemuExitCode::Failed)
 }

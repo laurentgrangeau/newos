@@ -2,9 +2,9 @@
 #![no_main]
 #![forbid(unsafe_code)]
 
-//! Isolated Ring-3 Worker Process (`worker`) — 100% `#![forbid(unsafe_code)]`.
+//! Isolated EL0 Worker Process (`worker`) — 100% `#![forbid(unsafe_code)]`.
 //!
-//! Runs in its own hardware `CR3` `VSpace` at the exact same virtual base (`0x400000`)
+//! Runs in its own hardware `TTBR0_EL1` `VSpace` at the exact same virtual base (`0x400000`)
 //! as `init`, communicating solely via capability-checked microkernel `Endpoint` IPC.
 
 use core::fmt::Write;
@@ -18,7 +18,7 @@ fn main() -> ! {
     let mut out = BufferedConsole::<256>::new();
     let _ = writeln!(
         out,
-        "[worker] alive in isolated Ring-3 VSpace (vaddr=0x400000, separate CR3)!"
+        "[worker] alive in isolated EL0 VSpace (vaddr=0x400000, separate TTBR0_EL1)!"
     );
     out.flush();
 
@@ -41,6 +41,6 @@ fn main() -> ! {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    let _ = newos_user_rt::debug_log("[worker] PANIC in Ring 3\n");
+    let _ = newos_user_rt::debug_log("[worker] PANIC in EL0\n");
     newos_user_rt::exit(QemuExitCode::Failed)
 }

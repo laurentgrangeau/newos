@@ -1,5 +1,5 @@
 //! Pure seL4-style kernel IPC primitives: `Endpoint` (fastpath), 64-bit `Notification`,
-//! and capability-scoped MMIO validation for Ring-3 drivers.
+//! and capability-scoped MMIO validation for EL0 drivers.
 //!
 //! 100% `#![forbid(unsafe_code)]`, zero kernel heap (`no_alloc`). All operations are
 //! capability-checked through the caller's `CNode`.
@@ -752,7 +752,7 @@ impl KernelIpcState {
             .insert_external_derived(derived, ext_parent)
     }
 
-    /// Validate a Ring-3 driver's 32-bit MMIO read against `pid`'s `MmioRegion` capability.
+    /// Validate an EL0 driver's 32-bit MMIO read against `pid`'s `MmioRegion` capability.
     #[inline]
     pub fn validate_mmio_read32_for(
         &self,
@@ -763,7 +763,7 @@ impl KernelIpcState {
         self.validate_mmio_access32(pid, cap_id, offset, Rights::READ)
     }
 
-    /// Validate a Ring-3 driver's 32-bit MMIO write against `pid`'s `MmioRegion` capability.
+    /// Validate an EL0 driver's 32-bit MMIO write against `pid`'s `MmioRegion` capability.
     #[inline]
     pub fn validate_mmio_write32_for(
         &self,
@@ -774,13 +774,13 @@ impl KernelIpcState {
         self.validate_mmio_access32(pid, cap_id, offset, Rights::WRITE)
     }
 
-    /// Validate a Ring-3 driver's 32-bit MMIO read in PID 0's `CSpace`.
+    /// Validate an EL0 driver's 32-bit MMIO read in PID 0's `CSpace`.
     #[inline]
     pub fn validate_mmio_read32(&self, cap_id: CapId, offset: u64) -> Result<PhysAddr, SysError> {
         self.validate_mmio_read32_for(0, cap_id, offset)
     }
 
-    /// Validate a Ring-3 driver's 32-bit MMIO write in PID 0's `CSpace`.
+    /// Validate an EL0 driver's 32-bit MMIO write in PID 0's `CSpace`.
     #[inline]
     pub fn validate_mmio_write32(&self, cap_id: CapId, offset: u64) -> Result<PhysAddr, SysError> {
         self.validate_mmio_write32_for(0, cap_id, offset)

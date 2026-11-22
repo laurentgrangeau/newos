@@ -97,7 +97,7 @@ pub fn debug_write_all(mut s: &str) -> Result<(), SysError> {
     Ok(())
 }
 
-/// Safe `core::fmt::Write` adapter for formatted Ring-3 diagnostics.
+/// Safe `core::fmt::Write` adapter for formatted EL0 diagnostics.
 pub struct DebugConsole;
 
 impl Write for DebugConsole {
@@ -223,9 +223,9 @@ pub fn read_cycles() -> Result<u64, SysError> {
     raw_syscall(SyscallNumber::ReadCycles, 0, 0, 0, 0)
 }
 
-/// Register a Ring-3 supervisor recovery entry point invoked if a Ring-3 hardware fault occurs.
+/// Register an EL0 supervisor recovery entry point invoked if an EL0 hardware fault occurs.
 pub fn set_fault_handler(handler: extern "C" fn() -> !) -> Result<(), SysError> {
-    // SAFETY: Computes the 16-byte-aligned top address of the static Ring-3 recovery stack.
+    // SAFETY: Computes the 16-byte-aligned top address of the static EL0 recovery stack.
     let stack_top = unsafe {
         SUPERVISOR_RECOVERY_STACK
             .get()
@@ -486,7 +486,7 @@ pub fn exit(code: QemuExitCode) -> ! {
     exit_with_cap(CapId::BOOTSTRAP_POWER, code)
 }
 
-/// Define a Ring-3 userspace `_start` entry point delegating to a `#![forbid(unsafe_code)]` `fn() -> !`.
+/// Define an EL0 userspace `_start` entry point delegating to a `#![forbid(unsafe_code)]` `fn() -> !`.
 #[macro_export]
 macro_rules! entry {
     ($path:path) => {

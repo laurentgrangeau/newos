@@ -1,6 +1,6 @@
 //! Capability-Scoped Content-Addressed Object Store (CAOS) — `#![forbid(unsafe_code)]`, `no_alloc`.
 //!
-//! Post-UNIX storage living 100% in Ring 3:
+//! Post-UNIX storage living 100% in EL0:
 //! - Every blob is **immutable** and addressed by its 64-bit content hash (`ObjHash`),
 //!   providing automatic deduplication, lock-free reads, and zero in-place corruption.
 //! - Mutable state exists only as explicit named **Refs** (`@name -> ObjHash`) with
@@ -169,7 +169,7 @@ impl RefMeta {
     }
 }
 
-/// Ring-3 Content-Addressed Object Store (`no_alloc`, `#![forbid(unsafe_code)]`).
+/// EL0 Content-Addressed Object Store (`no_alloc`, `#![forbid(unsafe_code)]`).
 pub struct ObjectStore {
     blobs: [BlobSlot; MAX_OBJECTS],
     refs: [RefSlot; MAX_REFS],

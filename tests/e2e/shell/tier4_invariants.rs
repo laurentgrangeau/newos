@@ -61,7 +61,7 @@ fn tier4_shell_full_interactive_operator_deploy_rollback_seal_session() {
     assert!(ping_out.contains(&format!("{}", 0xCAFFu64)));
 
     assert!(matches!(
-        sh.eval_pipeline("procs | where ring == 3 | count").first(),
+        sh.eval_pipeline("procs | where el == 0 | count").first(),
         Some(Record::Count(2))
     ));
 

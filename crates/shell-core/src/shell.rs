@@ -28,7 +28,7 @@ pub struct SysInfo {
 
 /// Host/OS syscall boundary for `newos-sh`.
 ///
-/// Implemented by Ring-3 `InitShellHost` (`crates/init`), host `BenchmarkHost`
+/// Implemented by EL0 `InitShellHost` (`crates/init`), host `BenchmarkHost`
 /// (`crates/bench`), and unit-test mocks.
 pub trait ShellHost {
     /// Emit a UTF-8 slice to the debug console (single `DebugWrite` syscall boundary).
@@ -70,8 +70,8 @@ pub trait ShellHost {
         Ok(0)
     }
 
-    /// Deliberately trigger a Ring-3 hardware fault (`crash` command).
-    /// Ring-3 `init` diverges (`!`); host tests may record the call and return.
+    /// Deliberately trigger an EL0 hardware fault (`crash` command).
+    /// EL0 `init` diverges (`!`); host tests may record the call and return.
     fn trigger_user_fault(&mut self) {}
 
     /// Terminate the root task (`exit` / `shutdown` in `run_interactive`).
@@ -82,7 +82,7 @@ pub trait ShellHost {
     }
 
     /// Handle the `net [dhcp|ping|resolve]` producer command.
-    /// Ring-3 `init` implements this using `newos-net`; host/bench default is no-op.
+    /// EL0 `init` implements this using `newos-net`; host/bench default is no-op.
     fn handle_net(
         &mut self,
         _subcmd: &str,
@@ -215,7 +215,7 @@ pub enum ExecOutcome {
 pub enum Record {
     Proc {
         pid: u64,
-        ring: u64,
+        el: u64,
         name: &'static str,
     },
     Object(ObjectMeta),
@@ -299,15 +299,15 @@ impl RecordStream {
         }
         match self.items[0] {
             Some(Record::Proc { .. }) => {
-                let _ = out.write_str("PID  RING  ISOLATION      NAME\n");
+                let _ = out.write_str("PID  EL    ISOLATION        NAME\n");
                 let mut line = AsciiLine::<96>::new();
                 for rec in self.items[..self.len].iter().flatten() {
-                    if let Record::Proc { pid, ring, name } = rec {
+                    if let Record::Proc { pid, el, name } = rec {
                         line.clear();
                         line.push_u64_left(*pid, 4);
-                        line.push_byte(b' ');
-                        line.push_u64_left(*ring, 5);
-                        line.push_str(" CR3 VSpace #");
+                        line.push_str(" EL");
+                        line.push_u64_left(*el, 3);
+                        line.push_str(" TTBR0 VSpace #");
                         line.push_u64(*pid);
                         line.push_str("  ");
                         line.push_str(name);
@@ -602,12 +602,12 @@ impl<H: ShellHost> Shell<H> {
         Ok(())
     }
 
-    /// Run the interactive Ring-3 REPL (`cargo xtask run`).
+    /// Run the interactive EL0 REPL (`cargo xtask run`).
     pub fn run_interactive(&mut self) -> ! {
         {
             let mut out = self.buffered_out();
             let _ = writeln!(out, "\n================================================================");
-            let _ = writeln!(out, "  newos-sh: Post-UNIX Typed Pipeline Shell + Ring-3 CAOS");
+            let _ = writeln!(out, "  newos-sh: Post-UNIX Typed Pipeline Shell + EL0 CAOS");
             let _ = writeln!(out, "  100% #![forbid(unsafe_code)] · zero POSIX paths · zero heap");
             let _ = writeln!(out, "  Try: `get @guide`, `objects | where size > 20`, `help`");
             let _ = writeln!(out, "================================================================\n");
@@ -709,7 +709,7 @@ impl<H: ShellHost> Shell<H> {
             "crash" => {
                 if !silent {
                     self.host.write_debug(
-                        "[newos-sh] triggering deliberate Ring-3 #UD fault (kernel stays alive)...\n",
+                        "[newos-sh] triggering deliberate EL0 `udf #0` fault (kernel stays alive)...\n",
                     );
                 }
                 self.host.trigger_user_fault();
@@ -956,13 +956,13 @@ fn eval_producer_tokens_with<H: ShellHost>(
             let info = sys_info_cached_with(host, cached_sys_info);
             stream.push(Record::Proc {
                 pid: 0,
-                ring: 3,
+                el: 0,
                 name: "init (newos-sh + CAOS)",
             });
             if info.proc_count > 1 {
                 stream.push(Record::Proc {
                     pid: 1,
-                    ring: 3,
+                    el: 0,
                     name: "worker (IPC responder)",
                 });
             }
@@ -1033,7 +1033,7 @@ fn eval_producer_tokens_with<H: ShellHost>(
             let t1 = host.read_cycles().unwrap_or(0);
             let avg = t1.saturating_sub(t0) / (ROUNDTRIPS * 2);
             stream.push(Record::Metric {
-                label: "cr3.switch.avg",
+                label: "ttbr0.switch.avg",
                 value: avg,
                 unit: "cycles",
             });
@@ -1115,12 +1115,12 @@ const HELP_TEXT: &str = concat!(
     "  get <@ref | obj:hash>       Read immutable object content\n",
     "  objects / refs / procs      Emit typed Object / Ref / Proc records\n",
     "  ref set|seal|rollback       Manage capability-gated Refs (atomic rollback)\n",
-    "  ping [hex] / bench          CR3 IPC round-trip & cycle benchmark\n",
-    "  net [dhcp|ping|resolve]     Ring-3 smoltcp + VirtIO / Pi 5 RP1 GEM\n",
+    "  ping [hex] / bench          TTBR0 IPC round-trip & cycle benchmark\n",
+    "  net [dhcp|ping|resolve]     EL0 smoltcp + Pi 5 RP1 GEM / QEMU VirtIO\n",
     "  | where <f> ==|!=|> <v>     Filter typed records (e.g. `objects | where size > 20`)\n",
     "  | save @<name>              Bind upstream Object hash to a named Ref\n",
     "  | first <n> / | count       Slice or count typed streams\n",
-    "  sys / crash / clear / exit  System info, Ring-3 fault test, power off\n",
+    "  sys / crash / clear / exit  System info, EL0 fault test, power off\n",
 );
 
 fn write_help<W: Write>(out: &mut W) {
@@ -1189,7 +1189,7 @@ impl EqOp {
 
 enum WherePredicate<'a> {
     Pid(CmpOp, u64),
-    Ring(CmpOp, u64),
+    El(CmpOp, u64),
     Size(CmpOp, u64),
     Value(CmpOp, u64),
     Count(CmpOp, u64),
@@ -1202,7 +1202,7 @@ impl<'a> WherePredicate<'a> {
     fn parse(field: &str, op: &str, rhs: &'a str) -> Option<Self> {
         match field {
             "pid" => Some(Self::Pid(CmpOp::parse(op)?, parse_u64(rhs)?)),
-            "ring" => Some(Self::Ring(CmpOp::parse(op)?, parse_u64(rhs)?)),
+            "el" => Some(Self::El(CmpOp::parse(op)?, parse_u64(rhs)?)),
             "size" => Some(Self::Size(CmpOp::parse(op)?, parse_u64(rhs)?)),
             "value" => Some(Self::Value(CmpOp::parse(op)?, parse_u64(rhs)?)),
             "count" => Some(Self::Count(CmpOp::parse(op)?, parse_u64(rhs)?)),
@@ -1224,7 +1224,7 @@ impl<'a> WherePredicate<'a> {
     fn matches(&self, rec: Record) -> bool {
         match (self, rec) {
             (Self::Pid(op, r), Record::Proc { pid, .. }) => op.eval(pid, *r),
-            (Self::Ring(op, r), Record::Proc { ring, .. }) => op.eval(ring, *r),
+            (Self::El(op, r), Record::Proc { el, .. }) => op.eval(el, *r),
             (Self::Name(op, r), Record::Proc { name, .. }) => op.eval_eq(name == *r),
             (Self::Size(op, r), Record::Object(meta)) => op.eval(meta.size as u64, *r),
             (Self::Name(op, r), Record::Ref(meta)) => {

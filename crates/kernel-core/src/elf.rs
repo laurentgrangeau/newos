@@ -1,6 +1,6 @@
 //! Pure, `#![forbid(unsafe_code)]`, `no_alloc` 64-bit ELF64 parser for bootstrapping `init`.
 //!
-//! Only the single Ring-3 root task (`init`) is parsed by Ring 0; all subsequent
+//! Only the single EL0 root task (`init`) is parsed by EL1; all subsequent
 //! processes and ELF binaries are loaded by userspace services.
 
 use crate::memory::{PageFlags, VirtAddr};
@@ -19,7 +19,7 @@ const PF_W: u32 = 1 << 1;
 /// Maximum `PT_LOAD` segments supported in the bootstrap `init` ELF64 image.
 pub const MAX_LOAD_SEGMENTS: usize = 8;
 
-/// Validated `PT_LOAD` segment from a 64-bit Ring-3 ELF64 executable.
+/// Validated `PT_LOAD` segment from a 64-bit EL0 ELF64 executable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoadSegment {
     pub vaddr: u64,
@@ -29,7 +29,7 @@ pub struct LoadSegment {
     pub flags: PageFlags,
 }
 
-/// Parsed 64-bit Ring-3 ELF64 executable metadata (`no_alloc`).
+/// Parsed 64-bit EL0 ELF64 executable metadata (`no_alloc`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParsedElf64 {
     pub entry: VirtAddr,
@@ -145,7 +145,7 @@ pub fn parse_elf64(bytes: &[u8]) -> Result<ParsedElf64, SysError> {
             return Err(SysError::InvalidArgument);
         }
 
-        // Strict W^X enforced for Ring-3 segments
+        // Strict W^X enforced for EL0 segments
         let writable = (p_flags & PF_W) != 0;
         let executable = (p_flags & PF_X) != 0;
         let flags = PageFlags::new_wx(writable, executable, true, false)?;

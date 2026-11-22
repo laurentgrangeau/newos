@@ -22,7 +22,7 @@ use memory::{
 use newos_abi::{QemuExitCode, Rights, SysError};
 
 const USER_STACK_BASE: u64 = 0x0000_7fff_f000_0000;
-const USER_STACK_PAGES: u64 = 16; // 64 KiB Ring-3 stack
+const USER_STACK_PAGES: u64 = 16; // 64 KiB EL0 stack
 
 /// Fixed-size, `no_alloc` boot descriptor handed from `newos-hal` to `newos-kernel-core`.
 #[derive(Debug, Clone, Copy)]
@@ -75,7 +75,7 @@ pub trait HalPlatform: Write {
     fn exit(&mut self, code: QemuExitCode) -> !;
 }
 
-/// Microkernel boot entry: verify Phases 1–3 + SMP, then load isolated Ring-3 `init` & `worker`.
+/// Microkernel boot entry: verify Phases 1–3 + SMP, then load isolated EL0 `init` & `worker`.
 pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
     let sec = platform.security_features();
     let board = if info.qemu_virt {
@@ -164,7 +164,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
         }
     }
 
-    // Phase 4+: Load `init` (PID 0) and `worker` (PID 1) into SEPARATE isolated Ring-3 VSpaces!
+    // Phase 4+: Load `init` (PID 0) and `worker` (PID 1) into SEPARATE isolated EL0 VSpaces!
     let Some(init_bytes) = info.init_module else {
         let _ = writeln!(platform, "[newos] FAIL: missing Limine boot module `newos-init`");
         platform.exit(QemuExitCode::Failed);
@@ -182,7 +182,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
             platform.start_userspace()
         }
         Err(err) => {
-            let _ = writeln!(platform, "[newos] FAIL: failed to spawn Ring-3 processes: {err:?}");
+            let _ = writeln!(platform, "[newos] FAIL: failed to spawn EL0 processes: {err:?}");
             platform.exit(QemuExitCode::Failed);
         }
     }
@@ -249,7 +249,7 @@ fn load_elf64_into_vspace<V: VSpaceMapper>(
         }
     }
 
-    // Map 16 KiB Ring-3 stack (USER | RW | NX)
+    // Map 64 KiB EL0 stack (USER | RW | UXN/PXN)
     let stack_flags = PageFlags::new_wx(true, false, true, false)?;
     for page in 0..USER_STACK_PAGES {
         let frame = untyped.retype_frame()?;

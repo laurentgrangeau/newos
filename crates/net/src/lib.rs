@@ -1,13 +1,13 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-//! Ring-3 Networking Stack (`smoltcp` IPv4/UDP/ICMP/DHCPv4/DNS + Capability-Scoped Drivers).
+//! EL0 Networking Stack (`smoltcp` IPv4/UDP/ICMP/DHCPv4/DNS + Capability-Scoped Drivers).
 //!
 //! Supports:
-//! - QEMU `virt`: Modern VirtIO 1.0+ (v2) MMIO (`virtio.rs`)
 //! - Raspberry Pi 5 (16 GB): RP1 Cadence GEM (`macb`) Gigabit Ethernet (`gem.rs`)
+//! - QEMU `virt` test harness: Modern VirtIO 1.0+ (v2) MMIO (`virtio.rs`)
 //!
-//! 100% `#![forbid(unsafe_code)]`, zero heap (`no_alloc`), zero network code in Ring 0.
+//! 100% `#![forbid(unsafe_code)]`, zero heap (`no_alloc`), zero network code in EL1.
 
 pub mod gem;
 pub mod virtio;
@@ -47,7 +47,7 @@ pub struct VirtioNetInfo {
     pub mac: [u8; 6],
 }
 
-/// Unified detected Ring-3 NIC (QEMU VirtIO-MMIO v2 or Raspberry Pi 5 RP1 Cadence GEM).
+/// Unified detected EL0 NIC (Raspberry Pi 5 RP1 Cadence GEM or QEMU VirtIO-MMIO v2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NicKind {
     Virtio(VirtioNetInfo),
@@ -138,7 +138,7 @@ where
     None
 }
 
-/// Fixed-capacity, zero-heap Ring-3 loopback Ethernet `smoltcp::phy::Device` for self-tests.
+/// Fixed-capacity, zero-heap EL0 loopback Ethernet `smoltcp::phy::Device` for self-tests.
 struct LoopbackEth {
     buf: [u8; 512],
     len: usize,
@@ -213,8 +213,8 @@ impl Device for LoopbackEth {
     }
 }
 
-/// Verify the pure-Rust Ring-3 `smoltcp` Ethernet + IPv4 + UDP stack end-to-end (`no_alloc`).
-pub fn verify_smoltcp_ring3_stack(mac: [u8; 6]) -> Result<usize, &'static str> {
+/// Verify the pure-Rust EL0 `smoltcp` Ethernet + IPv4 + UDP stack end-to-end (`no_alloc`).
+pub fn verify_smoltcp_el0_stack(mac: [u8; 6]) -> Result<usize, &'static str> {
     let mut device = LoopbackEth::new();
     let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
@@ -240,7 +240,7 @@ pub fn verify_smoltcp_ring3_stack(mac: [u8; 6]) -> Result<usize, &'static str> {
     let mut sockets = SocketSet::new(&mut storage[..]);
     let handle = sockets.add(udp_sock);
 
-    let payload = b"newos-ring3-smoltcp";
+    let payload = b"newos-el0-smoltcp";
     sockets
         .get_mut::<udp::Socket>(handle)
         .send_slice(payload, (IpAddress::v4(10, 0, 2, 2), 53))
@@ -256,7 +256,7 @@ pub fn verify_smoltcp_ring3_stack(mac: [u8; 6]) -> Result<usize, &'static str> {
     Ok(device.len)
 }
 
-/// Result of a live Ring-3 ICMP Echo Request/Reply round-trip.
+/// Result of a live EL0 ICMP Echo Request/Reply round-trip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PingResult {
     pub seq: u16,
@@ -407,7 +407,7 @@ pub fn run_icmp_ping<D: Device>(
     let handle = sockets.add(icmp_sock);
 
     let dest = IpAddress::Ipv4(Ipv4Address::from(target));
-    let payload = b"newos-ring3";
+    let payload = b"newos-el0";
     let echo = Icmpv4Repr::EchoRequest {
         ident: IDENT,
         seq_no: SEQ,
@@ -756,7 +756,7 @@ mod tests {
     #[test]
     fn smoltcp_emits_valid_ethernet_frame_no_alloc() {
         let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
-        let frame_len = verify_smoltcp_ring3_stack(mac).expect("smoltcp self-test");
+        let frame_len = verify_smoltcp_el0_stack(mac).expect("smoltcp self-test");
         assert!(frame_len >= 42);
     }
 

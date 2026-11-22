@@ -1,7 +1,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-//! Shared, 100% memory-safe ABI contract between the NewOS microkernel and Ring-3 userspace.
+//! Shared, 100% memory-safe ABI contract between the NewOS microkernel (EL1) and EL0 userspace.
 
 pub mod ring;
 
@@ -20,10 +20,10 @@ impl CapId {
     /// Well-known bootstrap `Endpoint` capability installed in `init`'s CSpace (slot 2, gen 1).
     pub const BOOTSTRAP_EP: Self = Self((1u64 << 32) | 2);
 
-    /// Well-known bootstrap Fault `Notification` capability (slot 3, gen 1) signaled on Ring-3 faults.
+    /// Well-known bootstrap Fault `Notification` capability (slot 3, gen 1) signaled on EL0 faults.
     pub const BOOTSTRAP_FAULT_NOTIF: Self = Self((1u64 << 32) | 3);
 
-    /// Well-known bootstrap VirtIO-MMIO capability (slot 4, gen 1) for Ring-3 NIC drivers.
+    /// Well-known bootstrap NIC MMIO capability (slot 4, gen 1) for EL0 NIC drivers.
     pub const BOOTSTRAP_NET_MMIO: Self = Self((1u64 << 32) | 4);
 
     /// Well-known bootstrap Console capability (slot 5, gen 1) gating `DebugRead`/`DebugWrite`.
@@ -168,15 +168,15 @@ pub enum SyscallNumber {
     IpcRecv = 7,
     /// Read the CPU monotonic timestamp counter (cycles) for IPC/syscall benchmarking.
     ReadCycles = 8,
-    /// Register Ring-3 supervisor fault-recovery entry `(rip, rsp)` for crash isolation.
+    /// Register EL0 supervisor fault-recovery entry `(pc, sp)` for crash isolation.
     SetFaultHandler = 9,
-    /// Capability-scoped 32-bit MMIO read `(mmio_cap_id, byte_offset)` for Ring-3 drivers.
+    /// Capability-scoped 32-bit MMIO read `(mmio_cap_id, byte_offset)` for EL0 drivers.
     MmioRead32 = 10,
     /// Non-blocking 1-byte read from the early debug serial console: `(console_cap)` (`Rights::READ`).
     DebugRead = 11,
     /// Read packed system info `(power_cap)` (`Rights::READ`) -> `(interactive << 32) | (proc_count << 16) | online_cpus`.
     SysInfo = 12,
-    /// Capability-scoped 32-bit MMIO write `(mmio_cap_id, byte_offset, value)` for Ring-3 drivers.
+    /// Capability-scoped 32-bit MMIO write `(mmio_cap_id, byte_offset, value)` for EL0 drivers.
     MmioWrite32 = 13,
     /// Translate a canonical EL0 virtual address in the designated `VSpace` to its physical address: `(vspace_cap, vaddr)` (`Rights::READ`).
     VirtToPhys = 14,

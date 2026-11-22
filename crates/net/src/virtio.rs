@@ -1,6 +1,6 @@
 //! Pure `#![forbid(unsafe_code)]`, `no_alloc` Modern VirtIO 1.0+ (v2) MMIO Network Driver.
 //!
-//! Runs 100% in Ring 3 / EL0 using capability-scoped `MmioRead32`/`MmioWrite32` and `VirtToPhys`.
+//! Runs 100% in EL0 using capability-scoped `MmioRead32`/`MmioWrite32` and `VirtToPhys`.
 //! Every DMA ring and packet buffer is page-aligned (`<= 4096B`) so it never crosses a page boundary.
 
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering, fence};
@@ -37,7 +37,7 @@ const STATUS_FEATURES_OK: u32 = 8;
 
 const DESC_F_WRITE: u16 = 2;
 
-/// Capability-scoped MMIO + DMA translation transport injected by Ring-3 `user-rt`.
+/// Capability-scoped MMIO + DMA translation transport injected by EL0 `user-rt`.
 pub trait VirtioTransport {
     fn read32(&self, offset: u64) -> Result<u32, SysError>;
     fn write32(&self, offset: u64, val: u32) -> Result<(), SysError>;
@@ -159,7 +159,7 @@ impl Default for VirtioNetDma {
     }
 }
 
-/// Live Ring-3 VirtIO 1.0+ (v2) network device implementing `smoltcp::phy::Device`.
+/// Live EL0 VirtIO 1.0+ (v2) network device implementing `smoltcp::phy::Device`.
 pub struct VirtioNetDevice<'a, T: VirtioTransport> {
     transport: T,
     slot_base: u64,

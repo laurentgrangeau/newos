@@ -16,7 +16,7 @@ A pure **seL4-style 64-bit capability microkernel** and **post-UNIX EL0 environm
   - Audited `unsafe` is strictly confined to hardware/paging/context-switch instructions in `crates/hal` (guarded by IRQ-disabling `IrqSpinLock`s and page-table-validated HHDM user copies) and the minimal `svc #0` trampoline in `crates/user-rt`.
 - **Post-UNIX Userspace (Zero POSIX Paths / Zero Untyped Text Pipes):**
   - **Content-Addressed Object Store (CAOS):** Immutable blobs addressed by 64-bit `ObjHash` with automatic deduplication, collision rejection, lock-free reads, mark-and-sweep `gc()`, validated binary snapshots (`encode_snapshot`/`decode_snapshot`), capability-gated named Refs (`@name`), instant atomic `rollback`, and irreversible `seal` (read-only attenuation).
-  - **Typed Pipeline Shell (`newos-sh`):** Stages pass typed `Record` values (`Proc`, `Object`, `Ref`, `Metric`, `Count`) directly through `|` (`put "hello" | save @note`, `objects | where size > 20`, `procs | where pid == 1 | count`, `net dhcp`, `net ping`, `net resolve`).
+  - **Typed Pipeline Shell (`newos-sh`):** Stages pass typed `Record` values (`Proc`, `Object`, `Ref`, `Metric`, `Count`) directly through `|` (`put "hello" | save @note`, `objects | where size > 20`, `procs | where el == 0 | count`, `net dhcp`, `net ping`, `net resolve`).
 - **Raspberry Pi 5 (16 GB) Hardware Target:**
   - Pure 64-bit `aarch64` compiled for `-C target-cpu=cortex-a76` (ARMv8.2-A, zero 32-bit, zero x86_64).
   - UEFI + Limine, 4-level `TTBR0_EL1`/`TTBR1_EL1` with ASID tagging, 4 KiB & 2 MiB block pages, `PXN`/`UXN` W^X, ARMv8.1-A **PAN** (`PSTATE.PAN` / `SCTLR_EL1.SPAN`), `MAIR_EL1` Device-nGnRnE (no cacheable HHDM fallback), ARM Generic Virtual Timer preemption (`__newos_irq_el0`), `svc #0`/`eret`, PSCI, BCM2712 3-pin JST Debug PL011 UART (`0x10_7D00_1000`), and RP1 Cadence GEM Gigabit Ethernet (`0x1F_0010_0000`) with 64-bit DMA.
@@ -146,6 +146,8 @@ newos/
 │   ├── kernel/                  # #![no_std], #![no_main], #![forbid(unsafe_code)] — Thin EL1 kernel binary
 │   ├── user-rt/                 # #![no_std] — Safe EL0 Rust SDK (aarch64 svc #0)
 │   ├── net/                     # #![no_std], no_alloc, #![forbid(unsafe_code)] — EL0 smoltcp + RP1 GEM & VirtIO 1.0+
+│   ├── shell-core/              # #![no_std], no_alloc, #![forbid(unsafe_code)] — CAOS & Typed Pipeline Shell (`newos-sh`)
+│   ├── bench/                   # #![forbid(unsafe_code)] — Host microbenchmark harness
 │   ├── init/                    # #![no_std], #![no_main], #![forbid(unsafe_code)] — Root task, CAOS & `newos-sh`
 │   └── worker/                  # #![no_std], #![no_main], #![forbid(unsafe_code)] — Isolated EL0 worker process
 └── infra/
@@ -193,6 +195,7 @@ put "hello newos" | save @note
 get @note
 objects | where size > 20
 refs | where writable == false
+procs | where el == 0 | count
 procs | where pid == 1 | count
 ref rollback @note
 ref seal @note
