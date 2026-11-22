@@ -20,7 +20,7 @@ use memory::{
 use newos_abi::{QemuExitCode, Rights, SysError};
 
 const USER_STACK_BASE: u64 = 0x0000_7fff_f000_0000;
-const USER_STACK_PAGES: u64 = 4; // 16 KiB Ring-3 stack
+const USER_STACK_PAGES: u64 = 16; // 64 KiB Ring-3 stack
 
 /// Fixed-size, `no_alloc` boot descriptor handed from `newos-hal` to `newos-kernel-core`.
 #[derive(Debug, Clone, Copy)]
@@ -33,6 +33,7 @@ pub struct BootInfo {
     pub rsdp_addr: u64,
     pub init_module: Option<&'static [u8]>,
     pub worker_module: Option<&'static [u8]>,
+    pub interactive_shell: bool,
 }
 
 impl BootInfo {
@@ -343,6 +344,7 @@ mod tests {
             rsdp_addr: 0x000e_0000,
             init_module: None,
             worker_module: None,
+            interactive_shell: false,
         };
         assert_eq!(info.usable_mib(), 256);
     }

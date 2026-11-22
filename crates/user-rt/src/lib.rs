@@ -11,7 +11,7 @@ use core::cell::SyncUnsafeCell;
 use core::fmt::{self, Write};
 use newos_abi::{CapId, QemuExitCode, SysError, SyscallNumber};
 
-const RECOVERY_STACK_SIZE: usize = 8 * 1024;
+const RECOVERY_STACK_SIZE: usize = 32 * 1024;
 
 #[repr(C, align(16))]
 struct RecoveryStack([u8; RECOVERY_STACK_SIZE]);
@@ -131,6 +131,29 @@ pub fn trigger_user_fault() -> ! {
     // isolation and supervisor recovery path can be verified end-to-end.
     unsafe {
         asm!("ud2", options(noreturn));
+    }
+}
+
+/// Read-only system summary returned by `sys_info()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SysInfo {
+    pub online_cpus: u16,
+    pub proc_count: u16,
+    pub interactive_shell: bool,
+}
+
+/// Non-blocking 1-byte read from the debug serial console (`Err(WouldBlock)` if no input).
+pub fn debug_read_byte() -> Result<u8, SysError> {
+    raw_syscall(SyscallNumber::DebugRead, 0, 0, 0, 0).map(|b| b as u8)
+}
+
+/// Read-only microkernel system info (`online_cpus`, `proc_count`, `interactive_shell`).
+pub fn sys_info() -> SysInfo {
+    let raw = raw_syscall(SyscallNumber::SysInfo, 0, 0, 0, 0).unwrap_or(0);
+    SysInfo {
+        online_cpus: (raw & 0xFFFF) as u16,
+        proc_count: ((raw >> 16) & 0xFFFF) as u16,
+        interactive_shell: ((raw >> 32) & 1) != 0,
     }
 }
 

@@ -3,7 +3,10 @@
 use limine::memmap::MEMMAP_USABLE;
 #[cfg(target_arch = "x86_64")]
 use limine::mp::MP_FLAG_X2APIC;
-use limine::request::{HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, MpResponse, RsdpRequest};
+use limine::request::{
+    ExecutableFileRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, MpResponse,
+    RsdpRequest,
+};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 use newos_kernel_core::BootInfo;
 use newos_kernel_core::memory::UntypedInventory;
@@ -42,6 +45,10 @@ static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static MODULES_REQUEST: ModulesRequest = ModulesRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static EXEC_FILE_REQUEST: ExecutableFileRequest = ExecutableFileRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests_end_marker")]
@@ -109,6 +116,11 @@ pub fn boot_info() -> BootInfo {
         }
     }
 
+    let interactive_shell = EXEC_FILE_REQUEST
+        .response()
+        .map(|resp| resp.executable_file().cmdline().contains("interactive"))
+        .unwrap_or(false);
+
     BootInfo {
         hhdm_offset,
         untyped,
@@ -118,5 +130,6 @@ pub fn boot_info() -> BootInfo {
         rsdp_addr,
         init_module,
         worker_module,
+        interactive_shell,
     }
 }

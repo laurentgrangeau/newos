@@ -50,6 +50,7 @@ impl X86Platform {
         let security = paging::enable_modern_cpu_features();
         syscall::init(info.hhdm_offset);
         let online_cpus = smp::bring_up_aps();
+        syscall::set_sys_info(online_cpus, info.interactive_shell);
         let vspace = paging::X86VSpace::from_current_cr3(info.hhdm_offset);
         Self {
             serial: serial::SerialPort::new(),

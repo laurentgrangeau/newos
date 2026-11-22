@@ -58,6 +58,18 @@ pub fn init() {
     }
 }
 
+/// Non-blocking 1-byte read from COM1 RX buffer (returns `None` if no byte is ready).
+pub fn try_read_byte() -> Option<u8> {
+    // SAFETY: Reading COM1 Line Status Register (0x3FD) bit 0 (Data Ready) and RX buffer (0x3F8).
+    unsafe {
+        if (inb(COM1_BASE + 5) & 0x01) != 0 {
+            Some(inb(COM1_BASE))
+        } else {
+            None
+        }
+    }
+}
+
 /// Stateless handle for writing to COM1 (usable from normal code, exceptions, and panic).
 pub struct SerialPort;
 

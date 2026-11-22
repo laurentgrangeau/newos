@@ -13,8 +13,8 @@ fn main() -> ExitCode {
     let cmd = args.first().map(String::as_str).unwrap_or("help");
 
     let result = match cmd {
-        "build" => build_iso().map(|_| ()),
-        "run" => run_qemu(false),
+        "build" => build_iso(true).map(|_| ()),
+        "run" => run_qemu(false, true),
         "test" => run_tests(),
         "host-test" => run_host_tests(),
         _ => {
@@ -133,7 +133,7 @@ fn ensure_limine(root: &Path) -> Result<PathBuf, String> {
 }
 
 /// Build a pure 64-bit UEFI-only bootable ISO (zero legacy BIOS / MBR stages).
-fn build_iso() -> Result<PathBuf, String> {
+fn build_iso(interactive: bool) -> Result<PathBuf, String> {
     let root = workspace_root();
     let kernel_elf = build_kernel(&root)?;
     let init_elf = build_user_elf(&root, "newos-init", "crates/init/linker-x86_64.ld")?;
@@ -158,16 +158,17 @@ fn build_iso() -> Result<PathBuf, String> {
     fs::copy(&worker_elf, iso_root.join("boot/newos-worker"))
         .map_err(|e| format!("failed to copy worker ELF: {e}"))?;
 
-    let limine_conf = "\
-timeout: 0
-serial: yes
-
-/NewOS
-    protocol: limine
-    path: boot():/boot/newos-kernel
-    module_path: boot():/boot/newos-init
-    module_path: boot():/boot/newos-worker
-";
+    let cmdline = if interactive { "interactive" } else { "test" };
+    let limine_conf = format!(
+        "timeout: 0\n\
+         serial: yes\n\n\
+         /NewOS\n\
+         \x20   protocol: limine\n\
+         \x20   path: boot():/boot/newos-kernel\n\
+         \x20   cmdline: {cmdline}\n\
+         \x20   module_path: boot():/boot/newos-init\n\
+         \x20   module_path: boot():/boot/newos-worker\n"
+    );
     fs::write(boot_limine.join("limine.conf"), limine_conf)
         .map_err(|e| format!("failed to write limine.conf: {e}"))?;
 
@@ -215,7 +216,7 @@ fn run_host_tests() -> Result<(), String> {
 
 fn run_tests() -> Result<(), String> {
     run_host_tests()?;
-    run_qemu(true)
+    run_qemu(true, false)
 }
 
 fn find_ovmf() -> Result<&'static str, String> {
@@ -230,8 +231,8 @@ fn find_ovmf() -> Result<&'static str, String> {
         .ok_or_else(|| "OVMF UEFI firmware not found (NewOS requires 64-bit UEFI)".to_string())
 }
 
-fn run_qemu(expect_success_exit: bool) -> Result<(), String> {
-    let iso_path = build_iso()?;
+fn run_qemu(expect_success_exit: bool, interactive: bool) -> Result<(), String> {
+    let iso_path = build_iso(interactive)?;
     let ovmf = find_ovmf()?;
 
     let mut qemu = Command::new("qemu-system-x86_64");

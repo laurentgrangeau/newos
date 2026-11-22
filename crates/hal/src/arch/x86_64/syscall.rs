@@ -25,6 +25,7 @@ const MAX_PROCS: usize = 4;
 
 static YIELD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
+static SYS_INFO_PACKED: AtomicU64 = AtomicU64::new(0);
 static FAULT_RECOVERY_RIP: AtomicU64 = AtomicU64::new(0);
 static FAULT_RECOVERY_RSP: AtomicU64 = AtomicU64::new(0);
 static IPC_STATE: SyncUnsafeCell<KernelIpcState> = SyncUnsafeCell::new(KernelIpcState::new());
@@ -127,6 +128,12 @@ pub fn init(hhdm_offset: u64) {
 /// Enable 64-bit `syscall`/`sysretq` MSRs on a secondary (AP) CPU.
 pub fn init_ap() {
     program_syscall_msrs();
+}
+
+/// Record read-only system info (`online_cpus`, `interactive_shell`) for `SyscallNumber::SysInfo`.
+pub fn set_sys_info(online_cpus: usize, interactive_shell: bool) {
+    let packed = ((u64::from(interactive_shell)) << 32) | (online_cpus as u64 & 0xFFFF);
+    SYS_INFO_PACKED.store(packed, Ordering::Release);
 }
 
 /// Register an isolated Ring-3 process `(entry_rip, user_rsp, cr3)` in the kernel process table.
@@ -335,6 +342,16 @@ extern "C" fn rust_syscall_dispatch(
             let val = unsafe { read_volatile(ptr) };
             u64::from(val)
         }),
+        SyscallNumber::DebugRead => match serial::try_read_byte() {
+            Some(byte) => Ok(u64::from(byte)),
+            None => Err(SysError::WouldBlock),
+        },
+        SyscallNumber::SysInfo => {
+            // SAFETY: Reading `PROCS.count` with `IF=0` on BSP.
+            let proc_count = unsafe { (*PROCS.get()).count as u64 };
+            let base = SYS_INFO_PACKED.load(Ordering::Acquire);
+            Ok(base | ((proc_count & 0xFFFF) << 16))
+        }
     };
 
     match result {

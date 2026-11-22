@@ -117,6 +117,10 @@ pub enum SyscallNumber {
     SetFaultHandler = 9,
     /// Capability-scoped 32-bit MMIO read `(mmio_cap_id, byte_offset)` for Ring-3 drivers.
     MmioRead32 = 10,
+    /// Non-blocking 1-byte read from the early debug serial console (returns `WouldBlock` if empty).
+    DebugRead = 11,
+    /// Read packed system info `(interactive << 32) | (proc_count << 16) | online_cpus`.
+    SysInfo = 12,
 }
 
 impl SyscallNumber {
@@ -133,6 +137,8 @@ impl SyscallNumber {
             8 => Some(Self::ReadCycles),
             9 => Some(Self::SetFaultHandler),
             10 => Some(Self::MmioRead32),
+            11 => Some(Self::DebugRead),
+            12 => Some(Self::SysInfo),
             _ => None,
         }
     }
