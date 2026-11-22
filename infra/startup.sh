@@ -33,6 +33,7 @@ apt-get install -y --no-install-recommends \
   qemu-system-arm \
   qemu-utils \
   ovmf \
+  qemu-efi-aarch64 \
   xorriso \
   grub-pc-bin \
   grub-common \

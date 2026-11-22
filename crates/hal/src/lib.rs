@@ -1,6 +1,6 @@
 #![no_std]
-#![feature(abi_x86_interrupt)]
-#![feature(sync_unsafe_cell)]
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
+#![cfg_attr(target_arch = "x86_64", feature(sync_unsafe_cell))]
 
 //! Minimal, strictly audited Hardware Abstraction Layer (HAL) for NewOS.
 //!
@@ -26,8 +26,8 @@ pub fn early_init() -> (Platform, BootInfo) {
         arch::exit_qemu(QemuExitCode::Failed);
     }
 
-    let info = boot::boot_info();
-    let platform = Platform::init(&info);
+    let mut info = boot::boot_info();
+    let platform = Platform::init(&mut info);
     (platform, info)
 }
 

@@ -11,6 +11,7 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
 const EM_X86_64: u16 = 62;
+const EM_AARCH64: u16 = 183;
 const PT_LOAD: u32 = 1;
 
 const PF_X: u32 = 1 << 0;
@@ -91,7 +92,12 @@ pub fn parse_elf64(bytes: &[u8]) -> Result<ParsedElf64, SysError> {
 
     let e_type = read_u16_le(bytes, 16)?;
     let e_machine = read_u16_le(bytes, 18)?;
-    if e_type != ET_EXEC || e_machine != EM_X86_64 {
+    let expected_machine = if cfg!(target_arch = "aarch64") {
+        EM_AARCH64
+    } else {
+        EM_X86_64
+    };
+    if e_type != ET_EXEC || e_machine != expected_machine {
         return Err(SysError::Unsupported);
     }
 

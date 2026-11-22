@@ -42,7 +42,7 @@ pub struct X86Platform {
 impl X86Platform {
     /// Initialize BSP GDT/TSS, IDT, per-CPU `IA32_GS_BASE`, x2APIC, modern CPU hardening,
     /// 64-bit `syscall`/`sysretq`, boot all SMP secondary cores, and wrap kernel `VSpace`.
-    pub fn init(info: &BootInfo) -> Self {
+    pub fn init(info: &mut BootInfo) -> Self {
         gdt::init_cpu(0);
         idt::init();
         percpu::init_cpu(0, info.bsp_lapic_id);

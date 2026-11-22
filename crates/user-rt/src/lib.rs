@@ -23,9 +23,9 @@ static SUPERVISOR_RECOVERY_STACK: SyncUnsafeCell<RecoveryStack> =
 fn raw_syscall(num: SyscallNumber, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, SysError> {
     let err: u64;
     let val: u64;
-    // SAFETY: Executing the 64-bit `syscall` instruction in Ring 3 transfers control to the
-    // kernel's `IA32_LSTAR` handler, returning `(err, val)` in `(rax, rdx)` while clobbering
-    // `rcx` and `r11`.
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: Executing 64-bit `syscall` in Ring 3 transfers control to `IA32_LSTAR`,
+    // returning `(err, val)` in `(rax, rdx)`.
     unsafe {
         asm!(
             "syscall",
@@ -36,6 +36,19 @@ fn raw_syscall(num: SyscallNumber, a0: u64, a1: u64, a2: u64, a3: u64) -> Result
             in("r10") a3,
             lateout("rcx") _,
             lateout("r11") _,
+            options(nostack),
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: Executing `svc #0` in EL0 traps to `VBAR_EL1`, returning `(err, val)` in `(x0, x1)`.
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x8") num as u64,
+            inlateout("x0") a0 => err,
+            inlateout("x1") a1 => val,
+            in("x2") a2,
+            in("x3") a3,
             options(nostack),
         );
     }
@@ -125,12 +138,17 @@ pub fn mmio_read32(mmio_cap: CapId, byte_offset: u64) -> Result<u32, SysError> {
     raw_syscall(SyscallNumber::MmioRead32, mmio_cap.raw(), byte_offset, 0, 0).map(|v| v as u32)
 }
 
-/// Deliberately trigger a Ring-3 hardware `#UD` (Invalid Opcode) exception for crash-isolation testing.
+/// Deliberately trigger a Ring-3/EL0 hardware invalid-instruction exception for crash-isolation testing.
 pub fn trigger_user_fault() -> ! {
-    // SAFETY: Intentionally executes `ud2` in Ring 3 so the microkernel's Ring-3 fault
-    // isolation and supervisor recovery path can be verified end-to-end.
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: Intentionally executes `ud2` in Ring 3 for crash-isolation verification.
     unsafe {
         asm!("ud2", options(noreturn));
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: Intentionally executes `udf #0` in EL0 for crash-isolation verification.
+    unsafe {
+        asm!("udf #0", options(noreturn));
     }
 }
 
