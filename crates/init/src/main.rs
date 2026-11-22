@@ -137,6 +137,33 @@ fn main() -> ! {
         "[init] Ring-3 CAOS (dedup/rollback/seal) & typed `|` pipeline self-check: OK"
     );
 
+    // Ring-3 Networking: capability-scoped VirtIO-MMIO probe + pure-Rust `smoltcp` IPv4/UDP stack
+    let detected_nic =
+        newos_net::probe_virtio_net(|off| newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, off));
+    let mac = detected_nic
+        .map(|n| n.mac)
+        .unwrap_or([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+    match newos_net::verify_smoltcp_ring3_stack(mac) {
+        Ok(frame_len) => {
+            if let Some(nic) = detected_nic {
+                let _ = writeln!(
+                    out,
+                    "[init] Ring-3 VirtIO-net (slot={}, v{}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}) & smoltcp ({frame_len}B frame): OK",
+                    nic.slot, nic.version, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "[init] Ring-3 smoltcp IPv4/UDP stack ({frame_len}B Ethernet frame, no_alloc, forbid_unsafe): OK"
+                );
+            }
+        }
+        Err(msg) => {
+            let _ = writeln!(out, "[init] FAIL: Ring-3 smoltcp stack check: {msg}");
+            newos_user_rt::exit(QemuExitCode::Failed);
+        }
+    }
+
     // Unauthorized MMIO capability rejection
     if newos_user_rt::mmio_read32(CapId::NULL, 0) != Err(SysError::InvalidCapability) {
         let _ = writeln!(out, "[init] FAIL: unauthorized MMIO read was not rejected");

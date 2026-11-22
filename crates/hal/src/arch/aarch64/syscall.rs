@@ -4,10 +4,11 @@
 use core::arch::asm;
 use core::cell::SyncUnsafeCell;
 use core::fmt::Write;
-use core::ptr::read_volatile;
+use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
 use newos_abi::{CapId, QemuExitCode, SysError, SyscallNumber};
 use newos_kernel_core::ipc::KernelIpcState;
+use newos_kernel_core::memory::PhysAddr;
 
 use super::serial;
 
@@ -16,6 +17,9 @@ const MAX_PROCS: usize = 4;
 
 static YIELD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
+static NET_MMIO_PHYS: AtomicU64 = AtomicU64::new(0);
+static NET_MMIO_VIRT: AtomicU64 = AtomicU64::new(0);
+static NET_MMIO_LEN: AtomicU64 = AtomicU64::new(0);
 static SYS_INFO_PACKED: AtomicU64 = AtomicU64::new(0);
 static FAULT_RECOVERY_PC: AtomicU64 = AtomicU64::new(0);
 static FAULT_RECOVERY_SP: AtomicU64 = AtomicU64::new(0);
@@ -73,11 +77,29 @@ impl ProcTable {
 
 static PROCS: SyncUnsafeCell<ProcTable> = SyncUnsafeCell::new(ProcTable::new());
 
-pub fn init(hhdm_offset: u64) {
+pub fn init(hhdm_offset: u64, net_mmio: Option<(PhysAddr, u64, u64)>) {
     HHDM_OFFSET.store(hhdm_offset, Ordering::Release);
+    let cap_region = net_mmio.map(|(phys, virt, len)| {
+        NET_MMIO_PHYS.store(phys.raw(), Ordering::Release);
+        NET_MMIO_VIRT.store(virt, Ordering::Release);
+        NET_MMIO_LEN.store(len, Ordering::Release);
+        (phys, len)
+    });
     // SAFETY: Single-core BSP bootstrap before entering EL0.
     unsafe {
-        let _ = (*IPC_STATE.get()).init_bootstrap_caps();
+        let _ = (*IPC_STATE.get()).init_bootstrap_caps(cap_region);
+    }
+}
+
+#[inline]
+fn mmio_phys_to_virt(phys: u64) -> u64 {
+    let base_phys = NET_MMIO_PHYS.load(Ordering::Acquire);
+    let base_virt = NET_MMIO_VIRT.load(Ordering::Acquire);
+    let len = NET_MMIO_LEN.load(Ordering::Acquire);
+    if len > 0 && phys >= base_phys && phys < base_phys + len {
+        base_virt + (phys - base_phys)
+    } else {
+        HHDM_OFFSET.load(Ordering::Acquire).wrapping_add(phys)
     }
 }
 
@@ -261,11 +283,16 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             }
         }
         SyscallNumber::MmioRead32 => ipc.validate_mmio_read32(CapId::new(a0), a1).map(|phys| {
-            let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
-            let ptr = hhdm.wrapping_add(phys.raw()) as *const u32;
+            let ptr = mmio_phys_to_virt(phys.raw()) as *const u32;
             // SAFETY: `validate_mmio_read32` verified rights, alignment, and bounds.
             let val = unsafe { read_volatile(ptr) };
             u64::from(val)
+        }),
+        SyscallNumber::MmioWrite32 => ipc.validate_mmio_write32(CapId::new(a0), a1).map(|phys| {
+            let ptr = mmio_phys_to_virt(phys.raw()) as *mut u32;
+            // SAFETY: `validate_mmio_write32` verified WRITE right, alignment, and bounds.
+            unsafe { write_volatile(ptr, frame.x[2] as u32) };
+            0
         }),
         SyscallNumber::DebugRead => match serial::try_read_byte() {
             Some(b) => Ok(u64::from(b)),

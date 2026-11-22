@@ -231,9 +231,28 @@ impl Aarch64Platform {
             serial::init_virt(info.hhdm_offset.wrapping_add(UART_PHYS));
         }
 
+        // Map VirtIO-MMIO window (0x0a00_0000..0x0a00_4000 on QEMU `virt`, 32 x 512B slots)
+        // at a dedicated Device-nGnRnE VA in TTBR1_EL1 for capability-scoped Ring-3 NIC drivers.
+        const VIRTIO_MMIO_PHYS: u64 = 0x0a00_0000;
+        const VIRTIO_MMIO_VIRT: u64 = 0xffff_b001_0000_0000;
+        const VIRTIO_MMIO_PAGES: u64 = 4;
+        if let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true) {
+            for p in 0..VIRTIO_MMIO_PAGES {
+                let off = p * 4096;
+                if let Ok(va) = VirtAddr::new_page_aligned(VIRTIO_MMIO_VIRT + off)
+                    && let Ok(frame) = PhysFrame::from_aligned(PhysAddr::new(VIRTIO_MMIO_PHYS + off))
+                {
+                    let _ = vspace.map_4k(va, frame, mmio_flags, &mut info.untyped);
+                }
+            }
+        }
+
         set_cpu_id(0);
         install_vectors();
-        syscall::init(info.hhdm_offset);
+        syscall::init(
+            info.hhdm_offset,
+            Some((PhysAddr::new(VIRTIO_MMIO_PHYS), VIRTIO_MMIO_VIRT, VIRTIO_MMIO_PAGES * 4096)),
+        );
         let online_cpus = smp::bring_up_aps();
         syscall::set_sys_info(online_cpus, info.interactive_shell);
         Self {

@@ -138,6 +138,18 @@ pub fn mmio_read32(mmio_cap: CapId, byte_offset: u64) -> Result<u32, SysError> {
     raw_syscall(SyscallNumber::MmioRead32, mmio_cap.raw(), byte_offset, 0, 0).map(|v| v as u32)
 }
 
+/// Perform a capability-scoped 32-bit MMIO write through an `MmioRegion` capability.
+pub fn mmio_write32(mmio_cap: CapId, byte_offset: u64, val: u32) -> Result<(), SysError> {
+    raw_syscall(
+        SyscallNumber::MmioWrite32,
+        mmio_cap.raw(),
+        byte_offset,
+        u64::from(val),
+        0,
+    )
+    .map(|_| ())
+}
+
 /// Deliberately trigger a Ring-3/EL0 hardware invalid-instruction exception for crash-isolation testing.
 pub fn trigger_user_fault() -> ! {
     #[cfg(target_arch = "x86_64")]

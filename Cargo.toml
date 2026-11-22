@@ -7,6 +7,7 @@ members = [
     "crates/kernel-core",
     "crates/kernel",
     "crates/user-rt",
+    "crates/net",
     "crates/init",
     "crates/worker",
 ]
@@ -14,6 +15,7 @@ default-members = [
     "xtask",
     "crates/abi",
     "crates/kernel-core",
+    "crates/net",
 ]
 
 [workspace.package]
@@ -26,6 +28,7 @@ limine = "0.6.5"
 newos-abi = { path = "crates/abi" }
 newos-hal = { path = "crates/hal" }
 newos-kernel-core = { path = "crates/kernel-core" }
+newos-net = { path = "crates/net" }
 newos-user-rt = { path = "crates/user-rt" }
 
 [profile.release]

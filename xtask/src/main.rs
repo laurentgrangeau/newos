@@ -254,8 +254,15 @@ fn build_iso(arch: Arch, interactive: bool) -> Result<PathBuf, String> {
 fn run_host_tests() -> Result<(), String> {
     let root = workspace_root();
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(&root)
-        .args(["test", "--package", "newos-abi", "--package", "newos-kernel-core"]);
+    cmd.current_dir(&root).args([
+        "test",
+        "--package",
+        "newos-abi",
+        "--package",
+        "newos-kernel-core",
+        "--package",
+        "newos-net",
+    ]);
     run_checked(&mut cmd, "cargo test (host)")
 }
 
@@ -334,6 +341,10 @@ fn run_qemu(arch: Arch, expect_success_exit: bool, interactive: bool) -> Result<
                 "-display",
                 "none",
                 "-no-reboot",
+                "-netdev",
+                "user,id=net0",
+                "-device",
+                "virtio-net-device,netdev=net0",
                 "-bios",
                 firmware,
                 "-cdrom",

@@ -23,6 +23,9 @@ impl CapId {
     /// Well-known bootstrap Fault `Notification` capability (slot 3, gen 1) signaled on Ring-3 faults.
     pub const BOOTSTRAP_FAULT_NOTIF: Self = Self((1u64 << 32) | 3);
 
+    /// Well-known bootstrap VirtIO-MMIO capability (slot 4, gen 1) for Ring-3 NIC drivers.
+    pub const BOOTSTRAP_NET_MMIO: Self = Self((1u64 << 32) | 4);
+
     #[inline]
     pub const fn new(raw: u64) -> Self {
         Self(raw)
@@ -121,6 +124,8 @@ pub enum SyscallNumber {
     DebugRead = 11,
     /// Read packed system info `(interactive << 32) | (proc_count << 16) | online_cpus`.
     SysInfo = 12,
+    /// Capability-scoped 32-bit MMIO write `(mmio_cap_id, byte_offset, value)` for Ring-3 drivers.
+    MmioWrite32 = 13,
 }
 
 impl SyscallNumber {
@@ -139,6 +144,7 @@ impl SyscallNumber {
             10 => Some(Self::MmioRead32),
             11 => Some(Self::DebugRead),
             12 => Some(Self::SysInfo),
+            13 => Some(Self::MmioWrite32),
             _ => None,
         }
     }

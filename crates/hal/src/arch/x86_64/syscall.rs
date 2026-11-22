@@ -4,7 +4,7 @@
 use core::arch::{asm, naked_asm};
 use core::cell::SyncUnsafeCell;
 use core::fmt::Write;
-use core::ptr::read_volatile;
+use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
 use newos_abi::{CapId, QemuExitCode, SysError, SyscallNumber};
 use newos_kernel_core::ipc::KernelIpcState;
@@ -121,7 +121,7 @@ pub fn init(hhdm_offset: u64) {
 
     // SAFETY: Initializing single-core bootstrap IPC state before entering Ring 3.
     unsafe {
-        let _ = (*IPC_STATE.get()).init_bootstrap_caps();
+        let _ = (*IPC_STATE.get()).init_bootstrap_caps(None);
     }
 }
 
@@ -341,6 +341,13 @@ extern "C" fn rust_syscall_dispatch(
             // SAFETY: `validate_mmio_read32` verified rights, alignment, and bounds.
             let val = unsafe { read_volatile(ptr) };
             u64::from(val)
+        }),
+        SyscallNumber::MmioWrite32 => ipc.validate_mmio_write32(CapId::new(a0), a1).map(|phys| {
+            let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
+            let ptr = hhdm.wrapping_add(phys.raw()) as *mut u32;
+            // SAFETY: `validate_mmio_write32` verified WRITE right, alignment, and bounds.
+            unsafe { write_volatile(ptr, _a2 as u32) };
+            0
         }),
         SyscallNumber::DebugRead => match serial::try_read_byte() {
             Some(byte) => Ok(u64::from(byte)),

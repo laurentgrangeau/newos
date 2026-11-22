@@ -503,6 +503,33 @@ impl Shell {
                     }
                 }
             }
+            "net" => {
+                let nic = newos_net::probe_virtio_net(|off| {
+                    newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, off)
+                });
+                let mac = nic
+                    .map(|n| n.mac)
+                    .unwrap_or([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+                if let Some(n) = nic {
+                    stream.push(Record::Metric {
+                        label: "virtio.net.slot",
+                        value: u64::from(n.slot),
+                        unit: "(mmio cap)",
+                    });
+                    stream.push(Record::Metric {
+                        label: "virtio.net.ver",
+                        value: u64::from(n.version),
+                        unit: "(virtio)",
+                    });
+                }
+                if let Ok(frame_len) = newos_net::verify_smoltcp_ring3_stack(mac) {
+                    stream.push(Record::Metric {
+                        label: "smoltcp.tx.frame",
+                        value: frame_len as u64,
+                        unit: "bytes (Ring-3 IPv4)",
+                    });
+                }
+            }
             "bench" => {
                 const ROUNDTRIPS: u64 = 100;
                 let t0 = newos_user_rt::read_cycles().unwrap_or(0);
@@ -592,7 +619,7 @@ impl Shell {
         let _ = writeln!(out, "  get <@ref | obj:hash>       Read immutable object content");
         let _ = writeln!(out, "  objects / refs / procs      Emit typed Object / Ref / Proc records");
         let _ = writeln!(out, "  ref set|seal|rollback       Manage capability-gated Refs (atomic rollback)");
-        let _ = writeln!(out, "  ping [hex] / bench          Cross-process CR3 IPC & cycle benchmark -> Metric");
+        let _ = writeln!(out, "  ping [hex] / bench / net    CR3 IPC, cycle bench, Ring-3 smoltcp & VirtIO-net");
         let _ = writeln!(out, "  | where <f> ==|!=|> <v>     Filter typed records (e.g. `objects | where size > 20`)");
         let _ = writeln!(out, "  | save @<name>              Bind upstream Object hash to a named Ref");
         let _ = writeln!(out, "  | first <n> / | count       Slice or count typed streams");

@@ -45,7 +45,11 @@ impl KernelIpcState {
     /// - Slot 1 (`BOOTSTRAP_NOTIF`): general `Notification`
     /// - Slot 2 (`BOOTSTRAP_EP`): badged (`0x5E14`) `Endpoint`
     /// - Slot 3 (`BOOTSTRAP_FAULT_NOTIF`): Ring-3 supervisor fault `Notification`
-    pub fn init_bootstrap_caps(&mut self) -> Result<(CapId, CapId, CapId), SysError> {
+    /// - Slot 4 (`BOOTSTRAP_NET_MMIO`): scoped VirtIO-MMIO window (if `net_mmio` is provided)
+    pub fn init_bootstrap_caps(
+        &mut self,
+        net_mmio: Option<(PhysAddr, u64)>,
+    ) -> Result<(CapId, CapId, CapId), SysError> {
         let notif = self.root_cspace.insert_root(Capability::new(
             CapObject::Notification { id: 0 },
             Rights::ALL,
@@ -59,6 +63,12 @@ impl KernelIpcState {
             CapObject::Notification { id: 1 },
             Rights::ALL,
         ))?;
+        if let Some((phys, len)) = net_mmio {
+            let _ = self.root_cspace.insert_root(Capability::new(
+                CapObject::MmioRegion { phys, len },
+                Rights::READ.union(Rights::WRITE),
+            ))?;
+        }
         Ok((notif, ep, fault_notif))
     }
 
@@ -127,7 +137,21 @@ impl KernelIpcState {
 
     /// Validate a Ring-3 driver's 32-bit MMIO read against its scoped `MmioRegion` capability.
     pub fn validate_mmio_read32(&self, cap_id: CapId, offset: u64) -> Result<PhysAddr, SysError> {
-        let cap = self.root_cspace.lookup(cap_id, Rights::READ)?;
+        self.validate_mmio_access32(cap_id, offset, Rights::READ)
+    }
+
+    /// Validate a Ring-3 driver's 32-bit MMIO write against its scoped `MmioRegion` capability.
+    pub fn validate_mmio_write32(&self, cap_id: CapId, offset: u64) -> Result<PhysAddr, SysError> {
+        self.validate_mmio_access32(cap_id, offset, Rights::WRITE)
+    }
+
+    fn validate_mmio_access32(
+        &self,
+        cap_id: CapId,
+        offset: u64,
+        required: Rights,
+    ) -> Result<PhysAddr, SysError> {
+        let cap = self.root_cspace.lookup(cap_id, required)?;
         let CapObject::MmioRegion { phys, len } = cap.object else {
             return Err(SysError::InvalidArgument);
         };
@@ -151,7 +175,7 @@ mod tests {
     #[test]
     fn notification_coalesces_bits_and_clears_on_poll() {
         let mut ipc = KernelIpcState::new();
-        let (notif, _ep, fault_notif) = ipc.init_bootstrap_caps().unwrap();
+        let (notif, _ep, fault_notif) = ipc.init_bootstrap_caps(None).unwrap();
         assert_eq!(notif, CapId::BOOTSTRAP_NOTIF);
         assert_eq!(fault_notif, CapId::BOOTSTRAP_FAULT_NOTIF);
 
@@ -164,7 +188,7 @@ mod tests {
     #[test]
     fn endpoint_stamps_badge_and_enforces_rights() {
         let mut ipc = KernelIpcState::new();
-        let (_notif, ep, _fault) = ipc.init_bootstrap_caps().unwrap();
+        let (_notif, ep, _fault) = ipc.init_bootstrap_caps(None).unwrap();
         assert_eq!(ep, CapId::BOOTSTRAP_EP);
 
         assert_eq!(ipc.ipc_recv(ep), Err(SysError::WouldBlock));

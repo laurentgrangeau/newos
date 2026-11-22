@@ -1,0 +1,9 @@
+[package]
+name = "newos-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+newos-abi = { workspace = true }
+smoltcp = { version = "0.12", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-udp", "socket-icmp"] }
