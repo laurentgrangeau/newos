@@ -10,7 +10,9 @@ use core::arch::asm;
 use core::cell::SyncUnsafeCell;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU64, Ordering};
-use newos_abi::{CAP_MINT_SET_BADGE, CapId, QemuExitCode, Rights, SysError, SyscallNumber};
+use newos_abi::{
+    CAP_MINT_SET_BADGE, CapId, ObjectType, QemuExitCode, Rights, SysError, SyscallNumber,
+};
 
 const DEBUG_WRITE_MAX: usize = 256;
 const SYS_INFO_UNCACHED: u64 = u64::MAX;
@@ -25,38 +27,55 @@ static SUPERVISOR_RECOVERY_STACK: SyncUnsafeCell<RecoveryStack> =
     SyncUnsafeCell::new(RecoveryStack([0; RECOVERY_STACK_SIZE]));
 
 #[inline]
-fn raw_syscall(num: SyscallNumber, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, SysError> {
+fn raw_syscall_full(
+    num: SyscallNumber,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+) -> Result<(u64, u64), SysError> {
     let err: u64;
     let val: u64;
-    // SAFETY: Executing `svc #0` in EL0 traps to `VBAR_EL1`, returning `(err, val)` in `(x0, x1)`.
+    let badge: u64;
+    // SAFETY: Executing `svc #0` in EL0 traps to `VBAR_EL1`, returning `(err, val, badge)` in `(x0, x1, x2)`.
     unsafe {
         asm!(
             "svc #0",
             in("x8") num as u64,
             inlateout("x0") a0 => err,
             inlateout("x1") a1 => val,
-            in("x2") a2,
+            inlateout("x2") a2 => badge,
             in("x3") a3,
             options(nostack),
         );
     }
     if err == 0 {
-        Ok(val)
+        Ok((val, badge))
     } else {
         Err(SysError::from_u64(err).unwrap_or(SysError::Unsupported))
     }
 }
 
-/// Write a UTF-8 diagnostic message to the microkernel's early debug console.
-pub fn debug_log(msg: &str) -> Result<usize, SysError> {
+#[inline]
+fn raw_syscall(num: SyscallNumber, a0: u64, a1: u64, a2: u64, a3: u64) -> Result<u64, SysError> {
+    raw_syscall_full(num, a0, a1, a2, a3).map(|(val, _)| val)
+}
+
+/// Write a UTF-8 diagnostic message to the microkernel's early debug console using an explicit `Console` cap.
+pub fn debug_log_with_cap(console_cap: CapId, msg: &str) -> Result<usize, SysError> {
     raw_syscall(
         SyscallNumber::DebugWrite,
+        console_cap.raw(),
         msg.as_ptr() as u64,
         msg.len() as u64,
         0,
-        0,
     )
     .map(|n| n as usize)
+}
+
+/// Write a UTF-8 diagnostic message to the microkernel's early debug console.
+pub fn debug_log(msg: &str) -> Result<usize, SysError> {
+    debug_log_with_cap(CapId::BOOTSTRAP_CONSOLE, msg)
 }
 
 /// Write an entire UTF-8 string to the debug console, chunking at `<= 256`B UTF-8 char boundaries.
@@ -171,21 +190,16 @@ pub fn ipc_send(cap: CapId, payload: u64) -> Result<(), SysError> {
     raw_syscall(SyscallNumber::IpcSend, cap.raw(), payload, 0, 0).map(|_| ())
 }
 
-#[inline]
-const fn unpack_ipc_msg(packed: u64) -> (u64, u64) {
-    (packed >> 48, packed & 0x0000_FFFF_FFFF_FFFF)
-}
-
-/// Receive a pending fastpath IPC `(badge, payload)` pair from an `Endpoint` capability.
+/// Receive a pending fastpath IPC `(badge, payload)` pair (full 64-bit badge + 64-bit payload).
 pub fn ipc_recv(cap: CapId) -> Result<(u64, u64), SysError> {
-    let packed = raw_syscall(SyscallNumber::IpcRecv, cap.raw(), 0, 0, 0)?;
-    Ok(unpack_ipc_msg(packed))
+    let (payload, badge) = raw_syscall_full(SyscallNumber::IpcRecv, cap.raw(), 0, 0, 0)?;
+    Ok((badge, payload))
 }
 
-/// Synchronous send+receive fastpath (`IpcCall`) in a single client syscall.
+/// Synchronous send+receive fastpath (`IpcCall`) in a single client syscall (full 64-bit badge + payload).
 pub fn ipc_call(ep: CapId, payload: u64) -> Result<(u64, u64), SysError> {
-    let packed = raw_syscall(SyscallNumber::IpcCall, ep.raw(), payload, 0, 0)?;
-    Ok(unpack_ipc_msg(packed))
+    let (reply_payload, badge) = raw_syscall_full(SyscallNumber::IpcCall, ep.raw(), payload, 0, 0)?;
+    Ok((badge, reply_payload))
 }
 
 /// Combined reply + wait-for-next-request fastpath (`IpcReplyRecv`) in a single server syscall.
@@ -194,14 +208,14 @@ pub fn ipc_reply_recv(
     reply_payload: u64,
     has_reply: bool,
 ) -> Result<(u64, u64), SysError> {
-    let packed = raw_syscall(
+    let (payload, badge) = raw_syscall_full(
         SyscallNumber::IpcReplyRecv,
         ep.raw(),
         reply_payload,
         u64::from(has_reply),
         0,
     )?;
-    Ok(unpack_ipc_msg(packed))
+    Ok((badge, payload))
 }
 
 /// Read the ARM Generic Timer virtual counter (`CNTVCT_EL0`) via syscall.
@@ -245,11 +259,16 @@ pub fn mmio_write32(mmio_cap: CapId, byte_offset: u64, val: u32) -> Result<(), S
     .map(|_| ())
 }
 
-/// Translate a Ring-3 reference's virtual address in the caller's `VSpace` to its physical address
-/// for Ring-3 DMA ring programming (zero `unsafe` in Ring-3 drivers).
-pub fn virt_to_phys<T>(value: &T) -> Result<u64, SysError> {
+/// Translate an EL0 reference's virtual address in `vspace_cap` to its physical address
+/// for EL0 DMA ring programming (`Rights::READ` on `VSpace` capability).
+pub fn virt_to_phys_with_cap<T>(vspace_cap: CapId, value: &T) -> Result<u64, SysError> {
     let va = (value as *const T) as u64;
-    raw_syscall(SyscallNumber::VirtToPhys, va, 0, 0, 0)
+    raw_syscall(SyscallNumber::VirtToPhys, vspace_cap.raw(), va, 0, 0)
+}
+
+/// Translate an EL0 reference's virtual address in `BOOTSTRAP_VSPACE` to its physical address.
+pub fn virt_to_phys<T>(value: &T) -> Result<u64, SysError> {
+    virt_to_phys_with_cap(CapId::BOOTSTRAP_VSPACE, value)
 }
 
 /// Derive a capability in the caller's `CSpace` with attenuated `rights` and optional immutable `badge`.
@@ -309,26 +328,71 @@ pub fn cap_revoke(cap: CapId) -> Result<usize, SysError> {
     raw_syscall(SyscallNumber::CapRevoke, cap.raw(), 0, 0, 0).map(|n| n as usize)
 }
 
-/// Map a fresh zeroed 4 KiB page at `vaddr` in the caller's `VSpace` (strict W^X enforced).
-///
-/// Returns the backing physical address of the newly mapped frame.
-pub fn map_page(vaddr: u64, rights: Rights) -> Result<u64, SysError> {
-    raw_syscall(SyscallNumber::MapPage, vaddr, u64::from(rights.bits()), 0, 0)
+/// Map a fresh zeroed 4 KiB page at `vaddr` in `vspace_cap` (strict W^X enforced; requires `Rights::WRITE`).
+pub fn map_page_with_cap(vspace_cap: CapId, vaddr: u64, rights: Rights) -> Result<(), SysError> {
+    raw_syscall(
+        SyscallNumber::MapPage,
+        vspace_cap.raw(),
+        vaddr,
+        u64::from(rights.bits()),
+        0,
+    )
+    .map(|_| ())
 }
 
-/// Unmap a 4 KiB page at `vaddr` from the caller's `VSpace` and reclaim its physical frame.
+/// Map a fresh zeroed 4 KiB page at `vaddr` in `BOOTSTRAP_VSPACE` (strict W^X enforced).
+pub fn map_page(vaddr: u64, rights: Rights) -> Result<(), SysError> {
+    map_page_with_cap(CapId::BOOTSTRAP_VSPACE, vaddr, rights)
+}
+
+/// Unmap a 4 KiB page at `vaddr` from `vspace_cap` and reclaim its physical frame (`Rights::WRITE`).
+pub fn unmap_page_with_cap(vspace_cap: CapId, vaddr: u64) -> Result<(), SysError> {
+    raw_syscall(SyscallNumber::UnmapPage, vspace_cap.raw(), vaddr, 0, 0).map(|_| ())
+}
+
+/// Unmap a 4 KiB page at `vaddr` from `BOOTSTRAP_VSPACE` and reclaim its physical frame.
 pub fn unmap_page(vaddr: u64) -> Result<(), SysError> {
-    raw_syscall(SyscallNumber::UnmapPage, vaddr, 0, 0, 0).map(|_| ())
+    unmap_page_with_cap(CapId::BOOTSTRAP_VSPACE, vaddr)
 }
 
-/// Set scheduling priority (`0..=255`, higher value = higher priority).
-///
-/// Pass `target_pid = None` to update the calling process's own priority.
-pub fn set_priority(target_pid: Option<usize>, priority: u8) -> Result<(), SysError> {
-    let pid_arg = target_pid.map_or(u64::MAX, |p| p as u64);
+/// Retype a kernel object (`Frame`, `Endpoint`, `Notification`) from a designated `Untyped` cap.
+pub fn untyped_retype(
+    untyped_cap: CapId,
+    obj_type: ObjectType,
+    dst_slot: Option<usize>,
+) -> Result<CapId, SysError> {
+    raw_syscall(
+        SyscallNumber::UntypedRetype,
+        untyped_cap.raw(),
+        obj_type as u64,
+        dst_slot.unwrap_or(0) as u64,
+        0,
+    )
+    .map(CapId::new)
+}
+
+/// Map a designated `Frame` capability into a designated `VSpace` capability (strict W^X enforced).
+pub fn frame_map(
+    vspace_cap: CapId,
+    frame_cap: CapId,
+    vaddr: u64,
+    rights: Rights,
+) -> Result<(), SysError> {
+    raw_syscall(
+        SyscallNumber::FrameMap,
+        vspace_cap.raw(),
+        frame_cap.raw(),
+        vaddr,
+        u64::from(rights.bits()),
+    )
+    .map(|_| ())
+}
+
+/// Set scheduling priority (`0..=255`, higher value = higher priority) on `thread_cap` (`Rights::WRITE`).
+pub fn set_priority(thread_cap: CapId, priority: u8) -> Result<(), SysError> {
     raw_syscall(
         SyscallNumber::SetPriority,
-        pid_arg,
+        thread_cap.raw(),
         u64::from(priority),
         0,
         0,
@@ -336,9 +400,9 @@ pub fn set_priority(target_pid: Option<usize>, priority: u8) -> Result<(), SysEr
     .map(|_| ())
 }
 
-/// Grant an attenuated capability from the caller's `CSpace` into `target_pid`'s `CSpace`.
+/// Grant an attenuated capability from the caller's `CSpace` into `dst_cnode_cap` (`Rights::WRITE`).
 pub fn cap_grant(
-    target_pid: usize,
+    dst_cnode_cap: CapId,
     src: CapId,
     rights: Rights,
     new_badge: Option<u64>,
@@ -349,7 +413,7 @@ pub fn cap_grant(
     };
     raw_syscall(
         SyscallNumber::CapGrant,
-        target_pid as u64,
+        dst_cnode_cap.raw(),
         src.raw(),
         flags,
         badge,
@@ -373,9 +437,14 @@ pub struct SysInfo {
     pub interactive_shell: bool,
 }
 
+/// Non-blocking 1-byte read from the debug serial console using an explicit `Console` cap (`Rights::READ`).
+pub fn debug_read_byte_with_cap(console_cap: CapId) -> Result<u8, SysError> {
+    raw_syscall(SyscallNumber::DebugRead, console_cap.raw(), 0, 0, 0).map(|b| b as u8)
+}
+
 /// Non-blocking 1-byte read from the debug serial console (`Err(WouldBlock)` if no input).
 pub fn debug_read_byte() -> Result<u8, SysError> {
-    raw_syscall(SyscallNumber::DebugRead, 0, 0, 0, 0).map(|b| b as u8)
+    debug_read_byte_with_cap(CapId::BOOTSTRAP_CONSOLE)
 }
 
 #[inline]
@@ -387,7 +456,7 @@ const fn decode_sys_info(raw: u64) -> SysInfo {
     }
 }
 
-/// Read-only microkernel system info (`online_cpus`, `proc_count`, `interactive_shell`).
+/// Read-only microkernel system info (`online_cpus`, `proc_count`, `interactive_shell`) via `BOOTSTRAP_POWER`.
 ///
 /// Static after boot; cached in an `AtomicU64` after the first successful syscall.
 pub fn sys_info() -> SysInfo {
@@ -395,7 +464,7 @@ pub fn sys_info() -> SysInfo {
     if cached != SYS_INFO_UNCACHED {
         return decode_sys_info(cached);
     }
-    match raw_syscall(SyscallNumber::SysInfo, 0, 0, 0, 0) {
+    match raw_syscall(SyscallNumber::SysInfo, CapId::BOOTSTRAP_POWER.raw(), 0, 0, 0) {
         Ok(raw) => {
             SYS_INFO_CACHE.store(raw, Ordering::Relaxed);
             decode_sys_info(raw)
@@ -404,12 +473,17 @@ pub fn sys_info() -> SysInfo {
     }
 }
 
-/// Exit the root task cleanly with `code`.
-pub fn exit(code: QemuExitCode) -> ! {
-    let _ = raw_syscall(SyscallNumber::Exit, code as u64, 0, 0, 0);
+/// Shut down the system cleanly with `code` using an explicit `PowerControl` capability (`Rights::WRITE`).
+pub fn exit_with_cap(power_cap: CapId, code: QemuExitCode) -> ! {
+    let _ = raw_syscall(SyscallNumber::Exit, power_cap.raw(), code as u64, 0, 0);
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// Exit the root task cleanly with `code` via `BOOTSTRAP_POWER`.
+pub fn exit(code: QemuExitCode) -> ! {
+    exit_with_cap(CapId::BOOTSTRAP_POWER, code)
 }
 
 /// Define a Ring-3 userspace `_start` entry point delegating to a `#![forbid(unsafe_code)]` `fn() -> !`.

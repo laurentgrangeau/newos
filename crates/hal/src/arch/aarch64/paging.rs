@@ -137,8 +137,9 @@ impl Aarch64VSpace {
         index: usize,
         untyped: &mut UntypedInventory,
     ) -> Result<u64, SysError> {
+        // SAFETY: `table_phys` is a valid 4 KiB-aligned translation table mapped via HHDM and `index < 512`.
         let entry_ptr = unsafe { self.table_ptr(table_phys).add(index) };
-        // SAFETY: `table_phys` is a valid 4 KiB-aligned translation table mapped via HHDM.
+        // SAFETY: `entry_ptr` points to a valid 8-byte descriptor inside the HHDM-mapped page table.
         let entry = unsafe { read_volatile(entry_ptr) };
 
         if (entry & DESC_VALID) != 0 {
@@ -159,8 +160,9 @@ impl Aarch64VSpace {
     }
 
     fn next_table_existing(&self, table_phys: u64, index: usize) -> Option<u64> {
+        // SAFETY: `table_phys` is a valid 4 KiB-aligned translation table mapped via HHDM and `index < 512`.
         let entry_ptr = unsafe { self.table_ptr(table_phys).add(index) };
-        // SAFETY: `table_phys` is a valid 4 KiB-aligned translation table mapped via HHDM.
+        // SAFETY: `entry_ptr` points to a valid 8-byte descriptor inside the HHDM-mapped page table.
         let entry = unsafe { read_volatile(entry_ptr) };
         if (entry & (DESC_VALID | DESC_TABLE_OR_PAGE)) != (DESC_VALID | DESC_TABLE_OR_PAGE) {
             None
@@ -194,8 +196,9 @@ impl VSpaceMapper for Aarch64VSpace {
         let l2 = self.next_table_or_create(l1, i1, untyped)?;
         let l3 = self.next_table_or_create(l2, i2, untyped)?;
 
+        // SAFETY: `l3` is a valid 4 KiB L3 page table mapped via HHDM and `i3 < 512`.
         let pte_ptr = unsafe { self.table_ptr(l3).add(i3) };
-        // SAFETY: `l3` is a valid 4 KiB L3 page table mapped via HHDM.
+        // SAFETY: `pte_ptr` points to a valid 8-byte L3 descriptor inside `l3`.
         if (unsafe { read_volatile(pte_ptr) } & DESC_VALID) != 0 {
             return Err(SysError::SlotOccupied);
         }
@@ -230,12 +233,14 @@ impl VSpaceMapper for Aarch64VSpace {
         let l1 = self.next_table_existing(self.l0_phys, i0)?;
         let l2 = self.next_table_existing(l1, i1)?;
 
+        // SAFETY: `l2` is a valid 4 KiB L2 table mapped via HHDM and `i2 < 512`.
         let l2_ptr = unsafe { self.table_ptr(l2).add(i2) };
-        // SAFETY: `l2` is a valid 4 KiB L2 table mapped via HHDM.
+        // SAFETY: `l2_ptr` points to a valid 8-byte L2 descriptor inside `l2`.
         let l2_desc = unsafe { read_volatile(l2_ptr) };
         if (l2_desc & DESC_VALID) == 0 {
             return None;
         }
+        let dev_idx = device_mair_index();
         if (l2_desc & DESC_TABLE_OR_PAGE) == 0 {
             // Level-2 2 MiB Block descriptor
             const DESC_2M_ADDR_MASK: u64 = 0x0000_FFFF_FFE0_0000;
@@ -247,6 +252,8 @@ impl VSpaceMapper for Aarch64VSpace {
             } else {
                 (l2_desc & DESC_PXN) == 0
             };
+            let attr_idx = (l2_desc >> 2) & 0x7;
+            let no_cache = attr_idx == dev_idx && dev_idx != 0;
             let phys =
                 PhysAddr::new((l2_desc & DESC_2M_ADDR_MASK) | (virt.raw() & HUGE_PAGE_MASK_2M));
             return Some((
@@ -255,14 +262,15 @@ impl VSpaceMapper for Aarch64VSpace {
                     writable,
                     executable,
                     user,
-                    no_cache: false,
+                    no_cache,
                 },
             ));
         }
 
         let l3 = l2_desc & DESC_ADDR_MASK;
+        // SAFETY: `l3` is a valid 4 KiB L3 page table mapped via HHDM and `i3 < 512`.
         let pte_ptr = unsafe { self.table_ptr(l3).add(i3) };
-        // SAFETY: `l3` is a valid 4 KiB L3 page table mapped via HHDM.
+        // SAFETY: `pte_ptr` points to a valid 8-byte L3 descriptor inside `l3`.
         let pte = unsafe { read_volatile(pte_ptr) };
         if (pte & DESC_VALID) == 0 {
             return None;
@@ -276,6 +284,8 @@ impl VSpaceMapper for Aarch64VSpace {
         } else {
             (pte & DESC_PXN) == 0
         };
+        let attr_idx = (pte >> 2) & 0x7;
+        let no_cache = attr_idx == dev_idx && dev_idx != 0;
 
         let phys = PhysAddr::new((pte & DESC_ADDR_MASK) | (virt.raw() & 0xFFF));
         Some((
@@ -284,7 +294,7 @@ impl VSpaceMapper for Aarch64VSpace {
                 writable,
                 executable,
                 user,
-                no_cache: false,
+                no_cache,
             },
         ))
     }
@@ -295,8 +305,9 @@ impl VSpaceMapper for Aarch64VSpace {
         let l2 = self.next_table_existing(l1, i1).ok_or(SysError::InvalidArgument)?;
         let l3 = self.next_table_existing(l2, i2).ok_or(SysError::InvalidArgument)?;
 
+        // SAFETY: `l3` is a valid 4 KiB L3 page table mapped via HHDM and `i3 < 512`.
         let pte_ptr = unsafe { self.table_ptr(l3).add(i3) };
-        // SAFETY: `l3` is a valid 4 KiB L3 page table mapped via HHDM.
+        // SAFETY: `pte_ptr` points to a valid 8-byte L3 descriptor inside `l3`.
         let pte = unsafe { read_volatile(pte_ptr) };
         if (pte & DESC_VALID) == 0 {
             return Err(SysError::InvalidArgument);
@@ -326,8 +337,9 @@ impl VSpaceMapper for Aarch64VSpace {
         let l1 = self.next_table_or_create(self.l0_phys, i0, untyped)?;
         let l2 = self.next_table_or_create(l1, i1, untyped)?;
 
+        // SAFETY: `l2` is a valid 4 KiB L2 table mapped via HHDM and `i2 < 512`.
         let desc_ptr = unsafe { self.table_ptr(l2).add(i2) };
-        // SAFETY: `l2` is a valid 4 KiB L2 table mapped via HHDM.
+        // SAFETY: `desc_ptr` points to a valid 8-byte L2 descriptor inside `l2`.
         if (unsafe { read_volatile(desc_ptr) } & DESC_VALID) != 0 {
             return Err(SysError::SlotOccupied);
         }
@@ -369,8 +381,9 @@ impl VSpaceMapper for Aarch64VSpace {
             .next_table_existing(l1, i1)
             .ok_or(SysError::InvalidArgument)?;
 
+        // SAFETY: `l2` is a valid 4 KiB L2 table mapped via HHDM and `i2 < 512`.
         let desc_ptr = unsafe { self.table_ptr(l2).add(i2) };
-        // SAFETY: `l2` is a valid 4 KiB L2 table mapped via HHDM.
+        // SAFETY: `desc_ptr` points to a valid 8-byte L2 descriptor inside `l2`.
         let desc = unsafe { read_volatile(desc_ptr) };
         if (desc & (DESC_VALID | DESC_TABLE_OR_PAGE)) != DESC_VALID {
             return Err(SysError::InvalidArgument);

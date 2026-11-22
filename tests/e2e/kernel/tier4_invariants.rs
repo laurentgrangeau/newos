@@ -277,3 +277,59 @@ fn tier4_kernel_spsc_ring_concurrent_conservation_invariant() {
     assert!(ring.is_empty());
     let _ = ThreadId(0);
 }
+
+#[test]
+fn tier4_kernel_designated_authority_negative_invariants() {
+    use newos_abi::{CapId, ObjectType};
+
+    let mut ipc = KernelIpcState::new();
+    let (notif, _, _) = ipc.init_bootstrap_caps(None).unwrap();
+    let _ = ipc.init_worker_bootstrap_caps(1).unwrap();
+    let (_, w1_cnode) = ipc.register_child_caps_in_root(1).unwrap();
+
+    // 1. Worker cannot access PowerControl, VSpace, or Console::READ.
+    assert_eq!(
+        ipc.validate_power_for(1, CapId::BOOTSTRAP_POWER, Rights::WRITE),
+        Err(SysError::InvalidCapability)
+    );
+    assert_eq!(
+        ipc.validate_vspace_for(1, CapId::BOOTSTRAP_VSPACE, Rights::WRITE),
+        Err(SysError::InvalidCapability)
+    );
+    assert_eq!(
+        ipc.validate_console_for(1, CapId::BOOTSTRAP_CONSOLE, Rights::READ),
+        Err(SysError::InsufficientRights)
+    );
+
+    // 2. Explicit Some(0) badge is rejected; cross-process CDT revocation cascades cleanly.
+    assert_eq!(
+        ipc.cap_grant_between(0, w1_cnode, notif, Rights::READ, Some(0)),
+        Err(SysError::InvalidArgument)
+    );
+    let granted = ipc
+        .cap_grant_between(0, w1_cnode, notif, Rights::READ, Some(0xFACE_B00C_1234_5678))
+        .unwrap();
+    assert_eq!(ipc.cap_revoke_for(0, notif), Ok(1));
+    assert_eq!(
+        ipc.notify_poll_for(1, granted),
+        Err(SysError::InvalidCapability)
+    );
+
+    // 3. UntypedRetype honors designated region_index and collects revoked frames.
+    let mut inv = UntypedInventory::new();
+    assert!(inv.push_raw_region(0x9000_0000, PAGE_SIZE));
+    let frame_cap = ipc
+        .untyped_retype_for(0, CapId::BOOTSTRAP_UNTYPED, ObjectType::Frame, 0, &mut inv)
+        .unwrap();
+    assert_eq!(
+        ipc.validate_frame_for(0, frame_cap, Rights::READ),
+        Ok(PhysAddr::new(0x9000_0000))
+    );
+    let mut revoked_frames = [None; 4];
+    let (caps, frames) = ipc
+        .cap_revoke_for_collecting_frames(0, CapId::BOOTSTRAP_UNTYPED, &mut revoked_frames)
+        .unwrap();
+    assert_eq!(caps, 1);
+    assert_eq!(frames, 1);
+    assert_eq!(revoked_frames[0], Some(PhysAddr::new(0x9000_0000)));
+}

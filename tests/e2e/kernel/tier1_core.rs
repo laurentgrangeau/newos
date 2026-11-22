@@ -380,10 +380,22 @@ fn tier1_ipc_bootstrap_caps_layout() {
 
     let ep_cap = ipc.root_cspace.lookup(ep, Rights::ALL).unwrap();
     assert_eq!(ep_cap.badge, 0x5E14);
-    assert_eq!(ipc.root_cspace.occupied_count(), 4);
+    assert_eq!(ipc.root_cspace.occupied_count(), 10);
     assert_eq!(
         ipc.validate_mmio_read32(CapId::BOOTSTRAP_NET_MMIO, 0),
         Ok(PhysAddr::new(0x1000_0000))
+    );
+    assert_eq!(
+        ipc.validate_console_for(0, CapId::BOOTSTRAP_CONSOLE, Rights::READ.union(Rights::WRITE)),
+        Ok(())
+    );
+    assert_eq!(
+        ipc.validate_power_for(0, CapId::BOOTSTRAP_POWER, Rights::READ.union(Rights::WRITE)),
+        Ok(())
+    );
+    assert_eq!(
+        ipc.validate_vspace_for(0, CapId::BOOTSTRAP_VSPACE, Rights::READ.union(Rights::WRITE)),
+        Ok(PhysAddr::new(0))
     );
 }
 

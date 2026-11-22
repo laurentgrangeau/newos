@@ -60,6 +60,7 @@ pub enum StoreError {
     ReadOnly,
     NoPreviousVersion,
     CorruptSnapshot,
+    HashCollision,
 }
 
 /// Public alias for `StoreError` per `newos-shell-core` interface contract.
@@ -207,10 +208,13 @@ impl ObjectStore {
         }
         let hash = ObjHash::hash_bytes(bytes);
 
-        // Content deduplication: single-pass bounded scan over live packed blobs.
+        // Content deduplication & collision rejection: single-pass bounded scan over live packed blobs.
         for slot in &self.blobs[..self.object_count] {
-            if slot.hash == hash && &slot.data[..slot.size] == bytes {
-                return Ok(hash);
+            if slot.hash == hash {
+                if &slot.data[..slot.size] == bytes {
+                    return Ok(hash);
+                }
+                return Err(StoreError::HashCollision);
             }
         }
 
@@ -480,7 +484,7 @@ impl ObjectStore {
             ref_count,
         };
 
-        for b in &mut store.blobs[..obj_count] {
+        for i in 0..obj_count {
             let hash = ObjHash(u64::from_le_bytes(
                 take(8)?
                     .try_into()
@@ -498,12 +502,17 @@ impl ObjectStore {
             if ObjHash::hash_bytes(data) != hash {
                 return Err(StoreError::CorruptSnapshot);
             }
+            // Reject duplicate blob hashes in snapshot (`M-4`).
+            if store.blobs[..i].iter().any(|prev| prev.hash == hash) {
+                return Err(StoreError::CorruptSnapshot);
+            }
+            let b = &mut store.blobs[i];
             b.hash = hash;
             b.size = size;
             b.data[..size].copy_from_slice(data);
         }
 
-        for r in &mut store.refs[..ref_count] {
+        for i in 0..ref_count {
             let hdr = take(2)?;
             let name_len = hdr[0] as usize;
             let rights = Rights::from_bits_truncate(hdr[1]);
@@ -511,6 +520,17 @@ impl ObjectStore {
                 return Err(StoreError::CorruptSnapshot);
             }
             let name = take(name_len)?;
+            if core::str::from_utf8(name).is_err() {
+                return Err(StoreError::CorruptSnapshot);
+            }
+            // Reject duplicate ref names (`M-4`).
+            if store.refs[..i].iter().any(|prev| prev.name_bytes() == name) {
+                return Err(StoreError::CorruptSnapshot);
+            }
+            // Reject tampered snapshots that unseal immutable boot refs (`@motd`, `@guide`).
+            if (name == b"motd" || name == b"guide") && rights.contains(Rights::WRITE) {
+                return Err(StoreError::CorruptSnapshot);
+            }
             let target = ObjHash(u64::from_le_bytes(
                 take(8)?
                     .try_into()
@@ -521,15 +541,26 @@ impl ObjectStore {
                     .try_into()
                     .map_err(|_| StoreError::CorruptSnapshot)?,
             );
-            r.name[..name_len].copy_from_slice(name);
-            r.name_len = name_len;
-            r.rights = rights;
-            r.target = target;
-            r.prev = if prev_raw == 0 {
+            let prev = if prev_raw == 0 {
                 None
             } else {
                 Some(ObjHash(prev_raw))
             };
+            // Verify referential integrity: `target` and `prev` must exist in `store.blobs` (`M-4`).
+            if !store.blobs[..obj_count].iter().any(|b| b.hash == target) {
+                return Err(StoreError::CorruptSnapshot);
+            }
+            if let Some(p) = prev
+                && !store.blobs[..obj_count].iter().any(|b| b.hash == p)
+            {
+                return Err(StoreError::CorruptSnapshot);
+            }
+            let r = &mut store.refs[i];
+            r.name[..name_len].copy_from_slice(name);
+            r.name_len = name_len;
+            r.rights = rights;
+            r.target = target;
+            r.prev = prev;
         }
 
         if pos != body_len {
@@ -701,6 +732,40 @@ mod tests {
 
         // Single-bit corruption is detected and rejected!
         buf[written / 2] ^= 0x01;
+        assert!(matches!(
+            ObjectStore::decode_snapshot(&buf[..written]),
+            Err(StoreError::CorruptSnapshot)
+        ));
+    }
+
+    #[test]
+    fn decode_snapshot_rejects_dangling_refs_and_unsealed_boot_refs() {
+        // Craft a checksummed snapshot with a dangling ref target hash (0xDEAD_BEEF).
+        let mut raw = [0u8; 256];
+        let mut pos = 0usize;
+        let mut push = |b: &[u8]| {
+            raw[pos..pos + b.len()].copy_from_slice(b);
+            pos += b.len();
+        };
+        push(b"CAOS");
+        push(&[1u8, 0u8, 1u8, 0u8]); // 0 blobs, 1 ref
+        push(&[4u8, Rights::READ.bits()]); // name_len=4, READ
+        push(b"note");
+        push(&0xDEAD_BEEFu64.to_le_bytes()); // dangling target
+        push(&0u64.to_le_bytes()); // prev = None
+        drop(push);
+        let crc = ObjHash::hash_bytes(&raw[..pos]);
+        raw[pos..pos + 8].copy_from_slice(&crc.0.to_le_bytes());
+        assert!(matches!(
+            ObjectStore::decode_snapshot(&raw[..pos + 8]),
+            Err(StoreError::CorruptSnapshot)
+        ));
+
+        // Craft a checksummed snapshot that tries to unseal `@motd` to WRITE.
+        let mut store = ObjectStore::new();
+        store.refs[0].rights = Rights::READ.union(Rights::WRITE);
+        let mut buf = [0u8; 4096];
+        let written = store.encode_snapshot(&mut buf).unwrap();
         assert!(matches!(
             ObjectStore::decode_snapshot(&buf[..written]),
             Err(StoreError::CorruptSnapshot)

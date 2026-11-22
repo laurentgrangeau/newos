@@ -64,11 +64,11 @@ impl<const N: usize> SpscRing<N> {
     /// Push one 64-bit word into the ring without blocking (`Release` publish).
     #[inline]
     pub fn try_push(&self, word: u64) -> Result<(), SysError> {
-        let tail = self.producer.tail.load(Ordering::Relaxed);
+        let tail = self.producer.tail.load(Ordering::Relaxed) & (N - 1);
         let next_tail = (tail + 1) & (N - 1);
-        let mut head = self.producer.cached_head.load(Ordering::Relaxed);
+        let mut head = self.producer.cached_head.load(Ordering::Relaxed) & (N - 1);
         if next_tail == head {
-            head = self.consumer.head.load(Ordering::Acquire);
+            head = self.consumer.head.load(Ordering::Acquire) & (N - 1);
             self.producer.cached_head.store(head, Ordering::Relaxed);
             if next_tail == head {
                 return Err(SysError::WouldBlock);
@@ -82,10 +82,10 @@ impl<const N: usize> SpscRing<N> {
     /// Pop one 64-bit word from the ring without blocking (`Acquire` consume).
     #[inline]
     pub fn try_pop(&self) -> Option<u64> {
-        let head = self.consumer.head.load(Ordering::Relaxed);
-        let mut tail = self.consumer.cached_tail.load(Ordering::Relaxed);
+        let head = self.consumer.head.load(Ordering::Relaxed) & (N - 1);
+        let mut tail = self.consumer.cached_tail.load(Ordering::Relaxed) & (N - 1);
         if head == tail {
-            tail = self.producer.tail.load(Ordering::Acquire);
+            tail = self.producer.tail.load(Ordering::Acquire) & (N - 1);
             self.consumer.cached_tail.store(tail, Ordering::Relaxed);
             if head == tail {
                 return None;
@@ -103,11 +103,11 @@ impl<const N: usize> SpscRing<N> {
         if src.is_empty() {
             return 0;
         }
-        let tail = self.producer.tail.load(Ordering::Relaxed);
-        let mut head = self.producer.cached_head.load(Ordering::Relaxed);
+        let tail = self.producer.tail.load(Ordering::Relaxed) & (N - 1);
+        let mut head = self.producer.cached_head.load(Ordering::Relaxed) & (N - 1);
         let mut free = head.wrapping_sub(tail).wrapping_sub(1) & (N - 1);
         if free < src.len() {
-            head = self.consumer.head.load(Ordering::Acquire);
+            head = self.consumer.head.load(Ordering::Acquire) & (N - 1);
             self.producer.cached_head.store(head, Ordering::Relaxed);
             free = head.wrapping_sub(tail).wrapping_sub(1) & (N - 1);
             if free == 0 {
@@ -144,11 +144,11 @@ impl<const N: usize> SpscRing<N> {
         if dst.is_empty() {
             return 0;
         }
-        let head = self.consumer.head.load(Ordering::Relaxed);
-        let mut tail = self.consumer.cached_tail.load(Ordering::Relaxed);
+        let head = self.consumer.head.load(Ordering::Relaxed) & (N - 1);
+        let mut tail = self.consumer.cached_tail.load(Ordering::Relaxed) & (N - 1);
         let mut avail = tail.wrapping_sub(head) & (N - 1);
         if avail < dst.len() {
-            tail = self.producer.tail.load(Ordering::Acquire);
+            tail = self.producer.tail.load(Ordering::Acquire) & (N - 1);
             self.consumer.cached_tail.store(tail, Ordering::Relaxed);
             avail = tail.wrapping_sub(head) & (N - 1);
             if avail == 0 {
@@ -340,5 +340,18 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SpscRing<64>>();
         assert_eq!(core::mem::align_of::<SpscRing<64>>(), 64);
+    }
+
+    #[test]
+    fn spsc_ring_survives_corrupted_peer_indices_without_panicking() {
+        let ring = SpscRing::<8>::new();
+        // Simulate a malicious peer sharing the RW frame writing out-of-range indices >= N.
+        ring.producer.tail.store(usize::MAX - 3, Ordering::Relaxed);
+        ring.consumer.head.store(12345, Ordering::Relaxed);
+        let _ = ring.try_push(0xAA);
+        let _ = ring.try_push_slice(&[1, 2, 3, 4]);
+        let mut out = [0u64; 4];
+        let _ = ring.try_pop();
+        let _ = ring.try_pop_slice(&mut out);
     }
 }

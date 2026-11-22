@@ -26,6 +26,24 @@ impl CapId {
     /// Well-known bootstrap VirtIO-MMIO capability (slot 4, gen 1) for Ring-3 NIC drivers.
     pub const BOOTSTRAP_NET_MMIO: Self = Self((1u64 << 32) | 4);
 
+    /// Well-known bootstrap Console capability (slot 5, gen 1) gating `DebugRead`/`DebugWrite`.
+    pub const BOOTSTRAP_CONSOLE: Self = Self((1u64 << 32) | 5);
+
+    /// Well-known bootstrap Power/Platform capability (slot 6, gen 1) gating `Exit`/`SysInfo`.
+    pub const BOOTSTRAP_POWER: Self = Self((1u64 << 32) | 6);
+
+    /// Well-known bootstrap `VSpace` capability (slot 7, gen 1) gating `MapPage`/`UnmapPage`/`VirtToPhys`.
+    pub const BOOTSTRAP_VSPACE: Self = Self((1u64 << 32) | 7);
+
+    /// Well-known bootstrap `Thread` capability (slot 8, gen 1) for the caller's own thread.
+    pub const BOOTSTRAP_SELF_THREAD: Self = Self((1u64 << 32) | 8);
+
+    /// Well-known bootstrap `CNode` capability (slot 9, gen 1) for the caller's own `CSpace`.
+    pub const BOOTSTRAP_SELF_CNODE: Self = Self((1u64 << 32) | 9);
+
+    /// Well-known bootstrap `Untyped` physical memory capability (slot 10, gen 1) for `UntypedRetype`.
+    pub const BOOTSTRAP_UNTYPED: Self = Self((1u64 << 32) | 10);
+
     #[inline]
     pub const fn new(raw: u64) -> Self {
         Self(raw)
@@ -100,6 +118,31 @@ pub enum ObjectType {
     Notification = 7,
     IrqHandler = 8,
     MmioRegion = 9,
+    Console = 10,
+    PowerControl = 11,
+    IoSpace = 12,
+}
+
+impl ObjectType {
+    #[inline]
+    pub const fn from_u64(raw: u64) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Untyped),
+            1 => Some(Self::Frame),
+            2 => Some(Self::PageTable),
+            3 => Some(Self::VSpace),
+            4 => Some(Self::CNode),
+            5 => Some(Self::Thread),
+            6 => Some(Self::Endpoint),
+            7 => Some(Self::Notification),
+            8 => Some(Self::IrqHandler),
+            9 => Some(Self::MmioRegion),
+            10 => Some(Self::Console),
+            11 => Some(Self::PowerControl),
+            12 => Some(Self::IoSpace),
+            _ => None,
+        }
+    }
 }
 
 /// Flag bit in `a2` of `SyscallNumber::CapMint` / `CapGrant` indicating `a3` carries a new badge.
@@ -109,11 +152,11 @@ pub const CAP_MINT_SET_BADGE: u64 = 1 << 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u64)]
 pub enum SyscallNumber {
-    /// Write diagnostic UTF-8 slice `(ptr, len)` to the early debug console.
+    /// Write diagnostic UTF-8 slice `(console_cap, ptr, len)` to the early debug console (`Rights::WRITE`).
     DebugWrite = 1,
     /// Yield the current thread's remaining time slice to the scheduler.
     Yield = 2,
-    /// Terminate the root task with a `QemuExitCode` status.
+    /// Terminate the system via PSCI `SYSTEM_OFF`: `(power_cap, exit_code)` (`Rights::WRITE`).
     Exit = 3,
     /// Bitwise-OR a 64-bit badge word into a `Notification` capability (`cap_id, badge`).
     NotifySignal = 4,
@@ -129,13 +172,13 @@ pub enum SyscallNumber {
     SetFaultHandler = 9,
     /// Capability-scoped 32-bit MMIO read `(mmio_cap_id, byte_offset)` for Ring-3 drivers.
     MmioRead32 = 10,
-    /// Non-blocking 1-byte read from the early debug serial console (returns `WouldBlock` if empty).
+    /// Non-blocking 1-byte read from the early debug serial console: `(console_cap)` (`Rights::READ`).
     DebugRead = 11,
-    /// Read packed system info `(interactive << 32) | (proc_count << 16) | online_cpus`.
+    /// Read packed system info `(power_cap)` (`Rights::READ`) -> `(interactive << 32) | (proc_count << 16) | online_cpus`.
     SysInfo = 12,
     /// Capability-scoped 32-bit MMIO write `(mmio_cap_id, byte_offset, value)` for Ring-3 drivers.
     MmioWrite32 = 13,
-    /// Translate a canonical Ring-3 virtual address in the caller's `VSpace` to its physical address for DMA.
+    /// Translate a canonical EL0 virtual address in the designated `VSpace` to its physical address: `(vspace_cap, vaddr)` (`Rights::READ`).
     VirtToPhys = 14,
     /// Synchronous fastpath IPC call: send `(cap_id, payload)` and receive the server's reply in 1 syscall.
     IpcCall = 15,
@@ -151,14 +194,22 @@ pub enum SyscallNumber {
     CapDelete = 20,
     /// Transitively revoke all CDT descendants of `cap_id` in the caller's `CSpace` -> `revoked_count`.
     CapRevoke = 21,
-    /// Grant an attenuated capability to another process's `CSpace`: `(target_pid, src_cap, rights | flags, badge)` -> `dst_cap_id`.
+    /// Grant an attenuated capability into the `CNode` designated by `dst_cnode_cap` (`Rights::WRITE`):
+    /// `(dst_cnode_cap, src_cap, rights | flags, badge)` -> `dst_cap_id` (preserves cross-process CDT).
     CapGrant = 22,
-    /// Set scheduling priority (`0..=255`, higher = higher priority): `(target_pid_or_u64_max, priority)`.
+    /// Set scheduling priority (`0..=255`, higher = higher priority) on `thread_cap` (`Rights::WRITE`):
+    /// `(thread_cap, priority)`.
     SetPriority = 23,
-    /// Map a fresh zeroed 4 KiB page into the caller's `VSpace` with W^X `Rights` `(vaddr, rights)` -> `phys_addr`.
+    /// Map a fresh zeroed 4 KiB page into the designated `VSpace` with W^X `Rights`: `(vspace_cap, vaddr, rights)` (`Rights::WRITE`).
     MapPage = 24,
-    /// Unmap a 4 KiB page from the caller's `VSpace` and reclaim its physical frame `(vaddr)`.
+    /// Unmap a 4 KiB page from the designated `VSpace` and reclaim its physical frame: `(vspace_cap, vaddr)` (`Rights::WRITE`).
     UnmapPage = 25,
+    /// Retype a kernel object (`Frame`, `Endpoint`, `Notification`) from a designated `Untyped` capability:
+    /// `(untyped_cap, object_type, dst_slot_or_0)` -> `new_cap_id` (`Rights::WRITE`).
+    UntypedRetype = 26,
+    /// Map a designated `Frame` capability into a designated `VSpace` capability with W^X `Rights`:
+    /// `(vspace_cap, frame_cap, vaddr, rights)`.
+    FrameMap = 27,
 }
 
 impl SyscallNumber {
@@ -190,6 +241,8 @@ impl SyscallNumber {
             23 => Some(Self::SetPriority),
             24 => Some(Self::MapPage),
             25 => Some(Self::UnmapPage),
+            26 => Some(Self::UntypedRetype),
+            27 => Some(Self::FrameMap),
             _ => None,
         }
     }
@@ -280,13 +333,15 @@ mod tests {
             (23, SyscallNumber::SetPriority),
             (24, SyscallNumber::MapPage),
             (25, SyscallNumber::UnmapPage),
+            (26, SyscallNumber::UntypedRetype),
+            (27, SyscallNumber::FrameMap),
         ];
         assert_eq!(SyscallNumber::from_u64(0), None);
         for (raw, variant) in expected_syscalls {
             assert_eq!(variant as u64, raw);
             assert_eq!(SyscallNumber::from_u64(raw), Some(variant));
         }
-        assert_eq!(SyscallNumber::from_u64(26), None);
+        assert_eq!(SyscallNumber::from_u64(28), None);
         assert_eq!(SyscallNumber::from_u64(99), None);
 
         let expected_errors = [

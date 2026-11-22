@@ -9,7 +9,7 @@ pub mod syscall;
 
 use core::arch::{asm, global_asm};
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use newos_abi::{QemuExitCode, SysError};
 use newos_kernel_core::memory::{CpuSecurityFeatures, PhysAddr, UntypedInventory, VirtAddr};
 use newos_kernel_core::{BootInfo, HalPlatform};
@@ -18,6 +18,38 @@ const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 
 static BREAKPOINT_COUNT: AtomicU64 = AtomicU64::new(0);
 static TIMER_COUNT: AtomicU64 = AtomicU64::new(0);
+static PAN_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Probe `ID_AA64MMFR1_EL1.PAN` (bits 23:20) and enable ARMv8.1-A Privileged Access Never
+/// (`SCTLR_EL1.SPAN = 0` + `PSTATE.PAN = 1`) when supported by hardware (`H-5`).
+fn enable_pan_if_supported() -> bool {
+    let mmfr1: u64;
+    // SAFETY: Reading `ID_AA64MMFR1_EL1` in EL1 inspects architectural PAN support.
+    unsafe {
+        asm!("mrs {}, id_aa64mmfr1_el1", out(reg) mmfr1, options(nomem, nostack));
+    }
+    let has_pan = ((mmfr1 >> 20) & 0xF) != 0;
+    if has_pan {
+        // SAFETY: CPU advertises ARMv8.1-A PAN; clearing `SCTLR_EL1.SPAN` (bit 23) ensures
+        // exceptions into EL1 automatically set `PSTATE.PAN = 1` (SMAP equivalent), and
+        // `msr s0_0_c4_c1_4, #1` (`msr pan, #1`) enables PAN immediately. All EL1 user-memory
+        // copies go through HHDM (`TTBR1_EL1`), so PAN remains active throughout EL1.
+        unsafe {
+            let mut sctlr: u64;
+            asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nomem, nostack));
+            sctlr &= !(1u64 << 23);
+            asm!(
+                "msr sctlr_el1, {sctlr}",
+                "msr pan, #1",
+                "isb",
+                sctlr = in(reg) sctlr,
+                options(nomem, nostack),
+            );
+        }
+    }
+    PAN_ENABLED.store(has_pan, Ordering::Release);
+    has_pan
+}
 
 // 2 KiB-aligned EL1 exception vector table handling EL1 `brk #0` and EL0 `svc #0` / faults.
 global_asm!(
@@ -34,9 +66,9 @@ global_asm!(
     ".balign 128", "b __newos_unhandled_el1",
     ".balign 128", "b __newos_unhandled_el1",
     ".balign 128", "b __newos_unhandled_el1",
-    // Lower EL using AArch64 (4 x 128B) -> EL0 `svc #0` and EL0 fault isolation!
+    // Lower EL using AArch64 (4 x 128B) -> EL0 `svc #0` / faults & EL0 IRQ preemption!
     ".balign 128", "b __newos_sync_el0",
-    ".balign 128", "b __newos_unhandled_el1",
+    ".balign 128", "b __newos_irq_el0",
     ".balign 128", "b __newos_unhandled_el1",
     ".balign 128", "b __newos_unhandled_el1",
     // Lower EL using AArch32 (unused — pure 64-bit only!)
@@ -94,7 +126,34 @@ global_asm!(
     "stp x10, x11, [sp, #256]",
     "mov x0, sp",
     "bl {sync_el0}",
+    "b __newos_el0_restore",
+    // EL0 IRQ entry: save full 272-byte `TrapFrame` for preemptive timer context switches
+    "__newos_irq_el0:",
+    "sub sp, sp, #272",
+    "stp x0,  x1,  [sp, #0]",
+    "stp x2,  x3,  [sp, #16]",
+    "stp x4,  x5,  [sp, #32]",
+    "stp x6,  x7,  [sp, #48]",
+    "stp x8,  x9,  [sp, #64]",
+    "stp x10, x11, [sp, #80]",
+    "stp x12, x13, [sp, #96]",
+    "stp x14, x15, [sp, #112]",
+    "stp x16, x17, [sp, #128]",
+    "stp x18, x19, [sp, #144]",
+    "stp x20, x21, [sp, #160]",
+    "stp x22, x23, [sp, #176]",
+    "stp x24, x25, [sp, #192]",
+    "stp x26, x27, [sp, #208]",
+    "stp x28, x29, [sp, #224]",
+    "mrs x9,  sp_el0",
+    "stp x30, x9,  [sp, #240]",
+    "mrs x10, elr_el1",
+    "mrs x11, spsr_el1",
+    "stp x10, x11, [sp, #256]",
+    "mov x0, sp",
+    "bl {irq_el0}",
     // Restore (possibly TTBR0-switched!) `TrapFrame` and return to EL0 via `eret`
+    "__newos_el0_restore:",
     "ldp x10, x11, [sp, #256]",
     "msr elr_el1, x10",
     "msr spsr_el1, x11",
@@ -121,6 +180,7 @@ global_asm!(
     "b __newos_unhandled_el1",
     sync_el1 = sym aarch64_sync_el1_handler,
     sync_el0 = sym syscall::sync_el0_dispatch,
+    irq_el0 = sym syscall::irq_el0_dispatch,
 );
 
 unsafe extern "C" {
@@ -262,13 +322,43 @@ impl Aarch64Platform {
                 }
             }
         }
-        let net_mmio = Some((
-            PhysAddr::new(net_mmio_phys),
-            NET_MMIO_VIRT,
-            NET_MMIO_PAGES * 4096,
-        ));
+        let net_mmio = if info.qemu_virt {
+            // Scope BOOTSTRAP_NET_MMIO strictly to the single 512-byte VirtIO-Net slot (`C-3`)
+            // rather than exposing all 32 VirtIO-MMIO devices on the bus.
+            const VIRTIO_MAGIC: u32 = 0x7472_6976;
+            const VIRTIO_DEV_NET: u32 = 1;
+            const SLOT_STRIDE: u64 = 0x200;
+            let mut found = None;
+            for slot in 0..32u64 {
+                let off = slot * SLOT_STRIDE;
+                let base_va = NET_MMIO_VIRT + off;
+                // SAFETY: `NET_MMIO_VIRT..NET_MMIO_VIRT + 16 KiB` was just mapped as Device-nGnRnE.
+                let (magic, dev_id) = unsafe {
+                    (
+                        core::ptr::read_volatile(base_va as *const u32),
+                        core::ptr::read_volatile((base_va + 8) as *const u32),
+                    )
+                };
+                if magic == VIRTIO_MAGIC && dev_id == VIRTIO_DEV_NET {
+                    found = Some((
+                        PhysAddr::new(net_mmio_phys + off),
+                        base_va,
+                        SLOT_STRIDE,
+                    ));
+                    break;
+                }
+            }
+            found
+        } else {
+            Some((
+                PhysAddr::new(net_mmio_phys),
+                NET_MMIO_VIRT,
+                NET_MMIO_PAGES * 4096,
+            ))
+        };
 
         set_cpu_id(0);
+        let _ = enable_pan_if_supported();
         install_vectors();
         syscall::init(info.hhdm_offset, net_mmio);
         let online_cpus = smp::bring_up_aps();
@@ -299,7 +389,7 @@ impl HalPlatform for Aarch64Platform {
             wp: true,
             nxe: true,
             smep: true,
-            smap: true,
+            smap: PAN_ENABLED.load(Ordering::Acquire),
             umip: true,
         }
     }

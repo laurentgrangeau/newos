@@ -4,19 +4,22 @@ A pure **seL4-style 64-bit capability microkernel** and **post-UNIX EL0 environm
 
 ## Architecture Principles
 
-- **Strict Liedtke Minimality (Ultra-Minimal EL1):**
-  - Only CPU/exception dispatch, 4-level `VSpace` page tables, `CSpace` capability & `Untyped` memory enforcement, thread scheduling, and minimal IPC (`Endpoint`, 64-bit `Notification`, capability-scoped `MmioRegion`) live in the kernel.
-  - Zero kernel heap (`no_alloc`): all 16 GB of physical memory is tracked in `UntypedInventory` (64 regions) and explicitly retyped into frames/page tables.
-  - Networking (`smoltcp` IPv4/DHCPv4/DNS/ICMP/TCP + Raspberry Pi 5 RP1 Cadence GEM Gigabit Ethernet & QEMU VirtIO 1.0+), storage (CAOS), shell (`newos-sh`), shared-memory ring buffers, and crash supervision live in isolated EL0 processes.
+- **Strict Liedtke Minimality & Designated-Authority Object Capabilities (EL1):**
+  - Only CPU/exception dispatch, 4-level `VSpace` page tables, `CSpace` capability & `Untyped` memory enforcement, preemptive thread scheduling, and minimal IPC (`Endpoint`, 64-bit `Notification`, capability-scoped `MmioRegion`) live in the kernel.
+  - **Zero Ambient Authority:** All privileged syscalls require explicit, unforgeable `CapId` handles validated in the caller's isolated per-process `CNode<64>` — including `Console` (`DebugRead`/`DebugWrite`), `PowerControl` (`Exit`/`SysInfo`), `VSpace` (`MapPage`/`UnmapPage`/`VirtToPhys`/`FrameMap`), `Untyped` (`UntypedRetype`), `CNode` (`CapGrant`), and `Thread` (`SetPriority` with MCP ceiling). Non-root `worker` processes receive least-privilege bootstrap caps (`BOOTSTRAP_NOTIF`, `BOOTSTRAP_EP`, write-only `BOOTSTRAP_CONSOLE`, `BOOTSTRAP_SELF_THREAD`) and cannot shut down the machine, steal UART input, map memory, or escalate priority.
+  - **Cross-Process CDT Revocation & Revocation-Driven Unmap:** `CapGrant` preserves cross-`CNode` `ExternalParent` links so `CapRevoke` transitively revokes capabilities across multi-hop process chains and automatically unmaps/reclaims any revoked `Frame` PTEs via `FrameMappingTracker`.
+  - **Single-Use Reply Capabilities & Full 64-Bit IPC Badges:** `IpcCall` mints an implicit single-use Reply capability consumed on `IpcReplyRecv` (preventing reply hijacking); `svc #0` returns `(x0 = err, x1 = payload, x2 = badge)` with zero badge truncation.
+  - Zero kernel heap (`no_alloc`): all 16 GB of physical memory is tracked in `UntypedInventory` (64 regions) with region-designated `retype_frame_in`, LIFO frame reclamation, and 2 MiB superpages.
+  - Networking (`smoltcp` IPv4/DHCPv4/DNS/ICMP/TCP + Raspberry Pi 5 RP1 Cadence GEM Gigabit Ethernet & QEMU single-slot VirtIO 1.0+), storage (CAOS), shell (`newos-sh`), bounds-hardened shared-memory `SpscRing` buffers, and crash supervision live in isolated EL0 processes.
 - **100% Memory-Safe Rust Interfaces:**
-  - `#![forbid(unsafe_code)]` is compiler-enforced on `newos-abi`, `newos-kernel-core`, `newos-kernel`, `newos-net`, `newos-init`, and `newos-worker`.
-  - Audited `unsafe` is strictly confined to hardware/paging/context-switch instructions in `crates/hal` and the minimal `svc #0` trampoline in `crates/user-rt`.
+  - `#![forbid(unsafe_code)]` is compiler-enforced on `newos-abi`, `newos-kernel-core`, `newos-kernel`, `newos-net`, `newos-shell-core`, `newos-init`, `newos-worker`, and `newos-bench`.
+  - Audited `unsafe` is strictly confined to hardware/paging/context-switch instructions in `crates/hal` (guarded by IRQ-disabling `IrqSpinLock`s and page-table-validated HHDM user copies) and the minimal `svc #0` trampoline in `crates/user-rt`.
 - **Post-UNIX Userspace (Zero POSIX Paths / Zero Untyped Text Pipes):**
-  - **Content-Addressed Object Store (CAOS):** Immutable blobs addressed by 64-bit `ObjHash` with automatic deduplication, lock-free reads, capability-gated named Refs (`@name`), instant atomic `rollback`, and irreversible `seal` (read-only attenuation).
+  - **Content-Addressed Object Store (CAOS):** Immutable blobs addressed by 64-bit `ObjHash` with automatic deduplication, collision rejection, lock-free reads, mark-and-sweep `gc()`, validated binary snapshots (`encode_snapshot`/`decode_snapshot`), capability-gated named Refs (`@name`), instant atomic `rollback`, and irreversible `seal` (read-only attenuation).
   - **Typed Pipeline Shell (`newos-sh`):** Stages pass typed `Record` values (`Proc`, `Object`, `Ref`, `Metric`, `Count`) directly through `|` (`put "hello" | save @note`, `objects | where size > 20`, `procs | where pid == 1 | count`, `net dhcp`, `net ping`, `net resolve`).
 - **Raspberry Pi 5 (16 GB) Hardware Target:**
   - Pure 64-bit `aarch64` compiled for `-C target-cpu=cortex-a76` (ARMv8.2-A, zero 32-bit, zero x86_64).
-  - UEFI + Limine, 4-level `TTBR0_EL1`/`TTBR1_EL1` with ASID tagging, 4 KiB & 2 MiB block pages, `PXN`/`UXN` W^X + `MAIR_EL1` Device-nGnRnE, `svc #0`/`eret`, PSCI, BCM2712 3-pin JST Debug PL011 UART (`0x10_7D00_1000`), and RP1 Cadence GEM Gigabit Ethernet (`0x1F_0010_0000`) with 64-bit DMA.
+  - UEFI + Limine, 4-level `TTBR0_EL1`/`TTBR1_EL1` with ASID tagging, 4 KiB & 2 MiB block pages, `PXN`/`UXN` W^X, ARMv8.1-A **PAN** (`PSTATE.PAN` / `SCTLR_EL1.SPAN`), `MAIR_EL1` Device-nGnRnE (no cacheable HHDM fallback), ARM Generic Virtual Timer preemption (`__newos_irq_el0`), `svc #0`/`eret`, PSCI, BCM2712 3-pin JST Debug PL011 UART (`0x10_7D00_1000`), and RP1 Cadence GEM Gigabit Ethernet (`0x1F_0010_0000`) with 64-bit DMA.
 
 ## System Architecture
 

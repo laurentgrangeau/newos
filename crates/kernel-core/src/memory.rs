@@ -283,6 +283,30 @@ impl UntypedInventory {
         true
     }
 
+    /// Remaining uncarved bytes in a specific `UntypedRegion` (`region_index`).
+    #[inline]
+    pub fn region_remaining(&self, region_index: usize) -> Option<u64> {
+        if region_index < self.count {
+            Some(self.regions[region_index].remaining())
+        } else {
+            None
+        }
+    }
+
+    /// Carve one 4 KiB `PhysFrame` strictly from the designated `region_index` (`H-3`).
+    ///
+    /// Enforces designated-authority resource accounting: holding an `Untyped { region_index }`
+    /// capability can only ever consume physical memory from that exact region.
+    #[inline]
+    pub fn retype_frame_in(&mut self, region_index: usize) -> Result<PhysFrame, SysError> {
+        if region_index >= self.count {
+            return Err(SysError::InvalidArgument);
+        }
+        let frame = self.regions[region_index].retype_frame()?;
+        self.retyped_frames = self.retyped_frames.saturating_add(1);
+        Ok(frame)
+    }
+
     /// Carve one 4 KiB `PhysFrame` — reusing a reclaimed frame first, otherwise advancing
     /// the first `UntypedRegion` with available space.
     #[inline]
@@ -442,6 +466,86 @@ pub trait VSpaceMapper {
     ) -> Result<(), SysError>;
 }
 
+/// Fixed-capacity, zero-heap reverse-mapping entry linking a physical `Frame` to a `(VSpace, VirtAddr)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameMapping {
+    pub vspace_root: PhysAddr,
+    pub virt: VirtAddr,
+    pub phys: PhysAddr,
+}
+
+/// Fixed-capacity reverse-mapping table (`#![forbid(unsafe_code)]`, `no_alloc`) enabling
+/// hardware PTE unmap + TLB flush when a `Frame` or parent `Untyped` capability is revoked (`H-3`).
+pub struct FrameMappingTracker<const MAX_MAPPINGS: usize> {
+    entries: [Option<FrameMapping>; MAX_MAPPINGS],
+}
+
+impl<const MAX_MAPPINGS: usize> Default for FrameMappingTracker<MAX_MAPPINGS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const MAX_MAPPINGS: usize> FrameMappingTracker<MAX_MAPPINGS> {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; MAX_MAPPINGS],
+        }
+    }
+
+    /// Record a new `(vspace_root, virt) -> phys` mapping.
+    pub fn record(&mut self, vspace_root: PhysAddr, virt: VirtAddr, phys: PhysAddr) -> Result<(), SysError> {
+        for slot in &mut self.entries {
+            if slot.is_none() {
+                *slot = Some(FrameMapping {
+                    vspace_root,
+                    virt,
+                    phys,
+                });
+                return Ok(());
+            }
+        }
+        Err(SysError::OutOfMemory)
+    }
+
+    /// Remove a specific `(vspace_root, virt)` mapping entry (e.g., on `UnmapPage`).
+    pub fn remove(&mut self, vspace_root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
+        for slot in &mut self.entries {
+            if let Some(m) = slot
+                && m.vspace_root == vspace_root
+                && m.virt == virt
+            {
+                let phys = m.phys;
+                *slot = None;
+                return Some(phys);
+            }
+        }
+        None
+    }
+
+    /// Drain all mappings referencing `phys` into `out` (returns count written), used on `CapRevoke`.
+    pub fn drain_for_phys(&mut self, phys: PhysAddr, out: &mut [Option<FrameMapping>]) -> usize {
+        let mut n = 0usize;
+        for slot in &mut self.entries {
+            if n >= out.len() {
+                break;
+            }
+            if let Some(m) = slot
+                && m.phys == phys
+            {
+                out[n] = slot.take();
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Count active tracked mappings.
+    pub fn count(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_some()).count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +645,28 @@ mod tests {
         assert_eq!(inv2.reclaimed_count(), 3);
         let pad = inv2.retype_frame().unwrap();
         assert_eq!(pad.start_addr().raw(), 0x20_0000 - PAGE_SIZE);
+    }
+
+    #[test]
+    fn frame_mapping_tracker_records_removes_and_drains_for_phys() {
+        let mut tracker = FrameMappingTracker::<8>::new();
+        let vs0 = PhysAddr::new(0x10_0000);
+        let vs1 = PhysAddr::new(0x20_0000);
+        let va0 = VirtAddr::new_page_aligned(0x40_0000).unwrap();
+        let va1 = VirtAddr::new_page_aligned(0x50_0000).unwrap();
+        let p0 = PhysAddr::new(0x8000_0000);
+        let p1 = PhysAddr::new(0x8000_1000);
+
+        tracker.record(vs0, va0, p0).unwrap();
+        tracker.record(vs1, va1, p0).unwrap();
+        tracker.record(vs0, va1, p1).unwrap();
+        assert_eq!(tracker.count(), 3);
+
+        let mut drained = [None; 4];
+        let n = tracker.drain_for_phys(p0, &mut drained);
+        assert_eq!(n, 2);
+        assert_eq!(tracker.count(), 1);
+        assert_eq!(tracker.remove(vs0, va1), Some(p1));
+        assert_eq!(tracker.count(), 0);
     }
 }

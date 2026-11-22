@@ -18,6 +18,9 @@ pub enum CapObject {
     Notification { id: u32 },
     IrqHandler { irq: u16 },
     MmioRegion { phys: PhysAddr, len: u64 },
+    Console,
+    PowerControl,
+    IoSpace { domain_id: u16 },
 }
 
 impl CapObject {
@@ -33,6 +36,9 @@ impl CapObject {
             Self::Notification { .. } => ObjectType::Notification,
             Self::IrqHandler { .. } => ObjectType::IrqHandler,
             Self::MmioRegion { .. } => ObjectType::MmioRegion,
+            Self::Console => ObjectType::Console,
+            Self::PowerControl => ObjectType::PowerControl,
+            Self::IoSpace { .. } => ObjectType::IoSpace,
         }
     }
 }
@@ -56,11 +62,19 @@ impl Capability {
     }
 }
 
+/// Cross-`CNode` CDT parent link identifying the `(cnode_id, slot)` that granted a capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalParent {
+    pub cnode_id: u16,
+    pub slot: u16,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CapSlot {
     cap: Option<Capability>,
     generation: u32,
     parent: Option<usize>,
+    external_parent: Option<ExternalParent>,
 }
 
 impl CapSlot {
@@ -68,6 +82,7 @@ impl CapSlot {
         cap: None,
         generation: 1,
         parent: None,
+        external_parent: None,
     };
 
     #[inline(always)]
@@ -170,6 +185,7 @@ impl<const SLOTS: usize> CNode<SLOTS> {
         }
         self.slots[dst_slot].cap = Some(cap);
         self.slots[dst_slot].parent = parent;
+        self.slots[dst_slot].external_parent = None;
         if dst_slot < 64 {
             let bit = 1u64 << dst_slot;
             self.occupied_mask |= bit;
@@ -180,10 +196,70 @@ impl<const SLOTS: usize> CNode<SLOTS> {
         Ok(encode_cap_id(dst_slot, self.slots[dst_slot].generation))
     }
 
+    /// Insert a cross-process granted capability with an explicit `ExternalParent` CDT link.
+    pub fn insert_external_derived(
+        &mut self,
+        cap: Capability,
+        ext_parent: ExternalParent,
+    ) -> Result<CapId, SysError> {
+        let dst = self.find_free_slot()?;
+        let id = self.insert_at(dst, cap, None)?;
+        self.slots[dst].external_parent = Some(ext_parent);
+        Ok(id)
+    }
+
+    /// Return the slot index of a valid `CapId` (for CDT parent tracking).
+    #[inline]
+    pub fn slot_index(&self, id: CapId) -> Result<usize, SysError> {
+        let (idx, _) = self.validate_cap(id)?;
+        Ok(idx)
+    }
+
+    /// Inspect `(intra_parent_slot, external_parent)` of a valid `CapId`.
+    #[inline]
+    pub fn parent_info(&self, id: CapId) -> Result<(usize, Option<usize>, Option<ExternalParent>), SysError> {
+        let (idx, _) = self.validate_cap(id)?;
+        Ok((idx, self.slots[idx].parent, self.slots[idx].external_parent))
+    }
+
+    /// Reparent any slots in this `CNode` whose `external_parent == Some(old)` to `new`.
+    pub fn reparent_external_children(
+        &mut self,
+        old: ExternalParent,
+        new: Option<ExternalParent>,
+    ) {
+        for slot in &mut self.slots[1..SLOTS] {
+            if slot.cap.is_some() && slot.external_parent == Some(old) {
+                slot.external_parent = new;
+            }
+        }
+    }
+
     /// Insert a root capability (e.g. during bootstrap) into the first free slot.
     pub fn insert_root(&mut self, cap: Capability) -> Result<CapId, SysError> {
         let dst = self.find_free_slot()?;
         self.insert_at(dst, cap, None)
+    }
+
+    /// Insert a root capability into an explicit slot index (`1..SLOTS`), ensuring deterministic
+    /// bootstrap `CapId`s even when optional hardware capabilities (e.g. `BOOTSTRAP_NET_MMIO`) are absent.
+    pub fn insert_root_at(&mut self, dst_slot: usize, cap: Capability) -> Result<CapId, SysError> {
+        self.insert_at(dst_slot, cap, None)
+    }
+
+    /// Bind the hardware root physical address on an existing `CapObject::VSpace` capability during boot.
+    pub fn bind_vspace_root(&mut self, id: CapId, root_phys: PhysAddr) -> Result<(), SysError> {
+        let (idx, _) = self.validate_cap(id)?;
+        let Some(cap) = self.slots[idx].cap.as_mut() else {
+            return Err(SysError::InvalidCapability);
+        };
+        match &mut cap.object {
+            CapObject::VSpace { root_phys: slot_root } => {
+                *slot_root = root_phys;
+                Ok(())
+            }
+            _ => Err(SysError::InvalidArgument),
+        }
     }
 
     /// Resolve a `CapId` and verify it carries at least `required` rights.
@@ -216,6 +292,10 @@ impl<const SLOTS: usize> CNode<SLOTS> {
 
         let badge = match new_badge {
             None => src_cap.badge,
+            Some(0) => {
+                // Badge 0 is the unbadged sentinel; reject explicit Some(0) to prevent re-badging.
+                return Err(SysError::InvalidArgument);
+            }
             Some(b) => {
                 // seL4 invariant: once a capability is badged, its badge cannot be altered.
                 if src_cap.badge != 0 {
@@ -254,6 +334,7 @@ impl<const SLOTS: usize> CNode<SLOTS> {
             .take()
             .ok_or(SysError::InvalidCapability)?;
         let parent = self.slots[src_idx].parent.take();
+        let ext_parent = self.slots[src_idx].external_parent.take();
         self.slots[src_idx].bump_generation();
         if src_idx < 64 {
             let bit = 1u64 << src_idx;
@@ -279,13 +360,16 @@ impl<const SLOTS: usize> CNode<SLOTS> {
             }
         }
 
-        self.insert_at(dst_slot, cap, parent)
+        let new_id = self.insert_at(dst_slot, cap, parent)?;
+        self.slots[dst_slot].external_parent = ext_parent;
+        Ok(new_id)
     }
 
     /// Delete a single capability slot (without revoking its descendants).
     pub fn delete(&mut self, id: CapId) -> Result<(), SysError> {
         let (idx, _) = self.validate_cap(id)?;
         let parent = self.slots[idx].parent.take();
+        let ext_parent = self.slots[idx].external_parent.take();
         self.slots[idx].cap = None;
         self.slots[idx].bump_generation();
         if idx < 64 {
@@ -303,6 +387,7 @@ impl<const SLOTS: usize> CNode<SLOTS> {
                 if self.slots[child_idx].parent == Some(idx) {
                     self.slots[child_idx].parent = parent;
                     if parent.is_none() {
+                        self.slots[child_idx].external_parent = ext_parent;
                         self.derived_mask &= !(1u64 << child_idx);
                     }
                 }
@@ -312,8 +397,11 @@ impl<const SLOTS: usize> CNode<SLOTS> {
                 if self.slots[child_idx].cap.is_some() && self.slots[child_idx].parent == Some(idx)
                 {
                     self.slots[child_idx].parent = parent;
-                    if parent.is_none() && child_idx < 64 {
-                        self.derived_mask &= !(1u64 << child_idx);
+                    if parent.is_none() {
+                        self.slots[child_idx].external_parent = ext_parent;
+                        if child_idx < 64 {
+                            self.derived_mask &= !(1u64 << child_idx);
+                        }
                     }
                 }
             }
@@ -369,6 +457,7 @@ impl<const SLOTS: usize> CNode<SLOTS> {
                 clear &= clear - 1;
                 self.slots[idx].cap = None;
                 self.slots[idx].parent = None;
+                self.slots[idx].external_parent = None;
                 self.slots[idx].bump_generation();
             }
             return Ok(revoked_count);
@@ -396,6 +485,7 @@ impl<const SLOTS: usize> CNode<SLOTS> {
             if *should_revoke {
                 self.slots[idx].cap = None;
                 self.slots[idx].parent = None;
+                self.slots[idx].external_parent = None;
                 self.slots[idx].bump_generation();
                 if idx < 64 {
                     let bit = 1u64 << idx;
@@ -408,11 +498,150 @@ impl<const SLOTS: usize> CNode<SLOTS> {
         Ok(revoked_count)
     }
 
-    /// Pure seL4 `Untyped` -> `Frame` retype: verifies `untyped_cap` carries `Rights::WRITE`,
-    /// carves a 4 KiB physical frame from `inv`, and installs a derived `Frame` capability.
-    pub fn retype_frame_from(
+    /// Transitively revoke all intra-`CNode` descendants of `id`, invoking `on_revoked` for each
+    /// revoked `Capability`, and return `(revoked_count, root_idx, revoked_slot_mask)` (`SLOTS <= 64`).
+    pub fn revoke_with_mask_cb(
+        &mut self,
+        id: CapId,
+        mut on_revoked: impl FnMut(Capability),
+    ) -> Result<(usize, usize, u64), SysError> {
+        let (root_idx, root_rights) = {
+            let (idx, cap) = self.validate_cap(id)?;
+            (idx, cap.rights)
+        };
+        if !root_rights.contains(Rights::REVOKE) {
+            return Err(SysError::InsufficientRights);
+        }
+
+        let mut candidates = self.derived_mask & !(1u64 << root_idx);
+        let mut marked = 0u64;
+        let mut frontier = 1u64 << root_idx;
+        while frontier != 0 && candidates != 0 {
+            let mut next_frontier = 0u64;
+            let mut active = frontier;
+            let mut scan = candidates;
+            while scan != 0 {
+                let idx = scan.trailing_zeros() as usize;
+                let bit = 1u64 << idx;
+                scan &= !bit;
+                if let Some(p) = self.slots[idx].parent
+                    && (active & (1u64 << p)) != 0
+                {
+                    marked |= bit;
+                    next_frontier |= bit;
+                    active |= bit;
+                    candidates &= !bit;
+                }
+            }
+            frontier = next_frontier;
+        }
+
+        if marked == 0 {
+            return Ok((0, root_idx, 0));
+        }
+        self.occupied_mask &= !marked;
+        self.derived_mask &= !marked;
+        let revoked_count = marked.count_ones() as usize;
+        let mut clear = marked;
+        while clear != 0 {
+            let idx = clear.trailing_zeros() as usize;
+            clear &= clear - 1;
+            if let Some(cap) = self.slots[idx].cap.take() {
+                on_revoked(cap);
+            }
+            self.slots[idx].parent = None;
+            self.slots[idx].external_parent = None;
+            self.slots[idx].bump_generation();
+        }
+        Ok((revoked_count, root_idx, marked))
+    }
+
+    /// Transitively revoke all intra-`CNode` descendants of `id` and return
+    /// `(revoked_count, root_idx, revoked_slot_mask)` for cross-`CNode` CDT propagation (`SLOTS <= 64`).
+    pub fn revoke_with_mask(&mut self, id: CapId) -> Result<(usize, usize, u64), SysError> {
+        self.revoke_with_mask_cb(id, |_| {})
+    }
+
+    /// Revoke all occupied slots in this `CNode` whose `external_parent` appears in `parent_masks`,
+    /// invoking `on_revoked` for each revoked `Capability`.
+    pub fn revoke_matching_external_parents_cb(
+        &mut self,
+        parent_masks: &[u64],
+        mut on_revoked: impl FnMut(Capability),
+    ) -> (usize, u64) {
+        let mut roots = 0u64;
+        let mut scan = self.occupied_mask;
+        while scan != 0 {
+            let idx = scan.trailing_zeros() as usize;
+            let bit = 1u64 << idx;
+            scan &= !bit;
+            if let Some(ext) = self.slots[idx].external_parent
+                && let Some(&mask) = parent_masks.get(ext.cnode_id as usize)
+                && ext.slot < 64
+                && (mask & (1u64 << ext.slot)) != 0
+            {
+                roots |= bit;
+            }
+        }
+        if roots == 0 {
+            return (0, 0);
+        }
+
+        let mut candidates = self.derived_mask & !roots;
+        let mut marked = roots;
+        let mut frontier = roots;
+        while frontier != 0 && candidates != 0 {
+            let mut next_frontier = 0u64;
+            let mut active = frontier;
+            let mut cscan = candidates;
+            while cscan != 0 {
+                let idx = cscan.trailing_zeros() as usize;
+                let bit = 1u64 << idx;
+                cscan &= !bit;
+                if let Some(p) = self.slots[idx].parent
+                    && (active & (1u64 << p)) != 0
+                {
+                    marked |= bit;
+                    next_frontier |= bit;
+                    active |= bit;
+                    candidates &= !bit;
+                }
+            }
+            frontier = next_frontier;
+        }
+
+        self.occupied_mask &= !marked;
+        self.derived_mask &= !marked;
+        let count = marked.count_ones() as usize;
+        let mut clear = marked;
+        while clear != 0 {
+            let idx = clear.trailing_zeros() as usize;
+            clear &= clear - 1;
+            if let Some(cap) = self.slots[idx].cap.take() {
+                on_revoked(cap);
+            }
+            self.slots[idx].parent = None;
+            self.slots[idx].external_parent = None;
+            self.slots[idx].bump_generation();
+        }
+        (count, marked)
+    }
+
+    /// Revoke all occupied slots in this `CNode` whose `external_parent` appears in `parent_masks`
+    /// (`parent_masks[cnode_id]` has bit `slot` set), plus all of their intra-`CNode` descendants.
+    ///
+    /// Returns `(revoked_count, revoked_slot_mask)` for `SLOTS <= 64`.
+    pub fn revoke_matching_external_parents(&mut self, parent_masks: &[u64]) -> (usize, u64) {
+        self.revoke_matching_external_parents_cb(parent_masks, |_| {})
+    }
+
+    /// Pure seL4 `Untyped` -> `Frame` retype into `dst_slot`: verifies `untyped_cap` carries
+    /// `Rights::WRITE`, carves a 4 KiB physical frame strictly from its designated `region_index`,
+    /// and installs a derived `Frame` capability as a CDT child of `untyped_cap`.
+    pub fn retype_frame_from_into(
         &mut self,
         untyped_cap: CapId,
+        dst_slot: usize,
         inv: &mut UntypedInventory,
     ) -> Result<CapId, SysError> {
         let (parent_idx, cap) = {
@@ -420,15 +649,20 @@ impl<const SLOTS: usize> CNode<SLOTS> {
             (idx, *cap)
         };
 
-        if !matches!(cap.object, CapObject::Untyped { .. }) {
+        let CapObject::Untyped { region_index } = cap.object else {
             return Err(SysError::InvalidArgument);
-        }
+        };
         if !cap.rights.contains(Rights::WRITE) {
             return Err(SysError::InsufficientRights);
         }
+        if dst_slot == 0 || dst_slot >= SLOTS {
+            return Err(SysError::InvalidArgument);
+        }
+        if self.slots[dst_slot].cap.is_some() {
+            return Err(SysError::SlotOccupied);
+        }
 
-        let dst_slot = self.find_free_slot()?;
-        let frame = inv.retype_frame()?;
+        let frame = inv.retype_frame_in(region_index as usize)?;
         let frame_cap = Capability::new(
             CapObject::Frame {
                 phys: frame.start_addr(),
@@ -436,6 +670,36 @@ impl<const SLOTS: usize> CNode<SLOTS> {
             Rights::ALL,
         );
         self.insert_at(dst_slot, frame_cap, Some(parent_idx))
+    }
+
+    /// Pure seL4 `Untyped` -> `Frame` retype into the first free slot.
+    pub fn retype_frame_from(
+        &mut self,
+        untyped_cap: CapId,
+        inv: &mut UntypedInventory,
+    ) -> Result<CapId, SysError> {
+        let dst_slot = self.find_free_slot()?;
+        self.retype_frame_from_into(untyped_cap, dst_slot, inv)
+    }
+
+    /// Install a kernel object capability retyped from `untyped_cap` into `dst_slot` as a CDT child.
+    pub fn insert_retyped_child(
+        &mut self,
+        untyped_cap: CapId,
+        dst_slot: usize,
+        object: CapObject,
+    ) -> Result<CapId, SysError> {
+        let (parent_idx, cap) = {
+            let (idx, cap) = self.validate_cap(untyped_cap)?;
+            (idx, *cap)
+        };
+        if !matches!(cap.object, CapObject::Untyped { .. }) {
+            return Err(SysError::InvalidArgument);
+        }
+        if !cap.rights.contains(Rights::WRITE) {
+            return Err(SysError::InsufficientRights);
+        }
+        self.insert_at(dst_slot, Capability::new(object, Rights::ALL), Some(parent_idx))
     }
 
     /// Count currently occupied capability slots.
@@ -527,6 +791,12 @@ mod tests {
             Err(SysError::InsufficientRights)
         );
 
+        // Explicit Some(0) badge is rejected to prevent confusion with the unbadged sentinel.
+        assert_eq!(
+            cnode.mint(root, 4, Rights::READ, Some(0)),
+            Err(SysError::InvalidArgument)
+        );
+
         // Copying without changing badge preserves 0xAA
         let copied = cnode.copy(badged, 3).expect("copy");
         assert_eq!(cnode.lookup(copied, Rights::READ).unwrap().badge, 0xAA);
@@ -605,6 +875,34 @@ mod tests {
         assert_eq!(
             cnode.lookup(frame_cap, Rights::NONE),
             Err(SysError::InvalidCapability)
+        );
+    }
+
+    #[test]
+    fn retype_frame_from_respects_designated_region_index() {
+        let mut inv = UntypedInventory::new();
+        assert!(inv.push_raw_region(0x10_0000, PAGE_SIZE * 4)); // region 0
+        assert!(inv.push_raw_region(0x50_0000, PAGE_SIZE)); // region 1 (1 frame only)
+
+        let mut cnode = CNode::<16>::new();
+        let region1_cap = cnode
+            .insert_root(Capability::new(
+                CapObject::Untyped { region_index: 1 },
+                Rights::ALL,
+            ))
+            .unwrap();
+
+        let f1 = cnode.retype_frame_from(region1_cap, &mut inv).unwrap();
+        let CapObject::Frame { phys } = cnode.lookup(f1, Rights::READ).unwrap().object else {
+            panic!("expected Frame");
+        };
+        assert_eq!(phys, PhysAddr::new(0x50_0000));
+        // Region 0 must be completely untouched, and region 1 must now be exhausted!
+        assert_eq!(inv.region_remaining(0), Some(PAGE_SIZE * 4));
+        assert_eq!(inv.region_remaining(1), Some(0));
+        assert_eq!(
+            cnode.retype_frame_from(region1_cap, &mut inv),
+            Err(SysError::OutOfMemory)
         );
     }
 
