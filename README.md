@@ -19,6 +19,125 @@ A pure **seL4-style 64-bit capability microkernel** and **post-UNIX Ring-3/EL0 e
   - `x86_64`: Pure 64-bit UEFI + Limine, x2APIC MSRs, `syscall`/`sysretq`, `WP`/`NXE`/`SMEP`/`SMAP`/`UMIP`, W^X page tables.
   - `aarch64`: ARMv8.2-A Cortex-A76 (QEMU `virt` & Raspberry Pi 5 BCM2712), UEFI + Limine, 4-level `TTBR0_EL1`/`TTBR1_EL1` with `PXN`/`UXN` + `MAIR_EL1` Device-nGnRnE, `svc #0`/`eret`, PSCI.
 
+## System Architecture
+
+```mermaid
+flowchart TB
+    subgraph Userspace["Userspace — Ring 3 (x86_64) / EL0 (aarch64)"]
+        direction LR
+
+        subgraph InitProc["newos-init (PID 0 — Isolated VSpace, forbid unsafe)"]
+            Shell["newos-sh (Typed Pipeline Shell)"]
+            CAOS["CAOS (Content-Addressed Object Store)"]
+            Sup["Crash Supervisor (supervisor_recover)"]
+            Net["newos-net (smoltcp TCP/IP + VirtIO 1.0+ / RPi5 RP1 GEM)"]
+            InitRT["newos-user-rt (Safe SDK + syscall / svc #0 trampoline)"]
+            Shell --> CAOS
+            Shell --> Net
+            Sup --> Shell
+            Shell --> InitRT
+            Net --> InitRT
+            Sup --> InitRT
+        end
+
+        subgraph WorkerProc["newos-worker (PID 1 — Isolated VSpace @ 0x400000, forbid unsafe)"]
+            WorkerMain["Worker Loop (IPC Echo)"]
+            WorkerRT["newos-user-rt (Safe SDK + syscall / svc #0 trampoline)"]
+            WorkerMain --> WorkerRT
+        end
+
+        ABI["newos-abi (forbid unsafe): SyscallNumber, CapId, Rights, SpscRing"]
+        InitRT -.-> ABI
+        WorkerRT -.-> ABI
+    end
+
+    subgraph Kernel["Microkernel — Ring 0 / EL1 (Zero Heap / no_alloc)"]
+        direction TB
+        KernelBin["newos-kernel (forbid unsafe): Thin entry wiring HAL -> Core"]
+
+        subgraph Core["newos-kernel-core (forbid unsafe, no_alloc)"]
+            direction LR
+            Mem["UntypedInventory & VSpaceMapper"]
+            CSpace["CSpace / CNode & CDT Revocation"]
+            IPC["Endpoint & 64-bit Notification IPC"]
+            ELF["ELF64 Loader & Scheduler"]
+        end
+
+        subgraph HAL["newos-hal (Minimal Audited unsafe TCB)"]
+            direction LR
+            Boot["Limine Boot Protocol (HHDM, Memmap, MP, RSDP, Modules)"]
+            X86["x86_64 HAL: GDT/TSS, IDT, GS_BASE, x2APIC, SMP, CR3, syscall/sysretq, COM1"]
+            ARM["aarch64 HAL: VBAR_EL1, TPIDR_EL1, SMP, TTBR0/TTBR1, svc #0/eret, PL011, PSCI"]
+        end
+
+        KernelBin --> Core
+        KernelBin --> HAL
+        Core -- "HalPlatform & VSpaceMapper traits" --> HAL
+    end
+
+    subgraph HW["64-bit Hardware / Firmware"]
+        direction LR
+        HW_X86["x86_64 UEFI + QEMU/KVM (x2APIC, VirtIO-Net)"]
+        HW_ARM["aarch64 UEFI + QEMU virt / Raspberry Pi 5 BCM2712 (PL011, RP1 GEM)"]
+    end
+
+    InitRT -- "syscall / svc #0 (IPC, Notify, MmioRegion, VirtToPhys)" --> HAL
+    WorkerRT -- "syscall / svc #0 (Endpoint IPC, Yield)" --> HAL
+    X86 --> HW_X86
+    ARM --> HW_ARM
+```
+
+## Boot Sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Boot as UEFI + Limine
+    participant HAL as newos-hal (_start)
+    participant Core as newos-kernel-core
+    participant Init as newos-init (PID 0)
+    participant Worker as newos-worker (PID 1)
+
+    Boot->>HAL: Load kernel + modules (newos-init, newos-worker), fulfill Limine requests, jump to _start()
+    HAL->>HAL: early_serial_init() & check Limine BaseRevision(3)
+    HAL->>HAL: boot::boot_info() — build UntypedInventory, parse HHDM, MP, RSDP, modules, cmdline
+
+    alt x86_64
+        HAL->>HAL: GDT/TSS, IDT, IA32_GS_BASE, x2APIC, WP/NXE/SMEP/SMAP/UMIP, syscall MSRs, SMP APs, wrap CR3
+    else aarch64
+        HAL->>HAL: Wrap TTBR1, map PL011 UART & Net MMIO (Device-nGnRnE), TPIDR_EL1, SP_EL1 + VBAR_EL1, svc #0, SMP APs
+    end
+
+    HAL->>Core: kmain(platform, info) -> boot_early()
+    Core->>Core: Verify all SMP secondary cores online
+    Core->>Core: Phase 1 — Trigger #BP (int3 / brk #0) & arm oneshot timer interrupt
+    Core->>Core: Phase 2 — Untyped retype -> 4-level VSpace map, translate, probe, unmap
+    Core->>Core: Phase 3 — CSpace root caps -> retype -> badged mint -> copy -> transitive CDT revoke
+
+    Core->>Core: Phase 4 — Create isolated VSpace, load newos-init ELF64 + 64 KiB stack -> register PID 0
+    Core->>Core: Phase 4 — Create isolated VSpace, load newos-worker ELF64 + 64 KiB stack -> register PID 1
+    Core->>HAL: start_userspace() — drop to Ring 3 / EL0 (sysretq / eret)
+
+    HAL->>Init: Enter newos-init::main()
+    Init->>HAL: set_fault_handler(supervisor_recover)
+
+    alt Interactive Mode (cmdline contains "interactive")
+        Init->>Init: Launch newos-sh ("newos λ " prompt)
+    else Automated Self-Test Mode (cargo xtask test)
+        Init->>HAL: ipc_send(BOOTSTRAP_EP, 0xA110_C0DE) + yield_now()
+        HAL->>Worker: Switch CR3/TTBR0 -> enter newos-worker::main()
+        Worker->>HAL: ipc_recv(BOOTSTRAP_EP) -> ipc_send(BOOTSTRAP_EP, payload + 1) + yield_now()
+        HAL->>Init: Switch CR3/TTBR0 back to init
+        Init->>Init: Verify IPC reply, 64-bit Notification + SpscRing, CR3 switch cycle benchmark
+        Init->>Init: Run CAOS (dedup/rollback/seal) & typed pipeline self-test
+        Init->>HAL: Probe NIC via BOOTSTRAP_NET_MMIO -> Ring-3 live DHCPv4 & ICMP ping (or smoltcp check)
+        Init->>HAL: Verify unauthorized CapId::NULL MMIO read is rejected
+        Init->>HAL: trigger_user_fault() (deliberate Ring-3 #UD)
+        HAL->>Init: Signal BOOTSTRAP_FAULT_NOTIF & redirect to supervisor_recover()
+        Init->>HAL: exit(QemuExitCode::Success) -> isa-debug-exit / PSCI SYSTEM_OFF
+    end
+```
+
 ## Workspace Layout
 
 ```text
