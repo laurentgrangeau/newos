@@ -1,22 +1,30 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-//! Ring-3 Networking Stack (`smoltcp` IPv4/UDP/ICMP + Capability-Scoped VirtIO-MMIO Net Driver).
+//! Ring-3 Networking Stack (`smoltcp` IPv4/UDP/ICMP/DHCPv4/DNS + Capability-Scoped Drivers).
+//!
+//! Supports:
+//! - QEMU `virt`: Modern VirtIO 1.0+ (v2) MMIO (`virtio.rs`)
+//! - Raspberry Pi 5 (16 GB): RP1 Cadence GEM (`macb`) Gigabit Ethernet (`gem.rs`)
 //!
 //! 100% `#![forbid(unsafe_code)]`, zero heap (`no_alloc`), zero network code in Ring 0.
 
+pub mod gem;
 pub mod virtio;
+
+pub use gem::{GemDma, GemInfo, GemNetDevice, probe_cadence_gem};
+pub use virtio::{VirtioNetDevice, VirtioNetDma, VirtioTransport};
 
 use newos_abi::SysError;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::icmp;
+use smoltcp::socket::{dhcpv4, dns, icmp};
 use smoltcp::socket::udp::{self, PacketBuffer, PacketMetadata};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
+    DnsQueryType, EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr,
+    Ipv4Address,
 };
-use virtio::{VirtioNetDevice, VirtioNetDma, VirtioTransport};
 
 const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976; // "virt"
 const VIRTIO_DEVICE_NET: u32 = 1;
@@ -37,6 +45,61 @@ pub struct VirtioNetInfo {
     pub version: u32,
     pub vendor_id: u32,
     pub mac: [u8; 6],
+}
+
+/// Unified detected Ring-3 NIC (QEMU VirtIO-MMIO v2 or Raspberry Pi 5 RP1 Cadence GEM).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NicKind {
+    Virtio(VirtioNetInfo),
+    CadenceGem(GemInfo),
+}
+
+impl NicKind {
+    pub fn mac(&self) -> [u8; 6] {
+        match self {
+            NicKind::Virtio(v) => v.mac,
+            NicKind::CadenceGem(g) => g.mac,
+        }
+    }
+
+    pub fn driver_name(&self) -> &'static str {
+        match self {
+            NicKind::Virtio(_) => "virtio-net-v2",
+            NicKind::CadenceGem(_) => "rpi5-rp1-gem",
+        }
+    }
+}
+
+/// Active IPv4 network configuration (acquired via DHCPv4 or static fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetConfig {
+    pub ip: [u8; 4],
+    pub prefix_len: u8,
+    pub gateway: Option<[u8; 4]>,
+    pub dns: Option<[u8; 4]>,
+}
+
+impl NetConfig {
+    pub const QEMU_DEFAULT: Self = Self {
+        ip: [10, 0, 2, 15],
+        prefix_len: 24,
+        gateway: Some([10, 0, 2, 2]),
+        dns: Some([10, 0, 2, 3]),
+    };
+}
+
+/// Probe for either a VirtIO-MMIO network device or a Raspberry Pi 5 RP1 Cadence GEM controller.
+pub fn probe_nic<F>(mut read32: F) -> Option<NicKind>
+where
+    F: FnMut(u64) -> Result<u32, SysError>,
+{
+    if let Some(v) = probe_virtio_net(&mut read32) {
+        return Some(NicKind::Virtio(v));
+    }
+    if let Some(g) = probe_cadence_gem(&mut read32) {
+        return Some(NicKind::CadenceGem(g));
+    }
+    None
 }
 
 /// Probe all 32 VirtIO-MMIO slots using a capability-gated 32-bit MMIO reader.
@@ -151,9 +214,6 @@ impl Device for LoopbackEth {
 }
 
 /// Verify the pure-Rust Ring-3 `smoltcp` Ethernet + IPv4 + UDP stack end-to-end (`no_alloc`).
-///
-/// Builds an Ethernet/IPv4/UDP packet from `10.0.2.15:5353` -> `10.0.2.15:5353` and verifies
-/// `smoltcp` serializes a valid Ethernet frame with our MAC address.
 pub fn verify_smoltcp_ring3_stack(mac: [u8; 6]) -> Result<usize, &'static str> {
     let mut device = LoopbackEth::new();
     let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
@@ -190,41 +250,118 @@ pub fn verify_smoltcp_ring3_stack(mac: [u8; 6]) -> Result<usize, &'static str> {
     if device.len < 42 {
         return Err("expected Ethernet/ARP or IPv4 frame from smoltcp");
     }
-    // Verify source MAC in emitted Ethernet frame matches our hardware MAC!
     if device.buf[6..12] != mac {
         return Err("emitted Ethernet frame source MAC mismatch");
     }
     Ok(device.len)
 }
 
-/// Result of a live Ring-3 VirtIO-net ICMP Echo Request/Reply round-trip.
+/// Result of a live Ring-3 ICMP Echo Request/Reply round-trip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PingResult {
     pub seq: u16,
-    pub rx_packets: u64,
-    pub tx_packets: u64,
+    pub target: [u8; 4],
 }
 
-/// Bring up a live Ring-3 VirtIO 1.0+ (v2) NIC and perform a real ARP + ICMP Echo ping to `10.0.2.2`
-/// (QEMU user-mode gateway) using `smoltcp` — 100% `#![forbid(unsafe_code)]` and `no_alloc`.
-pub fn live_virtio_icmp_ping<T: VirtioTransport>(
-    transport: T,
-    nic: VirtioNetInfo,
-    dma: &VirtioNetDma,
-) -> Result<PingResult, &'static str> {
-    if nic.version < 2 {
-        return Err("VirtIO-MMIO v2 (modern) required");
+/// Acquire a live IPv4 address, gateway, and DNS server via `smoltcp` DHCPv4 (`no_alloc`).
+pub fn run_dhcp_v4<D: Device>(device: &mut D, mac: [u8; 6]) -> Result<NetConfig, &'static str> {
+    let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    let mut iface = Interface::new(config, device, Instant::from_millis(0));
+
+    let dhcp_sock = dhcpv4::Socket::new();
+    let mut storage = [SocketStorage::EMPTY; 1];
+    let mut sockets = SocketSet::new(&mut storage[..]);
+    let handle = sockets.add(dhcp_sock);
+
+    for step in 0..40_000i64 {
+        let now = Instant::from_millis(step);
+        let _ = iface.poll(now, device, &mut sockets);
+        if let Some(dhcpv4::Event::Configured(cfg)) =
+            sockets.get_mut::<dhcpv4::Socket>(handle).poll()
+        {
+            return Ok(NetConfig {
+                ip: cfg.address.address().octets(),
+                prefix_len: cfg.address.prefix_len(),
+                gateway: cfg.router.map(|r| r.octets()),
+                dns: cfg.dns_servers.first().map(|d| d.octets()),
+            });
+        }
+    }
+    Err("DHCPv4 lease timed out")
+}
+
+/// Resolve a hostname to an IPv4 address via `smoltcp` DNS A-record query (`no_alloc`).
+pub fn run_dns_query<D: Device>(
+    device: &mut D,
+    mac: [u8; 6],
+    cfg: &NetConfig,
+    hostname: &str,
+) -> Result<[u8; 4], &'static str> {
+    let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    let mut iface = Interface::new(config, device, Instant::from_millis(0));
+    iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(
+            IpAddress::Ipv4(Ipv4Address::from(cfg.ip)),
+            cfg.prefix_len,
+        ));
+    });
+    if let Some(gw) = cfg.gateway {
+        let _ = iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::from(gw));
     }
 
-    let mut device = VirtioNetDevice::init(transport, nic.slot, dma)?;
-    let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(nic.mac)));
-    let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
+    let dns_ip = cfg.dns.unwrap_or([1, 1, 1, 1]);
+    let servers = [IpAddress::Ipv4(Ipv4Address::from(dns_ip))];
+    let mut queries = [None; 1];
+    let dns_sock = dns::Socket::new(&servers, &mut queries[..]);
+
+    let mut storage = [SocketStorage::EMPTY; 1];
+    let mut sockets = SocketSet::new(&mut storage[..]);
+    let handle = sockets.add(dns_sock);
+
+    let query = sockets
+        .get_mut::<dns::Socket>(handle)
+        .start_query(iface.context(), hostname, DnsQueryType::A)
+        .map_err(|_| "dns start_query failed")?;
+
+    for step in 0..40_000i64 {
+        let now = Instant::from_millis(step);
+        let _ = iface.poll(now, device, &mut sockets);
+        match sockets.get_mut::<dns::Socket>(handle).get_query_result(query) {
+            Ok(addrs) => {
+                if let Some(IpAddress::Ipv4(v4)) = addrs.first() {
+                    return Ok(v4.octets());
+                }
+                return Err("dns returned no IPv4 address");
+            }
+            Err(dns::GetQueryResultError::Pending) => {}
+            Err(dns::GetQueryResultError::Failed) => return Err("dns query failed"),
+        }
+    }
+    Err("dns query timed out")
+}
+
+/// Perform a live ARP + ICMP Echo Request/Reply round-trip to `target` over any `smoltcp` `Device`.
+pub fn run_icmp_ping<D: Device>(
+    device: &mut D,
+    mac: [u8; 6],
+    cfg: &NetConfig,
+    target: [u8; 4],
+) -> Result<PingResult, &'static str> {
+    let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    let mut iface = Interface::new(config, device, Instant::from_millis(0));
     iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24));
+        let _ = addrs.push(IpCidr::new(
+            IpAddress::Ipv4(Ipv4Address::from(cfg.ip)),
+            cfg.prefix_len,
+        ));
     });
-    let _ = iface
-        .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
+    if let Some(gw) = cfg.gateway {
+        let _ = iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::from(gw));
+    }
 
     let mut rx_meta = [icmp::PacketMetadata::EMPTY; 4];
     let mut rx_data = [0u8; 256];
@@ -245,7 +382,7 @@ pub fn live_virtio_icmp_ping<T: VirtioTransport>(
     let mut sockets = SocketSet::new(&mut storage[..]);
     let handle = sockets.add(icmp_sock);
 
-    let gateway = IpAddress::v4(10, 0, 2, 2);
+    let dest = IpAddress::Ipv4(Ipv4Address::from(target));
     let payload = b"newos-ring3";
     let echo = Icmpv4Repr::EchoRequest {
         ident: IDENT,
@@ -254,20 +391,19 @@ pub fn live_virtio_icmp_ping<T: VirtioTransport>(
     };
 
     let mut sent_echo = false;
-    for step in 0..20_000i64 {
+    for step in 0..25_000i64 {
         let now = Instant::from_millis(step);
-        let _ = iface.poll(now, &mut device, &mut sockets);
+        let _ = iface.poll(now, device, &mut sockets);
 
         let sock = sockets.get_mut::<icmp::Socket>(handle);
         if !sent_echo && sock.can_send() {
             let buf = sock
-                .send(echo.buffer_len(), gateway)
+                .send(echo.buffer_len(), dest)
                 .map_err(|_| "icmp send failed")?;
             let mut pkt = Icmpv4Packet::new_unchecked(buf);
             echo.emit(&mut pkt, &smoltcp::phy::ChecksumCapabilities::default());
             sent_echo = true;
-            // Poll immediately to emit ARP / ICMP frame
-            let _ = iface.poll(now, &mut device, &mut sockets);
+            let _ = iface.poll(now, device, &mut sockets);
         }
 
         let sock = sockets.get_mut::<icmp::Socket>(handle);
@@ -281,16 +417,15 @@ pub fn live_virtio_icmp_ping<T: VirtioTransport>(
         {
             return Ok(PingResult {
                 seq: seq_no,
-                rx_packets: device.rx_packets,
-                tx_packets: device.tx_packets,
+                target,
             });
         }
 
-        // Re-send once if ARP resolved on first try and initial ICMP was queued/dropped
-        if step == 500 && device.rx_packets > 0 {
+        // Re-send once after ARP resolution window
+        if step == 500 || step == 2_500 {
             let sock = sockets.get_mut::<icmp::Socket>(handle);
             if sock.can_send()
-                && let Ok(buf) = sock.send(echo.buffer_len(), gateway)
+                && let Ok(buf) = sock.send(echo.buffer_len(), dest)
             {
                 let mut pkt = Icmpv4Packet::new_unchecked(buf);
                 echo.emit(&mut pkt, &smoltcp::phy::ChecksumCapabilities::default());
@@ -298,12 +433,97 @@ pub fn live_virtio_icmp_ping<T: VirtioTransport>(
         }
     }
 
-    Err("timed out waiting for ICMP EchoReply from 10.0.2.2")
+    Err("timed out waiting for ICMP EchoReply")
+}
+
+/// High-level live DHCPv4 acquisition over either VirtIO-net (QEMU) or RP1 Cadence GEM (Pi 5).
+pub fn live_dhcp_v4<T: VirtioTransport>(
+    transport: T,
+    nic: NicKind,
+    virtio_dma: &VirtioNetDma,
+    gem_dma: &GemDma,
+) -> Result<NetConfig, &'static str> {
+    match nic {
+        NicKind::Virtio(v) => {
+            if v.version < 2 {
+                return Err("VirtIO-MMIO v2 (modern) required");
+            }
+            let mut dev = VirtioNetDevice::init(transport, v.slot, virtio_dma)?;
+            run_dhcp_v4(&mut dev, v.mac)
+        }
+        NicKind::CadenceGem(g) => {
+            let mut dev = GemNetDevice::init(transport, g, gem_dma)?;
+            run_dhcp_v4(&mut dev, g.mac)
+        }
+    }
+}
+
+/// High-level live ICMP Echo ping over either VirtIO-net (QEMU) or RP1 Cadence GEM (Pi 5).
+pub fn live_icmp_ping<T: VirtioTransport>(
+    transport: T,
+    nic: NicKind,
+    cfg: &NetConfig,
+    target: [u8; 4],
+    virtio_dma: &VirtioNetDma,
+    gem_dma: &GemDma,
+) -> Result<PingResult, &'static str> {
+    match nic {
+        NicKind::Virtio(v) => {
+            if v.version < 2 {
+                return Err("VirtIO-MMIO v2 (modern) required");
+            }
+            let mut dev = VirtioNetDevice::init(transport, v.slot, virtio_dma)?;
+            run_icmp_ping(&mut dev, v.mac, cfg, target)
+        }
+        NicKind::CadenceGem(g) => {
+            let mut dev = GemNetDevice::init(transport, g, gem_dma)?;
+            run_icmp_ping(&mut dev, g.mac, cfg, target)
+        }
+    }
+}
+
+/// High-level live DNS A-record resolution over either VirtIO-net (QEMU) or RP1 Cadence GEM (Pi 5).
+pub fn live_dns_resolve<T: VirtioTransport>(
+    transport: T,
+    nic: NicKind,
+    cfg: &NetConfig,
+    hostname: &str,
+    virtio_dma: &VirtioNetDma,
+    gem_dma: &GemDma,
+) -> Result<[u8; 4], &'static str> {
+    match nic {
+        NicKind::Virtio(v) => {
+            if v.version < 2 {
+                return Err("VirtIO-MMIO v2 (modern) required");
+            }
+            let mut dev = VirtioNetDevice::init(transport, v.slot, virtio_dma)?;
+            run_dns_query(&mut dev, v.mac, cfg, hostname)
+        }
+        NicKind::CadenceGem(g) => {
+            let mut dev = GemNetDevice::init(transport, g, gem_dma)?;
+            run_dns_query(&mut dev, g.mac, cfg, hostname)
+        }
+    }
+}
+
+/// Parse a dotted-quad IPv4 string (`"1.1.1.1"`) without heap allocation.
+pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut idx = 0usize;
+    for part in s.split('.') {
+        if idx >= 4 || part.is_empty() {
+            return None;
+        }
+        out[idx] = part.parse::<u8>().ok()?;
+        idx += 1;
+    }
+    if idx == 4 { Some(out) } else { None }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::{AtomicU32, Ordering};
 
     #[test]
     fn smoltcp_emits_valid_ethernet_frame_no_alloc() {
@@ -327,5 +547,67 @@ mod tests {
         assert_eq!(info.slot, 2);
         assert_eq!(info.version, 2);
         assert_eq!(info.mac, [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+    }
+
+    struct MockGemTransport {
+        ncr_writes: AtomicU32,
+        dmacfg: AtomicU32,
+    }
+
+    impl VirtioTransport for &MockGemTransport {
+        fn read32(&self, offset: u64) -> Result<u32, SysError> {
+            match offset {
+                gem::REG_MID => Ok(0x0007_0109), // Raspberry Pi 5 RP1 Cadence GEM rev 1p09
+                gem::REG_SA1B => Ok(u32::from_le_bytes([0xD8, 0x3A, 0xDD, 0xAA])),
+                gem::REG_SA1T => Ok(u32::from_le_bytes([0xBB, 0xCC, 0x00, 0x00])),
+                _ => Ok(0),
+            }
+        }
+
+        fn write32(&self, offset: u64, val: u32) -> Result<(), SysError> {
+            if offset == gem::REG_NCR {
+                self.ncr_writes.fetch_add(1, Ordering::Relaxed);
+            } else if offset == gem::REG_DMACFG {
+                self.dmacfg.store(val, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+
+        fn virt_to_phys<T>(&self, r: &T) -> Result<u64, SysError> {
+            Ok((r as *const T as usize) as u64)
+        }
+    }
+
+    #[test]
+    fn rpi5_rp1_gem_probe_and_init_64bit_dma() {
+        let mock = MockGemTransport {
+            ncr_writes: AtomicU32::new(0),
+            dmacfg: AtomicU32::new(0),
+        };
+        let nic =
+            probe_nic(|off| (&mock).read32(off)).expect("should detect Pi 5 RP1 Cadence GEM");
+        let NicKind::CadenceGem(info) = nic else {
+            panic!("expected CadenceGem");
+        };
+        assert_eq!(info.module_id, 0x0007_0109);
+        assert_eq!(info.mac, [0xD8, 0x3A, 0xDD, 0xAA, 0xBB, 0xCC]);
+
+        let dma = GemDma::new();
+        let mut dev = GemNetDevice::init(&mock, info, &dma).expect("gem init");
+        // Verify 64-bit DMA mode bit (bit 30) was programmed into DMACFG
+        assert_ne!(mock.dmacfg.load(Ordering::Relaxed) & (1 << 30), 0);
+        // Verify smoltcp TX queues a frame and triggers NCR_TSTART
+        let tx = dev.transmit(Instant::from_millis(0)).expect("tx token");
+        tx.consume(60, |buf| buf.fill(0xAB));
+        assert_eq!(dev.tx_packets, 1);
+        assert!(mock.ncr_writes.load(Ordering::Relaxed) >= 3);
+    }
+
+    #[test]
+    fn parse_ipv4_valid_and_invalid() {
+        assert_eq!(parse_ipv4("1.1.1.1"), Some([1, 1, 1, 1]));
+        assert_eq!(parse_ipv4("10.0.2.2"), Some([10, 0, 2, 2]));
+        assert_eq!(parse_ipv4("10.0.2"), None);
+        assert_eq!(parse_ipv4("999.0.0.1"), None);
     }
 }

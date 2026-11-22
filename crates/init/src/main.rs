@@ -14,12 +14,14 @@ use core::fmt::Write;
 use core::panic::PanicInfo;
 use newos_abi::ring::SpscRing;
 use newos_abi::{CapId, QemuExitCode, SysError};
-use newos_net::virtio::{VirtioNetDma, VirtioTransport};
+use newos_net::{GemDma, NetConfig, VirtioNetDma, VirtioTransport};
 use newos_user_rt::DebugConsole;
 use shell::Shell;
 
 /// Static Ring-3 DMA rings & packet buffers (`Sync` via atomics, 100% `#![forbid(unsafe_code)]`).
 pub static VIRTIO_DMA: VirtioNetDma = VirtioNetDma::new();
+/// Static Ring-3 64-bit DMA rings & packet buffers for Raspberry Pi 5 RP1 Cadence GEM.
+pub static GEM_DMA: GemDma = GemDma::new();
 
 /// Capability-scoped MMIO + `VirtToPhys` transport for Ring-3 VirtIO drivers.
 pub struct CapVirtioTransport;
@@ -158,33 +160,65 @@ fn main() -> ! {
         "[init] Ring-3 CAOS (dedup/rollback/seal) & typed `|` pipeline self-check: OK"
     );
 
-    // Ring-3 Networking: capability-scoped VirtIO 1.0+ DMA + pure-Rust `smoltcp` live ICMP ping
+    // Ring-3 Networking: capability-scoped NIC (VirtIO-net or Pi 5 RP1 GEM) + live DHCPv4 + ICMP ping
     let detected_nic =
-        newos_net::probe_virtio_net(|off| newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, off));
+        newos_net::probe_nic(|off| newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, off));
     let mac = detected_nic
-        .map(|n| n.mac)
+        .map(|n| n.mac())
         .unwrap_or([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
     if let Some(nic) = detected_nic {
-        match newos_net::live_virtio_icmp_ping(CapVirtioTransport, nic, &VIRTIO_DMA) {
-            Ok(res) => {
+        let cfg = match newos_net::live_dhcp_v4(CapVirtioTransport, nic, &VIRTIO_DMA, &GEM_DMA) {
+            Ok(leased) => {
+                let gw = leased.gateway.unwrap_or([0; 4]);
+                let dns = leased.dns.unwrap_or([0; 4]);
                 let _ = writeln!(
                     out,
-                    "[init] Ring-3 LIVE VirtIO-net (slot={}, v{}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}) ICMP ping 10.0.2.2: OK (seq={}, rx={}, tx={})",
-                    nic.slot,
-                    nic.version,
+                    "[init] Ring-3 LIVE DHCPv4 ({}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}): ip={}.{}.{}.{}/{}, gw={}.{}.{}.{}, dns={}.{}.{}.{}",
+                    nic.driver_name(),
                     mac[0],
                     mac[1],
                     mac[2],
                     mac[3],
                     mac[4],
                     mac[5],
+                    leased.ip[0],
+                    leased.ip[1],
+                    leased.ip[2],
+                    leased.ip[3],
+                    leased.prefix_len,
+                    gw[0],
+                    gw[1],
+                    gw[2],
+                    gw[3],
+                    dns[0],
+                    dns[1],
+                    dns[2],
+                    dns[3],
+                );
+                leased
+            }
+            Err(msg) => {
+                let _ = writeln!(out, "[init] FAIL: live DHCPv4 lease: {msg}");
+                newos_user_rt::exit(QemuExitCode::Failed);
+            }
+        };
+
+        let target = cfg.gateway.unwrap_or(NetConfig::QEMU_DEFAULT.gateway.unwrap_or([10, 0, 2, 2]));
+        match newos_net::live_icmp_ping(CapVirtioTransport, nic, &cfg, target, &VIRTIO_DMA, &GEM_DMA) {
+            Ok(res) => {
+                let _ = writeln!(
+                    out,
+                    "[init] Ring-3 LIVE ICMP ping {}.{}.{}.{} ({}): OK (seq={})",
+                    res.target[0],
+                    res.target[1],
+                    res.target[2],
+                    res.target[3],
+                    nic.driver_name(),
                     res.seq,
-                    res.rx_packets,
-                    res.tx_packets
                 );
             }
             Err(msg) => {
-                let _ = writeln!(out, "[init] FAIL: live VirtIO-net ICMP ping: {msg}");
+                let _ = writeln!(out, "[init] FAIL: live ICMP ping: {msg}");
                 newos_user_rt::exit(QemuExitCode::Failed);
             }
         }

@@ -7,13 +7,13 @@ A pure **seL4-style 64-bit capability microkernel** and **post-UNIX Ring-3/EL0 e
 - **Strict Liedtke Minimality (Ultra-Minimal Ring 0 / EL1):**
   - Only CPU/interrupt dispatch, 4-level `VSpace` page tables, `CSpace` capability & `Untyped` memory enforcement, thread scheduling, and minimal IPC (`Endpoint`, 64-bit `Notification`, capability-scoped `MmioRegion`) live in the kernel.
   - Zero kernel heap (`no_alloc`): all physical memory is tracked in `UntypedInventory` and explicitly retyped into frames/page tables.
-  - Networking (`smoltcp` + VirtIO-net), storage (CAOS), shell (`newos-sh`), shared-memory ring buffers, and crash supervision live in isolated Ring-3 / EL0 processes.
+  - Networking (`smoltcp` IPv4/DHCPv4/DNS/ICMP + VirtIO 1.0+ & Raspberry Pi 5 RP1 Cadence GEM Gigabit Ethernet), storage (CAOS), shell (`newos-sh`), shared-memory ring buffers, and crash supervision live in isolated Ring-3 / EL0 processes.
 - **100% Memory-Safe Rust Interfaces:**
   - `#![forbid(unsafe_code)]` is compiler-enforced on `newos-abi`, `newos-kernel-core`, `newos-kernel`, `newos-net`, `newos-init`, and `newos-worker`.
   - Audited `unsafe` is strictly confined to hardware/MSR/paging/context-switch instructions in `crates/hal` and the minimal `syscall`/`svc #0` trampoline in `crates/user-rt`.
 - **Post-UNIX Userspace (Zero POSIX Paths / Zero Untyped Text Pipes):**
   - **Content-Addressed Object Store (CAOS):** Immutable blobs addressed by 64-bit `ObjHash` with automatic deduplication, lock-free reads, capability-gated named Refs (`@name`), instant atomic `rollback`, and irreversible `seal` (read-only attenuation).
-  - **Typed Pipeline Shell (`newos-sh`):** Stages pass typed `Record` values (`Proc`, `Object`, `Ref`, `Metric`, `Count`) directly through `|` (`put "hello" | save @note`, `objects | where size > 20`, `procs | where pid == 1 | count`, `net ping`).
+  - **Typed Pipeline Shell (`newos-sh`):** Stages pass typed `Record` values (`Proc`, `Object`, `Ref`, `Metric`, `Count`) directly through `|` (`put "hello" | save @note`, `objects | where size > 20`, `procs | where pid == 1 | count`, `net dhcp`, `net ping`, `net resolve`).
 - **Modern 64-bit Hardware Only:**
   - Zero 32-bit, zero legacy BIOS/MBR, zero legacy xAPIC MMIO, zero legacy VirtIO v1.
   - `x86_64`: Pure 64-bit UEFI + Limine, x2APIC MSRs, `syscall`/`sysretq`, `WP`/`NXE`/`SMEP`/`SMAP`/`UMIP`, W^X page tables.
@@ -71,7 +71,10 @@ refs | where writable == false
 procs | where pid == 1 | count
 ref rollback @note
 ref seal @note
-net ping
+net
+net dhcp
+net ping 10.0.2.2
+net resolve example.com
 ping 0x1234
 bench
 crash

@@ -239,30 +239,34 @@ impl Aarch64Platform {
             serial::init_virt(info.hhdm_offset.wrapping_add(uart_phys));
         }
 
-        // Map QEMU `virt` VirtIO-MMIO window (0x0a00_0000..0x0a00_4000) only when not on bare-metal Pi 5.
-        let net_mmio = if !info.board_rpi5 {
-            const VIRTIO_MMIO_PHYS: u64 = 0x0a00_0000;
-            const VIRTIO_MMIO_VIRT: u64 = 0xffff_b001_0000_0000;
-            const VIRTIO_MMIO_PAGES: u64 = 4;
-            if let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true) {
-                for p in 0..VIRTIO_MMIO_PAGES {
-                    let off = p * 4096;
-                    if let Ok(va) = VirtAddr::new_page_aligned(VIRTIO_MMIO_VIRT + off)
-                        && let Ok(frame) =
-                            PhysFrame::from_aligned(PhysAddr::new(VIRTIO_MMIO_PHYS + off))
-                    {
-                        let _ = vspace.map_4k(va, frame, mmio_flags, &mut info.untyped);
-                    }
+        // Map capability-scoped Network Controller MMIO window (4 pages, Device-nGnRnE):
+        // - Raspberry Pi 5 (BCM2712 + RP1 Cadence GEM Gigabit Ethernet): `0x1F_0010_0000`
+        // - QEMU `virt` (VirtIO-MMIO slots 0..31): `0x0A00_0000`
+        const QEMU_NET_MMIO_PHYS: u64 = 0x0a00_0000;
+        const RPI5_RP1_GEM_PHYS: u64 = 0x1F_0010_0000;
+        const NET_MMIO_VIRT: u64 = 0xffff_b001_0000_0000;
+        const NET_MMIO_PAGES: u64 = 4;
+        let net_mmio_phys = if info.board_rpi5 {
+            RPI5_RP1_GEM_PHYS
+        } else {
+            QEMU_NET_MMIO_PHYS
+        };
+        if let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true) {
+            for p in 0..NET_MMIO_PAGES {
+                let off = p * 4096;
+                if let Ok(va) = VirtAddr::new_page_aligned(NET_MMIO_VIRT + off)
+                    && let Ok(frame) =
+                        PhysFrame::from_aligned(PhysAddr::new(net_mmio_phys + off))
+                {
+                    let _ = vspace.map_4k(va, frame, mmio_flags, &mut info.untyped);
                 }
             }
-            Some((
-                PhysAddr::new(VIRTIO_MMIO_PHYS),
-                VIRTIO_MMIO_VIRT,
-                VIRTIO_MMIO_PAGES * 4096,
-            ))
-        } else {
-            None
-        };
+        }
+        let net_mmio = Some((
+            PhysAddr::new(net_mmio_phys),
+            NET_MMIO_VIRT,
+            NET_MMIO_PAGES * 4096,
+        ));
 
         set_cpu_id(0);
         install_vectors();

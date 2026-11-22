@@ -142,6 +142,7 @@ pub struct Shell {
     history: [[u8; LINE_BUF_SIZE]; HISTORY_LEN],
     history_lens: [usize; HISTORY_LEN],
     history_count: usize,
+    net_cfg: Option<newos_net::NetConfig>,
 }
 
 impl Shell {
@@ -151,6 +152,7 @@ impl Shell {
             history: [[0; LINE_BUF_SIZE]; HISTORY_LEN],
             history_lens: [0; HISTORY_LEN],
             history_count: 0,
+            net_cfg: None,
         }
     }
 
@@ -504,48 +506,176 @@ impl Shell {
                 }
             }
             "net" => {
-                let nic = newos_net::probe_virtio_net(|off| {
+                let nic = newos_net::probe_nic(|off| {
                     newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, off)
                 });
                 let mac = nic
-                    .map(|n| n.mac)
+                    .map(|n| n.mac())
                     .unwrap_or([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
                 if let Some(n) = nic {
-                    stream.push(Record::Metric {
-                        label: "virtio.net.slot",
-                        value: u64::from(n.slot),
-                        unit: "(mmio cap)",
-                    });
-                    stream.push(Record::Metric {
-                        label: "virtio.net.ver",
-                        value: u64::from(n.version),
-                        unit: "(virtio)",
-                    });
-                    if toks.get(1).copied() == Some("ping") {
-                        match newos_net::live_virtio_icmp_ping(
+                    let sub = toks.get(1).copied().unwrap_or("");
+                    match sub {
+                        "dhcp" => match newos_net::live_dhcp_v4(
                             crate::CapVirtioTransport,
                             n,
                             &crate::VIRTIO_DMA,
+                            &crate::GEM_DMA,
                         ) {
-                            Ok(res) => {
+                            Ok(cfg) => {
+                                self.net_cfg = Some(cfg);
+                                let gw = cfg.gateway.unwrap_or([0; 4]);
+                                let dns = cfg.dns.unwrap_or([0; 4]);
+                                let _ = writeln!(
+                                    out,
+                                    "net dhcp ({}): ip={}.{}.{}.{}/{}, gw={}.{}.{}.{}, dns={}.{}.{}.{}",
+                                    n.driver_name(),
+                                    cfg.ip[0],
+                                    cfg.ip[1],
+                                    cfg.ip[2],
+                                    cfg.ip[3],
+                                    cfg.prefix_len,
+                                    gw[0],
+                                    gw[1],
+                                    gw[2],
+                                    gw[3],
+                                    dns[0],
+                                    dns[1],
+                                    dns[2],
+                                    dns[3],
+                                );
                                 stream.push(Record::Metric {
-                                    label: "icmp.reply.seq",
-                                    value: u64::from(res.seq),
-                                    unit: "(from 10.0.2.2)",
-                                });
-                                stream.push(Record::Metric {
-                                    label: "nic.rx.frames",
-                                    value: res.rx_packets,
-                                    unit: "frames",
-                                });
-                                stream.push(Record::Metric {
-                                    label: "nic.tx.frames",
-                                    value: res.tx_packets,
-                                    unit: "frames",
+                                    label: "dhcp.prefix",
+                                    value: u64::from(cfg.prefix_len),
+                                    unit: "bits (IPv4 leased)",
                                 });
                             }
                             Err(e) => {
-                                let _ = writeln!(out, "net ping: {e}");
+                                let _ = writeln!(out, "net dhcp: {e}");
+                            }
+                        },
+                        "ping" => {
+                            let cfg = self.net_cfg.unwrap_or(newos_net::NetConfig::QEMU_DEFAULT);
+                            let target = toks
+                                .get(2)
+                                .copied()
+                                .filter(|s| !s.is_empty())
+                                .and_then(newos_net::parse_ipv4)
+                                .or(cfg.gateway)
+                                .unwrap_or([10, 0, 2, 2]);
+                            match newos_net::live_icmp_ping(
+                                crate::CapVirtioTransport,
+                                n,
+                                &cfg,
+                                target,
+                                &crate::VIRTIO_DMA,
+                                &crate::GEM_DMA,
+                            ) {
+                                Ok(res) => {
+                                    let _ = writeln!(
+                                        out,
+                                        "ICMP EchoReply from {}.{}.{}.{} (seq={}, driver={})",
+                                        res.target[0],
+                                        res.target[1],
+                                        res.target[2],
+                                        res.target[3],
+                                        res.seq,
+                                        n.driver_name(),
+                                    );
+                                    stream.push(Record::Metric {
+                                        label: "icmp.reply.seq",
+                                        value: u64::from(res.seq),
+                                        unit: "(ok)",
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = writeln!(out, "net ping: {e}");
+                                }
+                            }
+                        }
+                        "resolve" => {
+                            let Some(host) = toks.get(2).copied().filter(|s| !s.is_empty()) else {
+                                let _ = writeln!(out, "usage: net resolve <hostname>");
+                                return stream;
+                            };
+                            let cfg = self.net_cfg.unwrap_or(newos_net::NetConfig::QEMU_DEFAULT);
+                            match newos_net::live_dns_resolve(
+                                crate::CapVirtioTransport,
+                                n,
+                                &cfg,
+                                host,
+                                &crate::VIRTIO_DMA,
+                                &crate::GEM_DMA,
+                            ) {
+                                Ok(ip) => {
+                                    let _ = writeln!(
+                                        out,
+                                        "{host} -> {}.{}.{}.{}",
+                                        ip[0], ip[1], ip[2], ip[3]
+                                    );
+                                    stream.push(Record::Metric {
+                                        label: "dns.resolved",
+                                        value: u64::from(u32::from_be_bytes(ip)),
+                                        unit: "(ipv4 u32)",
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = writeln!(out, "net resolve: {e}");
+                                }
+                            }
+                        }
+                        _ => {
+                            let _ = writeln!(
+                                out,
+                                "nic: driver={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                n.driver_name(),
+                                mac[0],
+                                mac[1],
+                                mac[2],
+                                mac[3],
+                                mac[4],
+                                mac[5],
+                            );
+                            if let Some(cfg) = self.net_cfg {
+                                let gw = cfg.gateway.unwrap_or([0; 4]);
+                                let dns = cfg.dns.unwrap_or([0; 4]);
+                                let _ = writeln!(
+                                    out,
+                                    "ipv4: {}.{}.{}.{}/{} gw={}.{}.{}.{} dns={}.{}.{}.{}",
+                                    cfg.ip[0],
+                                    cfg.ip[1],
+                                    cfg.ip[2],
+                                    cfg.ip[3],
+                                    cfg.prefix_len,
+                                    gw[0],
+                                    gw[1],
+                                    gw[2],
+                                    gw[3],
+                                    dns[0],
+                                    dns[1],
+                                    dns[2],
+                                    dns[3],
+                                );
+                            }
+                            match n {
+                                newos_net::NicKind::Virtio(v) => {
+                                    stream.push(Record::Metric {
+                                        label: "virtio.net.slot",
+                                        value: u64::from(v.slot),
+                                        unit: "(mmio cap)",
+                                    });
+                                    stream.push(Record::Metric {
+                                        label: "virtio.net.ver",
+                                        value: u64::from(v.version),
+                                        unit: "(virtio)",
+                                    });
+                                }
+                                newos_net::NicKind::CadenceGem(g) => {
+                                    stream.push(Record::Metric {
+                                        label: "rp1.gem.mid",
+                                        value: u64::from(g.module_id),
+                                        unit: "(rpi5 cadence gem)",
+                                    });
+                                }
                             }
                         }
                     }
@@ -646,7 +776,8 @@ impl Shell {
         let _ = writeln!(out, "  get <@ref | obj:hash>       Read immutable object content");
         let _ = writeln!(out, "  objects / refs / procs      Emit typed Object / Ref / Proc records");
         let _ = writeln!(out, "  ref set|seal|rollback       Manage capability-gated Refs (atomic rollback)");
-        let _ = writeln!(out, "  ping [hex] / bench / net    CR3 IPC, cycle bench, Ring-3 smoltcp & VirtIO-net");
+        let _ = writeln!(out, "  ping [hex] / bench          CR3 IPC round-trip & cycle benchmark");
+        let _ = writeln!(out, "  net [dhcp|ping|resolve]     Ring-3 smoltcp + VirtIO / Pi 5 RP1 GEM");
         let _ = writeln!(out, "  | where <f> ==|!=|> <v>     Filter typed records (e.g. `objects | where size > 20`)");
         let _ = writeln!(out, "  | save @<name>              Bind upstream Object hash to a named Ref");
         let _ = writeln!(out, "  | first <n> / | count       Slice or count typed streams");
