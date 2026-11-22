@@ -1,5 +1,4 @@
 #![no_std]
-#![feature(sync_unsafe_cell)]
 
 //! Minimal, strictly audited Hardware Abstraction Layer (HAL) for NewOS on Raspberry Pi 5 (16 GB, BCM2712).
 //!

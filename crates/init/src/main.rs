@@ -115,10 +115,35 @@ impl InitShellHost {
                 },
                 "ping" => {
                     let cfg = self.net_cfg.unwrap_or(NetConfig::QEMU_DEFAULT);
-                    let target = arg
-                        .and_then(newos_net::parse_ipv4)
-                        .or(cfg.gateway)
-                        .unwrap_or([10, 0, 2, 2]);
+                    let target = match arg {
+                        None => cfg.gateway.unwrap_or([10, 0, 2, 2]),
+                        Some(raw) => {
+                            if let Some(ip) = newos_net::parse_ipv4(raw) {
+                                ip
+                            } else if raw.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+                                let _ = writeln!(out, "net ping: invalid IPv4 address '{raw}'");
+                                return;
+                            } else {
+                                match newos_net::live_dns_resolve(
+                                    CapVirtioTransport,
+                                    n,
+                                    &cfg,
+                                    raw,
+                                    &VIRTIO_DMA,
+                                    &GEM_DMA,
+                                ) {
+                                    Ok(ip) => ip,
+                                    Err(e) => {
+                                        let _ = writeln!(
+                                            out,
+                                            "net ping: could not resolve '{raw}' ({e})"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    };
                     match newos_net::live_icmp_ping(
                         CapVirtioTransport,
                         n,
