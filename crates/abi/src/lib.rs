@@ -128,6 +128,10 @@ pub enum SyscallNumber {
     MmioWrite32 = 13,
     /// Translate a canonical Ring-3 virtual address in the caller's `VSpace` to its physical address for DMA.
     VirtToPhys = 14,
+    /// Synchronous fastpath IPC call: send `(cap_id, payload)` and receive the server's reply in 1 syscall.
+    IpcCall = 15,
+    /// Synchronous fastpath IPC server loop: optionally reply `(cap_id, reply_payload, has_reply)` and wait for next request.
+    IpcReplyRecv = 16,
 }
 
 impl SyscallNumber {
@@ -148,6 +152,8 @@ impl SyscallNumber {
             12 => Some(Self::SysInfo),
             13 => Some(Self::MmioWrite32),
             14 => Some(Self::VirtToPhys),
+            15 => Some(Self::IpcCall),
+            16 => Some(Self::IpcReplyRecv),
             _ => None,
         }
     }
@@ -214,13 +220,46 @@ mod tests {
 
     #[test]
     fn syscall_and_error_roundtrip() {
-        assert_eq!(SyscallNumber::from_u64(1), Some(SyscallNumber::DebugWrite));
-        assert_eq!(SyscallNumber::from_u64(4), Some(SyscallNumber::NotifySignal));
-        assert_eq!(SyscallNumber::from_u64(8), Some(SyscallNumber::ReadCycles));
+        let expected_syscalls = [
+            (1, SyscallNumber::DebugWrite),
+            (2, SyscallNumber::Yield),
+            (3, SyscallNumber::Exit),
+            (4, SyscallNumber::NotifySignal),
+            (5, SyscallNumber::NotifyPoll),
+            (6, SyscallNumber::IpcSend),
+            (7, SyscallNumber::IpcRecv),
+            (8, SyscallNumber::ReadCycles),
+            (9, SyscallNumber::SetFaultHandler),
+            (10, SyscallNumber::MmioRead32),
+            (11, SyscallNumber::DebugRead),
+            (12, SyscallNumber::SysInfo),
+            (13, SyscallNumber::MmioWrite32),
+            (14, SyscallNumber::VirtToPhys),
+            (15, SyscallNumber::IpcCall),
+            (16, SyscallNumber::IpcReplyRecv),
+        ];
+        assert_eq!(SyscallNumber::from_u64(0), None);
+        for (raw, variant) in expected_syscalls {
+            assert_eq!(variant as u64, raw);
+            assert_eq!(SyscallNumber::from_u64(raw), Some(variant));
+        }
+        assert_eq!(SyscallNumber::from_u64(17), None);
         assert_eq!(SyscallNumber::from_u64(99), None);
-        assert_eq!(
-            SysError::from_u64(SysError::WouldBlock as u64),
-            Some(SysError::WouldBlock)
-        );
+
+        let expected_errors = [
+            (1, SysError::InvalidCapability),
+            (2, SysError::InsufficientRights),
+            (3, SysError::OutOfMemory),
+            (4, SysError::InvalidArgument),
+            (5, SysError::SlotOccupied),
+            (6, SysError::WouldBlock),
+            (7, SysError::Unsupported),
+        ];
+        assert_eq!(SysError::from_u64(0), None);
+        for (raw, err) in expected_errors {
+            assert_eq!(err as u64, raw);
+            assert_eq!(SysError::from_u64(raw), Some(err));
+        }
+        assert_eq!(SysError::from_u64(8), None);
     }
 }

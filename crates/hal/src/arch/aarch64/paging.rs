@@ -10,6 +10,7 @@ use newos_kernel_core::memory::{
 const DESC_VALID: u64 = 1 << 0;
 const DESC_TABLE_OR_PAGE: u64 = 1 << 1;
 const DESC_AF: u64 = 1 << 10; // Access Flag
+const DESC_NG: u64 = 1 << 11; // Non-Global (ASID-tagged EL0 entries)
 const DESC_SH_INNER: u64 = 0b11 << 8; // Inner Shareable
 const DESC_AP_EL0_RW: u64 = 0b01 << 6;
 const DESC_AP_EL1_RO: u64 = 0b10 << 6;
@@ -60,6 +61,28 @@ fn tlbi_va(virt: VirtAddr) {
     }
 }
 
+/// Ensure `TTBR0_EL1` supplies the active ASID (`TCR_EL1.A1 == 0`) and flush stale boot TLB entries once.
+pub fn ensure_ttbr0_asid_enabled() {
+    // SAFETY: Configuring `TCR_EL1.A1 = 0` and executing a one-time EL1 TLB invalidation
+    // before entering EL0 guarantees `TTBR0_EL1[63:48]` tags all `DESC_NG` user mappings.
+    unsafe {
+        let mut tcr: u64;
+        asm!("mrs {}, tcr_el1", out(reg) tcr, options(nomem, nostack, preserves_flags));
+        if (tcr & (1u64 << 22)) != 0 {
+            tcr &= !(1u64 << 22);
+            asm!("msr tcr_el1, {}", in(reg) tcr, options(nostack, preserves_flags));
+            asm!("isb", options(nostack, preserves_flags));
+        }
+        asm!(
+            "dsb ish",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// 4-level 4 KiB ARMv8 `VSpace` (kernel `TTBR1_EL1` or isolated EL0 `TTBR0_EL1`).
 pub struct Aarch64VSpace {
     l0_phys: u64,
@@ -77,7 +100,7 @@ impl Aarch64VSpace {
     /// Wrap an existing L0 page-table root physical address (e.g. active `TTBR0_EL1`).
     pub const fn from_root_phys(l0_phys: u64, hhdm_offset: u64) -> Self {
         Self {
-            l0_phys,
+            l0_phys: l0_phys & DESC_ADDR_MASK,
             hhdm_offset,
         }
     }
@@ -181,10 +204,10 @@ impl VSpaceMapper for Aarch64VSpace {
             pte |= device_mair_index() << 2;
         }
         match (flags.user, flags.writable) {
-            (false, true) => {} // AP=00: EL1 RW
+            (false, true) => {} // AP=00: EL1 RW (Global)
             (false, false) => pte |= DESC_AP_EL1_RO,
-            (true, true) => pte |= DESC_AP_EL0_RW,
-            (true, false) => pte |= DESC_AP_EL0_RO,
+            (true, true) => pte |= DESC_AP_EL0_RW | DESC_NG,
+            (true, false) => pte |= DESC_AP_EL0_RO | DESC_NG,
         }
         if !flags.executable {
             pte |= DESC_PXN | DESC_UXN;

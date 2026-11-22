@@ -7,4 +7,5 @@ license.workspace = true
 [dependencies]
 newos-abi = { workspace = true }
 newos-net = { workspace = true }
+newos-shell-core = { workspace = true }
 newos-user-rt = { workspace = true }

@@ -6,7 +6,8 @@ use core::cell::SyncUnsafeCell;
 use core::fmt::Write;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
-use newos_abi::{CapId, QemuExitCode, SysError, SyscallNumber};
+use newos_abi::{CapId, QemuExitCode, Rights, SysError, SyscallNumber};
+use newos_kernel_core::cspace::CapObject;
 use newos_kernel_core::ipc::KernelIpcState;
 
 use super::{gdt, percpu, serial};
@@ -22,6 +23,13 @@ const SYSCALL_FMASK: u64 = (1 << 9) | (1 << 10) | (1 << 18);
 
 const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
 const MAX_PROCS: usize = 4;
+const CR3_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+const CR3_NOFLUSH: u64 = 1u64 << 63;
+
+#[inline]
+const fn pack_ipc_msg(badge: u64, payload: u64) -> u64 {
+    ((badge & 0xFFFF) << 48) | (payload & 0x0000_FFFF_FFFF_FFFF)
+}
 
 static YIELD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
@@ -67,10 +75,19 @@ impl SyscallFrame {
     };
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IpcWaitState {
+    Runnable,
+    WaitingReply,
+    WaitingRecv,
+}
+
 #[derive(Clone, Copy)]
 struct ProcessSlot {
     active: bool,
     cr3: u64,
+    wait: IpcWaitState,
+    wait_ep_id: u32,
     frame: SyscallFrame,
 }
 
@@ -78,6 +95,8 @@ impl ProcessSlot {
     const EMPTY: Self = Self {
         active: false,
         cr3: 0,
+        wait: IpcWaitState::Runnable,
+        wait_ep_id: 0,
         frame: SyscallFrame::ZERO,
     };
 }
@@ -95,6 +114,34 @@ impl ProcTable {
             count: 0,
             current: 0,
         }
+    }
+
+    #[inline]
+    fn find_next_runnable(&self, from: usize) -> Option<usize> {
+        if self.count <= 1 {
+            return None;
+        }
+        for offset in 1..self.count {
+            let idx = (from + offset) % self.count;
+            if self.procs[idx].active && self.procs[idx].wait == IpcWaitState::Runnable {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn find_waiter(&self, state: IpcWaitState, ep_id: u32, exclude: usize) -> Option<usize> {
+        for idx in 0..self.count {
+            if idx != exclude
+                && self.procs[idx].active
+                && self.procs[idx].wait == state
+                && self.procs[idx].wait_ep_id == ep_id
+            {
+                return Some(idx);
+            }
+        }
+        None
     }
 }
 
@@ -152,6 +199,8 @@ pub fn register_user_process(entry_rip: u64, user_rsp: u64, cr3: u64) -> Result<
         table.procs[pid] = ProcessSlot {
             active: true,
             cr3,
+            wait: IpcWaitState::Runnable,
+            wait_ep_id: 0,
             frame,
         };
         table.count += 1;
@@ -187,10 +236,22 @@ fn rdtsc() -> u64 {
 }
 
 #[inline]
-fn write_cr3(cr3: u64) {
-    // SAFETY: `cr3` is a verified 4 KiB-aligned PML4 physical address sharing kernel higher-half mappings.
+fn write_cr3_for_pid(pml4_phys: u64, pid: usize, noflush: bool) {
+    let base = pml4_phys & CR3_ADDR_MASK;
+    let val = if super::paging::pcid_enabled() {
+        let pcid = ((pid + 1) as u64) & 0xFFF;
+        if noflush {
+            CR3_NOFLUSH | base | pcid
+        } else {
+            base | pcid
+        }
+    } else {
+        base
+    };
+    // SAFETY: `base` is a verified 4 KiB-aligned PML4 physical address sharing kernel higher-half
+    // mappings. `CR3_NOFLUSH` (bit 63) and PCID bits `[11:0]` are only set when `CR4.PCIDE` is active.
     unsafe {
-        asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+        asm!("mov cr3, {}", in(reg) val, options(nostack, preserves_flags));
     }
 }
 
@@ -251,16 +312,19 @@ fn copy_from_user_smap(user_ptr: u64, len: u64, dst: &mut [u8]) -> Result<usize,
         return Err(SysError::InvalidArgument);
     }
     let count = (len as usize).min(dst.len());
+    if count == 0 {
+        return Ok(0);
+    }
     let src = user_ptr as *const u8;
 
-    // SAFETY: `user_ptr..user_ptr+count` is validated strictly within canonical Ring-3 user space.
-    // `stac`/`clac` temporarily bracket the copy so SMAP remains strictly enforced everywhere else.
+    // SAFETY: `user_ptr..user_ptr+count` is non-null, overflow-checked, and strictly within
+    // lower-half canonical user space (`< USER_ADDR_LIMIT`), while `dst` is a Ring-0 kernel
+    // stack slice in higher-half memory, so the regions cannot overlap. Omitting `nomem` on
+    // `stac`/`clac` prevents LLVM from reordering `copy_nonoverlapping` outside the SMAP window.
     unsafe {
-        asm!("stac", options(nomem, nostack));
-        for (i, slot) in dst.iter_mut().take(count).enumerate() {
-            *slot = read_volatile(src.add(i));
-        }
-        asm!("clac", options(nomem, nostack));
+        asm!("stac", options(nostack));
+        core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), count);
+        asm!("clac", options(nostack));
     }
     Ok(count)
 }
@@ -269,7 +333,7 @@ extern "C" fn rust_syscall_dispatch(
     frame: &mut SyscallFrame,
     a0: u64,
     a1: u64,
-    _a2: u64,
+    a2: u64,
     _a3: u64,
 ) {
     let Some(syscall) = SyscallNumber::from_u64(frame.rax) else {
@@ -292,20 +356,19 @@ extern "C" fn rust_syscall_dispatch(
             })
         }
         SyscallNumber::Yield => {
-            let next_count = YIELD_COUNTER.fetch_add(1, Ordering::AcqRel) + 1;
+            let next_count = YIELD_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
             // Write return values into the yielding process's frame before context-switching
             frame.rax = 0;
             frame.rdx = next_count;
 
-            // SAFETY: Single-core BSP cooperative round-robin switch across isolated CR3 address spaces.
+            // SAFETY: Single-core BSP cooperative round-robin switch across runnable CR3 address spaces.
             unsafe {
                 let table = &mut *PROCS.get();
-                if table.count > 1 {
-                    let cur = table.current;
-                    let next = (cur + 1) % table.count;
+                let cur = table.current;
+                if let Some(next) = table.find_next_runnable(cur) {
                     table.procs[cur].frame = *frame;
                     table.current = next;
-                    write_cr3(table.procs[next].cr3);
+                    write_cr3_for_pid(table.procs[next].cr3, next, true);
                     *frame = table.procs[next].frame;
                 }
             }
@@ -321,10 +384,184 @@ extern "C" fn rust_syscall_dispatch(
         }
         SyscallNumber::NotifySignal => ipc.notify_signal(CapId::new(a0), a1).map(|()| 0),
         SyscallNumber::NotifyPoll => ipc.notify_poll(CapId::new(a0)),
-        SyscallNumber::IpcSend => ipc.ipc_send(CapId::new(a0), a1).map(|()| 0),
-        SyscallNumber::IpcRecv => ipc.ipc_recv(CapId::new(a0)).map(|msg| {
-            ((msg.badge & 0xFFFF) << 48) | (msg.payload & 0x0000_FFFF_FFFF_FFFF)
-        }),
+        SyscallNumber::IpcSend => {
+            if let Ok((ep_id, badge)) = ipc
+                .root_cspace
+                .lookup(CapId::new(a0), Rights::WRITE)
+                .and_then(|cap| match cap.object {
+                    CapObject::Endpoint { id } => Ok((id, cap.badge)),
+                    _ => Err(SysError::InvalidArgument),
+                })
+            {
+                // SAFETY: `syscall_entry` runs with `IF=0` on BSP, giving exclusive access to `PROCS`.
+                let woken = unsafe {
+                    let table = &mut *PROCS.get();
+                    let cur = table.current;
+                    let waiter = table
+                        .find_waiter(IpcWaitState::WaitingRecv, ep_id, cur)
+                        .or_else(|| table.find_waiter(IpcWaitState::WaitingReply, ep_id, cur));
+                    if let Some(peer) = waiter {
+                        table.procs[peer].frame.rax = 0;
+                        table.procs[peer].frame.rdx = pack_ipc_msg(badge, a1);
+                        table.procs[peer].wait = IpcWaitState::Runnable;
+                        table.procs[peer].wait_ep_id = 0;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if woken {
+                    Ok(0)
+                } else {
+                    ipc.ipc_send(CapId::new(a0), a1).map(|()| 0)
+                }
+            } else {
+                ipc.ipc_send(CapId::new(a0), a1).map(|()| 0)
+            }
+        }
+        SyscallNumber::IpcRecv => ipc
+            .ipc_recv(CapId::new(a0))
+            .map(|msg| pack_ipc_msg(msg.badge, msg.payload)),
+        SyscallNumber::IpcCall => {
+            let resolved = ipc
+                .root_cspace
+                .lookup(CapId::new(a0), Rights::WRITE.union(Rights::READ))
+                .and_then(|cap| match cap.object {
+                    CapObject::Endpoint { id } => Ok((id, cap.badge)),
+                    _ => Err(SysError::InvalidArgument),
+                });
+            match resolved {
+                Err(e) => Err(e),
+                Ok((ep_id, badge)) => {
+                    // SAFETY: `syscall_entry` runs with `IF=0` on BSP, giving exclusive access to `PROCS`.
+                    unsafe {
+                        let table = &mut *PROCS.get();
+                        let cur = table.current;
+                        if let Some(server) =
+                            table.find_waiter(IpcWaitState::WaitingRecv, ep_id, cur)
+                        {
+                            // Direct synchronous fastpath: hand payload straight to waiting server frame.
+                            table.procs[server].frame.rax = 0;
+                            table.procs[server].frame.rdx = pack_ipc_msg(badge, a1);
+                            table.procs[server].wait = IpcWaitState::Runnable;
+                            table.procs[server].wait_ep_id = 0;
+                            table.procs[cur].wait = IpcWaitState::WaitingReply;
+                            table.procs[cur].wait_ep_id = ep_id;
+                            table.procs[cur].frame = *frame;
+                            table.current = server;
+                            write_cr3_for_pid(table.procs[server].cr3, server, true);
+                            *frame = table.procs[server].frame;
+                            return;
+                        }
+                        if let Some(next) = table.find_next_runnable(cur) {
+                            match ipc.ipc_send(CapId::new(a0), a1) {
+                                Ok(()) => {
+                                    table.procs[cur].wait = IpcWaitState::WaitingReply;
+                                    table.procs[cur].wait_ep_id = ep_id;
+                                    table.procs[cur].frame = *frame;
+                                    table.current = next;
+                                    write_cr3_for_pid(table.procs[next].cr3, next, true);
+                                    *frame = table.procs[next].frame;
+                                    return;
+                                }
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            Err(SysError::WouldBlock)
+                        }
+                    }
+                }
+            }
+        }
+        SyscallNumber::IpcReplyRecv => {
+            if a2 != 0 {
+                let resolved = ipc
+                    .root_cspace
+                    .lookup(CapId::new(a0), Rights::WRITE.union(Rights::READ))
+                    .and_then(|cap| match cap.object {
+                        CapObject::Endpoint { id } => Ok((id, cap.badge)),
+                        _ => Err(SysError::InvalidArgument),
+                    });
+                match resolved {
+                    Err(e) => Err(e),
+                    Ok((ep_id, badge)) => {
+                        // SAFETY: `syscall_entry` runs with `IF=0` on BSP, giving exclusive access to `PROCS`.
+                        unsafe {
+                            let table = &mut *PROCS.get();
+                            let cur = table.current;
+                            if let Some(client) =
+                                table.find_waiter(IpcWaitState::WaitingReply, ep_id, cur)
+                            {
+                                // Direct reply + park server in WaitingRecv in 1 syscall.
+                                table.procs[client].frame.rax = 0;
+                                table.procs[client].frame.rdx = pack_ipc_msg(badge, a1);
+                                table.procs[client].wait = IpcWaitState::Runnable;
+                                table.procs[client].wait_ep_id = 0;
+                                table.procs[cur].wait = IpcWaitState::WaitingRecv;
+                                table.procs[cur].wait_ep_id = ep_id;
+                                table.procs[cur].frame = *frame;
+                                table.current = client;
+                                write_cr3_for_pid(table.procs[client].cr3, client, true);
+                                *frame = table.procs[client].frame;
+                                return;
+                            }
+                            // No client parked in WaitingReply (e.g., legacy IpcSend/IpcRecv client):
+                            // buffer the reply, then park in WaitingRecv instead of falling through
+                            // into ipc_recv on the same endpoint (which would self-consume the reply).
+                            match ipc.ipc_send(CapId::new(a0), a1) {
+                                Ok(()) => {
+                                    if let Some(next) = table.find_next_runnable(cur) {
+                                        table.procs[cur].wait = IpcWaitState::WaitingRecv;
+                                        table.procs[cur].wait_ep_id = ep_id;
+                                        table.procs[cur].frame = *frame;
+                                        table.current = next;
+                                        write_cr3_for_pid(table.procs[next].cr3, next, true);
+                                        *frame = table.procs[next].frame;
+                                        return;
+                                    }
+                                    Err(SysError::WouldBlock)
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                    }
+                }
+            } else {
+                match ipc.ipc_recv(CapId::new(a0)) {
+                    Ok(msg) => Ok(pack_ipc_msg(msg.badge, msg.payload)),
+                    Err(SysError::WouldBlock) => {
+                        let resolved = ipc
+                            .root_cspace
+                            .lookup(CapId::new(a0), Rights::READ)
+                            .and_then(|cap| match cap.object {
+                                CapObject::Endpoint { id } => Ok(id),
+                                _ => Err(SysError::InvalidArgument),
+                            });
+                        match resolved {
+                            Err(e) => Err(e),
+                            Ok(ep_id) => {
+                                // SAFETY: `syscall_entry` runs with `IF=0` on BSP, giving exclusive access to `PROCS`.
+                                unsafe {
+                                    let table = &mut *PROCS.get();
+                                    let cur = table.current;
+                                    if let Some(next) = table.find_next_runnable(cur) {
+                                        table.procs[cur].wait = IpcWaitState::WaitingRecv;
+                                        table.procs[cur].wait_ep_id = ep_id;
+                                        table.procs[cur].frame = *frame;
+                                        table.current = next;
+                                        write_cr3_for_pid(table.procs[next].cr3, next, true);
+                                        *frame = table.procs[next].frame;
+                                        return;
+                                    }
+                                }
+                                Err(SysError::WouldBlock)
+                            }
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
         SyscallNumber::ReadCycles => Ok(rdtsc()),
         SyscallNumber::SetFaultHandler => {
             if a0 == 0 || a0 >= USER_ADDR_LIMIT || a1 == 0 || a1 >= USER_ADDR_LIMIT {
@@ -346,7 +583,7 @@ extern "C" fn rust_syscall_dispatch(
             let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
             let ptr = hhdm.wrapping_add(phys.raw()) as *mut u32;
             // SAFETY: `validate_mmio_write32` verified WRITE right, alignment, and bounds.
-            unsafe { write_volatile(ptr, _a2 as u32) };
+            unsafe { write_volatile(ptr, a2 as u32) };
             0
         }),
         SyscallNumber::DebugRead => match serial::try_read_byte() {
@@ -403,7 +640,7 @@ pub fn start_userspace() -> ! {
         )
     };
 
-    write_cr3(cr3);
+    write_cr3_for_pid(cr3, 0, false);
 
     let user_cs = u64::from(gdt::USER_CS);
     let user_ds = u64::from(gdt::USER_DS);

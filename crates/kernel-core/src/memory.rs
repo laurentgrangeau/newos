@@ -148,6 +148,7 @@ impl UntypedRegion {
     }
 
     /// Carve a single 4 KiB `PhysFrame` by advancing the watermark monotonically.
+    #[inline]
     pub fn retype_frame(&mut self) -> Result<PhysFrame, SysError> {
         if self.remaining() < PAGE_SIZE {
             return Err(SysError::OutOfMemory);
@@ -163,6 +164,7 @@ impl UntypedRegion {
 pub struct UntypedInventory {
     regions: [UntypedRegion; MAX_UNTYPED_REGIONS],
     count: usize,
+    active_region: usize,
     retyped_frames: u64,
 }
 
@@ -177,6 +179,7 @@ impl UntypedInventory {
         Self {
             regions: [UntypedRegion::EMPTY; MAX_UNTYPED_REGIONS],
             count: 0,
+            active_region: 0,
             retyped_frames: 0,
         }
     }
@@ -216,7 +219,7 @@ impl UntypedInventory {
 
     pub fn remaining_bytes(&self) -> u64 {
         let mut rem = 0u64;
-        let mut i = 0;
+        let mut i = self.active_region;
         while i < self.count {
             rem = rem.saturating_add(self.regions[i].remaining());
             i += 1;
@@ -225,12 +228,14 @@ impl UntypedInventory {
     }
 
     /// Carve one 4 KiB `PhysFrame` from the first `UntypedRegion` with available space.
+    #[inline]
     pub fn retype_frame(&mut self) -> Result<PhysFrame, SysError> {
-        for region in &mut self.regions[..self.count] {
-            if let Ok(frame) = region.retype_frame() {
+        while self.active_region < self.count {
+            if let Ok(frame) = self.regions[self.active_region].retype_frame() {
                 self.retyped_frames = self.retyped_frames.saturating_add(1);
                 return Ok(frame);
             }
+            self.active_region += 1;
         }
         Err(SysError::OutOfMemory)
     }
@@ -372,5 +377,28 @@ mod tests {
             VirtAddr::new_page_aligned(0xffff_9000_0000_0001),
             Err(SysError::InvalidArgument)
         );
+    }
+
+    #[test]
+    fn untyped_cursor_advances_and_handles_late_push() {
+        let mut inv = UntypedInventory::new();
+        assert!(inv.push_raw_region(0x10_0000, PAGE_SIZE));
+        assert!(inv.push_raw_region(0x20_0000, PAGE_SIZE));
+        assert!(inv.push_raw_region(0x30_0000, PAGE_SIZE));
+
+        assert_eq!(inv.retype_frame().unwrap().start_addr().raw(), 0x10_0000);
+        assert_eq!(inv.retype_frame().unwrap().start_addr().raw(), 0x20_0000);
+        assert_eq!(inv.retype_frame().unwrap().start_addr().raw(), 0x30_0000);
+        assert_eq!(inv.retype_frame(), Err(SysError::OutOfMemory));
+        assert_eq!(inv.remaining_bytes(), 0);
+
+        // Late push after cursor reached `count` must immediately serve frames.
+        assert!(inv.push_raw_region(0x40_0000, PAGE_SIZE * 2));
+        assert_eq!(inv.remaining_bytes(), PAGE_SIZE * 2);
+        assert_eq!(inv.retype_frame().unwrap().start_addr().raw(), 0x40_0000);
+        assert_eq!(inv.remaining_bytes(), PAGE_SIZE);
+        assert_eq!(inv.retype_frame().unwrap().start_addr().raw(), 0x40_1000);
+        assert_eq!(inv.remaining_bytes(), 0);
+        assert_eq!(inv.retyped_frames(), 5);
     }
 }

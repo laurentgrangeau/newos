@@ -54,18 +54,24 @@ fn main() -> ExitCode {
         }
     }
 
+    let release = args.iter().any(|a| a == "--release");
+
     let result = match cmd {
-        "build" => build_iso(arch, true).map(|_| ()),
-        "run" => run_qemu(arch, false, true),
-        "test" => run_tests(arch),
-        "host-test" => run_host_tests(),
-        "rpi5-image" => build_rpi5_image().map(|_| ()),
-        _ => {
+        "build" => build_iso(arch, true, release).map(|_| ()),
+        "run" => run_qemu(arch, false, true, release),
+        "test" => run_tests(arch, release),
+        "host-test" => run_host_tests(release),
+        "rpi5-image" => build_rpi5_image(release).map(|_| ()),
+        "bench" => run_bench(&args[1..]),
+        "help" | "-h" | "--help" => {
             eprintln!(
-                "Usage: cargo xtask <build|run|test|host-test|rpi5-image> [--arch x86_64|aarch64]"
+                "Usage: cargo xtask <build|run|test|host-test|rpi5-image|bench> [--arch x86_64|aarch64] [--release]"
             );
             Ok(())
         }
+        other => Err(format!(
+            "unknown subcommand `{other}`\nUsage: cargo xtask <build|run|test|host-test|rpi5-image|bench> [--arch x86_64|aarch64] [--release]"
+        )),
     };
 
     match result {
@@ -77,11 +83,17 @@ fn main() -> ExitCode {
     }
 }
 
+fn profile_dir(release: bool) -> &'static str {
+    if release { "release" } else { "debug" }
+}
+
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("xtask must live inside workspace root")
-        .to_path_buf()
+    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR")
+        && let Some(parent) = Path::new(manifest_dir).parent()
+    {
+        return parent.to_path_buf();
+    }
+    env::current_dir().expect("failed to determine workspace root")
 }
 
 fn run_checked(cmd: &mut Command, label: &str) -> Result<(), String> {
@@ -95,7 +107,7 @@ fn run_checked(cmd: &mut Command, label: &str) -> Result<(), String> {
     }
 }
 
-fn build_kernel(root: &Path, arch: Arch) -> Result<PathBuf, String> {
+fn build_kernel(root: &Path, arch: Arch, release: bool) -> Result<PathBuf, String> {
     let linker_script = root.join(format!("crates/kernel/linker-{}.ld", arch.name()));
     let rustflags = match arch {
         Arch::X86_64 => format!(
@@ -122,16 +134,25 @@ fn build_kernel(root: &Path, arch: Arch) -> Result<PathBuf, String> {
             "-Z",
             "build-std-features=compiler-builtins-mem",
         ]);
+    if release {
+        cmd.arg("--release");
+    }
     run_checked(&mut cmd, &format!("cargo build (newos-kernel {})", arch.name()))?;
 
     Ok(root
         .join("target")
         .join(arch.target_triple())
-        .join("debug")
+        .join(profile_dir(release))
         .join("newos-kernel"))
 }
 
-fn build_user_elf(root: &Path, arch: Arch, pkg: &str, dir: &str) -> Result<PathBuf, String> {
+fn build_user_elf(
+    root: &Path,
+    arch: Arch,
+    pkg: &str,
+    dir: &str,
+    release: bool,
+) -> Result<PathBuf, String> {
     let linker_script = root.join(format!("crates/{dir}/linker-{}.ld", arch.name()));
     let rustflags = format!(
         "-C link-arg=-T{} -C relocation-model=static",
@@ -152,12 +173,15 @@ fn build_user_elf(root: &Path, arch: Arch, pkg: &str, dir: &str) -> Result<PathB
             "-Z",
             "build-std-features=compiler-builtins-mem",
         ]);
+    if release {
+        cmd.arg("--release");
+    }
     run_checked(&mut cmd, &format!("cargo build ({pkg} {})", arch.name()))?;
 
     Ok(root
         .join("target")
         .join(arch.target_triple())
-        .join("debug")
+        .join(profile_dir(release))
         .join(pkg))
 }
 
@@ -183,11 +207,11 @@ fn ensure_limine(root: &Path) -> Result<PathBuf, String> {
 }
 
 /// Build a pure 64-bit UEFI-only bootable ISO for `x86_64` or `aarch64` (zero legacy BIOS).
-fn build_iso(arch: Arch, interactive: bool) -> Result<PathBuf, String> {
+fn build_iso(arch: Arch, interactive: bool, release: bool) -> Result<PathBuf, String> {
     let root = workspace_root();
-    let kernel_elf = build_kernel(&root, arch)?;
-    let init_elf = build_user_elf(&root, arch, "newos-init", "init")?;
-    let worker_elf = build_user_elf(&root, arch, "newos-worker", "worker")?;
+    let kernel_elf = build_kernel(&root, arch, release)?;
+    let init_elf = build_user_elf(&root, arch, "newos-init", "init", release)?;
+    let worker_elf = build_user_elf(&root, arch, "newos-worker", "worker", release)?;
     let limine_dir = ensure_limine(&root)?;
 
     let iso_root = root.join(format!("target/iso_root_{}", arch.name()));
@@ -256,11 +280,11 @@ fn build_iso(arch: Arch, interactive: bool) -> Result<PathBuf, String> {
 
 /// Build a 64 MiB FAT32 boot image (`target/newos-rpi5.img`) + staging folder (`target/rpi5_boot/`)
 /// for Raspberry Pi 5 (16 GB, BCM2712 Cortex-A76, 3-pin JST Debug UART `0x10_7D00_1000`).
-fn build_rpi5_image() -> Result<PathBuf, String> {
+fn build_rpi5_image(release: bool) -> Result<PathBuf, String> {
     let root = workspace_root();
-    let kernel_elf = build_kernel(&root, Arch::Aarch64)?;
-    let init_elf = build_user_elf(&root, Arch::Aarch64, "newos-init", "init")?;
-    let worker_elf = build_user_elf(&root, Arch::Aarch64, "newos-worker", "worker")?;
+    let kernel_elf = build_kernel(&root, Arch::Aarch64, release)?;
+    let init_elf = build_user_elf(&root, Arch::Aarch64, "newos-init", "init", release)?;
+    let worker_elf = build_user_elf(&root, Arch::Aarch64, "newos-worker", "worker", release)?;
     let limine_dir = ensure_limine(&root)?;
 
     let stage = root.join("target/rpi5_boot");
@@ -347,7 +371,7 @@ serial: yes
     Ok(img_path)
 }
 
-fn run_host_tests() -> Result<(), String> {
+fn run_host_tests(release: bool) -> Result<(), String> {
     let root = workspace_root();
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&root).args([
@@ -357,14 +381,142 @@ fn run_host_tests() -> Result<(), String> {
         "--package",
         "newos-kernel-core",
         "--package",
+        "newos-shell-core",
+        "--package",
         "newos-net",
     ]);
+    if release {
+        cmd.arg("--release");
+    }
     run_checked(&mut cmd, "cargo test (host)")
 }
 
-fn run_tests(arch: Arch) -> Result<(), String> {
-    run_host_tests()?;
-    run_qemu(arch, true, false)
+fn run_bench(raw_args: &[String]) -> Result<(), String> {
+    let root = workspace_root();
+    let bench_args: Vec<&str> = raw_args
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| *arg != "--release")
+        .collect();
+
+    if bench_args.iter().any(|a| *a == "-h" || *a == "--help") {
+        println!("Usage: cargo xtask bench [--markdown] [--json] [--help]");
+        println!("Builds and runs `newos-bench` in release mode (`opt-level=3`),");
+        println!("falling back to direct offline `rustc` compilation if Cargo deps are uncached.");
+        return Ok(());
+    }
+
+    let cargo_status = Command::new("cargo")
+        .current_dir(&root)
+        .args(["build", "--release", "--offline", "--package", "newos-bench"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let bin_path = match cargo_status {
+        Ok(status) if status.success() => root.join("target/release/newos-bench"),
+        _ => {
+            let out_dir = root.join("target/bench");
+            fs::create_dir_all(&out_dir)
+                .map_err(|e| format!("failed to create {}: {e}", out_dir.display()))?;
+
+            let abi_rlib = out_dir.join("libnewos_abi.rlib");
+            let kc_rlib = out_dir.join("libnewos_kernel_core.rlib");
+            let sc_rlib = out_dir.join("libnewos_shell_core.rlib");
+            let bench_bin = out_dir.join("newos_bench");
+
+            let abi_extern = format!("newos_abi={}", abi_rlib.display());
+            let kc_extern = format!("newos_kernel_core={}", kc_rlib.display());
+            let sc_extern = format!("newos_shell_core={}", sc_rlib.display());
+
+            run_checked(
+                Command::new("rustc").current_dir(&root).args([
+                    "--edition",
+                    "2024",
+                    "-C",
+                    "opt-level=3",
+                    "--crate-name",
+                    "newos_abi",
+                    "--crate-type",
+                    "lib",
+                    "crates/abi/src/lib.rs",
+                    "-o",
+                    abi_rlib.to_str().ok_or("invalid abi rlib path")?,
+                ]),
+                "rustc (newos_abi)",
+            )?;
+
+            run_checked(
+                Command::new("rustc").current_dir(&root).args([
+                    "--edition",
+                    "2024",
+                    "-C",
+                    "opt-level=3",
+                    "--crate-name",
+                    "newos_kernel_core",
+                    "--crate-type",
+                    "lib",
+                    "crates/kernel-core/src/lib.rs",
+                    "--extern",
+                    &abi_extern,
+                    "-o",
+                    kc_rlib.to_str().ok_or("invalid kernel_core rlib path")?,
+                ]),
+                "rustc (newos_kernel_core)",
+            )?;
+
+            run_checked(
+                Command::new("rustc").current_dir(&root).args([
+                    "--edition",
+                    "2024",
+                    "-C",
+                    "opt-level=3",
+                    "--crate-name",
+                    "newos_shell_core",
+                    "--crate-type",
+                    "lib",
+                    "crates/shell-core/src/lib.rs",
+                    "--extern",
+                    &abi_extern,
+                    "-o",
+                    sc_rlib.to_str().ok_or("invalid shell_core rlib path")?,
+                ]),
+                "rustc (newos_shell_core)",
+            )?;
+
+            run_checked(
+                Command::new("rustc").current_dir(&root).args([
+                    "--edition",
+                    "2024",
+                    "-C",
+                    "opt-level=3",
+                    "--crate-name",
+                    "newos_bench",
+                    "crates/bench/src/main.rs",
+                    "--extern",
+                    &abi_extern,
+                    "--extern",
+                    &kc_extern,
+                    "--extern",
+                    &sc_extern,
+                    "-o",
+                    bench_bin.to_str().ok_or("invalid bench bin path")?,
+                ]),
+                "rustc (newos_bench)",
+            )?;
+
+            bench_bin
+        }
+    };
+
+    let mut run_cmd = Command::new(&bin_path);
+    run_cmd.current_dir(&root).args(&bench_args);
+    run_checked(&mut run_cmd, "newos-bench")
+}
+
+fn run_tests(arch: Arch, release: bool) -> Result<(), String> {
+    run_host_tests(release)?;
+    run_qemu(arch, true, false, release)
 }
 
 fn find_firmware(arch: Arch) -> Result<&'static str, String> {
@@ -386,8 +538,13 @@ fn find_firmware(arch: Arch) -> Result<&'static str, String> {
         .ok_or_else(|| format!("UEFI firmware not found for {}", arch.name()))
 }
 
-fn run_qemu(arch: Arch, expect_success_exit: bool, interactive: bool) -> Result<(), String> {
-    let iso_path = build_iso(arch, interactive)?;
+fn run_qemu(
+    arch: Arch,
+    expect_success_exit: bool,
+    interactive: bool,
+    release: bool,
+) -> Result<(), String> {
+    let iso_path = build_iso(arch, interactive, release)?;
     let firmware = find_firmware(arch)?;
     let iso_str = iso_path.to_str().ok_or("invalid iso path")?;
 

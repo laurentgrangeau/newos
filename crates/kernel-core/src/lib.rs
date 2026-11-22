@@ -12,6 +12,8 @@ pub mod ipc;
 pub mod memory;
 pub mod sched;
 
+pub use ipc::{IpcMessage, IpcStats, KernelIpcState};
+
 use core::fmt::Write;
 use cspace::{CNode, CapObject, Capability};
 use memory::{

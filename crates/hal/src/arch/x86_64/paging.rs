@@ -1,8 +1,9 @@
 //! Minimal audited 64-bit 4-level paging (`VSpace`) and modern CPU security hardening (`WP`/`NXE`/`SMEP`/`SMAP`/`UMIP`).
 
 use core::arch::asm;
-use core::arch::x86_64::__cpuid_count;
+use core::arch::x86_64::{__cpuid, __cpuid_count};
 use core::ptr::{read_volatile, write_bytes, write_volatile};
+use core::sync::atomic::{AtomicBool, Ordering};
 use newos_abi::SysError;
 use newos_kernel_core::memory::{
     CpuSecurityFeatures, PAGE_SIZE, PageFlags, PhysAddr, PhysFrame, UntypedInventory, VSpaceMapper,
@@ -16,9 +17,19 @@ const EFER_NXE: u64 = 1 << 11;
 
 const CR0_WP: u64 = 1 << 16;
 
+const CR4_PGE: u64 = 1 << 7;
 const CR4_UMIP: u64 = 1 << 11;
+const CR4_PCIDE: u64 = 1 << 17;
 const CR4_SMEP: u64 = 1 << 20;
 const CR4_SMAP: u64 = 1 << 21;
+
+static PCID_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Return `true` if `CR4.PCIDE` was successfully enabled on this CPU.
+#[inline]
+pub fn pcid_enabled() -> bool {
+    PCID_ENABLED.load(Ordering::Relaxed)
+}
 
 // Hardware x86_64 4-level page-table entry bits
 const PTE_PRESENT: u64 = 1 << 0;
@@ -43,6 +54,9 @@ pub fn enable_modern_cpu_features() -> CpuSecurityFeatures {
         efer |= EFER_NXE;
         percpu::wrmsr(IA32_EFER_MSR, efer);
 
+        let leaf1 = __cpuid(1);
+        let has_pcid = (leaf1.ecx & (1 << 17)) != 0;
+
         let leaf7 = __cpuid_count(7, 0);
         let has_smep = (leaf7.ebx & (1 << 7)) != 0;
         let has_smap = (leaf7.ebx & (1 << 20)) != 0;
@@ -50,6 +64,7 @@ pub fn enable_modern_cpu_features() -> CpuSecurityFeatures {
 
         let mut cr4: u64;
         asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+        cr4 |= CR4_PGE;
         if has_smep {
             cr4 |= CR4_SMEP;
         }
@@ -59,7 +74,17 @@ pub fn enable_modern_cpu_features() -> CpuSecurityFeatures {
         if has_umip {
             cr4 |= CR4_UMIP;
         }
+        if has_pcid {
+            // Intel SDM Vol. 3A §4.10.1: CR3[11:0] must be 0 before setting CR4.PCIDE = 1.
+            let cr3: u64;
+            asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+            if (cr3 & 0xFFF) != 0 {
+                asm!("mov cr3, {}", in(reg) (cr3 & !0xFFF), options(nostack, preserves_flags));
+            }
+            cr4 |= CR4_PCIDE;
+        }
         asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
+        PCID_ENABLED.store(has_pcid, Ordering::Release);
 
         CpuSecurityFeatures {
             wp: true,

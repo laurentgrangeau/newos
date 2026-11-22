@@ -9,7 +9,12 @@
 use core::arch::asm;
 use core::cell::SyncUnsafeCell;
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicU64, Ordering};
 use newos_abi::{CapId, QemuExitCode, SysError, SyscallNumber};
+
+const DEBUG_WRITE_MAX: usize = 256;
+const SYS_INFO_UNCACHED: u64 = u64::MAX;
+static SYS_INFO_CACHE: AtomicU64 = AtomicU64::new(SYS_INFO_UNCACHED);
 
 const RECOVERY_STACK_SIZE: usize = 64 * 1024;
 
@@ -71,13 +76,95 @@ pub fn debug_log(msg: &str) -> Result<usize, SysError> {
     .map(|n| n as usize)
 }
 
+/// Write an entire UTF-8 string to the debug console, chunking at `<= 256`B UTF-8 char boundaries.
+pub fn debug_write_all(mut s: &str) -> Result<(), SysError> {
+    while !s.is_empty() {
+        let mut end = s.len().min(DEBUG_WRITE_MAX);
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            return Err(SysError::InvalidArgument);
+        }
+        let written = debug_log(&s[..end])?;
+        if written == 0 || written > end || !s.is_char_boundary(written) {
+            return Err(SysError::InvalidArgument);
+        }
+        s = &s[written..];
+    }
+    Ok(())
+}
+
 /// Safe `core::fmt::Write` adapter for formatted Ring-3 diagnostics.
 pub struct DebugConsole;
 
 impl Write for DebugConsole {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        let _ = debug_log(s);
-        Ok(())
+        debug_write_all(s).map_err(|_| fmt::Error)
+    }
+}
+
+/// Fixed-size stack-buffered `core::fmt::Write` console (`no_alloc`, zero `unsafe`).
+///
+/// Coalesces `write!`/`writeln!` fragments into `<= N`-byte `DebugWrite` syscalls and
+/// flushes automatically on `Drop` (call `flush()` explicitly before diverging calls).
+pub struct BufferedConsole<const N: usize = 256> {
+    buf: [u8; N],
+    pos: usize,
+}
+
+impl<const N: usize> BufferedConsole<N> {
+    pub const fn new() -> Self {
+        Self {
+            buf: [0u8; N],
+            pos: 0,
+        }
+    }
+
+    pub fn flush(&mut self) {
+        if self.pos > 0 {
+            if let Ok(s) = core::str::from_utf8(&self.buf[..self.pos]) {
+                let _ = debug_write_all(s);
+            }
+            self.pos = 0;
+        }
+    }
+}
+
+impl<const N: usize> Default for BufferedConsole<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> Write for BufferedConsole<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if s.is_empty() {
+            return Ok(());
+        }
+        if N == 0 {
+            return debug_write_all(s).map_err(|_| fmt::Error);
+        }
+        let bytes = s.as_bytes();
+        if bytes.len() <= N - self.pos {
+            self.buf[self.pos..self.pos + bytes.len()].copy_from_slice(bytes);
+            self.pos += bytes.len();
+            return Ok(());
+        }
+        self.flush();
+        if bytes.len() >= N {
+            debug_write_all(s).map_err(|_| fmt::Error)
+        } else {
+            self.buf[..bytes.len()].copy_from_slice(bytes);
+            self.pos = bytes.len();
+            Ok(())
+        }
+    }
+}
+
+impl<const N: usize> Drop for BufferedConsole<N> {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -101,12 +188,37 @@ pub fn ipc_send(cap: CapId, payload: u64) -> Result<(), SysError> {
     raw_syscall(SyscallNumber::IpcSend, cap.raw(), payload, 0, 0).map(|_| ())
 }
 
+#[inline]
+const fn unpack_ipc_msg(packed: u64) -> (u64, u64) {
+    (packed >> 48, packed & 0x0000_FFFF_FFFF_FFFF)
+}
+
 /// Receive a pending fastpath IPC `(badge, payload)` pair from an `Endpoint` capability.
 pub fn ipc_recv(cap: CapId) -> Result<(u64, u64), SysError> {
     let packed = raw_syscall(SyscallNumber::IpcRecv, cap.raw(), 0, 0, 0)?;
-    let badge = packed >> 48;
-    let payload = packed & 0x0000_FFFF_FFFF_FFFF;
-    Ok((badge, payload))
+    Ok(unpack_ipc_msg(packed))
+}
+
+/// Synchronous send+receive fastpath (`IpcCall`) in a single client syscall.
+pub fn ipc_call(ep: CapId, payload: u64) -> Result<(u64, u64), SysError> {
+    let packed = raw_syscall(SyscallNumber::IpcCall, ep.raw(), payload, 0, 0)?;
+    Ok(unpack_ipc_msg(packed))
+}
+
+/// Combined reply + wait-for-next-request fastpath (`IpcReplyRecv`) in a single server syscall.
+pub fn ipc_reply_recv(
+    ep: CapId,
+    reply_payload: u64,
+    has_reply: bool,
+) -> Result<(u64, u64), SysError> {
+    let packed = raw_syscall(
+        SyscallNumber::IpcReplyRecv,
+        ep.raw(),
+        reply_payload,
+        u64::from(has_reply),
+        0,
+    )?;
+    Ok(unpack_ipc_msg(packed))
 }
 
 /// Read the CPU monotonic cycle counter (`rdtsc`) via syscall.
@@ -184,13 +296,29 @@ pub fn debug_read_byte() -> Result<u8, SysError> {
     raw_syscall(SyscallNumber::DebugRead, 0, 0, 0, 0).map(|b| b as u8)
 }
 
-/// Read-only microkernel system info (`online_cpus`, `proc_count`, `interactive_shell`).
-pub fn sys_info() -> SysInfo {
-    let raw = raw_syscall(SyscallNumber::SysInfo, 0, 0, 0, 0).unwrap_or(0);
+#[inline]
+const fn decode_sys_info(raw: u64) -> SysInfo {
     SysInfo {
         online_cpus: (raw & 0xFFFF) as u16,
         proc_count: ((raw >> 16) & 0xFFFF) as u16,
         interactive_shell: ((raw >> 32) & 1) != 0,
+    }
+}
+
+/// Read-only microkernel system info (`online_cpus`, `proc_count`, `interactive_shell`).
+///
+/// Static after boot; cached in an `AtomicU64` after the first successful syscall.
+pub fn sys_info() -> SysInfo {
+    let cached = SYS_INFO_CACHE.load(Ordering::Relaxed);
+    if cached != SYS_INFO_UNCACHED {
+        return decode_sys_info(cached);
+    }
+    match raw_syscall(SyscallNumber::SysInfo, 0, 0, 0, 0) {
+        Ok(raw) => {
+            SYS_INFO_CACHE.store(raw, Ordering::Relaxed);
+            decode_sys_info(raw)
+        }
+        Err(_) => decode_sys_info(0),
     }
 }
 

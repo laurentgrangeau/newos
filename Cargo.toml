@@ -6,6 +6,8 @@ members = [
     "crates/hal",
     "crates/kernel-core",
     "crates/kernel",
+    "crates/shell-core",
+    "crates/bench",
     "crates/user-rt",
     "crates/net",
     "crates/init",
@@ -15,6 +17,8 @@ default-members = [
     "xtask",
     "crates/abi",
     "crates/kernel-core",
+    "crates/shell-core",
+    "crates/bench",
     "crates/net",
 ]
 
@@ -29,8 +33,11 @@ newos-abi = { path = "crates/abi" }
 newos-hal = { path = "crates/hal" }
 newos-kernel-core = { path = "crates/kernel-core" }
 newos-net = { path = "crates/net" }
+newos-shell-core = { path = "crates/shell-core" }
 newos-user-rt = { path = "crates/user-rt" }
 
 [profile.release]
+opt-level = 3
 lto = true
 codegen-units = 1
+panic = "abort"

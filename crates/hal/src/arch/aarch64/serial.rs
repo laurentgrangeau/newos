@@ -41,15 +41,10 @@ impl Pl011 {
         Self
     }
 
-    fn write_byte(&mut self, byte: u8) {
-        let base = PL011_VIRT_BASE.load(Ordering::Acquire) as usize;
-        if base == 0 {
-            return;
-        }
-        // SAFETY: `PL011_VIRT_BASE` points to the PL011 UART MMIO registers mapped via HHDM.
+    #[inline]
+    fn write_byte_mmio(fr: *const u32, dr: *mut u32, byte: u8) {
+        // SAFETY: `fr` and `dr` point to valid PL011 UART MMIO registers mapped via HHDM.
         unsafe {
-            let fr = (base + UART_FR_OFF) as *const u32;
-            let dr = (base + UART_DR_OFF) as *mut u32;
             while (read_volatile(fr) & UART_FR_TXFF) != 0 {
                 core::hint::spin_loop();
             }
@@ -60,11 +55,17 @@ impl Pl011 {
 
 impl Write for Pl011 {
     fn write_str(&mut self, s: &str) -> fmt::Result {
+        let base = PL011_VIRT_BASE.load(Ordering::Acquire) as usize;
+        if base == 0 {
+            return Ok(());
+        }
+        let fr = (base + UART_FR_OFF) as *const u32;
+        let dr = (base + UART_DR_OFF) as *mut u32;
         for byte in s.bytes() {
             if byte == b'\n' {
-                self.write_byte(b'\r');
+                Self::write_byte_mmio(fr, dr, b'\r');
             }
-            self.write_byte(byte);
+            Self::write_byte_mmio(fr, dr, byte);
         }
         Ok(())
     }

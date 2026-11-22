@@ -6,7 +6,8 @@ use core::cell::SyncUnsafeCell;
 use core::fmt::Write;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
-use newos_abi::{CapId, QemuExitCode, SysError, SyscallNumber};
+use newos_abi::{CapId, QemuExitCode, Rights, SysError, SyscallNumber};
+use newos_kernel_core::cspace::CapObject;
 use newos_kernel_core::ipc::KernelIpcState;
 use newos_kernel_core::memory::PhysAddr;
 
@@ -14,6 +15,12 @@ use super::serial;
 
 const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
 const MAX_PROCS: usize = 4;
+const TTBR0_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+#[inline]
+const fn pack_ipc_msg(badge: u64, payload: u64) -> u64 {
+    ((badge & 0xFFFF) << 48) | (payload & 0x0000_FFFF_FFFF_FFFF)
+}
 
 static YIELD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
@@ -44,10 +51,19 @@ impl TrapFrame {
     };
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IpcWaitState {
+    Runnable,
+    WaitingReply,
+    WaitingRecv,
+}
+
 #[derive(Clone, Copy)]
 struct ProcessSlot {
     active: bool,
     ttbr0: u64,
+    wait: IpcWaitState,
+    wait_ep_id: u32,
     frame: TrapFrame,
 }
 
@@ -55,6 +71,8 @@ impl ProcessSlot {
     const EMPTY: Self = Self {
         active: false,
         ttbr0: 0,
+        wait: IpcWaitState::Runnable,
+        wait_ep_id: 0,
         frame: TrapFrame::ZERO,
     };
 }
@@ -72,6 +90,34 @@ impl ProcTable {
             count: 0,
             current: 0,
         }
+    }
+
+    #[inline]
+    fn find_next_runnable(&self, from: usize) -> Option<usize> {
+        if self.count <= 1 {
+            return None;
+        }
+        for offset in 1..self.count {
+            let idx = (from + offset) % self.count;
+            if self.procs[idx].active && self.procs[idx].wait == IpcWaitState::Runnable {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn find_waiter(&self, state: IpcWaitState, ep_id: u32, exclude: usize) -> Option<usize> {
+        for idx in 0..self.count {
+            if idx != exclude
+                && self.procs[idx].active
+                && self.procs[idx].wait == state
+                && self.procs[idx].wait_ep_id == ep_id
+            {
+                return Some(idx);
+            }
+        }
+        None
     }
 }
 
@@ -123,6 +169,8 @@ pub fn register_user_process(entry_pc: u64, user_sp: u64, ttbr0: u64) -> Result<
         table.procs[pid] = ProcessSlot {
             active: true,
             ttbr0,
+            wait: IpcWaitState::Runnable,
+            wait_ep_id: 0,
             frame,
         };
         table.count += 1;
@@ -131,17 +179,18 @@ pub fn register_user_process(entry_pc: u64, user_sp: u64, ttbr0: u64) -> Result<
 }
 
 #[inline]
-fn switch_ttbr0(ttbr0: u64) {
-    // SAFETY: `ttbr0` is a verified 4 KiB-aligned EL0 L0 page-table physical address;
-    // `TTBR1_EL1` (kernel) remains untouched and `tlbi vmalle1` flushes stale EL0 TLB entries.
+fn switch_ttbr0(ttbr0_phys: u64, pid: usize) {
+    let asid = ((pid + 1) as u64) & 0xFF;
+    let val = (asid << 48) | (ttbr0_phys & TTBR0_ADDR_MASK);
+    // SAFETY: `ttbr0_phys` is a verified 4 KiB-aligned EL0 L0 page-table physical address whose
+    // user leaf PTEs are tagged with `DESC_NG = 1 << 11`. `TCR_EL1.A1 == 0` routes ASID selection
+    // through `TTBR0_EL1[63:48]`, so each PID (`1..=MAX_PROCS`) isolates its TLB entries without
+    // requiring a global `tlbi vmalle1` flush.
     unsafe {
         asm!(
-            "msr ttbr0_el1, {ttbr0}",
-            "dsb ish",
-            "tlbi vmalle1",
-            "dsb ish",
+            "msr ttbr0_el1, {val}",
             "isb",
-            ttbr0 = in(reg) ttbr0,
+            val = in(reg) val,
             options(nostack),
         );
     }
@@ -166,13 +215,15 @@ fn copy_from_user(user_ptr: u64, len: u64, dst: &mut [u8]) -> Result<usize, SysE
         return Err(SysError::InvalidArgument);
     }
     let count = (len as usize).min(dst.len());
+    if count == 0 {
+        return Ok(0);
+    }
     let src = user_ptr as *const u8;
-    // SAFETY: `user_ptr..user_ptr+count` is validated strictly within canonical EL0 user space
-    // mapped in the currently active `TTBR0_EL1`.
+    // SAFETY: `user_ptr..user_ptr+count` is non-null, overflow-checked, and strictly within
+    // lower-half canonical EL0 user space (`< USER_ADDR_LIMIT`) mapped in active `TTBR0_EL1`,
+    // while `dst` is an EL1 kernel stack slice in higher-half `TTBR1_EL1`, so regions are disjoint.
     unsafe {
-        for (i, slot) in dst.iter_mut().take(count).enumerate() {
-            *slot = read_volatile(src.add(i));
-        }
+        core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), count);
     }
     Ok(count)
 }
@@ -226,6 +277,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
 
     let a0 = frame.x[0];
     let a1 = frame.x[1];
+    let a2 = frame.x[2];
     // SAFETY: EL1 synchronous handler runs with DAIF masked on BSP.
     let ipc = unsafe { &mut *IPC_STATE.get() };
 
@@ -240,19 +292,18 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             })
         }
         SyscallNumber::Yield => {
-            let next_count = YIELD_COUNTER.fetch_add(1, Ordering::AcqRel) + 1;
+            let next_count = YIELD_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
             frame.x[0] = 0;
             frame.x[1] = next_count;
 
-            // SAFETY: Cooperative round-robin switch across isolated hardware `TTBR0_EL1` VSpaces.
+            // SAFETY: Cooperative round-robin switch across runnable hardware `TTBR0_EL1` VSpaces.
             unsafe {
                 let table = &mut *PROCS.get();
-                if table.count > 1 {
-                    let cur = table.current;
-                    let next = (cur + 1) % table.count;
+                let cur = table.current;
+                if let Some(next) = table.find_next_runnable(cur) {
                     table.procs[cur].frame = *frame;
                     table.current = next;
-                    switch_ttbr0(table.procs[next].ttbr0);
+                    switch_ttbr0(table.procs[next].ttbr0, next);
                     *frame = table.procs[next].frame;
                 }
             }
@@ -268,10 +319,182 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         }
         SyscallNumber::NotifySignal => ipc.notify_signal(CapId::new(a0), a1).map(|()| 0),
         SyscallNumber::NotifyPoll => ipc.notify_poll(CapId::new(a0)),
-        SyscallNumber::IpcSend => ipc.ipc_send(CapId::new(a0), a1).map(|()| 0),
-        SyscallNumber::IpcRecv => ipc.ipc_recv(CapId::new(a0)).map(|msg| {
-            ((msg.badge & 0xFFFF) << 48) | (msg.payload & 0x0000_FFFF_FFFF_FFFF)
-        }),
+        SyscallNumber::IpcSend => {
+            if let Ok((ep_id, badge)) = ipc
+                .root_cspace
+                .lookup(CapId::new(a0), Rights::WRITE)
+                .and_then(|cap| match cap.object {
+                    CapObject::Endpoint { id } => Ok((id, cap.badge)),
+                    _ => Err(SysError::InvalidArgument),
+                })
+            {
+                // SAFETY: EL1 synchronous handler runs with DAIF masked on BSP.
+                let woken = unsafe {
+                    let table = &mut *PROCS.get();
+                    let cur = table.current;
+                    let waiter = table
+                        .find_waiter(IpcWaitState::WaitingRecv, ep_id, cur)
+                        .or_else(|| table.find_waiter(IpcWaitState::WaitingReply, ep_id, cur));
+                    if let Some(peer) = waiter {
+                        table.procs[peer].frame.x[0] = 0;
+                        table.procs[peer].frame.x[1] = pack_ipc_msg(badge, a1);
+                        table.procs[peer].wait = IpcWaitState::Runnable;
+                        table.procs[peer].wait_ep_id = 0;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if woken {
+                    Ok(0)
+                } else {
+                    ipc.ipc_send(CapId::new(a0), a1).map(|()| 0)
+                }
+            } else {
+                ipc.ipc_send(CapId::new(a0), a1).map(|()| 0)
+            }
+        }
+        SyscallNumber::IpcRecv => ipc
+            .ipc_recv(CapId::new(a0))
+            .map(|msg| pack_ipc_msg(msg.badge, msg.payload)),
+        SyscallNumber::IpcCall => {
+            let resolved = ipc
+                .root_cspace
+                .lookup(CapId::new(a0), Rights::WRITE.union(Rights::READ))
+                .and_then(|cap| match cap.object {
+                    CapObject::Endpoint { id } => Ok((id, cap.badge)),
+                    _ => Err(SysError::InvalidArgument),
+                });
+            match resolved {
+                Err(e) => Err(e),
+                Ok((ep_id, badge)) => {
+                    // SAFETY: EL1 synchronous handler runs with DAIF masked on BSP.
+                    unsafe {
+                        let table = &mut *PROCS.get();
+                        let cur = table.current;
+                        if let Some(server) =
+                            table.find_waiter(IpcWaitState::WaitingRecv, ep_id, cur)
+                        {
+                            table.procs[server].frame.x[0] = 0;
+                            table.procs[server].frame.x[1] = pack_ipc_msg(badge, a1);
+                            table.procs[server].wait = IpcWaitState::Runnable;
+                            table.procs[server].wait_ep_id = 0;
+                            table.procs[cur].wait = IpcWaitState::WaitingReply;
+                            table.procs[cur].wait_ep_id = ep_id;
+                            table.procs[cur].frame = *frame;
+                            table.current = server;
+                            switch_ttbr0(table.procs[server].ttbr0, server);
+                            *frame = table.procs[server].frame;
+                            return;
+                        }
+                        if let Some(next) = table.find_next_runnable(cur) {
+                            match ipc.ipc_send(CapId::new(a0), a1) {
+                                Ok(()) => {
+                                    table.procs[cur].wait = IpcWaitState::WaitingReply;
+                                    table.procs[cur].wait_ep_id = ep_id;
+                                    table.procs[cur].frame = *frame;
+                                    table.current = next;
+                                    switch_ttbr0(table.procs[next].ttbr0, next);
+                                    *frame = table.procs[next].frame;
+                                    return;
+                                }
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            Err(SysError::WouldBlock)
+                        }
+                    }
+                }
+            }
+        }
+        SyscallNumber::IpcReplyRecv => {
+            if a2 != 0 {
+                let resolved = ipc
+                    .root_cspace
+                    .lookup(CapId::new(a0), Rights::WRITE.union(Rights::READ))
+                    .and_then(|cap| match cap.object {
+                        CapObject::Endpoint { id } => Ok((id, cap.badge)),
+                        _ => Err(SysError::InvalidArgument),
+                    });
+                match resolved {
+                    Err(e) => Err(e),
+                    Ok((ep_id, badge)) => {
+                        // SAFETY: EL1 synchronous handler runs with DAIF masked on BSP.
+                        unsafe {
+                            let table = &mut *PROCS.get();
+                            let cur = table.current;
+                            if let Some(client) =
+                                table.find_waiter(IpcWaitState::WaitingReply, ep_id, cur)
+                            {
+                                table.procs[client].frame.x[0] = 0;
+                                table.procs[client].frame.x[1] = pack_ipc_msg(badge, a1);
+                                table.procs[client].wait = IpcWaitState::Runnable;
+                                table.procs[client].wait_ep_id = 0;
+                                table.procs[cur].wait = IpcWaitState::WaitingRecv;
+                                table.procs[cur].wait_ep_id = ep_id;
+                                table.procs[cur].frame = *frame;
+                                table.current = client;
+                                switch_ttbr0(table.procs[client].ttbr0, client);
+                                *frame = table.procs[client].frame;
+                                return;
+                            }
+                            // No client parked in WaitingReply (e.g., legacy IpcSend/IpcRecv client):
+                            // buffer the reply, then park in WaitingRecv instead of falling through
+                            // into ipc_recv on the same endpoint (which would self-consume the reply).
+                            match ipc.ipc_send(CapId::new(a0), a1) {
+                                Ok(()) => {
+                                    if let Some(next) = table.find_next_runnable(cur) {
+                                        table.procs[cur].wait = IpcWaitState::WaitingRecv;
+                                        table.procs[cur].wait_ep_id = ep_id;
+                                        table.procs[cur].frame = *frame;
+                                        table.current = next;
+                                        switch_ttbr0(table.procs[next].ttbr0, next);
+                                        *frame = table.procs[next].frame;
+                                        return;
+                                    }
+                                    Err(SysError::WouldBlock)
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                    }
+                }
+            } else {
+                match ipc.ipc_recv(CapId::new(a0)) {
+                    Ok(msg) => Ok(pack_ipc_msg(msg.badge, msg.payload)),
+                    Err(SysError::WouldBlock) => {
+                        let resolved = ipc
+                            .root_cspace
+                            .lookup(CapId::new(a0), Rights::READ)
+                            .and_then(|cap| match cap.object {
+                                CapObject::Endpoint { id } => Ok(id),
+                                _ => Err(SysError::InvalidArgument),
+                            });
+                        match resolved {
+                            Err(e) => Err(e),
+                            Ok(ep_id) => {
+                                // SAFETY: EL1 synchronous handler runs with DAIF masked on BSP.
+                                unsafe {
+                                    let table = &mut *PROCS.get();
+                                    let cur = table.current;
+                                    if let Some(next) = table.find_next_runnable(cur) {
+                                        table.procs[cur].wait = IpcWaitState::WaitingRecv;
+                                        table.procs[cur].wait_ep_id = ep_id;
+                                        table.procs[cur].frame = *frame;
+                                        table.current = next;
+                                        switch_ttbr0(table.procs[next].ttbr0, next);
+                                        *frame = table.procs[next].frame;
+                                        return;
+                                    }
+                                }
+                                Err(SysError::WouldBlock)
+                            }
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
         SyscallNumber::ReadCycles => Ok(read_cntvct()),
         SyscallNumber::SetFaultHandler => {
             if a0 == 0 || a0 >= USER_ADDR_LIMIT || a1 == 0 || a1 >= USER_ADDR_LIMIT {
@@ -353,7 +576,8 @@ pub fn start_userspace() -> ! {
         )
     };
 
-    switch_ttbr0(ttbr0);
+    super::paging::ensure_ttbr0_asid_enabled();
+    switch_ttbr0(ttbr0, 0);
 
     // SAFETY: `ttbr0` is active, `entry_pc` and `user_sp` point to valid W^X EL0 mappings,
     // and `SPSR_EL1 = 0` transitions cleanly to AArch64 EL0t via `eret`.
