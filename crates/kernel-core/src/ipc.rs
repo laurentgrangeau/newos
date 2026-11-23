@@ -215,17 +215,39 @@ impl KernelIpcState {
                 badge: 0x1000,
             },
         )?;
-        let _ = self
-            .root_cspace
-            .insert_root_at(15, Capability::new(CapObject::Endpoint { id: 4 }, Rights::READ))?;
+        let _ = self.root_cspace.insert_root_at(
+            15,
+            Capability::new(CapObject::Endpoint { id: 4 }, Rights::READ),
+        )?;
         let _ = self.root_cspace.insert_root_at(
             16,
             Capability::new(CapObject::Endpoint { id: 5 }, Rights::READ),
         )?;
-        let _ = self
-            .root_cspace
-            .insert_root_at(17, Capability::new(CapObject::Endpoint { id: 6 }, Rights::WRITE))?;
+        let _ = self.root_cspace.insert_root_at(
+            17,
+            Capability::new(CapObject::Endpoint { id: 6 }, Rights::WRITE),
+        )?;
         Ok((notif, ep, fault_notif))
+    }
+
+    /// Install a capability-scoped `MmioRegion` (`R|W`) at `slot` in `init` (PID 0)'s `CSpace`.
+    pub fn register_bootstrap_mmio_cap(
+        &mut self,
+        slot: usize,
+        phys: PhysAddr,
+        len: u64,
+    ) -> Result<CapId, SysError> {
+        let rw = Rights::READ.union(Rights::WRITE);
+        self.root_cspace.insert_root_at(
+            slot,
+            Capability::new(CapObject::MmioRegion { phys, len }, rw),
+        )
+    }
+
+    /// Install `CapId::BOOTSTRAP_WDT_MMIO` (slot 18, gen 1, `R|W`) in `init` (PID 0)'s `CSpace`
+    /// for the Raspberry Pi 5 BCM2712 hardware watchdog (`0x10_7D20_0000`, `0x100` bytes).
+    pub fn register_wdt_mmio_cap(&mut self, phys: PhysAddr, len: u64) -> Result<CapId, SysError> {
+        self.register_bootstrap_mmio_cap(18, phys, len)
     }
 
     /// Install strict least-privilege capabilities for `newos-netd` (Network & DMA plane).

@@ -196,12 +196,40 @@ name = "newos-abi"
 version = "0.4.0"
 
 [[package]]
+name = "newos-ai"
+version = "0.4.0"
+dependencies = [
+ "newos-abi",
+]
+
+[[package]]
 name = "newos-bench"
 version = "0.4.0"
 dependencies = [
  "newos-abi",
  "newos-kernel-core",
  "newos-shell-core",
+]
+
+[[package]]
+name = "newos-board"
+version = "0.4.0"
+dependencies = [
+ "newos-abi",
+]
+
+[[package]]
+name = "newos-gpio"
+version = "0.4.0"
+dependencies = [
+ "newos-abi",
+]
+
+[[package]]
+name = "newos-gpu"
+version = "0.4.0"
+dependencies = [
+ "newos-abi",
 ]
 
 [[package]]
@@ -322,7 +350,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "newos-storage"
+version = "0.4.0"
+dependencies = [
+ "newos-abi",
+]
+
+[[package]]
+name = "newos-usb"
+version = "0.4.0"
+dependencies = [
+ "newos-abi",
+]
+
+[[package]]
 name = "newos-user-rt"
+version = "0.4.0"
+dependencies = [
+ "newos-abi",
+]
+
+[[package]]
+name = "newos-wdt"
 version = "0.4.0"
 dependencies = [
  "newos-abi",

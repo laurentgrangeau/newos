@@ -9,7 +9,8 @@ use core::arch::asm;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU64, Ordering};
 use newos_abi::{
-    CAP_MINT_SET_BADGE, CapId, ObjectType, Rights, ShutdownStatus, SysError, SyscallNumber,
+    CAP_MINT_SET_BADGE, CapId, DmaCacheOp, ObjectType, Rights, ShutdownStatus, SysError,
+    SyscallNumber,
 };
 
 pub const DEBUG_WRITE_MAX: usize = 1024;
@@ -500,6 +501,43 @@ pub fn virt_to_phys<T>(value: &T) -> Result<u64, SysError> {
     virt_to_phys_with_cap(CapId::BOOTSTRAP_VSPACE, value)
 }
 
+/// Perform PAN-safe DMA cache maintenance on `value` via `vspace_cap` (`Rights::READ`).
+pub fn dma_cache_op_with_cap<T>(
+    vspace_cap: CapId,
+    value: &T,
+    op: DmaCacheOp,
+) -> Result<u64, SysError> {
+    let va = (value as *const T) as u64;
+    let len = core::mem::size_of::<T>() as u64;
+    raw_syscall(
+        SyscallNumber::DmaCacheOp,
+        vspace_cap.raw(),
+        va,
+        len,
+        op as u64,
+    )
+}
+
+/// Clean data cache lines (`dc cvac`) for `value` before outbound DMA (Pi 5 RP1/PCIe).
+pub fn dma_clean<T>(value: &T) -> Result<u64, SysError> {
+    dma_cache_op_with_cap(CapId::BOOTSTRAP_VSPACE, value, DmaCacheOp::Clean)
+}
+
+/// Clean & invalidate data cache lines (`dc civac`) for `value` before/after inbound DMA.
+pub fn dma_invalidate<T>(value: &T) -> Result<u64, SysError> {
+    dma_cache_op_with_cap(CapId::BOOTSTRAP_VSPACE, value, DmaCacheOp::Invalidate)
+}
+
+/// Read packed ARMv8.2-A Cortex-A76 ISA feature bitmask & cache/PA geometry (`newos_abi::cpu_isa`).
+pub fn cpu_features_with_cap(power_cap: CapId) -> Result<u64, SysError> {
+    raw_syscall(SyscallNumber::CpuFeatures, power_cap.raw(), 0, 0, 0)
+}
+
+/// Read packed ARMv8.2-A Cortex-A76 ISA feature bitmask via `BOOTSTRAP_POWER`.
+pub fn cpu_features() -> Result<u64, SysError> {
+    cpu_features_with_cap(CapId::BOOTSTRAP_POWER)
+}
+
 /// Derive a capability in the caller's `CSpace` with attenuated `rights` and optional immutable `badge`.
 ///
 /// Pass `dst_slot = None` to let the kernel choose the first free slot automatically.
@@ -721,6 +759,11 @@ pub fn exit_with_cap(power_cap: CapId, code: ShutdownStatus) -> ! {
 /// Exit the root task cleanly with `code` via `BOOTSTRAP_POWER`.
 pub fn exit(code: ShutdownStatus) -> ! {
     exit_with_cap(CapId::BOOTSTRAP_POWER, code)
+}
+
+/// Reboot the machine cleanly via PSCI `SYSTEM_RESET` (`BOOTSTRAP_POWER`).
+pub fn reboot() -> ! {
+    exit_with_cap(CapId::BOOTSTRAP_POWER, ShutdownStatus::Reboot)
 }
 
 /// Define an EL0 userspace `_start` entry point delegating to a `#![forbid(unsafe_code)]` `fn() -> !`.

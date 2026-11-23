@@ -35,6 +35,14 @@ impl MmioDmaTransport for CapMmioDmaTransport {
     fn virt_to_phys<T>(&self, r: &T) -> Result<u64, SysError> {
         newos_user_rt::virt_to_phys(r)
     }
+
+    fn dma_clean<T>(&self, r: &T) -> Result<(), SysError> {
+        newos_user_rt::dma_clean(r).map(|_| ())
+    }
+
+    fn dma_invalidate<T>(&self, r: &T) -> Result<(), SysError> {
+        newos_user_rt::dma_invalidate(r).map(|_| ())
+    }
 }
 
 /// EL0 `ShellHost` adapter connecting `newos-shell-core` to `newos-user-rt`, `newos-net`,

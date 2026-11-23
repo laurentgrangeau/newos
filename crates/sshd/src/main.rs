@@ -174,7 +174,8 @@ fn main() -> ! {
     let mut shell_in = [0u8; 256];
 
     loop {
-        let Ok(status_word) = ipc_call_retry(CapId::BOOTSTRAP_NET_EP, net_ipc::encode_poll_status())
+        let Ok(status_word) =
+            ipc_call_retry(CapId::BOOTSTRAP_NET_EP, net_ipc::encode_poll_status())
         else {
             let _ = newos_user_rt::yield_now();
             continue;

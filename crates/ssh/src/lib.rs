@@ -17,12 +17,14 @@ pub mod aead;
 pub mod wire;
 
 use aead::{OpenSshChaCha20Poly1305, TAG_LEN};
-use ml_kem::kem::{Decapsulate, KeyExport};
 use ml_dsa::{
     B32 as DsaB32, EncodedSignature, EncodedVerifyingKey, Keypair, MlDsa87, Signature, SigningKey,
     VerifyingKey,
 };
-use ml_kem::{B32 as KemB32, Ciphertext, DecapsulationKey1024, EncapsulationKey1024, MlKem1024, Seed};
+use ml_kem::kem::{Decapsulate, KeyExport};
+use ml_kem::{
+    B32 as KemB32, Ciphertext, DecapsulationKey1024, EncapsulationKey1024, MlKem1024, Seed,
+};
 use newos_abi::key_ipc::{MLDSA87_PK_BYTES, MLDSA87_SIG_BYTES};
 use newos_abi::sha3::{sha3_512, shake256};
 use wire::{MAX_PACKET_BODY, WireReader, WireWriter};
@@ -143,7 +145,11 @@ fn compute_exchange_hash(
 }
 
 /// Derive directional 64-byte `chacha20-poly1305@openssh.com` keys via domain-separated `SHAKE256`.
-fn derive_session_keys(k_hash: &[u8; 64], h: &[u8; 64], session_id: &[u8; 64]) -> ([u8; 64], [u8; 64]) {
+fn derive_session_keys(
+    k_hash: &[u8; 64],
+    h: &[u8; 64],
+    session_id: &[u8; 64],
+) -> ([u8; 64], [u8; 64]) {
     let mut material = [0u8; 16 + 64 + 64 + 64];
     material[0..15].copy_from_slice(b"newos-pq-ssh-v1");
     material[15] = b'C';
@@ -532,7 +538,12 @@ impl SshServer {
         if self.rx_len < 4 {
             return Ok(None);
         }
-        let enc_len = [self.rx_buf[0], self.rx_buf[1], self.rx_buf[2], self.rx_buf[3]];
+        let enc_len = [
+            self.rx_buf[0],
+            self.rx_buf[1],
+            self.rx_buf[2],
+            self.rx_buf[3],
+        ];
         let packet_len = match &self.rx_cipher {
             Some(c) => c.decrypt_length(self.rx_seq, enc_len) as usize,
             None => u32::from_be_bytes(enc_len) as usize,
@@ -1042,7 +1053,12 @@ impl SshClient {
                 if self.rx_len < 4 {
                     break;
                 }
-                let enc_len = [self.rx_buf[0], self.rx_buf[1], self.rx_buf[2], self.rx_buf[3]];
+                let enc_len = [
+                    self.rx_buf[0],
+                    self.rx_buf[1],
+                    self.rx_buf[2],
+                    self.rx_buf[3],
+                ];
                 let packet_len = match &self.rx_cipher {
                     Some(c) => c.decrypt_length(self.rx_seq, enc_len) as usize,
                     None => u32::from_be_bytes(enc_len) as usize,
@@ -1184,8 +1200,8 @@ impl SshClient {
             }
             (ClientState::AwaitServiceAccept, MSG_SERVICE_ACCEPT) => {
                 let sid = self.session_id.ok_or(SshError::CryptoFailure)?;
-                let uname = core::str::from_utf8(&self.username[..self.username_len])
-                    .unwrap_or("newos");
+                let uname =
+                    core::str::from_utf8(&self.username[..self.username_len]).unwrap_or("newos");
                 let mut sd = [0u8; 512];
                 let sd_len = build_userauth_signed_data(&sid, uname, &self.user_pk, &mut sd)?;
 
@@ -1300,7 +1316,10 @@ mod tests {
             Ok([self.counter; 32])
         }
 
-        fn sign_kex_hash(&mut self, hash64: &[u8; 64]) -> Result<[u8; MLDSA87_SIG_BYTES], SshError> {
+        fn sign_kex_hash(
+            &mut self,
+            hash64: &[u8; 64],
+        ) -> Result<[u8; MLDSA87_SIG_BYTES], SshError> {
             let prefix = [0u8, CTX_KEX.len() as u8];
             let sig = self
                 .host_sk
@@ -1321,7 +1340,9 @@ mod tests {
             let Some(sid) = self.pending_sid.take() else {
                 return Ok(false);
             };
-            if signed_data.len() < 68 || &signed_data[4..68] != &sid || client_pk != &self.allowed_pk
+            if signed_data.len() < 68
+                || &signed_data[4..68] != &sid
+                || client_pk != &self.allowed_pk
             {
                 return Ok(false);
             }
@@ -1432,7 +1453,8 @@ mod tests {
         let mut w = WireWriter::new(&mut legacy);
         w.write_u8(MSG_KEXINIT).unwrap();
         w.write_raw(&[0u8; 16]).unwrap();
-        w.write_str("curve25519-sha256,kex-strict-c-v00@openssh.com").unwrap();
+        w.write_str("curve25519-sha256,kex-strict-c-v00@openssh.com")
+            .unwrap();
         w.write_str("ssh-ed25519").unwrap();
         w.write_str(ALG_CIPHER).unwrap();
         w.write_str(ALG_CIPHER).unwrap();

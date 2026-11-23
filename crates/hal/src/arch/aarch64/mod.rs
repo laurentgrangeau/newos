@@ -11,11 +11,12 @@ pub mod syscall;
 use core::arch::{asm, global_asm};
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use newos_abi::{ShutdownStatus, SysError};
+use newos_abi::{ShutdownStatus, SysError, cpu_isa};
 use newos_kernel_core::memory::{CpuSecurityFeatures, PhysAddr, UntypedInventory, VirtAddr};
 use newos_kernel_core::{BootInfo, HalPlatform};
 
 const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 
 static BREAKPOINT_COUNT: AtomicU64 = AtomicU64::new(0);
 static TIMER_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -23,20 +24,42 @@ static PAN_ENABLED: AtomicBool = AtomicBool::new(false);
 static SSBS_ENABLED: AtomicBool = AtomicBool::new(false);
 static CSV2_SUPPORTED: AtomicBool = AtomicBool::new(false);
 static CSV3_SUPPORTED: AtomicBool = AtomicBool::new(false);
+static PMUV3_ENABLED: AtomicBool = AtomicBool::new(false);
+static CPU_ISA_FEATURES: AtomicU64 = AtomicU64::new(0);
 static PSCI_USE_SMC: AtomicBool = AtomicBool::new(false);
 static ENTROPY_STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
 
-/// Probe ARMv8.2-A Cortex-A76 CPU security features (`PAN`, `SSBS`, `CSV2`, `CSV3`)
-/// and enable hardware `PAN` (ARMv8.1-A) and `SCTLR_EL1.DSSBS` (Spectre v4 mitigation) when present.
+#[inline]
+pub fn cpu_isa_features() -> u64 {
+    CPU_ISA_FEATURES.load(Ordering::Acquire)
+}
+
+#[inline]
+pub fn pmuv3_enabled() -> bool {
+    PMUV3_ENABLED.load(Ordering::Acquire)
+}
+
+/// Probe ARMv8.2-A Cortex-A76 CPU security & ISA features (`PAN`, `SSBS`, `CSV2`, `CSV3`,
+/// `LSE`, `CRC32`, `AES`, `PMULL`, `SHA1`, `SHA256`, `DOTPROD`, `FP16`, `ASIMD`, `PMUv3`),
+/// cache line size (`CTR_EL0`), and physical address width (`ID_AA64MMFR0_EL1.PARange`).
+/// Enables hardware `PAN`, `SCTLR_EL1.DSSBS`, and `PMUv3` cycle counter when present.
 fn probe_and_enable_cpu_hardening() {
+    let mmfr0: u64;
     let mmfr1: u64;
     let pfr0: u64;
     let pfr1: u64;
-    // SAFETY: Reading architectural ID registers in EL1 inspects hardware mitigation support.
+    let isar0: u64;
+    let dfr0: u64;
+    let ctr: u64;
+    // SAFETY: Reading architectural ID and cache-type registers in EL1 inspects hardware capabilities.
     unsafe {
+        asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0, options(nomem, nostack));
         asm!("mrs {}, id_aa64mmfr1_el1", out(reg) mmfr1, options(nomem, nostack));
         asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0, options(nomem, nostack));
         asm!("mrs {}, id_aa64pfr1_el1", out(reg) pfr1, options(nomem, nostack));
+        asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack));
+        asm!("mrs {}, id_aa64dfr0_el1", out(reg) dfr0, options(nomem, nostack));
+        asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
     }
     let has_pan = ((mmfr1 >> 20) & 0xF) != 0;
     let has_csv2 = ((pfr0 >> 56) & 0xF) != 0;
@@ -63,10 +86,84 @@ fn probe_and_enable_cpu_hardening() {
         }
     }
 
+    // Decode ARMv8.2-A Cortex-A76 ISA extensions & cache/PA geometry.
+    let mut isa = 0u64;
+    let aes_field = (isar0 >> 4) & 0xF;
+    if aes_field >= 1 {
+        isa |= cpu_isa::AES;
+    }
+    if aes_field >= 2 {
+        isa |= cpu_isa::PMULL;
+    }
+    if ((isar0 >> 8) & 0xF) >= 1 {
+        isa |= cpu_isa::SHA1;
+    }
+    if ((isar0 >> 12) & 0xF) >= 1 {
+        isa |= cpu_isa::SHA256;
+    }
+    if ((isar0 >> 16) & 0xF) >= 1 {
+        isa |= cpu_isa::CRC32;
+    }
+    if ((isar0 >> 20) & 0xF) >= 2 {
+        isa |= cpu_isa::LSE;
+    }
+    if ((isar0 >> 44) & 0xF) >= 1 {
+        isa |= cpu_isa::DOTPROD;
+    }
+    let asimd_field = (pfr0 >> 20) & 0xF;
+    let fp_field = (pfr0 >> 16) & 0xF;
+    if asimd_field != 0xF {
+        isa |= cpu_isa::ASIMD;
+    }
+    if asimd_field == 1 || fp_field == 1 {
+        isa |= cpu_isa::FP16;
+    }
+    let pmu_ver = (dfr0 >> 8) & 0xF;
+    let has_pmuv3 = pmu_ver >= 1 && pmu_ver != 0xF;
+    if has_pmuv3 {
+        isa |= cpu_isa::PMUV3;
+        // SAFETY: CPU advertises PMUv3 (`ID_AA64DFR0_EL1.PMUVer`); enable the architectural
+        // 64-bit cycle counter (`PMCCNTR_EL0`) for EL1/EL0 performance measurement.
+        unsafe {
+            let pmcr: u64 = (1 << 0) | (1 << 2); // E (enable) | C (reset cycle counter)
+            let cntenset: u64 = 1 << 31; // Enable PMCCNTR_EL0
+            let userenr: u64 = 1 << 2; // CR: allow EL0 read of PMCCNTR_EL0
+            asm!(
+                "msr pmuserenr_el0, {userenr}",
+                "msr pmcr_el0, {pmcr}",
+                "msr pmcntenset_el0, {cntenset}",
+                "isb",
+                userenr = in(reg) userenr,
+                pmcr = in(reg) pmcr,
+                cntenset = in(reg) cntenset,
+                options(nomem, nostack),
+            );
+        }
+    }
+
+    let pa_bits: u8 = match mmfr0 & 0xF {
+        0 => 32,
+        1 => 36,
+        2 => 40,
+        3 => 42,
+        4 => 44,
+        5 => 48,
+        6 => 52,
+        _ => 40,
+    };
+    let dmin_line = (ctr >> 16) & 0xF;
+    let dcache_line_bytes = (4u16).checked_shl(dmin_line as u32).unwrap_or(64);
+    paging::set_dcache_line_bytes(u64::from(dcache_line_bytes));
+
     PAN_ENABLED.store(has_pan, Ordering::Release);
     SSBS_ENABLED.store(has_ssbs, Ordering::Release);
     CSV2_SUPPORTED.store(has_csv2, Ordering::Release);
     CSV3_SUPPORTED.store(has_csv3, Ordering::Release);
+    PMUV3_ENABLED.store(has_pmuv3, Ordering::Release);
+    CPU_ISA_FEATURES.store(
+        cpu_isa::pack(isa, pa_bits, dcache_line_bytes),
+        Ordering::Release,
+    );
 }
 
 // 2 KiB-aligned EL1 exception vector table handling EL1 `brk #0` and EL0 `svc #0` / faults.
@@ -316,25 +413,32 @@ pub fn get_cpu_id() -> u64 {
     id
 }
 
-/// Power off cleanly via PSCI `SYSTEM_OFF` (`smc #0` on Raspberry Pi 5 ATF/UEFI, `hvc #0` on QEMU `virt`).
+/// Power off or reboot cleanly via PSCI `SYSTEM_OFF` / `SYSTEM_RESET`
+/// (`smc #0` on Raspberry Pi 5 ATF/UEFI, `hvc #0` on QEMU `virt`).
 pub fn system_off(code: ShutdownStatus) -> ! {
     let mut s = serial::Pl011::new();
-    match code {
+    let psci_fn = match code {
         ShutdownStatus::Success => {
             let _ = writeln!(s, "[newos-aarch64] PSCI SYSTEM_OFF (status=OK)");
+            PSCI_SYSTEM_OFF
         }
         ShutdownStatus::Failed => {
             let _ = writeln!(s, "[newos-aarch64] PSCI SYSTEM_OFF (status=FAIL)");
+            PSCI_SYSTEM_OFF
         }
-    }
+        ShutdownStatus::Reboot => {
+            let _ = writeln!(s, "[newos-aarch64] PSCI SYSTEM_RESET (reboot)");
+            PSCI_SYSTEM_RESET
+        }
+    };
     let use_smc = PSCI_USE_SMC.load(Ordering::Acquire);
-    // SAFETY: Invoking ARM PSCI `SYSTEM_OFF` (0x8400_0008) over the board's PSCI conduit
-    // (`smc #0` on RPi5 ATF/EL3, `hvc #0` on QEMU `virt` EL1) cleanly powers down the system.
+    // SAFETY: Invoking ARM PSCI `SYSTEM_OFF` (0x8400_0008) or `SYSTEM_RESET` (0x8400_0009)
+    // over the board's PSCI conduit (`smc #0` on RPi5 ATF/EL3, `hvc #0` on QEMU `virt`).
     unsafe {
         if use_smc {
-            asm!("smc #0", in("x0") PSCI_SYSTEM_OFF, options(nomem, nostack));
+            asm!("smc #0", in("x0") psci_fn, options(nomem, nostack));
         } else {
-            asm!("hvc #0", in("x0") PSCI_SYSTEM_OFF, options(nomem, nostack));
+            asm!("hvc #0", in("x0") psci_fn, options(nomem, nostack));
         }
     }
     loop {
@@ -759,6 +863,27 @@ impl Aarch64Platform {
         };
         PSCI_USE_SMC.store(use_smc, Ordering::Release);
 
+        // Map capability-scoped Raspberry Pi 5 BCM2712 Hardware Watchdog MMIO (`0x10_7D20_0000`, `0x100` B):
+        const RPI5_PM_WDT_PHYS: u64 = 0x10_7D20_0000;
+        const RPI5_PM_WDT_LEN: u64 = 0x100;
+        const WDT_MMIO_VIRT: u64 = 0xffff_b006_0000_0000;
+        let wdt_mmio = if !info.qemu_virt
+            && let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
+            && let Ok(wdt_va) = VirtAddr::new_page_aligned(WDT_MMIO_VIRT)
+            && let Ok(wdt_fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_PM_WDT_PHYS))
+            && vspace
+                .map_4k(wdt_va, wdt_fr, mmio_flags, &mut info.untyped)
+                .is_ok()
+        {
+            Some((
+                PhysAddr::new(RPI5_PM_WDT_PHYS),
+                WDT_MMIO_VIRT,
+                RPI5_PM_WDT_LEN,
+            ))
+        } else {
+            None
+        };
+
         set_cpu_id(0);
         probe_and_enable_cpu_hardening();
         install_vectors();
@@ -766,9 +891,258 @@ impl Aarch64Platform {
             info.hhdm_offset,
             net_mmio,
             rng_mmio,
+            wdt_mmio,
             info.qemu_virt,
             info.netd_module.is_some(),
         );
+
+        // Map Raspberry Pi 5 Phase 2 board peripherals (Device-nGnRnE) and grant capabilities to `init`:
+        // - Slot 19 (`BOOTSTRAP_GPIO_MMIO`): RP1 IO_BANK0 / RIO0 / PADS_BANK0 (40-pin GPIO 0..=27)
+        // - Slot 20 (`BOOTSTRAP_MBOX_MMIO`): BCM2712 VideoCore Property Mailbox (`0x10_7C01_3000`)
+        // - Slot 21 (`BOOTSTRAP_THERMAL_MMIO`): BCM2712 AVS TMON Thermal Sensor (`0x10_7D5D_2000`)
+        // - Slot 22 (`BOOTSTRAP_RP1_PERIPH_MMIO`): RP1 UART0, SPI0, I2C0, I2C1, PWM0
+        if !info.qemu_virt
+            && let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
+        {
+            const RP1_GPIO_PHYS: u64 = 0x1F_000D_0000;
+            const RP1_GPIO_LEN: u64 = 0x24000;
+            const RP1_GPIO_VIRT: u64 = 0xffff_b007_0000_0000;
+            let mut gpio_ok = true;
+            for block_off in [0x0_0000u64, 0x1_0000u64, 0x2_0000u64] {
+                let mut block_mapped = true;
+                for p in 0..4u64 {
+                    let off = block_off + p * 4096;
+                    let ok = VirtAddr::new_page_aligned(RP1_GPIO_VIRT + off)
+                        .and_then(|va| {
+                            PhysFrame::from_aligned(PhysAddr::new(RP1_GPIO_PHYS + off))
+                                .and_then(|fr| vspace.map_4k(va, fr, mmio_flags, &mut info.untyped))
+                        })
+                        .is_ok();
+                    if !ok {
+                        block_mapped = false;
+                        break;
+                    }
+                }
+                if block_mapped {
+                    syscall::register_extra_mmio_mapping(
+                        PhysAddr::new(RP1_GPIO_PHYS + block_off),
+                        RP1_GPIO_VIRT + block_off,
+                        0x4000,
+                    );
+                } else {
+                    gpio_ok = false;
+                }
+            }
+            if gpio_ok {
+                syscall::register_init_mmio_cap(19, PhysAddr::new(RP1_GPIO_PHYS), RP1_GPIO_LEN);
+            }
+
+            const MBOX_PHYS: u64 = 0x10_7C01_3000;
+            const MBOX_VIRT: u64 = 0xffff_b008_0000_0000;
+            if let Ok(va) = VirtAddr::new_page_aligned(MBOX_VIRT)
+                && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(MBOX_PHYS))
+                && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
+            {
+                syscall::register_extra_mmio_mapping(PhysAddr::new(MBOX_PHYS), MBOX_VIRT, 0x1000);
+                syscall::register_init_mmio_cap(20, PhysAddr::new(MBOX_PHYS), 0x1000);
+            }
+
+            const THERMAL_PHYS: u64 = 0x10_7D5D_2000;
+            const THERMAL_VIRT: u64 = 0xffff_b009_0000_0000;
+            if let Ok(va) = VirtAddr::new_page_aligned(THERMAL_VIRT)
+                && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(THERMAL_PHYS))
+                && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
+            {
+                syscall::register_extra_mmio_mapping(
+                    PhysAddr::new(THERMAL_PHYS),
+                    THERMAL_VIRT,
+                    0x1000,
+                );
+                syscall::register_init_mmio_cap(21, PhysAddr::new(THERMAL_PHYS), 0x1000);
+            }
+
+            const RP1_PERIPH_PHYS: u64 = 0x1F_0003_0000;
+            const RP1_PERIPH_LEN: u64 = 0x69000;
+            const RP1_PERIPH_VIRT: u64 = 0xffff_b00a_0000_0000;
+            let mut periph_any = false;
+            for off in [
+                0x0_0000u64,
+                0x2_0000u64,
+                0x4_0000u64,
+                0x4_4000u64,
+                0x6_8000u64,
+            ] {
+                if let Ok(va) = VirtAddr::new_page_aligned(RP1_PERIPH_VIRT + off)
+                    && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(RP1_PERIPH_PHYS + off))
+                    && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
+                {
+                    syscall::register_extra_mmio_mapping(
+                        PhysAddr::new(RP1_PERIPH_PHYS + off),
+                        RP1_PERIPH_VIRT + off,
+                        0x1000,
+                    );
+                    periph_any = true;
+                }
+            }
+            if periph_any {
+                syscall::register_init_mmio_cap(22, PhysAddr::new(RP1_PERIPH_PHYS), RP1_PERIPH_LEN);
+            }
+
+            // Phase 3: BCM2712 MIP MSI-X (`0x10_0013_0000`), microSD SDHCI (`0x10_00ff_f000`),
+            // RP1 dual xHCI USB 3.0 (`0x1f_0020_0000` / `0x1f_0030_0000`), and PCIe ECAM.
+            const RPI5_MIP_PHYS: u64 = 0x10_0013_0000;
+            const RPI5_MIP_VIRT: u64 = 0xffff_b00b_0000_0000;
+            if let Ok(va) = VirtAddr::new_page_aligned(RPI5_MIP_VIRT)
+                && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_MIP_PHYS))
+                && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
+            {
+                gic::init_bcm2712_mip(RPI5_MIP_VIRT);
+            }
+
+            const RPI5_SDHCI_PHYS: u64 = 0x10_00ff_f000;
+            const RPI5_SDHCI_VIRT: u64 = 0xffff_b00c_0000_0000;
+            if let Ok(va) = VirtAddr::new_page_aligned(RPI5_SDHCI_VIRT)
+                && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_SDHCI_PHYS))
+                && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
+            {
+                syscall::register_extra_mmio_mapping(
+                    PhysAddr::new(RPI5_SDHCI_PHYS),
+                    RPI5_SDHCI_VIRT,
+                    0x1000,
+                );
+                syscall::register_init_mmio_cap(23, PhysAddr::new(RPI5_SDHCI_PHYS), 0x1000);
+            }
+
+            for (slot, xhci_phys, xhci_virt) in [
+                (24usize, 0x1f_0020_0000u64, 0xffff_b00d_0000_0000u64),
+                (25usize, 0x1f_0030_0000u64, 0xffff_b00e_0000_0000u64),
+            ] {
+                let mut xhci_ok = true;
+                for p in 0..4u64 {
+                    let off = p * 4096;
+                    let ok = VirtAddr::new_page_aligned(xhci_virt + off)
+                        .and_then(|va| {
+                            PhysFrame::from_aligned(PhysAddr::new(xhci_phys + off))
+                                .and_then(|fr| vspace.map_4k(va, fr, mmio_flags, &mut info.untyped))
+                        })
+                        .is_ok();
+                    if !ok {
+                        xhci_ok = false;
+                        break;
+                    }
+                }
+                if xhci_ok {
+                    syscall::register_extra_mmio_mapping(
+                        PhysAddr::new(xhci_phys),
+                        xhci_virt,
+                        0x4000,
+                    );
+                    syscall::register_init_mmio_cap(slot, PhysAddr::new(xhci_phys), 0x4000);
+                }
+            }
+
+            // Map 64 KiB PCIe ECAM window (ACPI MCFG or BCM2712 RC1 FFC fallback `0x10_0011_0000`)
+            let ecam_phys = acpi.ecam_base.unwrap_or(0x10_0011_0000);
+            const PCIE_ECAM_VIRT: u64 = 0xffff_b00f_0000_0000;
+            const PCIE_ECAM_PAGES: u64 = 16;
+            if (ecam_phys & 0xFFF) == 0 {
+                let mut ecam_ok = true;
+                for p in 0..PCIE_ECAM_PAGES {
+                    let off = p * 4096;
+                    let ok = VirtAddr::new_page_aligned(PCIE_ECAM_VIRT + off)
+                        .and_then(|va| {
+                            PhysFrame::from_aligned(PhysAddr::new(ecam_phys + off))
+                                .and_then(|fr| vspace.map_4k(va, fr, mmio_flags, &mut info.untyped))
+                        })
+                        .is_ok();
+                    if !ok {
+                        ecam_ok = false;
+                        break;
+                    }
+                }
+                if ecam_ok {
+                    let ecam_len = PCIE_ECAM_PAGES * 4096;
+                    syscall::register_extra_mmio_mapping(
+                        PhysAddr::new(ecam_phys),
+                        PCIE_ECAM_VIRT,
+                        ecam_len,
+                    );
+                    syscall::register_init_mmio_cap(26, PhysAddr::new(ecam_phys), ecam_len);
+                }
+            }
+
+            // Phase 4: VideoCore VII V3D 7.1 (`0x10_0200_0000` Hub + `0x10_0200_8000` Core 0)
+            // and Broadcom BCM2712 IOMMU (`brcm,bcm2712-iommu` at `0x10_0000_5000`).
+            const RPI5_V3D_PHYS: u64 = 0x10_0200_0000;
+            const RPI5_V3D_LEN: u64 = 0x9000;
+            const RPI5_V3D_VIRT: u64 = 0xffff_b010_0000_0000;
+            let mut v3d_ok = true;
+            for off in [0x0000u64, 0x8000u64] {
+                let ok = VirtAddr::new_page_aligned(RPI5_V3D_VIRT + off)
+                    .and_then(|va| {
+                        PhysFrame::from_aligned(PhysAddr::new(RPI5_V3D_PHYS + off))
+                            .and_then(|fr| vspace.map_4k(va, fr, mmio_flags, &mut info.untyped))
+                    })
+                    .is_ok();
+                if ok {
+                    syscall::register_extra_mmio_mapping(
+                        PhysAddr::new(RPI5_V3D_PHYS + off),
+                        RPI5_V3D_VIRT + off,
+                        0x1000,
+                    );
+                } else {
+                    v3d_ok = false;
+                }
+            }
+            if v3d_ok {
+                syscall::register_init_mmio_cap(28, PhysAddr::new(RPI5_V3D_PHYS), RPI5_V3D_LEN);
+            }
+
+            const RPI5_IOMMU_PHYS: u64 = 0x10_0000_5000;
+            const RPI5_IOMMU_VIRT: u64 = 0xffff_b011_0000_0000;
+            if let Ok(va) = VirtAddr::new_page_aligned(RPI5_IOMMU_VIRT)
+                && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_IOMMU_PHYS))
+                && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
+            {
+                syscall::register_extra_mmio_mapping(
+                    PhysAddr::new(RPI5_IOMMU_PHYS),
+                    RPI5_IOMMU_VIRT,
+                    0x1000,
+                );
+                syscall::register_init_mmio_cap(29, PhysAddr::new(RPI5_IOMMU_PHYS), 0x1000);
+            }
+        }
+
+        // Map UEFI GOP / Limine linear framebuffer if present (capped at 4 MiB, slot 27).
+        if let Some(fb) = info.framebuffer
+            && fb.phys_addr != 0
+            && (fb.phys_addr & 0xFFF) == 0
+            && let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
+        {
+            const FB_VIRT: u64 = 0xffff_b012_0000_0000;
+            let raw_bytes = u64::from(fb.height).saturating_mul(u64::from(fb.pitch));
+            let map_bytes = raw_bytes.min(4 * 1024 * 1024);
+            let pages = map_bytes.div_ceil(4096);
+            let mut mapped_pages = 0u64;
+            for p in 0..pages {
+                let off = p * 4096;
+                let ok = VirtAddr::new_page_aligned(FB_VIRT + off)
+                    .and_then(|va| {
+                        PhysFrame::from_aligned(PhysAddr::new(fb.phys_addr + off))
+                            .and_then(|fr| vspace.map_4k(va, fr, mmio_flags, &mut info.untyped))
+                    })
+                    .is_ok();
+                if !ok {
+                    break;
+                }
+                mapped_pages += 1;
+            }
+            if mapped_pages > 0 {
+                let len = mapped_pages * 4096;
+                syscall::register_extra_mmio_mapping(PhysAddr::new(fb.phys_addr), FB_VIRT, len);
+                syscall::register_init_mmio_cap(27, PhysAddr::new(fb.phys_addr), len);
+            }
+        }
         let online_cpus = smp::bring_up_aps();
         syscall::set_sys_info(online_cpus, info.interactive_shell);
 
@@ -817,6 +1191,10 @@ impl HalPlatform for Aarch64Platform {
             csv2: CSV2_SUPPORTED.load(Ordering::Acquire),
             csv3: CSV3_SUPPORTED.load(Ordering::Acquire),
         }
+    }
+
+    fn cpu_isa_features(&self) -> u64 {
+        cpu_isa_features()
     }
 
     fn current_cpu_id(&self) -> u32 {

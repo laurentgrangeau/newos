@@ -24,11 +24,21 @@ pub const REG_RBQP: u64 = 0x0018;
 pub const REG_TBQP: u64 = 0x001C;
 pub const REG_RSR: u64 = 0x0020;
 pub const REG_IDR: u64 = 0x002C;
+pub const REG_MAN: u64 = 0x0034;
 pub const REG_SA1B: u64 = 0x0088;
 pub const REG_SA1T: u64 = 0x008C;
 pub const REG_MID: u64 = 0x00FC;
 pub const REG_TBQPH: u64 = 0x04C8;
 pub const REG_RBQPH: u64 = 0x04D4;
+
+// NSR bits
+const NSR_IDLE: u32 = 1 << 2;
+
+// IEEE 802.3 Clause 22 MDIO constants (BCM54213PE PHY on Raspberry Pi 5 is at address 1)
+pub const RPI5_PHY_ADDR: u8 = 1;
+pub const MII_BMSR: u8 = 0x01;
+pub const BMSR_LSTATUS: u16 = 1 << 2;
+const MAN_CLAUSE22_READ: u32 = (1 << 30) | (0b10 << 28) | (0b10 << 16);
 
 // NCR bits
 const NCR_RXEN: u32 = 1 << 2;
@@ -219,6 +229,12 @@ impl<'a, T: MmioDmaTransport> GemNetDevice<'a, T> {
                 .store(TX_USED | wrap, Ordering::Release);
         }
         fence(Ordering::SeqCst);
+        // Flush initial DMA descriptor rings & invalidate RX packet buffers for non-coherent RP1 DMA.
+        let _ = transport.dma_clean(&dma.rx_ring);
+        let _ = transport.dma_clean(&dma.tx_ring);
+        for buf in &dma.rx_bufs {
+            let _ = transport.dma_invalidate(buf);
+        }
 
         // 6. Program 64-bit RX and TX ring base addresses
         let rx_ring_phys = transport
@@ -262,6 +278,35 @@ impl<'a, T: MmioDmaTransport> GemNetDevice<'a, T> {
         })
     }
 
+    /// Perform an IEEE 802.3 Clause 22 MDIO register read on `phy_addr` (`0..=31`).
+    pub fn mdio_read(&self, phy_addr: u8, reg_addr: u8) -> Result<u16, SysError> {
+        if phy_addr > 31 || reg_addr > 31 {
+            return Err(SysError::InvalidArgument);
+        }
+        for _ in 0..10_000u32 {
+            if (self.transport.read32(REG_NSR)? & NSR_IDLE) != 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        let cmd = MAN_CLAUSE22_READ | (u32::from(phy_addr) << 23) | (u32::from(reg_addr) << 18);
+        self.transport.write32(REG_MAN, cmd)?;
+        for _ in 0..10_000u32 {
+            if (self.transport.read32(REG_NSR)? & NSR_IDLE) != 0 {
+                return Ok((self.transport.read32(REG_MAN)? & 0xFFFF) as u16);
+            }
+            core::hint::spin_loop();
+        }
+        Err(SysError::WouldBlock)
+    }
+
+    /// Check whether the Ethernet PHY reports an active link (IEEE 802.3 BMSR latched twice).
+    pub fn phy_link_up(&self, phy_addr: u8) -> Result<bool, SysError> {
+        let _ = self.mdio_read(phy_addr, MII_BMSR)?;
+        let bmsr = self.mdio_read(phy_addr, MII_BMSR)?;
+        Ok((bmsr & BMSR_LSTATUS) != 0)
+    }
+
     fn send_frame(&mut self, frame: &[u8]) {
         let len = frame.len().min(PKT_BUF_SIZE);
         let slot = self.tx_idx;
@@ -271,11 +316,13 @@ impl<'a, T: MmioDmaTransport> GemNetDevice<'a, T> {
         }
         let wrap = if slot + 1 == RING_SIZE { TX_WRAP } else { 0 };
         fence(Ordering::SeqCst);
+        let _ = self.transport.dma_clean(&self.dma.tx_bufs[slot]);
         // Clear TX_USED (bit 31) and set TX_LAST + length so GEM transmits the frame
         self.dma.tx_ring.0[slot]
             .ctrl
             .store((len as u32) | TX_LAST | wrap, Ordering::Release);
         fence(Ordering::SeqCst);
+        let _ = self.transport.dma_clean(&self.dma.tx_ring.0[slot]);
 
         let _ = self
             .transport
@@ -338,9 +385,13 @@ impl<'b, T: MmioDmaTransport> Device for GemNetDevice<'b, T> {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        let prev_slot = (self.rx_idx + RING_SIZE - 1) % RING_SIZE;
+        let _ = self.transport.dma_clean(&self.dma.rx_ring.0[prev_slot]);
+
         fence(Ordering::SeqCst);
         let slot = self.rx_idx;
         let desc = &self.dma.rx_ring.0[slot];
+        let _ = self.transport.dma_invalidate(desc);
         let addr_lo = desc.addr_lo.load(Ordering::Acquire);
         if (addr_lo & RX_USED) == 0 {
             return None;
@@ -352,8 +403,11 @@ impl<'b, T: MmioDmaTransport> Device for GemNetDevice<'b, T> {
 
         if frame_len == 0 || frame_len > PKT_BUF_SIZE {
             desc.addr_lo.store(addr_lo & !RX_USED, Ordering::Release);
+            let _ = self.transport.dma_clean(desc);
             return None;
         }
+
+        let _ = self.transport.dma_invalidate(&self.dma.rx_bufs[slot]);
 
         let rx = GemRxToken {
             buf: &self.dma.rx_bufs[slot],
@@ -366,6 +420,7 @@ impl<'b, T: MmioDmaTransport> Device for GemNetDevice<'b, T> {
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         let slot = self.tx_idx;
+        let _ = self.transport.dma_invalidate(&self.dma.tx_ring.0[slot]);
         let ctrl = self.dma.tx_ring.0[slot].ctrl.load(Ordering::Acquire);
         if (ctrl & TX_USED) == 0 {
             // Descriptor still in flight

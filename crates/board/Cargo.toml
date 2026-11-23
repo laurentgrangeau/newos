@@ -1,0 +1,8 @@
+[package]
+name = "newos-board"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+newos-abi = { workspace = true }

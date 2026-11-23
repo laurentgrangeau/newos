@@ -2,7 +2,7 @@
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_bytes, write_volatile};
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use newos_abi::SysError;
 use newos_kernel_core::memory::{
     HUGE_PAGE_MASK_2M, PAGE_SIZE, PageFlags, PhysAddr, PhysFrame, PhysFrame2M, UntypedInventory,
@@ -23,6 +23,14 @@ const DESC_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 const DESC_2M_ADDR_MASK: u64 = 0x0000_FFFF_FFE0_0000;
 
 static CACHED_DEVICE_MAIR_IDX: AtomicU8 = AtomicU8::new(u8::MAX);
+static DCACHE_LINE_BYTES: AtomicU64 = AtomicU64::new(64);
+
+/// Record the probed architectural D-cache minimum line size (`CTR_EL0.DminLine`, 64 B on Cortex-A76).
+pub fn set_dcache_line_bytes(bytes: u64) {
+    if bytes.is_power_of_two() && (16..=256).contains(&bytes) {
+        DCACHE_LINE_BYTES.store(bytes, Ordering::Release);
+    }
+}
 
 #[inline]
 fn device_mair_index() -> u64 {
@@ -77,11 +85,13 @@ fn tlbi_va(virt: VirtAddr) {
 /// (`TCR_EL1.AS = 1`) when advertised by `ID_AA64MMFR0_EL1.ASIDBits`, and flush stale boot TLBs.
 pub fn ensure_ttbr0_asid_enabled() {
     // SAFETY: Configuring `TCR_EL1.A1 = 0`, enabling 16-bit ASIDs when supported by hardware,
+    // ensuring `TCR_EL1.IPS` covers >=40-bit PA (required for RPi5 16 GB RAM + BCM2712/RP1 MMIO),
     // and executing a one-time EL1 TLB invalidation before entering EL0 guarantees
     // `TTBR0_EL1[63:48]` tags all `DESC_NG` user mappings.
     unsafe {
         let mmfr0: u64;
         asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0, options(nomem, nostack, preserves_flags));
+        let pa_range = mmfr0 & 0xF;
         let supports_16bit_asid = ((mmfr0 >> 4) & 0xF) == 0b0010;
 
         let mut tcr: u64;
@@ -89,6 +99,13 @@ pub fn ensure_ttbr0_asid_enabled() {
         let mut new_tcr = tcr & !(1u64 << 22); // A1 = 0 (TTBR0_EL1 defines ASID)
         if supports_16bit_asid {
             new_tcr |= 1u64 << 36; // AS = 1 (16-bit ASID)
+        }
+        // Ensure `TCR_EL1.IPS` (bits 34:32) is at least 40-bit (0b010) when hardware supports it
+        // (Cortex-A76 BCM2712 advertises PARange >= 40-bit; 16 GB RAM + 0x1F_xxxx_xxxx RP1 MMIO need >= 40-bit).
+        let cur_ips = (new_tcr >> 32) & 0x7;
+        let target_ips = pa_range.min(5); // cap at 48-bit (0b101)
+        if target_ips >= 2 && cur_ips < target_ips {
+            new_tcr = (new_tcr & !(0x7u64 << 32)) | (target_ips << 32);
         }
         if new_tcr != tcr {
             tcr = new_tcr;
@@ -451,14 +468,14 @@ impl VSpaceMapper for Aarch64VSpace {
 
 /// Clean data cache lines to Point of Coherency (`dc cvac`) before outbound DMA.
 pub fn dma_clean_range(start_va: u64, len: usize) {
-    const CACHE_LINE: u64 = 64;
-    let mut addr = start_va & !(CACHE_LINE - 1);
+    let cache_line = DCACHE_LINE_BYTES.load(Ordering::Acquire).max(16);
+    let mut addr = start_va & !(cache_line - 1);
     let end = start_va.saturating_add(len as u64);
     // SAFETY: `dc cvac` cleans cache lines for a valid mapped virtual address range to PoC.
     unsafe {
         while addr < end {
             asm!("dc cvac, {}", in(reg) addr, options(nostack, preserves_flags));
-            addr = addr.saturating_add(CACHE_LINE);
+            addr = addr.saturating_add(cache_line);
         }
         asm!("dsb sy", options(nostack, preserves_flags));
     }
@@ -466,14 +483,14 @@ pub fn dma_clean_range(start_va: u64, len: usize) {
 
 /// Clean & invalidate data cache lines to Point of Coherency (`dc civac`) for inbound DMA.
 pub fn dma_invalidate_range(start_va: u64, len: usize) {
-    const CACHE_LINE: u64 = 64;
-    let mut addr = start_va & !(CACHE_LINE - 1);
+    let cache_line = DCACHE_LINE_BYTES.load(Ordering::Acquire).max(16);
+    let mut addr = start_va & !(cache_line - 1);
     let end = start_va.saturating_add(len as u64);
     // SAFETY: `dc civac` cleans and invalidates cache lines for a valid mapped virtual address range.
     unsafe {
         while addr < end {
             asm!("dc civac, {}", in(reg) addr, options(nostack, preserves_flags));
-            addr = addr.saturating_add(CACHE_LINE);
+            addr = addr.saturating_add(cache_line);
         }
         asm!("dsb sy", options(nostack, preserves_flags));
     }

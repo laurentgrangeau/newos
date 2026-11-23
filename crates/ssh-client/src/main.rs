@@ -84,13 +84,19 @@ fn cmd_keygen(path_arg: Option<&str>) -> Result<(), String> {
         let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
     }
 
-    let pub_line = format!("ssh-mldsa87 {} newos-user\n", encode_hex(pk_bytes.as_slice()));
+    let pub_line = format!(
+        "ssh-mldsa87 {} newos-user\n",
+        encode_hex(pk_bytes.as_slice())
+    );
     fs::write(&pub_path, &pub_line).map_err(|e| format!("write {}: {e}", pub_path.display()))?;
 
     println!("Generated pure-PQ ML-DSA-87 keypair:");
     println!("  Private seed (0600): {}", key_path.display());
     println!("  Public key:          {}", pub_path.display());
-    println!("Add {} to authorized_keys.mldsa87 before building newos-keyd.", pub_path.display());
+    println!(
+        "Add {} to authorized_keys.mldsa87 before building newos-keyd.",
+        pub_path.display()
+    );
     Ok(())
 }
 
@@ -170,9 +176,7 @@ fn cmd_connect(args: &[String]) -> Result<(), String> {
                 let _ = client
                     .feed_rx(&net_buf[..n], cookie, sign_rnd, &mut shell_out)
                     .map_err(|e| format!("SSH protocol error: {e:?}"))?;
-                if !printed_fp
-                    && let Some(fp) = client.host_fingerprint()
-                {
+                if !printed_fp && let Some(fp) = client.host_fingerprint() {
                     let b64 = encode_base64_64(&fp);
                     let b64_str = std::str::from_utf8(&b64).unwrap_or("?");
                     eprintln!("[newos-ssh] Host ML-DSA-87 fingerprint: SHA3-512:{b64_str}");
@@ -185,7 +189,9 @@ fn cmd_connect(args: &[String]) -> Result<(), String> {
                     printed_fp = true;
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {}
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            }
             Err(e) => return Err(format!("tcp read: {e}")),
         }
     }
@@ -197,7 +203,9 @@ fn cmd_connect(args: &[String]) -> Result<(), String> {
 
     loop {
         line.clear();
-        let n = stdin.read_line(&mut line).map_err(|e| format!("stdin: {e}"))?;
+        let n = stdin
+            .read_line(&mut line)
+            .map_err(|e| format!("stdin: {e}"))?;
         if n == 0 {
             break;
         }
@@ -243,7 +251,9 @@ fn main() -> ExitCode {
             eprintln!("newos-ssh — Pure Post-Quantum SSHv2 Client (ML-KEM-1024 + ML-DSA-87)");
             eprintln!("Usage:");
             eprintln!("  newos-ssh keygen [key_path]");
-            eprintln!("  newos-ssh -i <key_path> [--fingerprint <SHA3-512:...>] [-p <port>] <user>@<host>");
+            eprintln!(
+                "  newos-ssh -i <key_path> [--fingerprint <SHA3-512:...>] [-p <port>] <user>@<host>"
+            );
             Ok(())
         }
         _ => cmd_connect(&args),

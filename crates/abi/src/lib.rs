@@ -77,6 +77,48 @@ impl CapId {
     /// unidirectional `newos-init` (`Rights::WRITE`) -> `newos-sshd` (`Rights::READ`, badge 4).
     pub const BOOTSTRAP_SSH_OUT_EP: Self = Self((1u64 << 32) | 17);
 
+    /// Well-known bootstrap Hardware Watchdog MMIO capability (slot 18, gen 1),
+    /// exposing the Raspberry Pi 5 BCM2712 PM/Watchdog block (`0x10_7D20_0000`, `0x100` bytes).
+    pub const BOOTSTRAP_WDT_MMIO: Self = Self((1u64 << 32) | 18);
+
+    /// Well-known bootstrap RP1 40-pin GPIO MMIO capability (slot 19, gen 1),
+    /// covering `IO_BANK0` (`0x1F_000D_0000`), `RIO0` (`0x1F_000E_0000`), and `PADS_BANK0` (`0x1F_000F_0000`).
+    pub const BOOTSTRAP_GPIO_MMIO: Self = Self((1u64 << 32) | 19);
+
+    /// Well-known bootstrap BCM2712 VideoCore Property Mailbox MMIO capability (slot 20, gen 1),
+    /// covering `0x10_7C01_3000` (Mailbox at offset `0x880`).
+    pub const BOOTSTRAP_MBOX_MMIO: Self = Self((1u64 << 32) | 20);
+
+    /// Well-known bootstrap BCM2712 AVS TMON Thermal Sensor MMIO capability (slot 21, gen 1),
+    /// covering `0x10_7D5D_2000` (TMON registers at offset `0x200`).
+    pub const BOOTSTRAP_THERMAL_MMIO: Self = Self((1u64 << 32) | 21);
+
+    /// Well-known bootstrap RP1 40-pin Bus Peripherals MMIO capability (slot 22, gen 1),
+    /// covering RP1 `UART0` (`0x1F_0003_0000`), `SPI0` (`0x1F_0005_0000`), `I2C0`/`I2C1` (`0x1F_0007_0000`),
+    /// and `PWM0` (`0x1F_0009_8000`).
+    pub const BOOTSTRAP_RP1_PERIPH_MMIO: Self = Self((1u64 << 32) | 22);
+
+    /// Well-known bootstrap BCM2712 microSD SDHCI MMIO capability (slot 23, gen 1, `0x10_00FF_F000`).
+    pub const BOOTSTRAP_SDHCI_MMIO: Self = Self((1u64 << 32) | 23);
+
+    /// Well-known bootstrap RP1 USB 3.0/2.0 xHCI0 MMIO capability (slot 24, gen 1, `0x1F_0020_0000`).
+    pub const BOOTSTRAP_XHCI0_MMIO: Self = Self((1u64 << 32) | 24);
+
+    /// Well-known bootstrap RP1 USB 3.0/2.0 xHCI1 MMIO capability (slot 25, gen 1, `0x1F_0030_0000`).
+    pub const BOOTSTRAP_XHCI1_MMIO: Self = Self((1u64 << 32) | 25);
+
+    /// Well-known bootstrap PCIe ECAM configuration space MMIO capability (slot 26, gen 1).
+    pub const BOOTSTRAP_PCIE_ECAM_MMIO: Self = Self((1u64 << 32) | 26);
+
+    /// Well-known bootstrap UEFI GOP / Limine Framebuffer MMIO capability (slot 27, gen 1).
+    pub const BOOTSTRAP_FB_MMIO: Self = Self((1u64 << 32) | 27);
+
+    /// Well-known bootstrap VideoCore VII V3D 7.1 GPU MMIO capability (slot 28, gen 1, `0x10_0200_0000`).
+    pub const BOOTSTRAP_V3D_MMIO: Self = Self((1u64 << 32) | 28);
+
+    /// Well-known bootstrap BCM2712 IOMMU (`brcm,bcm2712-iommu`) MMIO capability (slot 29, gen 1, `0x10_0000_5000`).
+    pub const BOOTSTRAP_IOMMU_MMIO: Self = Self((1u64 << 32) | 29);
+
     #[inline]
     pub const fn new(raw: u64) -> Self {
         Self(raw)
@@ -259,6 +301,11 @@ pub enum SyscallNumber {
     ThreadExit = 29,
     /// Acknowledge and unmask a hardware IRQ via a designated `IrqHandler` capability (`irq_cap`).
     IrqAck = 30,
+    /// Perform PAN-safe DMA cache maintenance on a caller-mapped EL0 range:
+    /// `(vspace_cap, vaddr, len, op)` where `op` is a [`DmaCacheOp`] discriminant.
+    DmaCacheOp = 31,
+    /// Read probed ARMv8.2-A Cortex-A76 ISA feature bitmask & cache/PA geometry: `(power_cap)` (`Rights::READ`).
+    CpuFeatures = 32,
 }
 
 impl SyscallNumber {
@@ -295,8 +342,77 @@ impl SyscallNumber {
             28 => Some(Self::TimerFreq),
             29 => Some(Self::ThreadExit),
             30 => Some(Self::IrqAck),
+            31 => Some(Self::DmaCacheOp),
+            32 => Some(Self::CpuFeatures),
             _ => None,
         }
+    }
+}
+
+/// Cache maintenance operation for [`SyscallNumber::DmaCacheOp`] (non-coherent DMA on Pi 5 RP1/PCIe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u64)]
+pub enum DmaCacheOp {
+    /// Clean data cache lines to Point of Coherency (`dc cvac`) before outbound DMA.
+    Clean = 0,
+    /// Clean & invalidate data cache lines to Point of Coherency (`dc civac`) before/after inbound DMA.
+    Invalidate = 1,
+    /// Clean & invalidate data cache lines (`dc civac`) for bidirectional DMA buffers.
+    CleanInvalidate = 2,
+}
+
+impl DmaCacheOp {
+    #[inline]
+    pub const fn from_u64(raw: u64) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Clean),
+            1 => Some(Self::Invalidate),
+            2 => Some(Self::CleanInvalidate),
+            _ => None,
+        }
+    }
+}
+
+/// Bitfield layout returned by [`SyscallNumber::CpuFeatures`] (ARMv8.2-A Cortex-A76 / BCM2712).
+pub mod cpu_isa {
+    /// ARMv8.1-A Large System Extensions (atomic CAS/LDADD/SWP).
+    pub const LSE: u64 = 1 << 0;
+    /// ARMv8.0-A CRC32 instructions.
+    pub const CRC32: u64 = 1 << 1;
+    /// ARMv8.0-A AES cryptographic instructions (`FEAT_AES`).
+    pub const AES: u64 = 1 << 2;
+    /// ARMv8.0-A Polynomial Multiply Long (`FEAT_PMULL`).
+    pub const PMULL: u64 = 1 << 3;
+    /// ARMv8.0-A SHA-1 cryptographic instructions (`FEAT_SHA1`).
+    pub const SHA1: u64 = 1 << 4;
+    /// ARMv8.0-A SHA-256 cryptographic instructions (`FEAT_SHA256`).
+    pub const SHA256: u64 = 1 << 5;
+    /// ARMv8.2-A Dot Product SIMD instructions (`FEAT_DotProd`).
+    pub const DOTPROD: u64 = 1 << 6;
+    /// ARMv8.2-A Half-Precision Floating Point (`FEAT_FP16`).
+    pub const FP16: u64 = 1 << 7;
+    /// ARMv8.0-A Advanced SIMD / NEON (`AdvSIMD`).
+    pub const ASIMD: u64 = 1 << 8;
+    /// ARMv8.2-A Performance Monitors Extension (`PMUv3` / `PMCCNTR_EL0`).
+    pub const PMUV3: u64 = 1 << 9;
+
+    /// Pack ISA feature flags together with probed physical address width (`pa_bits`)
+    /// and D-cache minimum line size (`dcache_line_bytes`) into one 64-bit syscall return word.
+    #[inline]
+    pub const fn pack(flags: u64, pa_bits: u8, dcache_line_bytes: u16) -> u64 {
+        (flags & 0xFFFF_FFFF)
+            | ((pa_bits as u64) << 32)
+            | (((dcache_line_bytes as u64) & 0xFFFF) << 40)
+    }
+
+    #[inline]
+    pub const fn pa_bits(packed: u64) -> u8 {
+        ((packed >> 32) & 0xFF) as u8
+    }
+
+    #[inline]
+    pub const fn dcache_line_bytes(packed: u64) -> u16 {
+        ((packed >> 40) & 0xFFFF) as u16
     }
 }
 
@@ -329,12 +445,13 @@ impl SysError {
     }
 }
 
-/// Shutdown status reported on PSCI `SYSTEM_OFF` (Raspberry Pi 5 & QEMU `aarch64` `virt`).
+/// Shutdown/reset status reported on PSCI `SYSTEM_OFF` / `SYSTEM_RESET` (Raspberry Pi 5 & QEMU `aarch64` `virt`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ShutdownStatus {
     Success = 0,
     Failed = 1,
+    Reboot = 2,
 }
 
 /// Register-only IPC log chunk framing for `CapId::BOOTSTRAP_LOG_EP`.
@@ -631,14 +748,27 @@ mod tests {
             (28, SyscallNumber::TimerFreq),
             (29, SyscallNumber::ThreadExit),
             (30, SyscallNumber::IrqAck),
+            (31, SyscallNumber::DmaCacheOp),
+            (32, SyscallNumber::CpuFeatures),
         ];
         assert_eq!(SyscallNumber::from_u64(0), None);
         for (raw, variant) in expected_syscalls {
             assert_eq!(variant as u64, raw);
             assert_eq!(SyscallNumber::from_u64(raw), Some(variant));
         }
-        assert_eq!(SyscallNumber::from_u64(31), None);
+        assert_eq!(SyscallNumber::from_u64(33), None);
         assert_eq!(SyscallNumber::from_u64(99), None);
+
+        assert_eq!(DmaCacheOp::from_u64(0), Some(DmaCacheOp::Clean));
+        assert_eq!(DmaCacheOp::from_u64(1), Some(DmaCacheOp::Invalidate));
+        assert_eq!(DmaCacheOp::from_u64(2), Some(DmaCacheOp::CleanInvalidate));
+        assert_eq!(DmaCacheOp::from_u64(3), None);
+
+        let packed = cpu_isa::pack(cpu_isa::LSE | cpu_isa::AES | cpu_isa::PMUV3, 40, 64);
+        assert_eq!(cpu_isa::pa_bits(packed), 40);
+        assert_eq!(cpu_isa::dcache_line_bytes(packed), 64);
+        assert_ne!(packed & cpu_isa::LSE, 0);
+        assert_ne!(packed & cpu_isa::PMUV3, 0);
 
         let expected_errors = [
             (1, SysError::InvalidCapability),

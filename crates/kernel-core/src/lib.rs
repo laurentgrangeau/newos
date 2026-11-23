@@ -30,6 +30,19 @@ pub const USER_PQ_STACK_PAGES: u64 = 256;
 const USER_SHADOW_STACK_BASE: u64 = 0x0000_7fff_e000_0000;
 const USER_SHADOW_STACK_PAGES: u64 = 2; // 8 KiB EL0 Shadow Call Stack (`x18`, grows upward)
 
+/// Linear UEFI GOP / Limine framebuffer geometry discovered at boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FramebufferInfo {
+    pub phys_addr: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub bpp: u16,
+    pub red_shift: u8,
+    pub green_shift: u8,
+    pub blue_shift: u8,
+}
+
 /// Fixed-size, `no_alloc` boot descriptor handed from `newos-hal` to `newos-kernel-core`.
 #[derive(Debug, Clone, Copy)]
 pub struct BootInfo {
@@ -38,6 +51,7 @@ pub struct BootInfo {
     pub untyped: UntypedInventory,
     pub cpu_count: usize,
     pub rsdp_addr: u64,
+    pub framebuffer: Option<FramebufferInfo>,
     pub init_module: Option<&'static [u8]>,
     pub worker_module: Option<&'static [u8]>,
     pub netd_module: Option<&'static [u8]>,
@@ -61,6 +75,10 @@ pub trait HalPlatform: Write {
 
     fn arch_name(&self) -> &'static str;
     fn security_features(&self) -> CpuSecurityFeatures;
+    /// Return packed ARMv8.2-A ISA feature bitmask + PA width + D-cache line size (`newos_abi::cpu_isa`).
+    fn cpu_isa_features(&self) -> u64 {
+        0
+    }
     fn current_cpu_id(&self) -> u32;
     fn online_cpus(&self) -> usize;
     fn trigger_breakpoint(&mut self);
@@ -127,6 +145,34 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
         sec.csv3,
         platform.current_cpu_id(),
     );
+    let isa = platform.cpu_isa_features();
+    if isa != 0 {
+        use newos_abi::cpu_isa;
+        let _ = writeln!(
+            platform,
+            "[newos] CPU ISA (ARMv8.2-A): PA={}b dcache={}B LSE={} CRC32={} AES={} PMULL={} SHA1={} SHA256={} DOTPROD={} FP16={} ASIMD={} PMUv3={}",
+            cpu_isa::pa_bits(isa),
+            cpu_isa::dcache_line_bytes(isa),
+            (isa & cpu_isa::LSE) != 0,
+            (isa & cpu_isa::CRC32) != 0,
+            (isa & cpu_isa::AES) != 0,
+            (isa & cpu_isa::PMULL) != 0,
+            (isa & cpu_isa::SHA1) != 0,
+            (isa & cpu_isa::SHA256) != 0,
+            (isa & cpu_isa::DOTPROD) != 0,
+            (isa & cpu_isa::FP16) != 0,
+            (isa & cpu_isa::ASIMD) != 0,
+            (isa & cpu_isa::PMUV3) != 0,
+        );
+    }
+
+    if let Some(fb) = info.framebuffer {
+        let _ = writeln!(
+            platform,
+            "[newos] UEFI GOP Framebuffer: {}x{} @ {}bpp pitch={} phys={:#x}",
+            fb.width, fb.height, fb.bpp, fb.pitch, fb.phys_addr,
+        );
+    }
 
     if platform.online_cpus() != info.cpu_count {
         let _ = writeln!(
@@ -468,6 +514,7 @@ mod tests {
             untyped,
             cpu_count: 4,
             rsdp_addr: 0x000e_0000,
+            framebuffer: None,
             init_module: None,
             worker_module: None,
             netd_module: None,

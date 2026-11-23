@@ -928,12 +928,16 @@ mod tests {
     struct MockGemTransport {
         ncr_writes: AtomicU32,
         dmacfg: AtomicU32,
+        dma_cleans: AtomicU32,
+        dma_invalidates: AtomicU32,
     }
 
     impl MmioDmaTransport for &MockGemTransport {
         fn read32(&self, offset: u64) -> Result<u32, SysError> {
             match offset {
                 gem::REG_MID => Ok(0x0007_0109), // Raspberry Pi 5 RP1 Cadence GEM rev 1p09
+                gem::REG_NSR => Ok(1 << 2),      // MDIO idle
+                gem::REG_MAN => Ok(u32::from(gem::BMSR_LSTATUS)),
                 gem::REG_SA1B => Ok(u32::from_le_bytes([0xD8, 0x3A, 0xDD, 0xAA])),
                 gem::REG_SA1T => Ok(u32::from_le_bytes([0xBB, 0xCC, 0x00, 0x00])),
                 _ => Ok(0),
@@ -952,6 +956,16 @@ mod tests {
         fn virt_to_phys<T>(&self, r: &T) -> Result<u64, SysError> {
             Ok((r as *const T as usize) as u64)
         }
+
+        fn dma_clean<T>(&self, _r: &T) -> Result<(), SysError> {
+            self.dma_cleans.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn dma_invalidate<T>(&self, _r: &T) -> Result<(), SysError> {
+            self.dma_invalidates.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
     }
 
     #[test]
@@ -959,6 +973,8 @@ mod tests {
         let mock = MockGemTransport {
             ncr_writes: AtomicU32::new(0),
             dmacfg: AtomicU32::new(0),
+            dma_cleans: AtomicU32::new(0),
+            dma_invalidates: AtomicU32::new(0),
         };
         let nic = probe_nic(|off| (&mock).read32(off)).expect("should detect Pi 5 RP1 Cadence GEM");
         let NicKind::CadenceGem(info) = nic else {
@@ -971,11 +987,15 @@ mod tests {
         let mut dev = GemNetDevice::init(&mock, info, &dma).expect("gem init");
         // Verify 64-bit DMA mode bit (bit 30) was programmed into DMACFG
         assert_ne!(mock.dmacfg.load(Ordering::Relaxed) & (1 << 30), 0);
-        // Verify smoltcp TX queues a frame and triggers NCR_TSTART
+        // Verify MDIO Clause 22 link-up probe works on BCM54213PE PHY address 1
+        assert_eq!(dev.phy_link_up(gem::RPI5_PHY_ADDR), Ok(true));
+        // Verify smoltcp TX queues a frame, performs DMA cache clean, and triggers NCR_TSTART
         let tx = dev.transmit(Instant::from_millis(0)).expect("tx token");
         tx.consume(60, |buf| buf.fill(0xAB));
         assert_eq!(dev.tx_packets, 1);
         assert!(mock.ncr_writes.load(Ordering::Relaxed) >= 3);
+        assert!(mock.dma_cleans.load(Ordering::Relaxed) >= 4);
+        assert!(mock.dma_invalidates.load(Ordering::Relaxed) >= 8);
     }
 
     #[test]

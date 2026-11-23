@@ -2,12 +2,12 @@
 
 use limine::memmap::MEMMAP_USABLE;
 use limine::request::{
-    ExecutableAddressRequest, ExecutableFileRequest, HhdmRequest, MemmapRequest, ModulesRequest,
-    MpRequest, MpResponse, RsdpRequest,
+    ExecutableAddressRequest, ExecutableFileRequest, FramebufferRequest, HhdmRequest,
+    MemmapRequest, ModulesRequest, MpRequest, MpResponse, RsdpRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
-use newos_kernel_core::BootInfo;
 use newos_kernel_core::memory::UntypedInventory;
+use newos_kernel_core::{BootInfo, FramebufferInfo};
 
 const MP_FLAGS: u64 = 0;
 
@@ -56,6 +56,11 @@ static EXEC_FILE_REQUEST: ExecutableFileRequest = ExecutableFileRequest::new();
 #[cfg_attr(target_os = "none", unsafe(link_section = ".requests"))]
 static EXEC_ADDR_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
 
+// SAFETY: Limine scans `.requests` in the bare-metal ELF image for `FramebufferRequest` (UEFI GOP).
+#[used]
+#[cfg_attr(target_os = "none", unsafe(link_section = ".requests"))]
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+
 // SAFETY: Limine scans `.requests_end_marker` in the bare-metal ELF image.
 #[used]
 #[cfg_attr(target_os = "none", unsafe(link_section = ".requests_end_marker"))]
@@ -95,6 +100,19 @@ pub fn boot_info() -> BootInfo {
         .map(|r| r.address as u64)
         .unwrap_or(0);
 
+    let framebuffer = FRAMEBUFFER_REQUEST.response().and_then(|resp| {
+        resp.framebuffers().first().map(|fb| FramebufferInfo {
+            phys_addr: (fb.address() as u64).saturating_sub(hhdm_offset),
+            width: fb.width as u32,
+            height: fb.height as u32,
+            pitch: fb.pitch as u32,
+            bpp: fb.bpp,
+            red_shift: fb.red_mask_shift,
+            green_shift: fb.green_mask_shift,
+            blue_shift: fb.blue_mask_shift,
+        })
+    });
+
     let mut init_module = None;
     let mut worker_module = None;
     let mut netd_module = None;
@@ -130,6 +148,7 @@ pub fn boot_info() -> BootInfo {
         untyped,
         cpu_count,
         rsdp_addr,
+        framebuffer,
         init_module,
         worker_module,
         netd_module,

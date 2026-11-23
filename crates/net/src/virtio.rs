@@ -37,11 +37,21 @@ const STATUS_FEATURES_OK: u32 = 8;
 
 const DESC_F_WRITE: u16 = 2;
 
-/// Capability-scoped MMIO + DMA translation transport injected by EL0 `user-rt`.
+/// Capability-scoped MMIO + DMA translation & cache-coherency transport injected by EL0 `user-rt`.
 pub trait MmioDmaTransport {
     fn read32(&self, offset: u64) -> Result<u32, SysError>;
     fn write32(&self, offset: u64, val: u32) -> Result<(), SysError>;
     fn virt_to_phys<T>(&self, r: &T) -> Result<u64, SysError>;
+
+    /// Clean data cache lines (`dc cvac`) for `r` before outbound non-coherent DMA.
+    fn dma_clean<T>(&self, _r: &T) -> Result<(), SysError> {
+        Ok(())
+    }
+
+    /// Clean & invalidate data cache lines (`dc civac`) for `r` before/after inbound non-coherent DMA.
+    fn dma_invalidate<T>(&self, _r: &T) -> Result<(), SysError> {
+        Ok(())
+    }
 }
 
 #[repr(C)]

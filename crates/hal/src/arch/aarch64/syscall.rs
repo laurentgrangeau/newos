@@ -8,7 +8,8 @@ use core::ops::{Deref, DerefMut};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use newos_abi::{
-    CAP_MINT_SET_BADGE, CapId, ObjectType, Rights, ShutdownStatus, SysError, SyscallNumber,
+    CAP_MINT_SET_BADGE, CapId, DmaCacheOp, ObjectType, Rights, ShutdownStatus, SysError,
+    SyscallNumber,
 };
 use newos_kernel_core::ipc::{KernelIpcState, MAX_ENDPOINTS, MAX_IPC_PROCS};
 use newos_kernel_core::memory::{
@@ -22,6 +23,8 @@ use super::serial;
 const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
 const MAX_PROCS: usize = MAX_IPC_PROCS;
 const _: () = assert!(MAX_PROCS <= 8);
+const MAX_CPUS: usize = 8;
+const MAX_DMA_CACHE_LEN: u64 = 64 * 1024;
 const TTBR0_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 const CNTV_CTL_ENABLE: u64 = 1 << 0;
 const CNTV_CTL_ISTATUS: u64 = 1 << 2;
@@ -138,6 +141,64 @@ static NET_MMIO_LEN: AtomicU64 = AtomicU64::new(0);
 static RNG_MMIO_PHYS: AtomicU64 = AtomicU64::new(0);
 static RNG_MMIO_VIRT: AtomicU64 = AtomicU64::new(0);
 static RNG_MMIO_LEN: AtomicU64 = AtomicU64::new(0);
+static WDT_MMIO_PHYS: AtomicU64 = AtomicU64::new(0);
+static WDT_MMIO_VIRT: AtomicU64 = AtomicU64::new(0);
+static WDT_MMIO_LEN: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+struct ExtraMmioEntry {
+    phys: u64,
+    virt: u64,
+    len: u64,
+}
+
+struct ExtraMmioTable<const N: usize> {
+    entries: [ExtraMmioEntry; N],
+    count: usize,
+}
+
+impl<const N: usize> ExtraMmioTable<N> {
+    const fn new() -> Self {
+        Self {
+            entries: [ExtraMmioEntry {
+                phys: 0,
+                virt: 0,
+                len: 0,
+            }; N],
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, phys: u64, virt: u64, len: u64) {
+        if self.count < N && len > 0 {
+            self.entries[self.count] = ExtraMmioEntry { phys, virt, len };
+            self.count += 1;
+        }
+    }
+
+    fn translate(&self, phys: u64) -> Option<u64> {
+        for e in &self.entries[..self.count] {
+            if phys >= e.phys && phys < e.phys.saturating_add(e.len) {
+                return Some(e.virt + (phys - e.phys));
+            }
+        }
+        None
+    }
+}
+
+static EXTRA_MMIO_MAPS: IrqSpinLock<ExtraMmioTable<32>> = IrqSpinLock::new(ExtraMmioTable::new());
+
+/// Record a verified Device-nGnRnE physical->virtual MMIO mapping for capability-gated EL0 access.
+pub fn register_extra_mmio_mapping(phys: PhysAddr, virt: u64, len: u64) {
+    EXTRA_MMIO_MAPS.lock().push(phys.raw(), virt, len);
+}
+
+/// Grant a capability-scoped `MmioRegion` (`R|W`) at `slot` in `init` (PID 0)'s `CSpace`.
+pub fn register_init_mmio_cap(slot: usize, phys: PhysAddr, len: u64) {
+    let _ = IPC_STATE
+        .lock()
+        .register_bootstrap_mmio_cap(slot, phys, len);
+}
 static IS_QEMU_VIRT: AtomicBool = AtomicBool::new(false);
 static SYS_INFO_PACKED: AtomicU64 = AtomicU64::new(0);
 static TIMER_TICK_INTERVAL: AtomicU64 = AtomicU64::new(625_000);
@@ -290,6 +351,8 @@ struct ProcessSlot {
     ttbr0: u64,
     wait: IpcWaitState,
     wait_ep_id: u32,
+    /// Logical CPU currently executing this process in EL0 (`None` when queued/blocked).
+    running_on: Option<usize>,
     /// Single-use implicit Reply capability minted on `IpcCall` rendezvous, consumed on `IpcReplyRecv`.
     reply_target: Option<usize>,
     fault_pc: u64,
@@ -305,6 +368,7 @@ impl ProcessSlot {
         ttbr0: 0,
         wait: IpcWaitState::Runnable,
         wait_ep_id: 0,
+        running_on: None,
         reply_target: None,
         fault_pc: 0,
         fault_sp: 0,
@@ -320,7 +384,7 @@ struct ProcTable {
     recv_waiters: [u8; MAX_ENDPOINTS],
     reply_waiters: [u8; MAX_ENDPOINTS],
     count: usize,
-    current: usize,
+    cpu_current: [Option<usize>; MAX_CPUS],
 }
 
 impl ProcTable {
@@ -331,8 +395,14 @@ impl ProcTable {
             recv_waiters: [0; MAX_ENDPOINTS],
             reply_waiters: [0; MAX_ENDPOINTS],
             count: 0,
-            current: 0,
+            cpu_current: [None; MAX_CPUS],
         }
+    }
+
+    #[inline]
+    fn current_for_this_cpu(&self) -> usize {
+        let cpu = (super::get_cpu_id() as usize).min(MAX_CPUS - 1);
+        self.cpu_current[cpu].unwrap_or(0)
     }
 
     #[inline]
@@ -360,6 +430,9 @@ impl ProcTable {
                 IpcWaitState::Runnable => {}
             }
         }
+        if new_state == IpcWaitState::Runnable && old_state != IpcWaitState::Runnable {
+            super::smp::wake_idle_aps();
+        }
     }
 
     #[inline]
@@ -367,16 +440,43 @@ impl ProcTable {
         if self.count <= 1 {
             return None;
         }
-        let _ = self.sched.schedule_next()?;
-        let next = self.sched.current_slot()?;
-        if next != from
-            && self.procs[next].active
-            && self.procs[next].wait == IpcWaitState::Runnable
-        {
-            Some(next)
-        } else {
-            None
+        for _ in 0..self.count {
+            let _ = self.sched.schedule_next()?;
+            let next = self.sched.current_slot()?;
+            if next != from
+                && self.procs[next].active
+                && self.procs[next].wait == IpcWaitState::Runnable
+                && self.procs[next].running_on.is_none()
+            {
+                return Some(next);
+            }
         }
+        None
+    }
+
+    #[inline]
+    fn claim_any_runnable(&mut self, cpu_id: usize) -> Option<usize> {
+        for pid in 0..self.count {
+            if self.procs[pid].active
+                && self.procs[pid].wait == IpcWaitState::Runnable
+                && self.procs[pid].running_on.is_none()
+            {
+                self.procs[pid].running_on = Some(cpu_id);
+                self.cpu_current[cpu_id] = Some(pid);
+                return Some(pid);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn has_other_running_cpu(&self, this_cpu: usize) -> bool {
+        for (cpu, slot) in self.cpu_current.iter().enumerate() {
+            if cpu != this_cpu && slot.is_some() {
+                return true;
+            }
+        }
+        false
     }
 
     #[inline]
@@ -407,6 +507,7 @@ pub fn init(
     hhdm_offset: u64,
     net_mmio: Option<(PhysAddr, u64, u64)>,
     rng_mmio: Option<(PhysAddr, u64, u64)>,
+    wdt_mmio: Option<(PhysAddr, u64, u64)>,
     qemu_virt: bool,
     netd_present: bool,
 ) {
@@ -423,10 +524,19 @@ pub fn init(
         RNG_MMIO_VIRT.store(virt, Ordering::Release);
         RNG_MMIO_LEN.store(len, Ordering::Release);
     }
+    if let Some((phys, virt, len)) = wdt_mmio {
+        WDT_MMIO_PHYS.store(phys.raw(), Ordering::Release);
+        WDT_MMIO_VIRT.store(virt, Ordering::Release);
+        WDT_MMIO_LEN.store(len, Ordering::Release);
+    }
     // When `newos-netd` (PID 2) is loaded, omit `BOOTSTRAP_NET_MMIO` from `init` (PID 0)
     // so `netd` is the sole holder of NIC DMA authority.
     let init_net_cap = if netd_present { None } else { cap_region };
-    let _ = IPC_STATE.lock().init_bootstrap_caps(init_net_cap);
+    let mut ipc = IPC_STATE.lock();
+    let _ = ipc.init_bootstrap_caps(init_net_cap);
+    if let Some((phys, _, len)) = wdt_mmio {
+        let _ = ipc.register_wdt_mmio_cap(phys, len);
+    }
 }
 
 #[inline]
@@ -442,6 +552,15 @@ fn mmio_phys_to_virt(phys: u64) -> Option<u64> {
     let rng_len = RNG_MMIO_LEN.load(Ordering::Acquire);
     if rng_len > 0 && phys >= rng_phys && phys < rng_phys.saturating_add(rng_len) {
         return Some(rng_virt + (phys - rng_phys));
+    }
+    let wdt_phys = WDT_MMIO_PHYS.load(Ordering::Acquire);
+    let wdt_virt = WDT_MMIO_VIRT.load(Ordering::Acquire);
+    let wdt_len = WDT_MMIO_LEN.load(Ordering::Acquire);
+    if wdt_len > 0 && phys >= wdt_phys && phys < wdt_phys.saturating_add(wdt_len) {
+        return Some(wdt_virt + (phys - wdt_phys));
+    }
+    if let Some(virt) = EXTRA_MMIO_MAPS.lock().translate(phys) {
+        return Some(virt);
     }
     // Never fall back to cacheable HHDM for Device MMIO (`H-5`).
     None
@@ -473,6 +592,7 @@ pub fn register_user_process(
         ttbr0,
         wait: IpcWaitState::Runnable,
         wait_ep_id: 0,
+        running_on: None,
         reply_target: None,
         fault_pc: 0,
         fault_sp: 0,
@@ -493,14 +613,16 @@ pub fn register_user_process(
         }
         2 => {
             let len = NET_MMIO_LEN.load(Ordering::Acquire);
-            let net_cap = (len > 0).then(|| (PhysAddr::new(NET_MMIO_PHYS.load(Ordering::Acquire)), len));
+            let net_cap =
+                (len > 0).then(|| (PhysAddr::new(NET_MMIO_PHYS.load(Ordering::Acquire)), len));
             let _ = ipc.init_netd_bootstrap_caps(2, net_cap);
             let _ = ipc.bind_bootstrap_vspace(2, PhysAddr::new(ttbr0));
             let _ = ipc.register_child_caps_in_root(2);
         }
         3 => {
             let len = RNG_MMIO_LEN.load(Ordering::Acquire);
-            let rng_cap = (len > 0).then(|| (PhysAddr::new(RNG_MMIO_PHYS.load(Ordering::Acquire)), len));
+            let rng_cap =
+                (len > 0).then(|| (PhysAddr::new(RNG_MMIO_PHYS.load(Ordering::Acquire)), len));
             let qemu = IS_QEMU_VIRT.load(Ordering::Acquire);
             let _ = ipc.init_keyd_bootstrap_caps(3, rng_cap, qemu);
             if qemu {
@@ -540,12 +662,75 @@ fn switch_ttbr0(ttbr0_phys: u64, pid: usize) {
 /// Save `from`'s GPR + NEON/FP state and switch `TTBR0_EL1` + registers to `to`.
 #[inline]
 fn context_switch(table: &mut ProcTable, from: usize, to: usize, frame: &mut TrapFrame) {
+    let cpu = (super::get_cpu_id() as usize).min(MAX_CPUS - 1);
     table.procs[from].frame = *frame;
     save_fp_state(&mut table.procs[from].fp);
-    table.current = to;
+    table.procs[from].running_on = None;
+    table.procs[to].running_on = Some(cpu);
+    table.cpu_current[cpu] = Some(to);
     switch_ttbr0(table.procs[to].ttbr0, to);
     restore_fp_state(&table.procs[to].fp);
     *frame = table.procs[to].frame;
+}
+
+/// Read true hardware CPU cycle counter (`PMCCNTR_EL0`) when PMUv3 is enabled,
+/// falling back to the architectural Generic Virtual Counter (`CNTVCT_EL0`).
+#[inline]
+fn read_cycles() -> u64 {
+    if super::pmuv3_enabled() {
+        let c: u64;
+        // SAFETY: `PMCCNTR_EL0` is enabled by `probe_and_enable_cpu_hardening` when PMUv3 is present.
+        unsafe {
+            asm!("isb", "mrs {}, pmccntr_el0", out(reg) c, options(nomem, nostack));
+        }
+        c
+    } else {
+        read_cntvct()
+    }
+}
+
+/// Perform PAN-safe, page-table-validated DMA cache maintenance (`dc cvac` / `dc civac`)
+/// over an EL0 virtual address range `user_ptr..user_ptr+len` via its HHDM physical alias.
+fn handle_dma_cache_op(
+    ttbr0: u64,
+    user_ptr: u64,
+    len: u64,
+    op: DmaCacheOp,
+) -> Result<u64, SysError> {
+    if len == 0 {
+        return Ok(0);
+    }
+    if len > MAX_DMA_CACHE_LEN {
+        return Err(SysError::InvalidArgument);
+    }
+    let end = user_ptr.checked_add(len).ok_or(SysError::InvalidArgument)?;
+    if user_ptr == 0 || end >= USER_ADDR_LIMIT {
+        return Err(SysError::InvalidArgument);
+    }
+    let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
+    let vspace = super::paging::Aarch64VSpace::from_root_phys(ttbr0, hhdm);
+    let require_write = matches!(op, DmaCacheOp::Invalidate | DmaCacheOp::CleanInvalidate);
+
+    let mut cur = user_ptr;
+    while cur < end {
+        let page_va_raw = cur & !PAGE_MASK;
+        let page_off = cur & PAGE_MASK;
+        let chunk = (PAGE_SIZE - page_off).min(end - cur) as usize;
+        let page_va = VirtAddr::new_page_aligned(page_va_raw)?;
+        let (phys, flags) = vspace.translate(page_va).ok_or(SysError::InvalidArgument)?;
+        if !flags.user || (require_write && !flags.writable) {
+            return Err(SysError::InsufficientRights);
+        }
+        let hhdm_va = hhdm.wrapping_add(phys.raw().wrapping_add(page_off));
+        match op {
+            DmaCacheOp::Clean => super::paging::dma_clean_range(hhdm_va, chunk),
+            DmaCacheOp::Invalidate | DmaCacheOp::CleanInvalidate => {
+                super::paging::dma_invalidate_range(hhdm_va, chunk);
+            }
+        }
+        cur += chunk as u64;
+    }
+    Ok(len)
 }
 
 #[inline]
@@ -624,7 +809,7 @@ pub extern "C" fn irq_el0_dispatch(frame: &mut TrapFrame) {
 
         let mut table = PROCS.lock();
         if table.sched.on_timer_tick() {
-            let cur = table.current;
+            let cur = table.current_for_this_cpu();
             if let Some(next) = table.pick_next_runnable(cur) {
                 context_switch(&mut table, cur, next, frame);
                 PREEMPT_PENDING.store(false, Ordering::Release);
@@ -713,7 +898,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         // Hardware EL0 fault (e.g., `udf #0` illegal instruction EC=0x00, data/insn abort)
         let (cur_pid, rec_pc, rec_sp, rec_shadow_sp) = {
             let table = PROCS.lock();
-            let cur = table.current;
+            let cur = table.current_for_this_cpu();
             if cur < table.count {
                 (
                     cur,
@@ -819,7 +1004,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
     let a3 = frame.x[3];
     let (cur_pid, cur_ttbr0) = {
         let table = PROCS.lock();
-        let cur = table.current;
+        let cur = table.current_for_this_cpu();
         (cur, table.procs[cur].ttbr0)
     };
 
@@ -839,7 +1024,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             PREEMPT_PENDING.store(false, Ordering::Release);
 
             let mut table = PROCS.lock();
-            let cur = table.current;
+            let cur = table.current_for_this_cpu();
             if let Some(next) = table.pick_next_runnable(cur) {
                 context_switch(&mut table, cur, next, frame);
             }
@@ -853,6 +1038,8 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 Ok(()) => {
                     let code = if a1 == ShutdownStatus::Success as u64 {
                         ShutdownStatus::Success
+                    } else if a1 == ShutdownStatus::Reboot as u64 {
+                        ShutdownStatus::Reboot
                     } else {
                         ShutdownStatus::Failed
                     };
@@ -872,7 +1059,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             match ipc.lookup_endpoint_for(cur_pid, CapId::new(a0), Rights::WRITE) {
                 Err(e) => Err(e),
                 Ok((ep_id, badge)) => {
-                    let cur = table.current;
+                    let cur = table.current_for_this_cpu();
                     // Strictly wake only `WaitingRecv` servers — NEVER hijack `WaitingReply` callers.
                     if let Some(peer) = table.find_waiter(IpcWaitState::WaitingRecv, ep_id, cur) {
                         set_ipc_return(&mut table.procs[peer].frame, a1, badge);
@@ -904,8 +1091,10 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             ) {
                 Err(e) => Err(e),
                 Ok((ep_id, badge)) => {
-                    let cur = table.current;
-                    if let Some(server) = table.find_waiter(IpcWaitState::WaitingRecv, ep_id, cur) {
+                    let cur = table.current_for_this_cpu();
+                    if let Some(server) = table.find_waiter(IpcWaitState::WaitingRecv, ep_id, cur)
+                        && table.procs[server].running_on.is_none()
+                    {
                         drop(ipc);
                         // Mint single-use Reply capability on `server` pointing exclusively to `cur`.
                         set_ipc_return(&mut table.procs[server].frame, a1, badge);
@@ -928,6 +1117,30 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                                     context_switch(&mut table, cur, next, frame);
                                     return;
                                 }
+                                let this_cpu = (super::get_cpu_id() as usize).min(MAX_CPUS - 1);
+                                if table.has_other_running_cpu(this_cpu) {
+                                    // True SMP blocking IPC: park `cur` in `WaitingReply` and
+                                    // release `PROCS` so the peer running on another core can
+                                    // receive the buffered message and deliver the reply.
+                                    table.procs[cur].frame = *frame;
+                                    save_fp_state(&mut table.procs[cur].fp);
+                                    table.procs[cur].running_on = None;
+                                    table.cpu_current[this_cpu] = None;
+                                    drop(ipc);
+                                    drop(table);
+                                    loop {
+                                        {
+                                            let mut t = PROCS.lock();
+                                            if let Some(next) = t.claim_any_runnable(this_cpu) {
+                                                switch_ttbr0(t.procs[next].ttbr0, next);
+                                                restore_fp_state(&t.procs[next].fp);
+                                                *frame = t.procs[next].frame;
+                                                return;
+                                            }
+                                        }
+                                        core::hint::spin_loop();
+                                    }
+                                }
                                 // Roll back buffered message so no orphan remains in the endpoint.
                                 let _ = ipc.ipc_recv_resolved(ep_id);
                                 table.set_wait_state(cur, IpcWaitState::Runnable, 0);
@@ -946,7 +1159,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         SyscallNumber::IpcReplyRecv => {
             let mut table = PROCS.lock();
             let mut ipc = IPC_STATE.lock();
-            let cur = table.current;
+            let cur = table.current_for_this_cpu();
             let required = if a2 != 0 {
                 Rights::WRITE.union(Rights::READ)
             } else {
@@ -984,7 +1197,9 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                             Ok(msg.payload)
                         }
                         Err(SysError::WouldBlock) => {
-                            if let Some(client) = fastpath_client {
+                            if let Some(client) = fastpath_client
+                                && table.procs[client].running_on.is_none()
+                            {
                                 drop(ipc);
                                 table.set_wait_state(cur, IpcWaitState::WaitingRecv, ep_id);
                                 let _ = table.sched.block_slot(cur);
@@ -1011,7 +1226,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 }
             }
         }
-        SyscallNumber::ReadCycles => Ok(read_cntvct()),
+        SyscallNumber::ReadCycles => Ok(read_cycles()),
         SyscallNumber::SetFaultHandler => {
             if a0 == 0 || a0 >= USER_ADDR_LIMIT || a1 == 0 || a1 >= USER_ADDR_LIMIT {
                 Err(SysError::InvalidArgument)
@@ -1445,6 +1660,24 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 super::gic::enable_irq(u32::from(irq));
                 u64::from(irq)
             }),
+        SyscallNumber::DmaCacheOp => match DmaCacheOp::from_u64(a3) {
+            Some(op) => IPC_STATE
+                .lock()
+                .validate_vspace_for(cur_pid, CapId::new(a0), Rights::READ)
+                .and_then(|root| {
+                    let target_ttbr0 = if root.raw() != 0 {
+                        root.raw()
+                    } else {
+                        cur_ttbr0
+                    };
+                    handle_dma_cache_op(target_ttbr0, a1, a2, op)
+                }),
+            None => Err(SysError::InvalidArgument),
+        },
+        SyscallNumber::CpuFeatures => IPC_STATE
+            .lock()
+            .validate_power_for(cur_pid, CapId::new(a0), Rights::READ)
+            .map(|()| super::cpu_isa_features()),
     };
 
     match result {
@@ -1478,7 +1711,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             true
         };
         if should_preempt {
-            let cur = table.current;
+            let cur = table.current_for_this_cpu();
             if let Some(next) = table.pick_next_runnable(cur) {
                 context_switch(&mut table, cur, next, frame);
             }
@@ -1486,12 +1719,14 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
     }
 }
 
-/// Load Process 0 (`init`)'s isolated `TTBR0_EL1` and enter EL0 via `eret`.
+/// Load Process 0 (`init`)'s isolated `TTBR0_EL1`, signal secondary Cortex-A76 cores
+/// to enter the multi-core EL0 scheduler, and enter EL0 via `eret`.
 pub fn start_userspace() -> ! {
     let (ttbr0, entry_pc, user_sp, user_shadow_sp) = {
         let mut table = PROCS.lock();
         assert!(table.count > 0 && table.procs[0].active);
-        table.current = 0;
+        table.procs[0].running_on = Some(0);
+        table.cpu_current[0] = Some(0);
         table.sched.select_slot(0);
         (
             table.procs[0].ttbr0,
@@ -1505,6 +1740,7 @@ pub fn start_userspace() -> ! {
     enable_fp_simd();
     switch_ttbr0(ttbr0, 0);
     init_preempt_timer();
+    super::smp::signal_userspace_ready();
 
     // SAFETY: `ttbr0` is active, `entry_pc`, `user_sp`, and `user_shadow_sp` (`x18`) point to
     // valid W^X EL0 mappings, and `SPSR_EL1 = 0` transitions cleanly to AArch64 EL0t via `eret`.
@@ -1520,5 +1756,60 @@ pub fn start_userspace() -> ! {
             user_shadow_sp = in(reg) user_shadow_sp,
             options(noreturn),
         );
+    }
+}
+
+/// Secondary Cortex-A76 core (AP) EL0 scheduler entry.
+///
+/// Claims any runnable, unassigned EL0 process from `PROCS` and enters EL0 via `eret`,
+/// or parks in low-power `wfi` until woken by a GICv2 `SGI_RESCHEDULE` IPI.
+pub fn ap_enter_scheduler() -> ! {
+    let cpu_id = (super::get_cpu_id() as usize).min(MAX_CPUS - 1);
+    super::paging::ensure_ttbr0_asid_enabled();
+    enable_fp_simd();
+    init_preempt_timer();
+
+    loop {
+        let claimed = {
+            let mut table = PROCS.lock();
+            table.claim_any_runnable(cpu_id).map(|pid| {
+                let p = &table.procs[pid];
+                (
+                    pid,
+                    p.ttbr0,
+                    p.frame.elr_el1,
+                    p.frame.sp_el0,
+                    p.shadow_sp,
+                    p.fp,
+                )
+            })
+        };
+
+        if let Some((pid, ttbr0, entry_pc, user_sp, user_shadow_sp, fp)) = claimed {
+            super::smp::mark_ap_idle(cpu_id, false);
+            switch_ttbr0(ttbr0, pid);
+            restore_fp_state(&fp);
+            // SAFETY: Secondary core holds exclusive `running_on = Some(cpu_id)` ownership
+            // of `pid` with valid W^X EL0 mappings in `ttbr0`, entering EL0t via `eret`.
+            unsafe {
+                asm!(
+                    "msr sp_el0, {user_sp}",
+                    "msr elr_el1, {entry_pc}",
+                    "msr spsr_el1, xzr",
+                    "mov x18, {user_shadow_sp}",
+                    "eret",
+                    user_sp = in(reg) user_sp,
+                    entry_pc = in(reg) entry_pc,
+                    user_shadow_sp = in(reg) user_shadow_sp,
+                    options(noreturn),
+                );
+            }
+        }
+
+        super::smp::mark_ap_idle(cpu_id, true);
+        // SAFETY: Park idle secondary Cortex-A76 core in low-power WFI until SGI/IRQ wakes it.
+        unsafe {
+            asm!("wfi", options(nomem, nostack));
+        }
     }
 }

@@ -41,10 +41,7 @@ impl<'a> WireReader<'a> {
     }
 
     pub fn read_exact(&mut self, len: usize) -> Result<&'a [u8], SshError> {
-        let end = self
-            .pos
-            .checked_add(len)
-            .ok_or(SshError::MalformedPacket)?;
+        let end = self.pos.checked_add(len).ok_or(SshError::MalformedPacket)?;
         if end > self.buf.len() {
             return Err(SshError::MalformedPacket);
         }

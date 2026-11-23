@@ -3,13 +3,53 @@
 //! and cross-core SGI IPI wakeup verification.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use limine::mp::MpInfo;
 
 use crate::boot;
 
 static ONLINE_CPUS: AtomicUsize = AtomicUsize::new(1);
 static AP_SGI_ACK_COUNT: AtomicU64 = AtomicU64::new(0);
+static USERSPACE_READY: AtomicBool = AtomicBool::new(false);
+static IDLE_AP_MASK: AtomicU8 = AtomicU8::new(0);
+
+/// Signal all parked secondary Cortex-A76 cores that EL0 processes are ready to schedule,
+/// waking them via GICv2 `SGI_RESCHEDULE`.
+pub fn signal_userspace_ready() {
+    USERSPACE_READY.store(true, Ordering::Release);
+    let online = ONLINE_CPUS.load(Ordering::Acquire);
+    if online > 1 {
+        let mut mask = 0u8;
+        for cpu in 1..online.min(8) {
+            mask |= 1u8 << cpu;
+        }
+        if mask != 0 {
+            super::gic::send_sgi(super::gic::SGI_RESCHEDULE, mask);
+        }
+    }
+}
+
+/// Record whether secondary core `cpu_id` (`1..8`) is currently idle in `wfi`.
+#[inline]
+pub fn mark_ap_idle(cpu_id: usize, idle: bool) {
+    if (1..8).contains(&cpu_id) {
+        let bit = 1u8 << cpu_id;
+        if idle {
+            IDLE_AP_MASK.fetch_or(bit, Ordering::Release);
+        } else {
+            IDLE_AP_MASK.fetch_and(!bit, Ordering::Release);
+        }
+    }
+}
+
+/// Wake any idle secondary Cortex-A76 cores via GICv2 `SGI_RESCHEDULE` when work becomes runnable.
+#[inline]
+pub fn wake_idle_aps() {
+    let mask = IDLE_AP_MASK.load(Ordering::Acquire);
+    if mask != 0 {
+        super::gic::send_sgi(super::gic::SGI_RESCHEDULE, mask);
+    }
+}
 
 /// Called by the EL1 IRQ handler when a secondary core receives `SGI_RESCHEDULE`.
 #[inline]
@@ -84,10 +124,14 @@ unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
 
     ONLINE_CPUS.fetch_add(1, Ordering::AcqRel);
 
-    loop {
+    // Wait in low-power WFI until BSP finishes early boot and signals EL0 userspace ready.
+    while !USERSPACE_READY.load(Ordering::Acquire) {
         // SAFETY: Secondary ARM64 core parks in low-power WFI until woken by an SGI/IRQ.
         unsafe {
             asm!("wfi", options(nomem, nostack));
         }
     }
+
+    // Enter multi-core EL0 scheduler on this secondary Cortex-A76 core.
+    super::syscall::ap_enter_scheduler()
 }

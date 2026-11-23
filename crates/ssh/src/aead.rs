@@ -279,12 +279,7 @@ impl OpenSshChaCha20Poly1305 {
     }
 
     /// Verify the 16-byte Poly1305 tag in constant time, then decrypt `packet_with_len[4..]` in place.
-    pub fn open_in_place(
-        &self,
-        seq: u64,
-        packet_with_len: &mut [u8],
-        tag: &[u8; TAG_LEN],
-    ) -> bool {
+    pub fn open_in_place(&self, seq: u64, packet_with_len: &mut [u8], tag: &[u8; TAG_LEN]) -> bool {
         let nonce = seq_nonce(seq);
         let mut poly_blk = chacha20_block(&self.k_main, 0, &nonce);
         let mut otk = [0u8; 32];
@@ -334,7 +329,10 @@ mod tests {
 
         let tag = cipher.seal_in_place(7, &mut pkt);
         assert_ne!(&pkt[4..20], &orig_body);
-        assert_eq!(cipher.decrypt_length(7, [pkt[0], pkt[1], pkt[2], pkt[3]]), 16);
+        assert_eq!(
+            cipher.decrypt_length(7, [pkt[0], pkt[1], pkt[2], pkt[3]]),
+            16
+        );
 
         // Tampered ciphertext MUST fail constant-time tag verification
         let mut tampered = pkt;
