@@ -1,6 +1,6 @@
 # NewOS
 
-> **Release:** [`v0.5.0`](https://github.com/laurentgrangeau/newos/releases/tag/v0.5.0) · Security Audit Hardening (Soft-Float EL1, KCFI/SSBS/W^X, SMP IPC, PQ-SSH, 445 Tests & CI).
+> **Release:** [`v0.5.0`](https://github.com/laurentgrangeau/newos/releases/tag/v0.5.0) · `main` is on `0.6.0` development.
 
 A pure **seL4-style 64-bit capability microkernel** and **post-UNIX EL0 environment** written in modern Rust — built solely for the **Raspberry Pi 5 16 GB** (`aarch64` / ARMv8.2-A quad-core BCM2712 Cortex-A76, with QEMU `aarch64` `virt` retained as a local test harness). Built with **zero kernel heap (`no_alloc` in EL1)**, **100% memory-safe Rust APIs (`#![forbid(unsafe_code)]` across core, board/GPIO/watchdog/storage/USB/GPU/AI drivers, networking, RNG, PQ-SSH, shell, userspace & benchmarks)**, **Kernel PIE + Limine KASLR**, **Userspace PIE + full ASLR + KCFI + LLVM ShadowCallStack (`x18`)**, **true quad-core SMP EL0 scheduling with GICv2 SGI wakeups & cross-core blocking IPC**, **isolated `TTBR0_EL1` address spaces (16-bit ASIDs + full NEON/FP save/restore)**, **EL0 crash isolation**, **live ACPI hardware discovery (`FADT`/`SPCR`/`MADT`/`GTDT`/`MCFG`)**, a **full Raspberry Pi 5 (16 GB) EL0 hardware driver stack** (**BCM2712 Watchdog**, **RP1 40-pin GPIO**, **VideoCore Mailbox**, **AVS TMON Thermal & Active Cooler Fan**, **RTC**, **RP1 UART/I2C/SPI/PWM**, **BCM2712 MIP MSI-X**, **PCIe ECAM**, **microSD SDHCI**, **NVMe 1.4**, **RP1 Dual xHCI USB 3.0**, **UEFI GOP Framebuffer**, **`brcm,bcm2712-iommu`**, **VideoCore VII V3D 7.1**, **Cortex-A76 NEON/DotProd AI Compute**, and **Hailo-8/8L/10H PCIe NPU**), a **3-process privilege-separated Pure Post-Quantum SSHv2 server (`newos-netd` + `newos-keyd` + `newos-sshd`)** with **hardware TRNG (`BCM2712 iproc-rng200` / `VirtIO-RNG`)**, an **EL0 `smoltcp` IPv4/IPv6 TCP/IP stack + RP1 Cadence GEM Gigabit Ethernet driver** (plus VirtIO 1.0+ for QEMU testing), a **FIPS 202 `SHA3-512` Content-Addressed Object Store (CAOS)**, and a **UTF-8 Typed Pipeline Shell (`newos-sh`)**.
 
@@ -151,7 +151,7 @@ sequenceDiagram
 ```text
 newos/
 ├── rust-toolchain.toml          # Nightly toolchain + rust-src, llvm-tools-preview, aarch64-unknown-none
-├── Cargo.toml                   # Workspace manifest (v0.5.0)
+├── Cargo.toml                   # Workspace manifest (v0.6.0; v0.5.0 released)
 ├── BENCHMARK_RESULTS.md         # Reproducible 28-metric before/after kernel, shell & IPC benchmarks
 ├── targets/
 │   └── aarch64-newos-user.json  # Custom Cortex-A76 EL0 PIE target spec enabling KCFI + LLVM ShadowCallStack (x18)
