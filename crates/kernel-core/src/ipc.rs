@@ -91,7 +91,7 @@ impl KernelIpcState {
             endpoints: [IpcMessage::EMPTY; MAX_ENDPOINTS],
             stats: IpcStats::new(),
             notifications: [0; MAX_NOTIFICATIONS],
-            next_endpoint_id: 2,
+            next_endpoint_id: 7,
             next_notif_id: 2,
         }
     }
@@ -206,7 +206,172 @@ impl KernelIpcState {
             11,
             Capability::new(CapObject::Endpoint { id: 1 }, Rights::ALL),
         )?;
+        let rw = Rights::READ.union(Rights::WRITE);
+        let _ = self.root_cspace.insert_root_at(
+            13,
+            Capability {
+                object: CapObject::Endpoint { id: 2 },
+                rights: rw,
+                badge: 0x1000,
+            },
+        )?;
+        let _ = self
+            .root_cspace
+            .insert_root_at(15, Capability::new(CapObject::Endpoint { id: 4 }, Rights::READ))?;
+        let _ = self.root_cspace.insert_root_at(
+            16,
+            Capability::new(CapObject::Endpoint { id: 5 }, Rights::READ),
+        )?;
+        let _ = self
+            .root_cspace
+            .insert_root_at(17, Capability::new(CapObject::Endpoint { id: 6 }, Rights::WRITE))?;
         Ok((notif, ep, fault_notif))
+    }
+
+    /// Install strict least-privilege capabilities for `newos-netd` (Network & DMA plane).
+    ///
+    /// Holds ONLY `BOOTSTRAP_NET_MMIO` (`R|W`), `BOOTSTRAP_VSPACE` (`R` only for `VirtToPhys`),
+    /// `BOOTSTRAP_NET_EP` (`R|W`, server), and write-only `BOOTSTRAP_LOG_EP` (`W`, badged `pid`).
+    /// Explicitly omits `RNG_MMIO`, `KEY_EP`, `AUTH_GATE_EP`, `SSH_SHELL_EP`, `THREAD`, `CNODE`,
+    /// `CONSOLE`, `POWER`, `UNTYPED`, and `GRANT`/`REVOKE`.
+    pub fn init_netd_bootstrap_caps(
+        &mut self,
+        pid: usize,
+        net_mmio: Option<(PhysAddr, u64)>,
+    ) -> Result<(), SysError> {
+        if pid == 0 || pid >= MAX_IPC_PROCS {
+            return Err(SysError::InvalidArgument);
+        }
+        let cnode = &mut self.proc_cspaces[pid - 1];
+        let rw = Rights::READ.union(Rights::WRITE);
+        if let Some((phys, len)) = net_mmio {
+            let _ = cnode
+                .insert_root_at(4, Capability::new(CapObject::MmioRegion { phys, len }, rw))?;
+        }
+        let _ = cnode.insert_root_at(
+            7,
+            Capability::new(
+                CapObject::VSpace {
+                    root_phys: PhysAddr::new(0),
+                },
+                Rights::READ,
+            ),
+        )?;
+        let _ = cnode.insert_root_at(
+            11,
+            Capability {
+                object: CapObject::Endpoint { id: 1 },
+                rights: Rights::WRITE,
+                badge: pid as u64,
+            },
+        )?;
+        let _ = cnode.insert_root_at(13, Capability::new(CapObject::Endpoint { id: 2 }, rw))?;
+        Ok(())
+    }
+
+    /// Install strict least-privilege capabilities for `newos-keyd` (Entropy & PQ Signing Vault).
+    ///
+    /// Holds ONLY `BOOTSTRAP_RNG_MMIO` (`R|W`), `BOOTSTRAP_VSPACE` (`R` only, QEMU VirtIO-RNG DMA
+    /// only — omitted on Raspberry Pi 5), `BOOTSTRAP_KEY_EP` (`R|W`, server), write-only
+    /// `BOOTSTRAP_AUTH_GATE_EP` (`W`, badged `pid`), and write-only `BOOTSTRAP_LOG_EP` (`W`, badged `pid`).
+    pub fn init_keyd_bootstrap_caps(
+        &mut self,
+        pid: usize,
+        rng_mmio: Option<(PhysAddr, u64)>,
+        allow_vspace_read: bool,
+    ) -> Result<(), SysError> {
+        if pid == 0 || pid >= MAX_IPC_PROCS {
+            return Err(SysError::InvalidArgument);
+        }
+        let cnode = &mut self.proc_cspaces[pid - 1];
+        let rw = Rights::READ.union(Rights::WRITE);
+        if allow_vspace_read {
+            let _ = cnode.insert_root_at(
+                7,
+                Capability::new(
+                    CapObject::VSpace {
+                        root_phys: PhysAddr::new(0),
+                    },
+                    Rights::READ,
+                ),
+            )?;
+        }
+        let _ = cnode.insert_root_at(
+            11,
+            Capability {
+                object: CapObject::Endpoint { id: 1 },
+                rights: Rights::WRITE,
+                badge: pid as u64,
+            },
+        )?;
+        if let Some((phys, len)) = rng_mmio {
+            let _ = cnode
+                .insert_root_at(12, Capability::new(CapObject::MmioRegion { phys, len }, rw))?;
+        }
+        let _ = cnode.insert_root_at(14, Capability::new(CapObject::Endpoint { id: 3 }, rw))?;
+        let _ = cnode.insert_root_at(
+            16,
+            Capability {
+                object: CapObject::Endpoint { id: 5 },
+                rights: Rights::WRITE,
+                badge: pid as u64,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Install strict least-privilege capabilities for `newos-sshd` (Untrusted SSH Parser).
+    ///
+    /// Holds **ZERO** MMIO capabilities, **ZERO** `VSpace` capability, **ZERO** `AUTH_GATE_EP`,
+    /// **ZERO** `THREAD`/`CNODE`/`GRANT`/`REVOKE`. Holds ONLY badged `BOOTSTRAP_NET_EP`,
+    /// `BOOTSTRAP_KEY_EP`, `BOOTSTRAP_SSH_SHELL_EP`, and write-only `BOOTSTRAP_LOG_EP`.
+    pub fn init_sshd_bootstrap_caps(&mut self, pid: usize) -> Result<(), SysError> {
+        if pid == 0 || pid >= MAX_IPC_PROCS {
+            return Err(SysError::InvalidArgument);
+        }
+        let cnode = &mut self.proc_cspaces[pid - 1];
+        let rw = Rights::READ.union(Rights::WRITE);
+        let _ = cnode.insert_root_at(
+            11,
+            Capability {
+                object: CapObject::Endpoint { id: 1 },
+                rights: Rights::WRITE,
+                badge: pid as u64,
+            },
+        )?;
+        let _ = cnode.insert_root_at(
+            13,
+            Capability {
+                object: CapObject::Endpoint { id: 2 },
+                rights: rw,
+                badge: pid as u64,
+            },
+        )?;
+        let _ = cnode.insert_root_at(
+            14,
+            Capability {
+                object: CapObject::Endpoint { id: 3 },
+                rights: rw,
+                badge: pid as u64,
+            },
+        )?;
+        let _ = cnode.insert_root_at(
+            15,
+            Capability {
+                object: CapObject::Endpoint { id: 4 },
+                rights: Rights::WRITE,
+                badge: pid as u64,
+            },
+        )?;
+        let _ = cnode.insert_root_at(
+            17,
+            Capability {
+                object: CapObject::Endpoint { id: 6 },
+                rights: Rights::READ,
+                badge: pid as u64,
+            },
+        )?;
+        Ok(())
     }
 
     /// Install least-privilege bootstrap capabilities for a non-root process (`pid >= 1`).
@@ -1767,5 +1932,139 @@ mod tests {
             .unwrap();
         assert_eq!(ipc.cap_revoke_for(0, unrelated), Ok(0));
         assert!(ipc.cspace(0).unwrap().lookup(g2_b, Rights::READ).is_ok());
+    }
+
+    #[test]
+    fn three_process_ssh_capability_isolation_enforces_least_privilege() {
+        let mut ipc = KernelIpcState::new();
+        let net_mmio = Some((PhysAddr::new(0x1F_0010_0000), 0x4000));
+        let rng_mmio = Some((PhysAddr::new(0x10_7D20_8000), 0x28));
+
+        // PID 0 (`init`): holds no NET_MMIO when netd owns it, no RNG_MMIO, no KEY_EP,
+        // read-only AUTH_GATE_EP, and SSH_SHELL_EP.
+        ipc.init_bootstrap_caps(None).unwrap();
+        // PID 2 (`netd`): NIC MMIO + read-only VSpace + NET_EP + badged LOG_EP only.
+        ipc.init_netd_bootstrap_caps(2, net_mmio).unwrap();
+        // PID 3 (`keyd`, Raspberry Pi 5 mode): RNG MMIO + KEY_EP + write-only AUTH_GATE_EP, NO VSpace.
+        ipc.init_keyd_bootstrap_caps(3, rng_mmio, false).unwrap();
+        // PID 4 (`sshd`): ZERO MMIO, ZERO VSpace, ZERO AUTH_GATE_EP, ZERO THREAD/CNODE.
+        ipc.init_sshd_bootstrap_caps(4).unwrap();
+
+        // 1. MMIO isolation
+        assert_eq!(
+            ipc.validate_mmio_read32_for(2, CapId::BOOTSTRAP_NET_MMIO, 0),
+            Ok(PhysAddr::new(0x1F_0010_0000))
+        );
+        assert_eq!(
+            ipc.validate_mmio_read32_for(2, CapId::BOOTSTRAP_RNG_MMIO, 0),
+            Err(SysError::InvalidCapability)
+        );
+        assert_eq!(
+            ipc.validate_mmio_read32_for(3, CapId::BOOTSTRAP_RNG_MMIO, 0),
+            Ok(PhysAddr::new(0x10_7D20_8000))
+        );
+        assert_eq!(
+            ipc.validate_mmio_read32_for(3, CapId::BOOTSTRAP_RNG_MMIO, 0x28),
+            Err(SysError::InvalidArgument)
+        );
+        assert_eq!(
+            ipc.validate_mmio_read32_for(3, CapId::BOOTSTRAP_NET_MMIO, 0),
+            Err(SysError::InvalidCapability)
+        );
+        // `sshd` (PID 4) has ZERO MMIO capabilities
+        assert_eq!(
+            ipc.validate_mmio_read32_for(4, CapId::BOOTSTRAP_NET_MMIO, 0),
+            Err(SysError::InvalidCapability)
+        );
+        assert_eq!(
+            ipc.validate_mmio_read32_for(4, CapId::BOOTSTRAP_RNG_MMIO, 0),
+            Err(SysError::InvalidCapability)
+        );
+
+        // 2. VSpace isolation (`netd` has READ-only; Pi 5 `keyd` and `sshd` have NONE)
+        assert_eq!(
+            ipc.validate_vspace_for(2, CapId::BOOTSTRAP_VSPACE, Rights::READ),
+            Ok(PhysAddr::new(0))
+        );
+        assert_eq!(
+            ipc.validate_vspace_for(2, CapId::BOOTSTRAP_VSPACE, Rights::WRITE),
+            Err(SysError::InsufficientRights)
+        );
+        assert_eq!(
+            ipc.validate_vspace_for(3, CapId::BOOTSTRAP_VSPACE, Rights::READ),
+            Err(SysError::InvalidCapability)
+        );
+        assert_eq!(
+            ipc.validate_vspace_for(4, CapId::BOOTSTRAP_VSPACE, Rights::READ),
+            Err(SysError::InvalidCapability)
+        );
+
+        // 3. Auth-gate isolation: ONLY `keyd` (PID 3) can write, ONLY `init` (PID 0) can read.
+        // `sshd` (PID 4) and `netd` (PID 2) cannot forge SessionOpen!
+        assert_eq!(
+            ipc.ipc_send_for(4, CapId::BOOTSTRAP_AUTH_GATE_EP, 1),
+            Err(SysError::InvalidCapability)
+        );
+        assert_eq!(
+            ipc.ipc_send_for(2, CapId::BOOTSTRAP_AUTH_GATE_EP, 1),
+            Err(SysError::InvalidCapability)
+        );
+        assert_eq!(
+            ipc.ipc_send_for(0, CapId::BOOTSTRAP_AUTH_GATE_EP, 1),
+            Err(SysError::InsufficientRights)
+        );
+        assert_eq!(
+            ipc.ipc_recv_for(3, CapId::BOOTSTRAP_AUTH_GATE_EP),
+            Err(SysError::InsufficientRights)
+        );
+        assert_eq!(
+            ipc.ipc_send_for(3, CapId::BOOTSTRAP_AUTH_GATE_EP, 0xA07B),
+            Ok(())
+        );
+        assert_eq!(
+            ipc.ipc_recv_for(0, CapId::BOOTSTRAP_AUTH_GATE_EP),
+            Ok(IpcMessage {
+                badge: 3,
+                payload: 0xA07B,
+            })
+        );
+
+        // 4. Key-vault endpoint isolation: ONLY `sshd` (PID 4) and `keyd` (PID 3) hold KEY_EP
+        assert_eq!(
+            ipc.ipc_send_for(2, CapId::BOOTSTRAP_KEY_EP, 1),
+            Err(SysError::InvalidCapability)
+        );
+        assert_eq!(
+            ipc.ipc_send_for(0, CapId::BOOTSTRAP_KEY_EP, 1),
+            Err(SysError::InvalidCapability)
+        );
+        assert_eq!(ipc.ipc_send_for(4, CapId::BOOTSTRAP_KEY_EP, 0xCAFE), Ok(()));
+        assert_eq!(
+            ipc.ipc_recv_for(3, CapId::BOOTSTRAP_KEY_EP),
+            Ok(IpcMessage {
+                badge: 4,
+                payload: 0xCAFE,
+            })
+        );
+
+        // 5. Zero Thread / CNode / Console / Power / Untyped / GRANT on all 3 daemons
+        for pid in [2usize, 3, 4] {
+            assert_eq!(
+                ipc.validate_thread_for(pid, CapId::BOOTSTRAP_SELF_THREAD, Rights::READ),
+                Err(SysError::InvalidCapability)
+            );
+            assert_eq!(
+                ipc.validate_console_for(pid, CapId::BOOTSTRAP_CONSOLE, Rights::WRITE),
+                Err(SysError::InvalidCapability)
+            );
+            assert_eq!(
+                ipc.validate_power_for(pid, CapId::BOOTSTRAP_POWER, Rights::READ),
+                Err(SysError::InvalidCapability)
+            );
+            assert_eq!(
+                ipc.cap_mint_for(pid, CapId::BOOTSTRAP_LOG_EP, 0, Rights::WRITE, None),
+                Err(SysError::InsufficientRights)
+            );
+        }
     }
 }

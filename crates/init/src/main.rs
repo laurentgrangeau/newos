@@ -37,11 +37,16 @@ impl MmioDmaTransport for CapMmioDmaTransport {
     }
 }
 
-/// EL0 `ShellHost` adapter connecting `newos-shell-core` to `newos-user-rt` and `newos-net`.
+/// EL0 `ShellHost` adapter connecting `newos-shell-core` to `newos-user-rt`, `newos-net`,
+/// and the `newos-keyd`-gated `newos-sshd` interactive shell channel.
 struct InitShellHost {
     net_cfg: Option<NetConfig>,
     cached_nic: Option<Option<NicKind>>,
     log_rx: IpcLogAssembler<256>,
+    ssh_session_authorized: bool,
+    ssh_rx_buf: [u8; 64],
+    ssh_rx_pos: usize,
+    ssh_rx_len: usize,
 }
 
 impl InitShellHost {
@@ -54,6 +59,31 @@ impl InitShellHost {
             net_cfg: None,
             cached_nic: None,
             log_rx,
+            ssh_session_authorized: false,
+            ssh_rx_buf: [0u8; 64],
+            ssh_rx_pos: 0,
+            ssh_rx_len: 0,
+        }
+    }
+
+    /// Poll `CapId::BOOTSTRAP_AUTH_GATE_EP` (`newos-keyd` PID 3 write-only -> `init` read-only)
+    /// to open/close the SSH shell channel strictly on `keyd`'s ML-DSA-87 verification.
+    fn poll_ssh_auth_gate(&mut self) {
+        while let Ok((badge, word)) = newos_user_rt::ipc_recv(CapId::BOOTSTRAP_AUTH_GATE_EP) {
+            if badge != newos_abi::auth_gate_ipc::BADGE_KEYD {
+                continue;
+            }
+            match word {
+                newos_abi::auth_gate_ipc::SESSION_OPEN => {
+                    self.ssh_session_authorized = true;
+                }
+                newos_abi::auth_gate_ipc::SESSION_CLOSE => {
+                    self.ssh_session_authorized = false;
+                    self.ssh_rx_pos = 0;
+                    self.ssh_rx_len = 0;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -287,6 +317,20 @@ impl InitShellHost {
 impl ShellHost for InitShellHost {
     fn write_debug(&mut self, s: &str) {
         let _ = newos_user_rt::debug_write_all(s);
+        if self.ssh_session_authorized {
+            for chunk in s.as_bytes().chunks(newos_abi::log_ipc::MAX_CHUNK_BYTES) {
+                let word = newos_abi::log_ipc::encode_chunk(chunk);
+                for _ in 0..128 {
+                    match newos_user_rt::ipc_send(CapId::BOOTSTRAP_SSH_OUT_EP, word) {
+                        Ok(()) => break,
+                        Err(SysError::WouldBlock) => {
+                            let _ = newos_user_rt::yield_now();
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
     }
 
     fn sys_info(&mut self) -> SysInfo {
@@ -299,6 +343,32 @@ impl ShellHost for InitShellHost {
     }
 
     fn read_debug_byte(&mut self) -> Result<u8, SysError> {
+        self.poll_ssh_auth_gate();
+        if self.ssh_session_authorized {
+            if self.ssh_rx_pos < self.ssh_rx_len {
+                let b = self.ssh_rx_buf[self.ssh_rx_pos];
+                self.ssh_rx_pos += 1;
+                if self.ssh_rx_pos == self.ssh_rx_len {
+                    self.ssh_rx_pos = 0;
+                    self.ssh_rx_len = 0;
+                }
+                return Ok(b);
+            }
+            if let Ok((badge, word)) = newos_user_rt::ipc_recv(CapId::BOOTSTRAP_SSH_SHELL_EP)
+                && badge == newos_abi::key_ipc::BADGE_SSHD
+            {
+                let (bytes, n) = newos_abi::log_ipc::decode_chunk(word);
+                if n > 0 {
+                    self.ssh_rx_buf[..n].copy_from_slice(&bytes[..n]);
+                    self.ssh_rx_len = n;
+                    self.ssh_rx_pos = 1;
+                    return Ok(self.ssh_rx_buf[0]);
+                }
+            }
+        } else {
+            // Drain and discard any unsolicited SSH shell bytes while auth-gate is closed.
+            let _ = newos_user_rt::ipc_recv(CapId::BOOTSTRAP_SSH_SHELL_EP);
+        }
         newos_user_rt::debug_read_byte()
     }
 

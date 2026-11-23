@@ -10,6 +10,13 @@ members = [
     "crates/bench",
     "crates/user-rt",
     "crates/net",
+    "crates/rng",
+    "crates/netd",
+    "crates/key-vault",
+    "crates/keyd",
+    "crates/ssh",
+    "crates/sshd",
+    "crates/ssh-client",
     "crates/init",
     "crates/worker",
 ]
@@ -20,6 +27,10 @@ default-members = [
     "crates/shell-core",
     "crates/bench",
     "crates/net",
+    "crates/rng",
+    "crates/key-vault",
+    "crates/ssh",
+    "crates/ssh-client",
 ]
 
 [workspace.package]
@@ -32,8 +43,11 @@ limine = "0.6.5"
 newos-abi = { path = "crates/abi" }
 newos-hal = { path = "crates/hal" }
 newos-kernel-core = { path = "crates/kernel-core" }
+newos-key-vault = { path = "crates/key-vault" }
 newos-net = { path = "crates/net" }
+newos-rng = { path = "crates/rng" }
 newos-shell-core = { path = "crates/shell-core" }
+newos-ssh-proto = { path = "crates/ssh" }
 newos-user-rt = { path = "crates/user-rt" }
 
 [profile.release]

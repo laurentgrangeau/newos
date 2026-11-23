@@ -16,14 +16,6 @@
     "tier": 3
   },
   "panic-strategy": "abort",
-  "pre-link-args": {
-    "gnu": [
-      "--fix-cortex-a53-843419"
-    ],
-    "gnu-lld": [
-      "--fix-cortex-a53-843419"
-    ]
-  },
   "relocation-model": "pic",
   "stack-probes": {
     "kind": "inline"

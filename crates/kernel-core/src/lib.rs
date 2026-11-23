@@ -12,8 +12,6 @@ pub mod elf;
 pub mod ipc;
 pub mod memory;
 pub mod sched;
-pub mod sha256;
-pub mod smmu;
 
 pub use ipc::{IpcMessage, IpcStats, KernelIpcState};
 
@@ -26,6 +24,9 @@ use newos_abi::{Rights, ShutdownStatus, SysError};
 
 const USER_STACK_BASE: u64 = 0x0000_7fff_f000_0000;
 const USER_STACK_PAGES: u64 = 16; // 64 KiB EL0 data stack
+/// 1 MiB EL0 data stack for pure-PQ `no_alloc` daemons (`newos-netd`, `newos-keyd`, `newos-sshd`)
+/// running `no_alloc` NIST Level 5 ML-DSA-87 / ML-KEM-1024 lattice math.
+pub const USER_PQ_STACK_PAGES: u64 = 256;
 const USER_SHADOW_STACK_BASE: u64 = 0x0000_7fff_e000_0000;
 const USER_SHADOW_STACK_PAGES: u64 = 2; // 8 KiB EL0 Shadow Call Stack (`x18`, grows upward)
 
@@ -39,6 +40,9 @@ pub struct BootInfo {
     pub rsdp_addr: u64,
     pub init_module: Option<&'static [u8]>,
     pub worker_module: Option<&'static [u8]>,
+    pub netd_module: Option<&'static [u8]>,
+    pub keyd_module: Option<&'static [u8]>,
+    pub sshd_module: Option<&'static [u8]>,
     pub interactive_shell: bool,
     pub qemu_virt: bool,
 }
@@ -113,7 +117,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
     );
     let _ = writeln!(
         platform,
-        "[newos] CPU hardening: PXN={}, UXN={}, PAN={}, W^X={}, SSBS={}, CSV2={}, CSV3={}, PAC={}, BTI={}, MTE={} (bsp_cpu_id={})",
+        "[newos] CPU hardening: PXN={}, UXN={}, PAN={}, W^X={}, SSBS={}, CSV2={}, CSV3={} (bsp_cpu_id={})",
         sec.pxn,
         sec.uxn,
         sec.pan,
@@ -121,9 +125,6 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
         sec.ssbs,
         sec.csv2,
         sec.csv3,
-        sec.pac,
-        sec.bti,
-        sec.mte,
         platform.current_cpu_id(),
     );
 
@@ -202,7 +203,18 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
 
     match spawn_isolated_process(platform, "init", init_bytes, &mut info.untyped)
         .and_then(|_| spawn_isolated_process(platform, "worker", worker_bytes, &mut info.untyped))
-    {
+        .and_then(|_| {
+            if let Some(netd) = info.netd_module {
+                spawn_isolated_process(platform, "newos-netd", netd, &mut info.untyped)?;
+            }
+            if let Some(keyd) = info.keyd_module {
+                spawn_isolated_process(platform, "newos-keyd", keyd, &mut info.untyped)?;
+            }
+            if let Some(sshd) = info.sshd_module {
+                spawn_isolated_process(platform, "newos-sshd", sshd, &mut info.untyped)?;
+            }
+            Ok(())
+        }) {
         Ok(()) => {
             platform.install_runtime_untyped(info.untyped);
             platform.start_userspace()
@@ -223,12 +235,17 @@ fn spawn_isolated_process<P: HalPlatform>(
     elf_bytes: &[u8],
     untyped: &mut UntypedInventory,
 ) -> Result<(), SysError> {
-    let sha_prefix = sha256::digest_prefix_u64(elf_bytes);
+    let sha_prefix = newos_abi::sha3::digest_prefix_u64(elf_bytes);
     let entropy = platform.random_u64();
     let stack_slide = (entropy & 0xFF) * PAGE_SIZE;
     let pie_base = 0x0040_0000u64 + (((entropy >> 8) & 0xFF) * PAGE_SIZE);
     let shadow_slide = ((entropy >> 16) & 0xFF) * PAGE_SIZE;
     let mut user_vspace = platform.create_user_vspace(untyped)?;
+    let stack_pages = if matches!(name, "newos-netd" | "newos-keyd" | "newos-sshd") {
+        USER_PQ_STACK_PAGES
+    } else {
+        USER_STACK_PAGES
+    };
     let (entry, user_sp, user_shadow_sp, segs) = load_elf64_into_vspace(
         &mut user_vspace,
         elf_bytes,
@@ -236,12 +253,13 @@ fn spawn_isolated_process<P: HalPlatform>(
         pie_base,
         stack_slide,
         shadow_slide,
+        stack_pages,
     )?;
     let root = user_vspace.root_phys();
     let pid = platform.register_user_process(entry, user_sp, user_shadow_sp, root)?;
     let _ = writeln!(
         platform,
-        "[newos] spawned EL0 `{name}` (pid={pid}, ttbr0={:#018x}, entry={:#018x}, sp={:#018x}, scs={:#018x}, segs={segs}, sha256={sha_prefix:#018x})",
+        "[newos] spawned EL0 `{name}` (pid={pid}, ttbr0={:#018x}, entry={:#018x}, sp={:#018x}, scs={:#018x}, segs={segs}, sha3_512={sha_prefix:#018x})",
         root.raw(),
         entry.raw(),
         user_sp.raw(),
@@ -259,6 +277,7 @@ fn load_elf64_into_vspace<V: VSpaceMapper>(
     pie_base: u64,
     stack_slide: u64,
     shadow_slide: u64,
+    stack_pages: u64,
 ) -> Result<(VirtAddr, VirtAddr, VirtAddr, usize), SysError> {
     let parsed = elf::parse_elf64_with_base(elf_bytes, pie_base)?;
 
@@ -322,17 +341,22 @@ fn load_elf64_into_vspace<V: VSpaceMapper>(
         })?;
     }
 
-    // Map 64 KiB EL0 stack (USER | RW | UXN/PXN) with ASLR slide (page-aligned downward offset)
+    // Map EL0 data stack (USER | RW | UXN/PXN) with ASLR slide and an unmapped 4 KiB guard page
+    // immediately below `stack_base` so any stack overflow traps cleanly.
     let stack_base = USER_STACK_BASE.saturating_sub(stack_slide & !memory::PAGE_MASK);
+    let guard_va = VirtAddr::new_page_aligned(stack_base.saturating_sub(PAGE_SIZE))?;
+    if vspace.translate(guard_va).is_some() {
+        return Err(SysError::SlotOccupied);
+    }
     let stack_flags = PageFlags::new_wx(true, false, true, false)?;
-    for page in 0..USER_STACK_PAGES {
+    for page in 0..stack_pages {
         let frame = untyped.retype_frame()?;
         vspace.zero_frame(&frame);
         let virt = VirtAddr::new_page_aligned(stack_base + page * PAGE_SIZE)?;
         vspace.map_4k(virt, frame, stack_flags, untyped)?;
     }
 
-    let user_sp = VirtAddr::new_canonical(stack_base + USER_STACK_PAGES * PAGE_SIZE)?;
+    let user_sp = VirtAddr::new_canonical(stack_base + stack_pages * PAGE_SIZE)?;
 
     // Map 8 KiB EL0 Shadow Call Stack (`x18`, grows upward, USER | RW | UXN/PXN) with ASLR slide
     let shadow_base = USER_SHADOW_STACK_BASE.saturating_sub(shadow_slide & !memory::PAGE_MASK);
@@ -446,6 +470,9 @@ mod tests {
             rsdp_addr: 0x000e_0000,
             init_module: None,
             worker_module: None,
+            netd_module: None,
+            keyd_module: None,
+            sshd_module: None,
             interactive_shell: false,
             qemu_virt: false,
         };

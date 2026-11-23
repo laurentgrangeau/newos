@@ -1,0 +1,10 @@
+[package]
+name = "newos-netd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+newos-abi = { workspace = true }
+newos-net = { workspace = true }
+newos-user-rt = { workspace = true }

@@ -2,3 +2,6 @@
 *.iso
 *.img
 .DS_Store
+
+# Local SSH authorized keys (never commit user keys)
+authorized_keys.mldsa87

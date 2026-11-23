@@ -10,7 +10,6 @@ const SPCR_SIGNATURE: [u8; 4] = *b"SPCR";
 const MADT_SIGNATURE: [u8; 4] = *b"APIC";
 const GTDT_SIGNATURE: [u8; 4] = *b"GTDT";
 const MCFG_SIGNATURE: [u8; 4] = *b"MCFG";
-const IORT_SIGNATURE: [u8; 4] = *b"IORT";
 
 /// ACPI SPCR `interface_type` value for ARM PL011 UART.
 pub const SPCR_INTERFACE_PL011: u8 = 0x03;
@@ -67,17 +66,6 @@ pub struct ParsedMcfg {
     pub segment: u16,
     pub start_bus: u8,
     pub end_bus: u8,
-}
-
-/// Validated ACPI IORT (IO Remapping Table) ARM SMMUv3 descriptor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ParsedIort {
-    pub smmuv3_base: u64,
-    pub flags: u32,
-    pub event_gsiv: u32,
-    pub pri_gsiv: u32,
-    pub gerror_gsiv: u32,
-    pub smmu_count: usize,
 }
 
 #[inline]
@@ -277,87 +265,6 @@ pub fn parse_mcfg(bytes: &[u8]) -> Option<ParsedMcfg> {
     })
 }
 
-/// Parse ARM SMMUv3 nodes (`type == 4`) from a validated ACPI `IORT` table (ARM DEN 0049).
-pub fn parse_iort(bytes: &[u8]) -> Option<ParsedIort> {
-    let len = validate_sdt(bytes, &IORT_SIGNATURE)?;
-    if len < 48 {
-        return None;
-    }
-    let node_count = u32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]) as usize;
-    let mut off = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]) as usize;
-    if off < 48 || off > len {
-        return None;
-    }
-
-    let mut smmuv3_base = 0u64;
-    let mut flags = 0u32;
-    let mut event_gsiv = 0u32;
-    let mut pri_gsiv = 0u32;
-    let mut gerror_gsiv = 0u32;
-    let mut smmu_count = 0usize;
-
-    for _ in 0..node_count {
-        if off + 4 > len {
-            break;
-        }
-        let node_type = bytes[off];
-        let node_len = u16::from_le_bytes([bytes[off + 1], bytes[off + 2]]) as usize;
-        if node_len < 4 || off + node_len > len {
-            break;
-        }
-        // IORT Node Type 4 = ARM SMMUv3 (minimum 52 bytes)
-        if node_type == 4 && node_len >= 52 {
-            smmu_count += 1;
-            if smmuv3_base == 0 {
-                smmuv3_base = u64::from_le_bytes([
-                    bytes[off + 16],
-                    bytes[off + 17],
-                    bytes[off + 18],
-                    bytes[off + 19],
-                    bytes[off + 20],
-                    bytes[off + 21],
-                    bytes[off + 22],
-                    bytes[off + 23],
-                ]);
-                flags = u32::from_le_bytes([
-                    bytes[off + 24],
-                    bytes[off + 25],
-                    bytes[off + 26],
-                    bytes[off + 27],
-                ]);
-                event_gsiv = u32::from_le_bytes([
-                    bytes[off + 32],
-                    bytes[off + 33],
-                    bytes[off + 34],
-                    bytes[off + 35],
-                ]);
-                pri_gsiv = u32::from_le_bytes([
-                    bytes[off + 36],
-                    bytes[off + 37],
-                    bytes[off + 38],
-                    bytes[off + 39],
-                ]);
-                gerror_gsiv = u32::from_le_bytes([
-                    bytes[off + 44],
-                    bytes[off + 45],
-                    bytes[off + 46],
-                    bytes[off + 47],
-                ]);
-            }
-        }
-        off += node_len;
-    }
-
-    Some(ParsedIort {
-        smmuv3_base,
-        flags,
-        event_gsiv,
-        pri_gsiv,
-        gerror_gsiv,
-        smmu_count,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,32 +394,5 @@ mod tests {
         assert_eq!(parsed_mcfg.segment, 0);
         assert_eq!(parsed_mcfg.start_bus, 0);
         assert_eq!(parsed_mcfg.end_bus, 255);
-    }
-
-    #[test]
-    fn parses_iort_smmuv3_node() {
-        // IORT header (48 bytes) + 1 SMMUv3 node (68 bytes) = 116 bytes
-        let mut iort = [0u8; 116];
-        iort[0..4].copy_from_slice(b"IORT");
-        iort[4..8].copy_from_slice(&116u32.to_le_bytes());
-        iort[36..40].copy_from_slice(&1u32.to_le_bytes()); // node_count = 1
-        iort[40..44].copy_from_slice(&48u32.to_le_bytes()); // node_offset = 48
-
-        // SMMUv3 node at offset 48
-        iort[48] = 4; // type = SMMUv3
-        iort[49..51].copy_from_slice(&68u16.to_le_bytes());
-        iort[48 + 16..48 + 24].copy_from_slice(&0x0905_0000u64.to_le_bytes());
-        iort[48 + 24..48 + 28].copy_from_slice(&1u32.to_le_bytes());
-        iort[48 + 32..48 + 36].copy_from_slice(&74u32.to_le_bytes());
-        iort[48 + 36..48 + 40].copy_from_slice(&75u32.to_le_bytes());
-        iort[48 + 44..48 + 48].copy_from_slice(&77u32.to_le_bytes());
-        set_checksum(&mut iort, 9);
-
-        let parsed = parse_iort(&iort).expect("valid IORT");
-        assert_eq!(parsed.smmu_count, 1);
-        assert_eq!(parsed.smmuv3_base, 0x0905_0000);
-        assert_eq!(parsed.event_gsiv, 74);
-        assert_eq!(parsed.pri_gsiv, 75);
-        assert_eq!(parsed.gerror_gsiv, 77);
     }
 }

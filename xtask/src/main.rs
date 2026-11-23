@@ -75,7 +75,7 @@ fn run_checked(cmd: &mut Command, label: &str) -> Result<(), String> {
 fn build_kernel(root: &Path, release: bool) -> Result<PathBuf, String> {
     let linker_script = root.join("crates/kernel/linker-aarch64.ld");
     let rustflags = format!(
-        "-C link-arg=-T{} -C relocation-model=pie -C link-arg=-pie -C target-cpu={TARGET_CPU} -Z branch-protection=bti,pac-ret -Z sanitizer=kcfi",
+        "-C link-arg=-T{} -C relocation-model=pie -C link-arg=-pie -C target-cpu={TARGET_CPU} -Z sanitizer=kcfi",
         linker_script.display()
     );
 
@@ -107,7 +107,7 @@ fn build_user_elf(root: &Path, pkg: &str, dir: &str, release: bool) -> Result<Pa
     let linker_script = root.join(format!("crates/{dir}/linker-aarch64.ld"));
     let target_json = root.join("targets/aarch64-newos-user.json");
     let rustflags = format!(
-        "-C link-arg=-T{} -C relocation-model=pie -C link-arg=-pie -C target-cpu={TARGET_CPU} -Z fixed-x18 -Z branch-protection=bti,pac-ret -Z sanitizer=kcfi -Z sanitizer=shadow-call-stack",
+        "-C link-arg=-T{} -C relocation-model=pie -C link-arg=-pie -C target-cpu={TARGET_CPU} -Z fixed-x18 -Z sanitizer=kcfi -Z sanitizer=shadow-call-stack",
         linker_script.display()
     );
 
@@ -204,6 +204,15 @@ fn build_uefi_disk(interactive: bool, release: bool) -> Result<PathBuf, String> 
     let kernel_elf = build_kernel(&root, release)?;
     let init_elf = build_user_elf(&root, "newos-init", "init", release)?;
     let worker_elf = build_user_elf(&root, "newos-worker", "worker", release)?;
+    let ssh_daemons = if interactive {
+        Some((
+            build_user_elf(&root, "newos-netd", "netd", release)?,
+            build_user_elf(&root, "newos-keyd", "keyd", release)?,
+            build_user_elf(&root, "newos-sshd", "sshd", release)?,
+        ))
+    } else {
+        None
+    };
     let limine_dir = ensure_limine(&root)?;
 
     let stage = root.join("target/esp_root_aarch64");
@@ -222,6 +231,19 @@ fn build_uefi_disk(interactive: bool, release: bool) -> Result<PathBuf, String> 
         .map_err(|e| format!("failed to copy init ELF: {e}"))?;
     fs::copy(&worker_elf, stage.join("boot/newos-worker"))
         .map_err(|e| format!("failed to copy worker ELF: {e}"))?;
+    let extra_modules = if let Some((netd, keyd, sshd)) = ssh_daemons {
+        fs::copy(&netd, stage.join("boot/newos-netd"))
+            .map_err(|e| format!("failed to copy netd ELF: {e}"))?;
+        fs::copy(&keyd, stage.join("boot/newos-keyd"))
+            .map_err(|e| format!("failed to copy keyd ELF: {e}"))?;
+        fs::copy(&sshd, stage.join("boot/newos-sshd"))
+            .map_err(|e| format!("failed to copy sshd ELF: {e}"))?;
+        "    module_path: boot():/boot/newos-netd\n\
+         \x20   module_path: boot():/boot/newos-keyd\n\
+         \x20   module_path: boot():/boot/newos-sshd\n"
+    } else {
+        ""
+    };
 
     let cmdline = if interactive {
         "interactive qemu"
@@ -236,7 +258,8 @@ fn build_uefi_disk(interactive: bool, release: bool) -> Result<PathBuf, String> 
          \x20   path: boot():/boot/newos-kernel\n\
          \x20   cmdline: {cmdline}\n\
          \x20   module_path: boot():/boot/newos-init\n\
-         \x20   module_path: boot():/boot/newos-worker\n"
+         \x20   module_path: boot():/boot/newos-worker\n\
+         {extra_modules}"
     );
     fs::write(boot_limine.join("limine.conf"), limine_conf)
         .map_err(|e| format!("failed to write limine.conf: {e}"))?;
@@ -267,6 +290,9 @@ fn build_rpi5_image(release: bool) -> Result<PathBuf, String> {
     let kernel_elf = build_kernel(&root, release)?;
     let init_elf = build_user_elf(&root, "newos-init", "init", release)?;
     let worker_elf = build_user_elf(&root, "newos-worker", "worker", release)?;
+    let netd_elf = build_user_elf(&root, "newos-netd", "netd", release)?;
+    let keyd_elf = build_user_elf(&root, "newos-keyd", "keyd", release)?;
+    let sshd_elf = build_user_elf(&root, "newos-sshd", "sshd", release)?;
     let limine_dir = ensure_limine(&root)?;
 
     let stage = root.join("target/rpi5_boot");
@@ -301,6 +327,9 @@ serial: yes
     cmdline: interactive
     module_path: boot():/boot/newos-init
     module_path: boot():/boot/newos-worker
+    module_path: boot():/boot/newos-netd
+    module_path: boot():/boot/newos-keyd
+    module_path: boot():/boot/newos-sshd
 ";
     fs::write(boot_limine.join("limine.conf"), limine_conf)
         .map_err(|e| format!("failed to write limine.conf: {e}"))?;
@@ -311,6 +340,12 @@ serial: yes
         .map_err(|e| format!("failed to copy init ELF: {e}"))?;
     fs::copy(&worker_elf, stage.join("boot/newos-worker"))
         .map_err(|e| format!("failed to copy worker ELF: {e}"))?;
+    fs::copy(&netd_elf, stage.join("boot/newos-netd"))
+        .map_err(|e| format!("failed to copy netd ELF: {e}"))?;
+    fs::copy(&keyd_elf, stage.join("boot/newos-keyd"))
+        .map_err(|e| format!("failed to copy keyd ELF: {e}"))?;
+    fs::copy(&sshd_elf, stage.join("boot/newos-sshd"))
+        .map_err(|e| format!("failed to copy sshd ELF: {e}"))?;
     fs::copy(
         limine_dir.join("BOOTAA64.EFI"),
         efi_boot.join("BOOTAA64.EFI"),
@@ -356,6 +391,12 @@ fn run_host_tests(release: bool) -> Result<(), String> {
         "newos-shell-core",
         "--package",
         "newos-net",
+        "--package",
+        "newos-rng",
+        "--package",
+        "newos-key-vault",
+        "--package",
+        "newos-ssh-proto",
     ]);
     if release {
         cmd.arg("--release");
@@ -378,6 +419,12 @@ fn run_miri_tests() -> Result<(), String> {
         "newos-shell-core",
         "--package",
         "newos-net",
+        "--package",
+        "newos-rng",
+        "--package",
+        "newos-key-vault",
+        "--package",
+        "newos-ssh-proto",
     ]);
     run_checked(&mut cmd, "cargo miri test")
 }
@@ -572,9 +619,13 @@ fn run_qemu(interactive: bool, release: bool) -> Result<(), String> {
         "-global",
         "virtio-mmio.force-legacy=false",
         "-netdev",
-        "user,id=net0",
+        "user,id=net0,hostfwd=tcp::2222-:22",
         "-device",
         "virtio-net-device,netdev=net0",
+        "-object",
+        "rng-random,filename=/dev/urandom,id=rng0",
+        "-device",
+        "virtio-rng-device,rng=rng0",
         "-drive",
         &pflash_arg,
         "-drive",

@@ -4,6 +4,7 @@
 //! Shared, 100% memory-safe ABI contract between the NewOS microkernel (EL1) and EL0 userspace.
 
 pub mod ring;
+pub mod sha3;
 
 /// Unforgeable handle indexing a slot inside a process's capability space (`CSpace`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -49,6 +50,32 @@ impl CapId {
     /// PID 0 (`init`, console owner) holds `Rights::ALL`; non-root processes (`pid >= 1`)
     /// hold write-only (`Rights::WRITE`) with an immutable kernel-stamped `badge = pid as u64`.
     pub const BOOTSTRAP_LOG_EP: Self = Self((1u64 << 32) | 11);
+
+    /// Well-known bootstrap Hardware RNG MMIO capability (slot 12, gen 1), exclusively owned
+    /// by `newos-keyd` (BCM2712 RNG200 on Raspberry Pi 5 or VirtIO-RNG slot on QEMU).
+    pub const BOOTSTRAP_RNG_MMIO: Self = Self((1u64 << 32) | 12);
+
+    /// Well-known bootstrap Network Data-Plane `Endpoint` capability (slot 13, gen 1)
+    /// connecting `newos-netd` (server) to `newos-sshd` (badge 4) and `newos-init` (badge 0x1000).
+    pub const BOOTSTRAP_NET_EP: Self = Self((1u64 << 32) | 13);
+
+    /// Well-known bootstrap Cryptographic Vault `Endpoint` capability (slot 14, gen 1)
+    /// connecting `newos-keyd` (server) exclusively to `newos-sshd` (badge 4).
+    pub const BOOTSTRAP_KEY_EP: Self = Self((1u64 << 32) | 14);
+
+    /// Well-known bootstrap SSH Shell input `Endpoint` capability (slot 15, gen 1):
+    /// unidirectional `newos-sshd` (`Rights::WRITE`, badge 4) -> `newos-init` (`Rights::READ`),
+    /// gated by `BOOTSTRAP_AUTH_GATE_EP`.
+    pub const BOOTSTRAP_SSH_SHELL_EP: Self = Self((1u64 << 32) | 15);
+
+    /// Well-known bootstrap Cryptographic Auth-Gate `Endpoint` capability (slot 16, gen 1).
+    /// `newos-keyd` holds write-only (`Rights::WRITE`, badge 3); `newos-init` holds read-only
+    /// (`Rights::READ`). `newos-sshd` explicitly does NOT hold this capability.
+    pub const BOOTSTRAP_AUTH_GATE_EP: Self = Self((1u64 << 32) | 16);
+
+    /// Well-known bootstrap SSH Shell output `Endpoint` capability (slot 17, gen 1):
+    /// unidirectional `newos-init` (`Rights::WRITE`) -> `newos-sshd` (`Rights::READ`, badge 4).
+    pub const BOOTSTRAP_SSH_OUT_EP: Self = Self((1u64 << 32) | 17);
 
     #[inline]
     pub const fn new(raw: u64) -> Self {
@@ -352,6 +379,202 @@ pub mod log_ipc {
             i += 1;
         }
         (buf, len)
+    }
+}
+
+/// Register-only IPC wire protocol for `CapId::BOOTSTRAP_NET_EP` (`newos-netd` <-> `newos-sshd`/`init`).
+///
+/// Each 64-bit request word carries an opcode in bits `56..64` and up to 7 payload bytes in bits `0..56`:
+/// - `OP_POLL_STATUS (0x01)`: query connection/readiness bits + active IPv4 address
+/// - `OP_RECV_CHUNK  (0x02)`: pull up to 7 TCP RX bytes (reply: `0..=7` len in bits `56..64`, or `REPLY_EOF`)
+/// - `OP_SEND_BASE..=OP_SEND_BASE+7 (0x10..=0x17)`: push `len` (`0..=7`) TCP TX bytes; reply = bytes accepted
+/// - `OP_CLOSE       (0x0E)`: graceful TCP FIN close
+/// - `OP_ABORT       (0x0F)`: immediate TCP RST abort (e.g., strict-KEX violation)
+pub mod net_ipc {
+    pub const MAX_CHUNK_BYTES: usize = 7;
+
+    pub const OP_POLL_STATUS: u8 = 0x01;
+    pub const OP_RECV_CHUNK: u8 = 0x02;
+    pub const OP_CLOSE: u8 = 0x0E;
+    pub const OP_ABORT: u8 = 0x0F;
+    pub const OP_SEND_BASE: u8 = 0x10;
+
+    /// Reply sentinel in bits `56..64` for `OP_RECV_CHUNK` when no active TCP connection exists.
+    pub const REPLY_EOF: u8 = 0xFF;
+
+    /// Status bitmask flags returned in the low 32 bits of `OP_POLL_STATUS`.
+    pub const STATUS_CONNECTED: u64 = 1 << 0;
+    pub const STATUS_RX_AVAIL: u64 = 1 << 1;
+    pub const STATUS_TX_READY: u64 = 1 << 2;
+
+    /// Kernel-stamped IPC badge for `newos-init` querying `newos-netd` status.
+    pub const BADGE_INIT: u64 = 0x1000;
+    /// Kernel-stamped IPC badge for `newos-sshd` (PID 4) owning the TCP :22 stream.
+    pub const BADGE_SSHD: u64 = 4;
+
+    #[inline]
+    pub const fn encode_poll_status() -> u64 {
+        (OP_POLL_STATUS as u64) << 56
+    }
+
+    #[inline]
+    pub const fn encode_recv_chunk() -> u64 {
+        (OP_RECV_CHUNK as u64) << 56
+    }
+
+    #[inline]
+    pub const fn encode_close() -> u64 {
+        (OP_CLOSE as u64) << 56
+    }
+
+    #[inline]
+    pub const fn encode_abort() -> u64 {
+        (OP_ABORT as u64) << 56
+    }
+
+    #[inline]
+    pub const fn encode_send_chunk(bytes: &[u8]) -> u64 {
+        let len = if bytes.len() > MAX_CHUNK_BYTES {
+            MAX_CHUNK_BYTES
+        } else {
+            bytes.len()
+        };
+        let mut word = ((OP_SEND_BASE + len as u8) as u64) << 56;
+        let mut i = 0;
+        while i < len {
+            word |= (bytes[i] as u64) << (i * 8);
+            i += 1;
+        }
+        word
+    }
+
+    #[inline]
+    pub const fn encode_status_reply(flags: u64, ipv4: [u8; 4]) -> u64 {
+        let ip_u32 = u32::from_be_bytes(ipv4) as u64;
+        (ip_u32 << 32) | (flags & 0xFFFF_FFFF)
+    }
+
+    #[inline]
+    pub const fn decode_status_reply(word: u64) -> (u64, [u8; 4]) {
+        let flags = word & 0xFFFF_FFFF;
+        let ip = ((word >> 32) as u32).to_be_bytes();
+        (flags, ip)
+    }
+
+    #[inline]
+    pub const fn encode_recv_reply(bytes: &[u8]) -> u64 {
+        crate::log_ipc::encode_chunk(bytes)
+    }
+
+    #[inline]
+    pub const fn encode_recv_eof() -> u64 {
+        (REPLY_EOF as u64) << 56
+    }
+
+    /// Decode a `net_ipc` request word into `(opcode, [u8; 7], payload_len)`.
+    #[inline]
+    pub const fn decode_request(word: u64) -> (u8, [u8; MAX_CHUNK_BYTES], usize) {
+        let op = (word >> 56) as u8;
+        if op >= OP_SEND_BASE && op <= OP_SEND_BASE + (MAX_CHUNK_BYTES as u8) {
+            let len = (op - OP_SEND_BASE) as usize;
+            let mut buf = [0u8; MAX_CHUNK_BYTES];
+            let mut i = 0;
+            while i < len {
+                buf[i] = ((word >> (i * 8)) & 0xFF) as u8;
+                i += 1;
+            }
+            (OP_SEND_BASE, buf, len)
+        } else {
+            (op, [0u8; MAX_CHUNK_BYTES], 0)
+        }
+    }
+}
+
+/// Cryptographic shell auth-gate signals sent over `CapId::BOOTSTRAP_AUTH_GATE_EP`
+/// (`newos-keyd` PID 3 write-only -> `newos-init` PID 0 read-only).
+pub mod auth_gate_ipc {
+    /// Kernel-stamped IPC badge of `newos-keyd` (PID 3).
+    pub const BADGE_KEYD: u64 = 3;
+    /// Signal `newos-init` to open `BOOTSTRAP_SSH_SHELL_EP` after valid ML-DSA-87 userauth.
+    pub const SESSION_OPEN: u64 = 0x5345_5353_4F50_454E;
+    /// Signal `newos-init` to close `BOOTSTRAP_SSH_SHELL_EP` on disconnect.
+    pub const SESSION_CLOSE: u64 = 0x5345_5353_434C_4F53;
+}
+
+/// Narrow, register-only IPC RPC protocol for `CapId::BOOTSTRAP_KEY_EP`
+/// (`newos-sshd` PID 4 -> `newos-keyd` PID 3).
+///
+/// The ML-DSA-87 host private key never leaves `newos-keyd`.
+pub mod key_ipc {
+    /// ML-DSA-87 (NIST FIPS 204) public key size in bytes.
+    pub const MLDSA87_PK_BYTES: usize = 2592;
+    /// ML-DSA-87 (NIST FIPS 204) signature size in bytes.
+    pub const MLDSA87_SIG_BYTES: usize = 4627;
+    /// Maximum random bytes `newos-sshd` may request per KEX window (`<= 64 B` cap).
+    pub const MAX_RANDOM_BYTES_PER_WINDOW: usize = 64;
+    /// Maximum chunk payload bytes carried in a single 64-bit IPC register word.
+    pub const MAX_CHUNK_BYTES: usize = 7;
+
+    /// Kernel-stamped IPC badge of `newos-sshd` (PID 4).
+    pub const BADGE_SSHD: u64 = 4;
+
+    /// Opcode tags in bits `56..64` of the 64-bit IPC request word.
+    pub const OP_GET_HOST_PK_WORD: u8 = 0x01;
+    pub const OP_GET_RANDOM_U64: u8 = 0x02;
+    pub const OP_SIGN_KEX_RESET: u8 = 0x03;
+    pub const OP_SIGN_KEX_PUSH_BASE: u8 = 0x10; // 0x10..=0x17 carries 0..=7 bytes
+    pub const OP_SIGN_KEX_COMMIT: u8 = 0x04;
+    pub const OP_SIGN_KEX_READ_WORD: u8 = 0x05;
+    pub const OP_VERIFY_RESET: u8 = 0x06;
+    pub const OP_VERIFY_PUSH_PK_BASE: u8 = 0x20; // 0x20..=0x27 carries 0..=7 bytes
+    pub const OP_VERIFY_PUSH_MSG_BASE: u8 = 0x30; // 0x30..=0x37 carries 0..=7 bytes
+    pub const OP_VERIFY_PUSH_SIG_BASE: u8 = 0x40; // 0x40..=0x47 carries 0..=7 bytes
+    pub const OP_VERIFY_COMMIT: u8 = 0x07;
+    pub const OP_CLOSE_SESSION: u8 = 0x08;
+
+    /// Reply status codes.
+    pub const REPLY_DENIED: u64 = 0;
+    pub const REPLY_OK: u64 = 1;
+    pub const REPLY_RATE_LIMITED: u64 = 2;
+
+    #[inline]
+    pub const fn encode_word_req(op: u8, word_index: u32) -> u64 {
+        ((op as u64) << 56) | (word_index as u64)
+    }
+
+    #[inline]
+    pub const fn encode_chunk_req(base_op: u8, bytes: &[u8]) -> u64 {
+        let len = if bytes.len() > MAX_CHUNK_BYTES {
+            MAX_CHUNK_BYTES
+        } else {
+            bytes.len()
+        };
+        let mut word = ((base_op + len as u8) as u64) << 56;
+        let mut i = 0;
+        while i < len {
+            word |= (bytes[i] as u64) << (i * 8);
+            i += 1;
+        }
+        word
+    }
+
+    #[inline]
+    pub const fn decode_chunk_req(
+        word: u64,
+        base_op: u8,
+    ) -> Option<([u8; MAX_CHUNK_BYTES], usize)> {
+        let op = (word >> 56) as u8;
+        if op < base_op || op > base_op + (MAX_CHUNK_BYTES as u8) {
+            return None;
+        }
+        let len = (op - base_op) as usize;
+        let mut buf = [0u8; MAX_CHUNK_BYTES];
+        let mut i = 0;
+        while i < len {
+            buf[i] = ((word >> (i * 8)) & 0xFF) as u8;
+            i += 1;
+        }
+        Some((buf, len))
     }
 }
 

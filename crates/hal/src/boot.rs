@@ -97,6 +97,9 @@ pub fn boot_info() -> BootInfo {
 
     let mut init_module = None;
     let mut worker_module = None;
+    let mut netd_module = None;
+    let mut keyd_module = None;
+    let mut sshd_module = None;
     if let Some(resp) = MODULES_REQUEST.response() {
         for file in resp.modules() {
             let path = file.path();
@@ -104,6 +107,12 @@ pub fn boot_info() -> BootInfo {
                 init_module = Some(file.data());
             } else if path.ends_with("newos-worker") {
                 worker_module = Some(file.data());
+            } else if path.ends_with("newos-netd") {
+                netd_module = Some(file.data());
+            } else if path.ends_with("newos-keyd") {
+                keyd_module = Some(file.data());
+            } else if path.ends_with("newos-sshd") {
+                sshd_module = Some(file.data());
             }
         }
     }
@@ -123,6 +132,9 @@ pub fn boot_info() -> BootInfo {
         rsdp_addr,
         init_module,
         worker_module,
+        netd_module,
+        keyd_module,
+        sshd_module,
         interactive_shell,
         qemu_virt,
     }

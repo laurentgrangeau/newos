@@ -5,7 +5,6 @@
 pub mod gic;
 pub mod paging;
 pub mod serial;
-pub mod smmu;
 pub mod smp;
 pub mod syscall;
 
@@ -24,33 +23,25 @@ static PAN_ENABLED: AtomicBool = AtomicBool::new(false);
 static SSBS_ENABLED: AtomicBool = AtomicBool::new(false);
 static CSV2_SUPPORTED: AtomicBool = AtomicBool::new(false);
 static CSV3_SUPPORTED: AtomicBool = AtomicBool::new(false);
-static PAC_SUPPORTED: AtomicBool = AtomicBool::new(false);
-static BTI_SUPPORTED: AtomicBool = AtomicBool::new(false);
-static MTE_SUPPORTED: AtomicBool = AtomicBool::new(false);
 static PSCI_USE_SMC: AtomicBool = AtomicBool::new(false);
 static ENTROPY_STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
 
-/// Probe ARMv8.x/v9 CPU security features (`PAN`, `SSBS`, `CSV2`, `CSV3`, `PAC`, `BTI`, `MTE`)
+/// Probe ARMv8.2-A Cortex-A76 CPU security features (`PAN`, `SSBS`, `CSV2`, `CSV3`)
 /// and enable hardware `PAN` (ARMv8.1-A) and `SCTLR_EL1.DSSBS` (Spectre v4 mitigation) when present.
 fn probe_and_enable_cpu_hardening() {
     let mmfr1: u64;
     let pfr0: u64;
     let pfr1: u64;
-    let isar1: u64;
     // SAFETY: Reading architectural ID registers in EL1 inspects hardware mitigation support.
     unsafe {
         asm!("mrs {}, id_aa64mmfr1_el1", out(reg) mmfr1, options(nomem, nostack));
         asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0, options(nomem, nostack));
         asm!("mrs {}, id_aa64pfr1_el1", out(reg) pfr1, options(nomem, nostack));
-        asm!("mrs {}, id_aa64isar1_el1", out(reg) isar1, options(nomem, nostack));
     }
     let has_pan = ((mmfr1 >> 20) & 0xF) != 0;
     let has_csv2 = ((pfr0 >> 56) & 0xF) != 0;
     let has_csv3 = ((pfr0 >> 60) & 0xF) != 0;
-    let has_bti = (pfr1 & 0xF) != 0;
     let has_ssbs = ((pfr1 >> 4) & 0xF) != 0;
-    let has_mte = ((pfr1 >> 8) & 0xF) != 0;
-    let has_pac = (((isar1 >> 4) & 0xF) != 0) || (((isar1 >> 8) & 0xF) != 0);
 
     if has_pan || has_ssbs {
         // SAFETY: CPU advertises PAN and/or SSBS; clearing `SCTLR_EL1.SPAN` (bit 23) forces
@@ -76,12 +67,6 @@ fn probe_and_enable_cpu_hardening() {
     SSBS_ENABLED.store(has_ssbs, Ordering::Release);
     CSV2_SUPPORTED.store(has_csv2, Ordering::Release);
     CSV3_SUPPORTED.store(has_csv3, Ordering::Release);
-    PAC_SUPPORTED.store(has_pac, Ordering::Release);
-    BTI_SUPPORTED.store(has_bti, Ordering::Release);
-    if has_bti {
-        paging::enable_bti_guarded_pages();
-    }
-    MTE_SUPPORTED.store(has_mte, Ordering::Release);
 }
 
 // 2 KiB-aligned EL1 exception vector table handling EL1 `brk #0` and EL0 `svc #0` / faults.
@@ -376,7 +361,6 @@ struct AcpiHardware {
     madt_cpus: usize,
     virt_timer_irq: Option<u32>,
     ecam_base: Option<u64>,
-    smmuv3_base: Option<u64>,
 }
 
 /// Read `dst.len()` bytes from physical memory `phys_addr` using HHDM if already mapped,
@@ -508,7 +492,7 @@ fn probe_acpi_hardware(
             continue;
         }
         match &hdr_buf[0..4] {
-            b"FACP" | b"SPCR" | b"APIC" | b"GTDT" | b"MCFG" | b"IORT" => {}
+            b"FACP" | b"SPCR" | b"APIC" | b"GTDT" | b"MCFG" => {}
             _ => continue,
         }
         if !read_phys_bytes(
@@ -562,14 +546,6 @@ fn probe_acpi_hardware(
                     && mcfg.ecam_base != 0
                 {
                     hw.ecam_base = Some(mcfg.ecam_base);
-                }
-            }
-            b"IORT" => {
-                if let Some(iort) = newos_kernel_core::acpi::parse_iort(tbl)
-                    && iort.smmuv3_base != 0
-                    && (iort.smmuv3_base & 0xFFF) == 0
-                {
-                    hw.smmuv3_base = Some(iort.smmuv3_base);
                 }
             }
             _ => {}
@@ -679,6 +655,71 @@ impl Aarch64Platform {
             ))
         };
 
+        // Map capability-scoped Hardware RNG MMIO window (Device-nGnRnE):
+        // - Raspberry Pi 5 (BCM2712 `iproc-rng200`): `0x10_7D20_8000` (scoped to `0x28` bytes)
+        // - QEMU `virt`: single 512-byte VirtIO-RNG slot (`device_id == 4`) on `0x0A00_0000`
+        const RPI5_RNG200_PHYS: u64 = 0x10_7D20_8000;
+        const RPI5_RNG200_LEN: u64 = 0x28;
+        const RNG_MMIO_VIRT: u64 = 0xffff_b005_0000_0000;
+        let rng_mmio = if info.qemu_virt {
+            if !net_mmio_mapped {
+                None
+            } else {
+                const VIRTIO_MAGIC: u32 = 0x7472_6976;
+                const VIRTIO_DEV_RNG: u32 = 4;
+                const SLOT_STRIDE: u64 = 0x200;
+                let mut found = None;
+                for slot in 0..32u64 {
+                    let off = slot * SLOT_STRIDE;
+                    let base_va = NET_MMIO_VIRT + off;
+                    // SAFETY: `NET_MMIO_VIRT..+16 KiB` was verified mapped as Device-nGnRnE.
+                    let (magic, dev_id) = unsafe {
+                        (
+                            core::ptr::read_volatile(base_va as *const u32),
+                            core::ptr::read_volatile((base_va + 8) as *const u32),
+                        )
+                    };
+                    if magic == VIRTIO_MAGIC && dev_id == VIRTIO_DEV_RNG {
+                        found = Some((PhysAddr::new(net_mmio_phys + off), base_va, SLOT_STRIDE));
+                        break;
+                    }
+                }
+                found
+            }
+        } else if let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
+            && let Ok(rng_va) = VirtAddr::new_page_aligned(RNG_MMIO_VIRT)
+            && let Ok(rng_fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_RNG200_PHYS))
+            && vspace
+                .map_4k(rng_va, rng_fr, mmio_flags, &mut info.untyped)
+                .is_ok()
+        {
+            // Optionally mix 64 bits of hardware TRNG into `ENTROPY_STATE` for EL0 ASLR
+            // before handing `BOOTSTRAP_RNG_MMIO` exclusively to `newos-keyd`.
+            // SAFETY: `RNG_MMIO_VIRT` was just mapped as Device-nGnRnE to BCM2712 `iproc-rng200`.
+            unsafe {
+                let ctrl = RNG_MMIO_VIRT as *mut u32;
+                let fifo_cnt = (RNG_MMIO_VIRT + 0x24) as *const u32;
+                let fifo_data = (RNG_MMIO_VIRT + 0x20) as *const u32;
+                let cur = core::ptr::read_volatile(ctrl);
+                core::ptr::write_volatile(ctrl, cur | 1);
+                for _ in 0..256u32 {
+                    if (core::ptr::read_volatile(fifo_cnt) & 0xFF) >= 2 {
+                        let lo = u64::from(core::ptr::read_volatile(fifo_data));
+                        let hi = u64::from(core::ptr::read_volatile(fifo_data));
+                        ENTROPY_STATE.fetch_xor((hi << 32) | lo, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+            Some((
+                PhysAddr::new(RPI5_RNG200_PHYS),
+                RNG_MMIO_VIRT,
+                RPI5_RNG200_LEN,
+            ))
+        } else {
+            None
+        };
+
         // Map GICv2 / GIC-400 Distributor & CPU Interface (ACPI MADT -> board fallback):
         // - Default: Raspberry Pi 5 BCM2712 GIC-400: GICD `0x10_7FFF_9000`, GICC `0x10_7FFF_A000`
         // - QEMU `virt` GICv2:                      GICD `0x0800_0000`,    GICC `0x0801_0000`
@@ -721,29 +762,20 @@ impl Aarch64Platform {
         set_cpu_id(0);
         probe_and_enable_cpu_hardening();
         install_vectors();
-        syscall::init(info.hhdm_offset, net_mmio);
+        syscall::init(
+            info.hhdm_offset,
+            net_mmio,
+            rng_mmio,
+            info.qemu_virt,
+            info.netd_module.is_some(),
+        );
         let online_cpus = smp::bring_up_aps();
         syscall::set_sys_info(online_cpus, info.interactive_shell);
-
-        // Probe ARM SMMUv3 if advertised by ACPI IORT
-        const SMMU_VIRT: u64 = 0xffff_b004_0000_0000;
-        let smmu_info = if let Some(smmu_phys) = acpi.smmuv3_base
-            && let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
-            && let Ok(smmu_va) = VirtAddr::new_page_aligned(SMMU_VIRT)
-            && let Ok(smmu_fr) = PhysFrame::from_aligned(PhysAddr::new(smmu_phys))
-            && vspace
-                .map_4k(smmu_va, smmu_fr, mmio_flags, &mut info.untyped)
-                .is_ok()
-        {
-            smmu::probe(SMMU_VIRT)
-        } else {
-            smmu::SmmuInfo::default()
-        };
 
         let mut serial = serial::Pl011::new();
         let _ = writeln!(
             serial,
-            "[newos-hal] ACPI/GIC: uart={:#x} gicd={:#x} gicc={:#x} (v{}, cpus={}) timer_irq={} psci={} ecam={:#x} smmuv3={:#x}(s1={},sid={}b) ap_sgi_acks={}",
+            "[newos-hal] ACPI/GIC: uart={:#x} gicd={:#x} gicc={:#x} (v{}, cpus={}) timer_irq={} psci={} ecam={:#x} ap_sgi_acks={}",
             uart_phys,
             gicd_phys,
             gicc_phys,
@@ -752,9 +784,6 @@ impl Aarch64Platform {
             virt_timer_irq,
             if use_smc { "SMC" } else { "HVC" },
             acpi.ecam_base.unwrap_or(0),
-            acpi.smmuv3_base.unwrap_or(0),
-            smmu_info.stage1,
-            smmu_info.sid_bits,
             smp::ap_sgi_ack_count(),
         );
         Self {
@@ -787,9 +816,6 @@ impl HalPlatform for Aarch64Platform {
             ssbs: SSBS_ENABLED.load(Ordering::Acquire),
             csv2: CSV2_SUPPORTED.load(Ordering::Acquire),
             csv3: CSV3_SUPPORTED.load(Ordering::Acquire),
-            pac: PAC_SUPPORTED.load(Ordering::Acquire),
-            bti: BTI_SUPPORTED.load(Ordering::Acquire),
-            mte: MTE_SUPPORTED.load(Ordering::Acquire),
         }
     }
 

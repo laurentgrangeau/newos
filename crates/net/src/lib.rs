@@ -10,9 +10,12 @@
 //! 100% `#![forbid(unsafe_code)]`, zero heap (`no_alloc`), zero network code in EL1.
 
 pub mod gem;
+pub mod stack;
 pub mod virtio;
 
 pub use gem::{GemDma, GemInfo, GemNetDevice, probe_cadence_gem};
+pub use smoltcp::phy::Device as NetDevice;
+pub use stack::{NetStack, NetStackStorage, SSH_PORT, TCP_BUF_SIZE, TcpEvent};
 pub use virtio::{MmioDmaTransport, VirtioNetDevice, VirtioNetDma};
 
 use newos_abi::SysError;

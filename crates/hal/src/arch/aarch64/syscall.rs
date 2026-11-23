@@ -135,6 +135,10 @@ static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 static NET_MMIO_PHYS: AtomicU64 = AtomicU64::new(0);
 static NET_MMIO_VIRT: AtomicU64 = AtomicU64::new(0);
 static NET_MMIO_LEN: AtomicU64 = AtomicU64::new(0);
+static RNG_MMIO_PHYS: AtomicU64 = AtomicU64::new(0);
+static RNG_MMIO_VIRT: AtomicU64 = AtomicU64::new(0);
+static RNG_MMIO_LEN: AtomicU64 = AtomicU64::new(0);
+static IS_QEMU_VIRT: AtomicBool = AtomicBool::new(false);
 static SYS_INFO_PACKED: AtomicU64 = AtomicU64::new(0);
 static TIMER_TICK_INTERVAL: AtomicU64 = AtomicU64::new(625_000);
 static SYSCALL_TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -399,15 +403,30 @@ impl ProcTable {
 
 static PROCS: IrqSpinLock<ProcTable> = IrqSpinLock::new(ProcTable::new());
 
-pub fn init(hhdm_offset: u64, net_mmio: Option<(PhysAddr, u64, u64)>) {
+pub fn init(
+    hhdm_offset: u64,
+    net_mmio: Option<(PhysAddr, u64, u64)>,
+    rng_mmio: Option<(PhysAddr, u64, u64)>,
+    qemu_virt: bool,
+    netd_present: bool,
+) {
     HHDM_OFFSET.store(hhdm_offset, Ordering::Release);
+    IS_QEMU_VIRT.store(qemu_virt, Ordering::Release);
     let cap_region = net_mmio.map(|(phys, virt, len)| {
         NET_MMIO_PHYS.store(phys.raw(), Ordering::Release);
         NET_MMIO_VIRT.store(virt, Ordering::Release);
         NET_MMIO_LEN.store(len, Ordering::Release);
         (phys, len)
     });
-    let _ = IPC_STATE.lock().init_bootstrap_caps(cap_region);
+    if let Some((phys, virt, len)) = rng_mmio {
+        RNG_MMIO_PHYS.store(phys.raw(), Ordering::Release);
+        RNG_MMIO_VIRT.store(virt, Ordering::Release);
+        RNG_MMIO_LEN.store(len, Ordering::Release);
+    }
+    // When `newos-netd` (PID 2) is loaded, omit `BOOTSTRAP_NET_MMIO` from `init` (PID 0)
+    // so `netd` is the sole holder of NIC DMA authority.
+    let init_net_cap = if netd_present { None } else { cap_region };
+    let _ = IPC_STATE.lock().init_bootstrap_caps(init_net_cap);
 }
 
 #[inline]
@@ -416,11 +435,16 @@ fn mmio_phys_to_virt(phys: u64) -> Option<u64> {
     let base_virt = NET_MMIO_VIRT.load(Ordering::Acquire);
     let len = NET_MMIO_LEN.load(Ordering::Acquire);
     if len > 0 && phys >= base_phys && phys < base_phys.saturating_add(len) {
-        Some(base_virt + (phys - base_phys))
-    } else {
-        // Never fall back to cacheable HHDM for Device MMIO (`H-5`).
-        None
+        return Some(base_virt + (phys - base_phys));
     }
+    let rng_phys = RNG_MMIO_PHYS.load(Ordering::Acquire);
+    let rng_virt = RNG_MMIO_VIRT.load(Ordering::Acquire);
+    let rng_len = RNG_MMIO_LEN.load(Ordering::Acquire);
+    if rng_len > 0 && phys >= rng_phys && phys < rng_phys.saturating_add(rng_len) {
+        return Some(rng_virt + (phys - rng_phys));
+    }
+    // Never fall back to cacheable HHDM for Device MMIO (`H-5`).
+    None
 }
 
 pub fn set_sys_info(online_cpus: usize, interactive_shell: bool) {
@@ -459,11 +483,39 @@ pub fn register_user_process(
     let _ = table.sched.spawn(DEFAULT_PRIORITY);
     table.count += 1;
     let mut ipc = IPC_STATE.lock();
-    if pid == 0 {
-        let _ = ipc.bind_bootstrap_vspace(0, PhysAddr::new(ttbr0));
-    } else {
-        let _ = ipc.init_worker_bootstrap_caps(pid);
-        let _ = ipc.register_child_caps_in_root(pid);
+    match pid {
+        0 => {
+            let _ = ipc.bind_bootstrap_vspace(0, PhysAddr::new(ttbr0));
+        }
+        1 => {
+            let _ = ipc.init_worker_bootstrap_caps(1);
+            let _ = ipc.register_child_caps_in_root(1);
+        }
+        2 => {
+            let len = NET_MMIO_LEN.load(Ordering::Acquire);
+            let net_cap = (len > 0).then(|| (PhysAddr::new(NET_MMIO_PHYS.load(Ordering::Acquire)), len));
+            let _ = ipc.init_netd_bootstrap_caps(2, net_cap);
+            let _ = ipc.bind_bootstrap_vspace(2, PhysAddr::new(ttbr0));
+            let _ = ipc.register_child_caps_in_root(2);
+        }
+        3 => {
+            let len = RNG_MMIO_LEN.load(Ordering::Acquire);
+            let rng_cap = (len > 0).then(|| (PhysAddr::new(RNG_MMIO_PHYS.load(Ordering::Acquire)), len));
+            let qemu = IS_QEMU_VIRT.load(Ordering::Acquire);
+            let _ = ipc.init_keyd_bootstrap_caps(3, rng_cap, qemu);
+            if qemu {
+                let _ = ipc.bind_bootstrap_vspace(3, PhysAddr::new(ttbr0));
+            }
+            let _ = ipc.register_child_caps_in_root(3);
+        }
+        4 => {
+            let _ = ipc.init_sshd_bootstrap_caps(4);
+            let _ = ipc.register_child_caps_in_root(4);
+        }
+        _ => {
+            let _ = ipc.init_worker_bootstrap_caps(pid);
+            let _ = ipc.register_child_caps_in_root(pid);
+        }
     }
     Ok(pid)
 }

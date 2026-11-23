@@ -1,0 +1,10 @@
+[package]
+name = "newos-sshd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+newos-abi = { workspace = true }
+newos-ssh-proto = { workspace = true }
+newos-user-rt = { workspace = true }

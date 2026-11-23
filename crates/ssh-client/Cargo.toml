@@ -1,0 +1,12 @@
+[package]
+name = "newos-ssh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ml-dsa = { version = "0.1", default-features = false, features = ["zeroize"] }
+newos-abi = { workspace = true }
+newos-key-vault = { workspace = true }
+newos-ssh-proto = { workspace = true }
+zeroize = { version = "1", default-features = false }

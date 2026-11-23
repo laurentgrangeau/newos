@@ -456,7 +456,7 @@ impl PageFlags {
     };
 }
 
-/// Summary of AArch64 hardware memory-protection & speculative-execution mitigations enabled by `newos-hal`.
+/// Summary of AArch64 (ARMv8.2-A Cortex-A76) hardware memory-protection & speculative-execution mitigations enabled by `newos-hal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuSecurityFeatures {
     pub pxn: bool,
@@ -466,9 +466,6 @@ pub struct CpuSecurityFeatures {
     pub ssbs: bool,
     pub csv2: bool,
     pub csv3: bool,
-    pub pac: bool,
-    pub bti: bool,
-    pub mte: bool,
 }
 
 /// Safe, architecture-agnostic 4-level page-table interface implemented by `newos-hal`.

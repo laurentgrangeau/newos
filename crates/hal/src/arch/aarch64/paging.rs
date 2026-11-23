@@ -2,7 +2,7 @@
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_bytes, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 use newos_abi::SysError;
 use newos_kernel_core::memory::{
     HUGE_PAGE_MASK_2M, PAGE_SIZE, PageFlags, PhysAddr, PhysFrame, PhysFrame2M, UntypedInventory,
@@ -17,19 +17,12 @@ const DESC_SH_INNER: u64 = 0b11 << 8; // Inner Shareable
 const DESC_AP_EL0_RW: u64 = 0b01 << 6;
 const DESC_AP_EL1_RO: u64 = 0b10 << 6;
 const DESC_AP_EL0_RO: u64 = 0b11 << 6;
-const DESC_GP: u64 = 1 << 50; // Guarded Page (ARMv8.5-A FEAT_BTI)
 const DESC_PXN: u64 = 1 << 53; // Privileged Execute Never (SMEP equivalent)
 const DESC_UXN: u64 = 1 << 54; // Unprivileged Execute Never (NX for EL0)
 const DESC_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 const DESC_2M_ADDR_MASK: u64 = 0x0000_FFFF_FFE0_0000;
 
 static CACHED_DEVICE_MAIR_IDX: AtomicU8 = AtomicU8::new(u8::MAX);
-static BTI_GUARDED_PAGES: AtomicBool = AtomicBool::new(false);
-
-/// Enable ARMv8.5-A Guarded Page (`DESC_GP`) marking on executable PTEs when hardware advertises `FEAT_BTI`.
-pub fn enable_bti_guarded_pages() {
-    BTI_GUARDED_PAGES.store(true, Ordering::Release);
-}
 
 #[inline]
 fn device_mair_index() -> u64 {
@@ -260,16 +253,11 @@ impl VSpaceMapper for Aarch64VSpace {
         }
         if !flags.executable {
             pte |= DESC_PXN | DESC_UXN;
+        } else if flags.user {
+            // EL0 executable pages are NEVER executable by EL1 (hardware PXN)
+            pte |= DESC_PXN;
         } else {
-            if BTI_GUARDED_PAGES.load(Ordering::Acquire) {
-                pte |= DESC_GP;
-            }
-            if flags.user {
-                // EL0 executable pages are NEVER executable by EL1 (hardware PXN)
-                pte |= DESC_PXN;
-            } else {
-                pte |= DESC_UXN;
-            }
+            pte |= DESC_UXN;
         }
 
         self.write_desc(l3, i3, pte)?;
