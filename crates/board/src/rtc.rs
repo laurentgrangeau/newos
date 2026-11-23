@@ -1,6 +1,6 @@
-//! Raspberry Pi 5 Real-Time Clock (RTC) Driver & Gregorian Calendar Codec (`#![forbid(unsafe_code)]`).
+//! Raspberry Pi 5 Real-Time Clock (RTC) Driver & Gregorian Calendar Codec.
 //!
-//! Supports both Unix-epoch <-> Gregorian `DateTime` conversion (`no_alloc`) and the
+//! Supports both Unix-epoch <-> Gregorian `DateTime` conversion and the
 //! capability-scoped Raspberry Pi 5 RTC seconds / alarm / trickle-charge interface.
 
 use crate::MmioTransport;

@@ -1,4 +1,4 @@
-//! NVMe 1.4 PCIe SSD Block Driver (`#![forbid(unsafe_code)]`, `no_alloc`).
+//! NVMe 1.4 PCIe SSD Block Driver.
 //!
 //! Targets NVMe SSDs attached to the Raspberry Pi 5 PCIe 2.0 x1 FFC connector, using
 //! 4 KiB-aligned Submission/Completion Queues and PRP1 data buffers with `dma_clean`/`dma_invalidate`.
@@ -103,7 +103,7 @@ struct CqPage([NvmeCqe; QUEUE_DEPTH]);
 #[repr(C, align(4096))]
 struct DataPage([AtomicU8; 4096]);
 
-/// Static 4 KiB-aligned `no_alloc` DMA queues & PRP1 data page for NVMe 1.4.
+/// Static 4 KiB-aligned DMA queues & PRP1 data page for NVMe 1.4.
 pub struct NvmeDma {
     admin_sq: SqPage,
     admin_cq: CqPage,

@@ -1,4 +1,4 @@
-//! Zero-heap, `#![forbid(unsafe_code)]` priority + round-robin microkernel scheduler
+//! Priority + round-robin microkernel scheduler
 //! with preemptive time-slice accounting and per-CPU SMP runqueues with work-stealing.
 
 use newos_abi::SysError;
@@ -67,7 +67,7 @@ pub struct ThreadControlBlock {
     pub preemptions: u64,
 }
 
-/// Fixed-capacity, `no_alloc` priority + round-robin scheduler.
+/// Fixed-capacity priority + round-robin scheduler.
 pub struct Scheduler<const MAX_THREADS: usize> {
     threads: [Option<ThreadControlBlock>; MAX_THREADS],
     priorities: [u8; MAX_THREADS],

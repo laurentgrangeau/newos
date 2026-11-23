@@ -1,6 +1,6 @@
 # NewOS Raspberry Pi 5 Full System Composition Profile
 # Full SMP microkernel, priority+RR scheduler, verified boot ELF attestation,
-# dual-stack IPv4/IPv6, NIST Level 5 pure-PQ SSH (`netd` + `keyd` + `sshd`),
+# dual-stack IPv4/IPv6, SSH (`netd` + `keyd` + `sshd`),
 # and all Raspberry Pi 5 (BCM2712 + RP1) hardware drivers.
 
 [target]

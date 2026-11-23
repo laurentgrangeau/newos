@@ -1,6 +1,6 @@
-//! Pure `#![forbid(unsafe_code)]`, `no_alloc` Modern VirtIO 1.0+ (v2) MMIO Network Driver.
+//! Modern VirtIO 1.0+ (v2) MMIO Network Driver.
 //!
-//! Runs 100% in EL0 using capability-scoped `MmioRead32`/`MmioWrite32` and `VirtToPhys`.
+//! Runs in EL0 using capability-scoped `MmioRead32`/`MmioWrite32` and `VirtToPhys`.
 //! Every DMA ring and packet buffer is page-aligned (`<= 4096B`) so it never crosses a page boundary.
 
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering, fence};
@@ -101,7 +101,7 @@ impl PacketBuf {
     }
 }
 
-/// Static DMA memory backing RX and TX split virtqueues (`#![forbid(unsafe_code)]`, `no_alloc`).
+/// Static DMA memory backing RX and TX split virtqueues.
 pub struct VirtioNetDma {
     rx_desc: DescTable,
     rx_avail: AvailRing,

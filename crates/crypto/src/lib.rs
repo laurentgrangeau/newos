@@ -1,7 +1,6 @@
 #![no_std]
-#![forbid(unsafe_code)]
 
-//! Modular, `#![no_std]`, `#![forbid(unsafe_code)]`, `no_alloc` Cryptographic Abstraction Layer
+//! Modular Cryptographic Abstraction Layer
 //! for NewOS.
 //!
 //! Every cryptographic algorithm is independently toggleable via Cargo features:
@@ -10,7 +9,7 @@
 //! - `chacha20-poly1305`: RFC 8439 / OpenSSH `chacha20-poly1305@openssh.com` AEAD.
 //! - `ml-kem-1024`: NIST FIPS 203 ML-KEM-1024 key encapsulation mechanism.
 //! - `ml-dsa-87`: NIST FIPS 204 ML-DSA-87 digital signature scheme.
-//! - `suite-pq-level5`: enables the full NIST Level 5 / CNSA 2.0 pure-PQ suite.
+//! - `suite-pq-level5`: enables the NIST Level 5 post-quantum suite.
 
 #[cfg(feature = "chacha20-poly1305")]
 pub mod chacha20_poly1305;

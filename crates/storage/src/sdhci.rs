@@ -1,4 +1,4 @@
-//! Raspberry Pi 5 (BCM2712) microSD SDHCI 3.0 / SDR104 Block Driver (`#![forbid(unsafe_code)]`).
+//! Raspberry Pi 5 (BCM2712) microSD SDHCI 3.0 / SDR104 Block Driver.
 //!
 //! Physical MMIO base: `0x10_00ff_f000` (4 KiB, `CapId::BOOTSTRAP_SDHCI_MMIO`).
 

@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 //! Opaque-box E2E test suite for `newos-shell-core` (CAOS + `newos-sh` typed pipeline shell).
 //!
 //! Compile & run offline with:

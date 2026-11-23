@@ -1,5 +1,5 @@
 //! Modern VirtIO 1.0+ (v2) MMIO Entropy Device (`virtio-rng-device`, `device_id == 4`)
-//! running 100% in EL0 with `#![forbid(unsafe_code)]` and `no_alloc` for QEMU `aarch64` `virt`.
+//! running in EL0 for QEMU `aarch64` `virt`.
 
 use crate::{EntropySource, RngError, RngTransport};
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering, fence};

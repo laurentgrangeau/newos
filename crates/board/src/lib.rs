@@ -1,9 +1,8 @@
 #![no_std]
-#![forbid(unsafe_code)]
 
-//! Pure `#![forbid(unsafe_code)]`, `no_alloc` Raspberry Pi 5 (16 GB) Board Peripherals Suite.
+//! Raspberry Pi 5 (16 GB) Board Peripherals Suite.
 //!
-//! All drivers run 100% in EL0 over capability-scoped MMIO (`MmioRead32`/`MmioWrite32`) and
+//! All drivers run in EL0 over capability-scoped MMIO (`MmioRead32`/`MmioWrite32`) and
 //! PAN-safe DMA translation/cache ops (`VirtToPhys`/`DmaCacheOp`):
 //! - [`mailbox`]: BCM2712 VideoCore Property Mailbox (`0x10_7C01_3880`)
 //! - [`thermal`]: BCM2712 AVS TMON Thermal Sensor (`0x10_7D5D_2200`) & Active Cooler PWM Fan Curve

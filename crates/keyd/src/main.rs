@@ -1,8 +1,7 @@
 #![no_std]
 #![no_main]
-#![forbid(unsafe_code)]
 
-//! Isolated EL0 Pure-PQ Entropy & ML-DSA-87 Signing Vault (`newos-keyd`, PID 3).
+//! Isolated EL0 Entropy & ML-DSA-87 Signing Vault (`newos-keyd`, PID 3).
 //!
 //! Strict least-privilege capability set:
 //! - `CapId::BOOTSTRAP_RNG_MMIO` (`R|W`) — BCM2712 RNG200 (Pi 5) or VirtIO-RNG (QEMU)

@@ -1,6 +1,6 @@
-//! Pure seL4-style Capability Space (`CSpace`) and inline Capability Derivation Tree (CDT).
+//! Capability Space (`CSpace`) and inline Capability Derivation Tree (CDT).
 //!
-//! 100% `#![forbid(unsafe_code)]`, zero kernel heap (`no_alloc`), generational `CapId` handles,
+//! Zero kernel heap, generational `CapId` handles,
 //! non-escalating rights attenuation, immutable badging, and transitive `revoke`.
 
 use crate::memory::{PhysAddr, UntypedInventory};
@@ -157,7 +157,7 @@ const fn decode_cap_id(id: CapId) -> (usize, u32) {
     (slot, generation)
 }
 
-/// Fixed-capacity, `no_alloc` capability table with inline Capability Derivation Tree (CDT).
+/// Fixed-capacity capability table with inline Capability Derivation Tree (CDT).
 ///
 /// Slot `0` is permanently reserved for `CapId::NULL`.
 pub struct CNode<const SLOTS: usize> {
@@ -446,7 +446,7 @@ impl<const SLOTS: usize> CNode<SLOTS> {
                 return Err(SysError::InvalidArgument);
             }
             Some(b) => {
-                // seL4 invariant: once a capability is badged, its badge cannot be altered.
+                // Invariant: once a capability is badged, its badge cannot be altered.
                 if src_cap.badge != 0 {
                     return Err(SysError::InsufficientRights);
                 }
@@ -597,7 +597,7 @@ impl<const SLOTS: usize> CNode<SLOTS> {
 
     /// Transitively revoke all descendants derived from `id` (leaving `id` itself intact).
     ///
-    /// Requires `Rights::REVOKE`. Uses an iterative, zero-heap fixed-point scan over `SLOTS`.
+    /// Requires `Rights::REVOKE`. Uses an iterative fixed-point scan over `SLOTS`.
     pub fn revoke(&mut self, id: CapId) -> Result<usize, SysError> {
         let (root_idx, root_rights) = {
             let (idx, cap) = self.validate_cap(id)?;
@@ -903,7 +903,7 @@ impl<const SLOTS: usize> CNode<SLOTS> {
         self.revoke_matching_external_parents_cb(parent_masks, |_| {})
     }
 
-    /// Pure seL4 `Untyped` -> `Frame` retype into `dst_slot`: verifies `untyped_cap` carries
+    /// `Untyped` -> `Frame` retype into `dst_slot`: verifies `untyped_cap` carries
     /// `Rights::WRITE`, carves a 4 KiB physical frame strictly from its designated `region_index`,
     /// and installs a derived `Frame` capability as a CDT child of `untyped_cap`.
     pub fn retype_frame_from_into(
@@ -943,7 +943,7 @@ impl<const SLOTS: usize> CNode<SLOTS> {
         self.insert_at(dst_slot, frame_cap, Some(parent_idx))
     }
 
-    /// Pure seL4 `Untyped` -> `Frame` retype into the first free slot.
+    /// `Untyped` -> `Frame` retype into the first free slot.
     pub fn retype_frame_from(
         &mut self,
         untyped_cap: CapId,

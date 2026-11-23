@@ -1,8 +1,8 @@
-//! Raspberry Pi AI HAT+ / AI Kit (Hailo-8 / Hailo-8L / Hailo-10H) PCIe NPU Driver (`#![forbid(unsafe_code)]`).
+//! Raspberry Pi AI HAT+ / AI Kit (Hailo-8 / Hailo-8L / Hailo-10H) PCIe NPU Driver.
 //!
 //! Targets external Hailo AI accelerators attached to the Raspberry Pi 5 PCIe 2.0 x1 FFC slot,
 //! providing PCIe device identification, BAR control status probing, and aligned vDMA descriptor
-//! ring submission (`no_alloc`).
+//! ring submission.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use newos_abi::SysError;
@@ -77,7 +77,7 @@ impl HailoVdmaDesc {
     }
 }
 
-/// Static 4 KiB-aligned `no_alloc` Hailo vDMA descriptor ring.
+/// Static 4 KiB-aligned Hailo vDMA descriptor ring.
 #[repr(C, align(4096))]
 pub struct HailoVdmaRing {
     descs: [HailoVdmaDesc; VDMA_RING_SIZE],

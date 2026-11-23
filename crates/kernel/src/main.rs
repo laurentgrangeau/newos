@@ -1,8 +1,7 @@
 #![no_std]
 #![no_main]
-#![forbid(unsafe_code)]
 
-//! Thin EL1 kernel binary wiring `newos-hal` into the 100% safe `newos-kernel-core`.
+//! Thin EL1 kernel binary wiring `newos-hal` into `newos-kernel-core`.
 
 use core::panic::PanicInfo;
 use newos_hal::Platform;

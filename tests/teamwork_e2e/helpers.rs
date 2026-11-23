@@ -336,7 +336,7 @@ impl Xorshift64 {
 }
 
 // ============================================================================
-// Pure-std Zero-False-Positive Rust Lexical Scanner for Static Safety Audits
+// Rust Lexical Scanner for Static Safety Audits
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -978,6 +978,33 @@ pub fn has_forbid_unsafe_code(tokens: &[Tok]) -> bool {
         }
     }
     false
+}
+
+/// Checks whether a crate enforces `unsafe_code = "forbid"` either via
+/// workspace lint inheritance (`[workspace.lints.rust]` + `[lints] workspace = true`)
+/// or an explicit `#![forbid(unsafe_code)]` crate-root attribute.
+pub fn crate_forbids_unsafe_code(repo_root: &Path, crate_dir: &Path, root_src: &Path) -> bool {
+    let ws_toml = fs::read_to_string(repo_root.join("Cargo.toml")).unwrap_or_default();
+    let crate_toml = fs::read_to_string(crate_dir.join("Cargo.toml")).unwrap_or_default();
+    let ws_forbids = ws_toml
+        .lines()
+        .any(|l| l.trim().starts_with("unsafe_code") && l.contains("\"forbid\""));
+    let mut in_lints = false;
+    let mut inherits_ws_lints = false;
+    for line in crate_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_lints = trimmed == "[lints]";
+        } else if in_lints && trimmed.starts_with("workspace") && trimmed.contains("true") {
+            inherits_ws_lints = true;
+            break;
+        }
+    }
+    if ws_forbids && inherits_ws_lints {
+        return true;
+    }
+    let scanned = scan_rust_source(root_src);
+    has_forbid_unsafe_code(&scanned.tokens)
 }
 
 // ============================================================================

@@ -1,10 +1,8 @@
 #![no_std]
-#![forbid(unsafe_code)]
 
-//! Pure Post-Quantum SSHv2 Engine (`newos-ssh-proto`) — `#![no_std]`, `no_alloc`,
-//! `#![forbid(unsafe_code)]`.
+//! SSHv2 protocol engine (`newos-ssh-proto`).
 //!
-//! Enforces a single, maximally hardened NIST Level 5 / CNSA 2.0 pure-PQ cryptographic suite:
+//! Enforces a single NIST Level 5 post-quantum cryptographic suite:
 //! - **KEX:** `mlkem1024-sha3-512` (NIST FIPS 203 **ML-KEM-1024** + `SHA3-512`)
 //! - **Host & User Auth:** `ssh-mldsa87` (NIST FIPS 204 **ML-DSA-87**, hedged, domain-separated)
 //! - **AEAD:** `chacha20-poly1305@openssh.com` (256-bit ChaCha20 + Poly1305, encrypted length)
@@ -34,7 +32,7 @@ use zeroize::Zeroize;
 pub const SSH_BANNER: &[u8] = b"SSH-2.0-NewOS_PQ_0.1\r\n";
 pub const SSH_BANNER_NO_CRLF: &[u8] = b"SSH-2.0-NewOS_PQ_0.1";
 
-/// Single-suite strict algorithm identifiers (zero legacy / classical algorithms).
+/// Algorithm identifiers for the supported suite.
 pub const ALG_KEX: &str = "mlkem1024-sha3-512";
 pub const ALG_KEX_STRICT_S: &str = "kex-strict-s-v00@openssh.com";
 pub const ALG_KEX_STRICT_C: &str = "kex-strict-c-v00@openssh.com";
@@ -231,7 +229,7 @@ fn build_kexinit(is_server: bool, cookie: &[u8; 16], out: &mut [u8]) -> Result<u
     Ok(w.len())
 }
 
-/// Validate a peer's `SSH_MSG_KEXINIT` against our strict pure-PQ single-suite policy.
+/// Validate a peer's `SSH_MSG_KEXINIT` against the supported suite.
 fn validate_peer_kexinit(payload: &[u8], peer_is_client: bool) -> Result<(), SshError> {
     let mut r = WireReader::new(payload);
     if r.read_u8()? != MSG_KEXINIT {
@@ -302,7 +300,7 @@ enum ServerState {
     ShellOpen,
 }
 
-/// Server-side pure-PQ SSHv2 state machine (`#![no_std]`, `no_alloc`, `#![forbid(unsafe_code)]`).
+/// Server-side SSHv2 state machine.
 pub struct SshServer {
     state: ServerState,
     rx_buf: [u8; MAX_PACKET_BODY + 64],
@@ -519,7 +517,7 @@ impl SshServer {
         self.rx_buf.copy_within(consumed..self.rx_len, 0);
         self.rx_len -= consumed;
 
-        // Immediately send strict pure-PQ `SSH_MSG_KEXINIT`
+        // Immediately send `SSH_MSG_KEXINIT`
         let rnd = vault.random_32()?;
         let mut cookie = [0u8; 16];
         cookie.copy_from_slice(&rnd[..16]);
@@ -851,7 +849,7 @@ impl SshServer {
     }
 }
 
-/// Client-side pure-PQ SSHv2 state machine shared by `crates/ssh-client` (`newos-ssh`) and tests.
+/// Client-side SSHv2 state machine shared by `crates/ssh-client` (`newos-ssh`) and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientState {
     AwaitBanner,

@@ -1,4 +1,4 @@
-//! Broadcom VideoCore VII (V3D 7.1) GPU Probe & Compute Shader Dispatch (`#![forbid(unsafe_code)]`).
+//! Broadcom VideoCore VII (V3D 7.1) GPU Probe & Compute Shader Dispatch.
 //!
 //! Physical MMIO layout on Raspberry Pi 5 (BCM2712):
 //! - `V3D_HUB`:   `0x10_0200_0000` (offset `+0x0000`) — `IDENT0..3`, MMU control

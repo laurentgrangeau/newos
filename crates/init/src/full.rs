@@ -1,7 +1,6 @@
 //! EL0 Root Task (`init`), Crash Supervisor, Content-Addressed Object Store (CAOS),
-//! and Post-UNIX Typed Pipeline Shell (`newos-sh`).
+//! and Typed Pipeline Shell (`newos-sh`).
 //!
-//! 100% memory-safe Rust (`#![forbid(unsafe_code)]`, `no_alloc`).
 
 use core::fmt::Write;
 use newos_abi::ring::SpscRing;
@@ -10,7 +9,7 @@ use newos_net::{GemDma, MmioDmaTransport, NetConfig, NicKind, VirtioNetDma};
 use newos_shell_core::shell::{NullWriter, Record, RecordStream, Shell, ShellHost, SysInfo};
 use newos_user_rt::{BufferedConsole, IpcLogAssembler};
 
-/// Static EL0 DMA rings & packet buffers (`Sync` via atomics, 100% `#![forbid(unsafe_code)]`).
+/// Static EL0 DMA rings & packet buffers (`Sync` via atomics).
 pub static VIRTIO_DMA: VirtioNetDma = VirtioNetDma::new();
 /// Static EL0 64-bit DMA rings & packet buffers for Raspberry Pi 5 RP1 Cadence GEM.
 pub static GEM_DMA: GemDma = GemDma::new();
@@ -520,10 +519,7 @@ pub fn main() -> ! {
     }
 
     // Automated self-test mode (`cargo xtask test`)
-    let _ = writeln!(
-        out,
-        "[init] hello from EL0 (100% safe Rust, forbid_unsafe, isolated TTBR0_EL1 VSpace)!"
-    );
+    let _ = writeln!(out, "[init] hello from EL0 (isolated TTBR0_EL1 VSpace)!");
     out.flush();
 
     if info.proc_count > 1 {
@@ -589,7 +585,7 @@ pub fn main() -> ! {
         "[init] phase-5 IPC, Notification & TTBR0 switch self-check: OK (~{avg_cycles} cycles/TTBR0-switch)"
     );
 
-    // EL0 Post-UNIX CAOS + Typed Pipeline Shell (`newos-sh`) self-check
+    // EL0 CAOS + Typed Pipeline Shell (`newos-sh`) self-check
     let mut sh = Shell::new(InitShellHost::new());
     if let Err(msg) = sh.run_self_test() {
         let _ = writeln!(
@@ -682,7 +678,7 @@ pub fn main() -> ! {
             Ok(frame_len) => {
                 let _ = writeln!(
                     out,
-                    "[init] EL0 smoltcp IPv4/UDP stack ({frame_len}B Ethernet frame, no_alloc, forbid_unsafe): OK"
+                    "[init] EL0 smoltcp IPv4/UDP stack ({frame_len}B Ethernet frame): OK"
                 );
             }
             Err(msg) => {

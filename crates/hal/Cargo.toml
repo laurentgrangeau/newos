@@ -18,5 +18,10 @@ limine = { workspace = true }
 newos-abi = { workspace = true, default-features = false }
 newos-kernel-core = { workspace = true, default-features = false }
 
-[lints]
-workspace = true
+# Audited unsafe TCB: mirrors workspace lints except `unsafe_code = "forbid"`.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[lints.clippy]
+all = "warn"

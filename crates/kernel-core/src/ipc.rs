@@ -1,7 +1,7 @@
-//! Pure seL4-style kernel IPC primitives: `Endpoint` (fastpath), 64-bit `Notification`,
+//! Kernel IPC primitives: `Endpoint` (fastpath), 64-bit `Notification`,
 //! and capability-scoped MMIO validation for EL0 drivers.
 //!
-//! 100% `#![forbid(unsafe_code)]`, zero kernel heap (`no_alloc`). All operations are
+//! Zero kernel heap. All operations are
 //! capability-checked through the caller's `CNode`.
 
 use crate::cspace::{CNode, CapObject, Capability, ExternalParent};
@@ -56,7 +56,7 @@ impl IpcStats {
     }
 }
 
-/// Fixed-capacity, `no_alloc` kernel IPC + per-process isolated `CSpace` state.
+/// Fixed-capacity kernel IPC + per-process isolated `CSpace` state.
 ///
 /// PID 0 (`init`) owns `root_cspace`; PIDs `1..MAX_IPC_PROCS` each own an independent
 /// `CNode<64>` so unprivileged processes cannot access capabilities belonging to `init`

@@ -1,8 +1,7 @@
 #![no_std]
 #![no_main]
-#![forbid(unsafe_code)]
 
-//! Isolated EL0 Pure-PQ SSHv2 Protocol Engine (`newos-sshd`, PID 4).
+//! Isolated EL0 SSHv2 daemon (`newos-sshd`, PID 4).
 //!
 //! Strict least-privilege capability set:
 //! - `CapId::BOOTSTRAP_NET_EP` (`R|W`, badge 4) — opaque TCP byte stream from `newos-netd`
@@ -167,7 +166,7 @@ fn main() -> ! {
     let mut out = IpcLogConsole::<256>::new(CapId::BOOTSTRAP_LOG_EP);
     let _ = writeln!(
         out,
-        "[sshd] online (pure-PQ: mlkem1024-sha3-512 + ssh-mldsa87 + chacha20-poly1305, ZERO MMIO)"
+        "[sshd] online (mlkem1024-sha3-512 + ssh-mldsa87 + chacha20-poly1305)"
     );
     out.flush();
 

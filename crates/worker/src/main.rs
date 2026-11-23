@@ -1,8 +1,7 @@
 #![no_std]
 #![no_main]
-#![forbid(unsafe_code)]
 
-//! Isolated EL0 Worker Process (`worker`) — 100% `#![forbid(unsafe_code)]`.
+//! Isolated EL0 Worker Process (`worker`).
 //!
 //! Runs in its own hardware `TTBR0_EL1` `VSpace` at the exact same virtual base (`0x400000`)
 //! as `init`, communicating solely via capability-checked microkernel `Endpoint` IPC.

@@ -1,4 +1,4 @@
-//! Persistent, `no_alloc`, `#![forbid(unsafe_code)]` EL0 `smoltcp` Network Stack (`NetStack`).
+//! Persistent EL0 `smoltcp` Network Stack (`NetStack`).
 //!
 //! Designed for `newos-netd` (PID 2): initializes the NIC once, maintains an automatic DHCPv4
 //! lease (with `NetConfig::QEMU_DEFAULT` fallback), and serves a persistent single-connection
@@ -35,7 +35,7 @@ pub enum TcpEvent {
     Disconnected,
 }
 
-/// Static, `no_alloc` backing buffers owned by the caller (e.g., `newos-netd` main/BSS)
+/// Static backing buffers owned by the caller (e.g., `newos-netd` main/BSS)
 /// and borrowed by [`NetStack`].
 pub struct NetStackStorage<'a> {
     pub tcp_rx_buf: [u8; TCP_BUF_SIZE],
@@ -59,7 +59,7 @@ impl NetStackStorage<'_> {
     }
 }
 
-/// Long-lived EL0 `smoltcp` IPv4/IPv6 dual-stack TCP listener (`#![forbid(unsafe_code)]`, `no_alloc`).
+/// Long-lived EL0 `smoltcp` IPv4/IPv6 dual-stack TCP listener.
 pub struct NetStack<'a, D: Device> {
     device: D,
     iface: Interface,

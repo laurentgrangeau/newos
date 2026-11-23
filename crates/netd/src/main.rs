@@ -1,6 +1,5 @@
 #![no_std]
 #![no_main]
-#![forbid(unsafe_code)]
 
 //! Isolated EL0 Network & DMA Plane Daemon (`newos-netd`, PID 2).
 //!
@@ -26,7 +25,7 @@ use newos_net::{GemDma, GemNetDevice};
 use newos_net::{VirtioNetDevice, VirtioNetDma};
 use newos_user_rt::IpcLogConsole;
 
-/// Static EL0 DMA rings & packet buffers (`Sync` via atomics, 100% `#![forbid(unsafe_code)]`).
+/// Static EL0 DMA rings & packet buffers (`Sync` via atomics).
 #[cfg(feature = "driver-virtio")]
 static VIRTIO_DMA: VirtioNetDma = VirtioNetDma::new();
 #[cfg(feature = "driver-gem")]

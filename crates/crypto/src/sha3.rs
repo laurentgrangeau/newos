@@ -1,4 +1,4 @@
-//! Pure `#![forbid(unsafe_code)]`, `no_alloc`, `const fn` FIPS 202 **SHA3-512** (Keccak-f[1600]).
+//! Pure `const fn` FIPS 202 **SHA3-512** (Keccak-f[1600]).
 //!
 //! Shared across NewOS EL1 Verified Boot ELF attestation (`newos-kernel-core`) and
 //! EL0 Content-Addressed Object Store (`newos-shell-core`), eliminating all SHA-2 from the OS.
@@ -194,7 +194,7 @@ fn absorb_shake256_block(state: &mut [u64; 25], block: &[u8; SHAKE256_RATE_BYTES
 }
 
 /// Compute FIPS 202 **SHAKE256** XOF over `input`, writing arbitrary-length output into `out`
-/// without heap allocation (`#![forbid(unsafe_code)]`).
+/// without heap allocation.
 pub fn shake256(input: &[u8], out: &mut [u8]) {
     let mut state = [0u64; 25];
     let mut pos = 0;

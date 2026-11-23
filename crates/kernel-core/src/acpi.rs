@@ -1,4 +1,4 @@
-//! Pure `#![forbid(unsafe_code)]`, `no_alloc` ACPI table validators for AArch64 UEFI.
+//! ACPI table validators for AArch64 UEFI.
 //!
 //! Validates ACPI 2.0+ RSDP, XSDT, FADT (`ARM_BOOT_ARCH`), SPCR (PL011 UART),
 //! MADT (GICv2/GICv3 GICD/GICC & CPU count), GTDT (Generic Timer GSIVs),

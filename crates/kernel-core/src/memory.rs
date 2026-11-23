@@ -1,6 +1,6 @@
-//! Pure seL4-style `Untyped` physical memory inventory and safe 4-level `VSpace` traits.
+//! `Untyped` physical memory inventory and 4-level `VSpace` traits.
 //!
-//! Zero kernel heap (`no_alloc`) and 100% `#![forbid(unsafe_code)]`.
+//! Zero kernel heap.
 
 use newos_abi::SysError;
 
@@ -15,7 +15,7 @@ pub const HUGE_PAGE_MASK_2M: u64 = HUGE_PAGE_SIZE_2M - 1;
 /// Maximum number of usable physical memory regions tracked at bootstrap (sized for RPi5 16 GB UEFI maps).
 pub const MAX_UNTYPED_REGIONS: usize = 64;
 
-/// Fixed-capacity zero-heap LIFO cache for reclaimed 4 KiB physical frames.
+/// Fixed-capacity LIFO cache for reclaimed 4 KiB physical frames.
 pub const MAX_RECLAIMED_FRAMES: usize = 512;
 
 /// 64-bit physical address.
@@ -145,7 +145,7 @@ impl PhysFrame2M {
     }
 }
 
-/// Single contiguous `Untyped` physical memory region using a seL4-style monotonic watermark.
+/// Single contiguous `Untyped` physical memory region using a monotonic watermark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UntypedRegion {
     pub base: u64,
@@ -195,7 +195,7 @@ impl UntypedRegion {
     }
 }
 
-/// Fixed-capacity, zero-heap inventory of bootstrap `Untyped` physical memory regions
+/// Fixed-capacity inventory of bootstrap `Untyped` physical memory regions
 /// with a bounded LIFO free-frame cache for reclaimed 4 KiB pages.
 ///
 /// Intentionally NOT `Copy` so a stray copy can never hand out the same physical frames twice.
@@ -519,7 +519,7 @@ pub trait VSpaceMapper {
     ) -> Result<(), SysError>;
 }
 
-/// Fixed-capacity, zero-heap reverse-mapping entry linking a physical `Frame` to a `(VSpace, VirtAddr)`
+/// Fixed-capacity reverse-mapping entry linking a physical `Frame` to a `(VSpace, VirtAddr)`
 /// along with its W/X permissions to enforce system-wide W^X anti-aliasing (`M1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameMapping {
@@ -540,7 +540,7 @@ impl FrameMapping {
     };
 }
 
-/// Fixed-capacity reverse-mapping table (`#![forbid(unsafe_code)]`, `no_alloc`) enabling
+/// Fixed-capacity reverse-mapping table enabling
 /// hardware PTE unmap + TLB flush when a `Frame` or parent `Untyped` capability is revoked (`H-3`),
 /// and system-wide W^X anti-aliasing checks across all VSpaces (`M1`).
 pub struct FrameMappingTracker<const MAX_MAPPINGS: usize> {

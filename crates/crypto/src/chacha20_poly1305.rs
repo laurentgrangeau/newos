@@ -1,4 +1,4 @@
-//! Pure-Rust `#![forbid(unsafe_code)]`, `no_alloc`, constant-time
+//! Constant-time
 //! **`chacha20-poly1305@openssh.com`** AEAD packet cipher (RFC 8439 + OpenSSH spec).
 //!
 //! - `k_len` (32 B): encrypts/decrypts the 4-byte SSH packet length (`counter = 0`).

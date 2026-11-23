@@ -1,4 +1,4 @@
-//! Limine boot protocol requests and safe `no_alloc` response extraction.
+//! Limine boot protocol requests and response extraction.
 
 use limine::memmap::MEMMAP_USABLE;
 use limine::request::{
@@ -76,7 +76,7 @@ pub fn mp_response() -> Option<&'static MpResponse> {
     MP_REQUEST.response()
 }
 
-/// Extract a safe, `no_alloc` boot descriptor and bootstrap `UntypedInventory` from Limine.
+/// Extract a boot descriptor and bootstrap `UntypedInventory` from Limine.
 pub fn boot_info() -> BootInfo {
     // If Limine fails to provide an HHDM response, `hhdm_offset` stays 0 and `Aarch64Platform::new`
     // halts via `system_off(ShutdownStatus::Failed)` rather than panicking before UART init.

@@ -1,4 +1,4 @@
-//! Post-UNIX Typed Zero-Copy Pipeline Shell (`newos-sh`) — `#![forbid(unsafe_code)]`, `no_alloc`.
+//! Typed Pipeline Shell (`newos-sh`).
 //!
 //! Instead of piping untyped ASCII text through regexes, stages pass typed `Record` values
 //! (`Proc`, `Object`, `Ref`, `Metric`, `Count`) directly through structured `|` pipelines:
@@ -118,7 +118,7 @@ impl Write for NullWriter {
     }
 }
 
-/// Fixed-size stack-buffered `core::fmt::Write` wrapper (`no_alloc`, `#![forbid(unsafe_code)]`).
+/// Fixed-size stack-buffered `core::fmt::Write` wrapper.
 /// Exported per interface contract; automatically flushes on `Drop`.
 pub struct BufferedWriter<const N: usize, W: Write> {
     inner: W,
@@ -243,7 +243,7 @@ pub enum Record {
     },
 }
 
-/// Fixed-capacity, `no_alloc` typed stream passed between pipeline stages.
+/// Fixed-capacity typed stream passed between pipeline stages.
 pub struct RecordStream {
     items: [Record; MAX_STREAM_RECORDS],
     len: usize,
@@ -411,7 +411,7 @@ impl RecordStream {
     }
 }
 
-/// Zero-alloc, `#![forbid(unsafe_code)]` stack line formatter avoiding `core::fmt` overhead on hot paths.
+/// Stack line formatter avoiding `core::fmt` overhead on hot paths.
 struct AsciiLine<const N: usize> {
     buf: [u8; N],
     len: usize,
@@ -489,8 +489,7 @@ impl<const N: usize> AsciiLine<N> {
 
 const BANNER_TEXT: &str = concat!(
     "\n================================================================\n",
-    "  newos-sh: Post-UNIX Typed Pipeline Shell + EL0 CAOS\n",
-    "  100% #![forbid(unsafe_code)] · zero POSIX paths · zero heap\n",
+    "  newos-sh: Typed Pipeline Shell + CAOS\n",
     "  Try: `get @guide`, `objects | where size > 20`, `help`\n",
     "================================================================\n\n",
 );
@@ -621,7 +620,7 @@ impl<H: ShellHost> Shell<H> {
         self.history_count = self.history_count.wrapping_add(1);
     }
 
-    /// Automated post-UNIX CAOS + typed-pipeline self-check (run by `cargo xtask test`).
+    /// Automated CAOS + typed-pipeline self-check (run by `cargo xtask test`).
     pub fn run_self_test(&mut self) -> Result<(), &'static str> {
         // 1. Typed pipeline: `put "v1" | save @demo`
         let before_objs = self.store.object_count();
@@ -1502,7 +1501,7 @@ fn eval_transform_tokens_with<H: ShellHost>(
 }
 
 const HELP_TEXT: &str = concat!(
-    "Post-UNIX Typed Pipelines & CAOS:\n",
+    "Typed Pipelines & CAOS:\n",
     "  put <text>               Store immutable object -> Object\n",
     "  get <@ref | obj:hash>    Read object content\n",
     "  objects / refs / procs   Emit Object / Ref / Proc records\n",
@@ -1863,7 +1862,7 @@ mod tests {
         assert!(sh.host().output_str().contains("1  sys"));
 
         assert_eq!(sh.exec_line("help"), ExecOutcome::Continue);
-        assert!(sh.host().output_str().contains("Post-UNIX Typed Pipelines"));
+        assert!(sh.host().output_str().contains("Typed Pipelines"));
 
         assert_eq!(sh.exec_line("get @motd"), ExecOutcome::Continue);
         assert!(sh.host().output_str().contains("NewOS:"));
@@ -2276,7 +2275,7 @@ mod tests {
         assert_eq!(sh.exec_line("help"), ExecOutcome::Continue);
         assert_eq!(sh.host().debug_write_syscalls, 1);
         assert!(sh.host().output_str().len() <= 1024);
-        assert!(sh.host().output_str().contains("Post-UNIX Typed Pipelines"));
+        assert!(sh.host().output_str().contains("Typed Pipelines"));
     }
 
     #[test]

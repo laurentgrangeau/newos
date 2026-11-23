@@ -1,7 +1,5 @@
-#![forbid(unsafe_code)]
-
 //! Opaque-box E2E test suite for `newos-bench`, `BENCHMARK_RESULTS.md`, `Cargo.toml`, and `xtask`.
-//! Pure Rust `std`-only binary (zero workspace `.rlib` dependencies).
+//! Standalone benchmark E2E test binary.
 //!
 //! Compile & run offline with:
 //! ```bash

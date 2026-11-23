@@ -398,7 +398,7 @@ impl BuildProfile {
         feats
     }
 
-    /// Render a resolved seL4-style system composition & TCB summary for `cargo xtask config`.
+    /// Render a resolved system composition & TCB summary for `cargo xtask config`.
     pub fn render_system_composition(&self) -> String {
         let yn = |b: bool| if b { "y" } else { "n" };
         let list = |v: &[String]| {

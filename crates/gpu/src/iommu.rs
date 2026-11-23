@@ -1,4 +1,4 @@
-//! Broadcom BCM2712 IOMMU (`brcm,bcm2712-iommu`) Page-Table & TLB Driver (`#![forbid(unsafe_code)]`).
+//! Broadcom BCM2712 IOMMU (`brcm,bcm2712-iommu`) Page-Table & TLB Driver.
 //!
 //! Raspberry Pi 5's BCM2712 SoC does NOT use ARM SMMUv3; instead, VideoCore VII (V3D 7.1),
 //! ISP, and HEVC use Broadcom's custom `brcm,bcm2712-iommu` (`0x10_0000_5100`, 4 KiB page table
@@ -57,7 +57,7 @@ impl Bcm2712IommuPte {
     }
 }
 
-/// Fixed-capacity `no_alloc` BCM2712 IOMMU IOVA translation table (4 KiB granularity).
+/// Fixed-capacity BCM2712 IOMMU IOVA translation table (4 KiB granularity).
 #[repr(C, align(4096))]
 pub struct Bcm2712IommuTable<const PAGES: usize> {
     entries: [Bcm2712IommuPte; PAGES],

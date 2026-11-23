@@ -1,9 +1,8 @@
 #![no_std]
-#![forbid(unsafe_code)]
 
 //! Capability-Scoped EL0 Hardware Entropy & Fast-Key-Erasure CSPRNG (`newos-rng`).
 //!
-//! Supports both hardware targets with zero `unsafe` and zero heap (`no_alloc`):
+//! Supports both hardware targets:
 //! - **Raspberry Pi 5 (BCM2712):** Broadcom `iproc-rng200` (`0x10_7D20_8000`, zero DMA)
 //! - **QEMU `aarch64` `virt`:** Modern VirtIO 1.0+ MMIO RNG (`virtio-rng-device`, `device_id == 4`)
 //!

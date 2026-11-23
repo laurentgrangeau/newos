@@ -1,4 +1,4 @@
-//! Raspberry Pi 5 RP1 40-Pin Header Bus Peripheral Drivers (`#![forbid(unsafe_code)]`, `no_alloc`).
+//! Raspberry Pi 5 RP1 40-Pin Header Bus Peripheral Drivers.
 //!
 //! Covers the four primary RP1 serial/bus controllers exposed on the 40-pin header:
 //! - [`Rp1Uart`]: ARM PL011 UART (`UART0` `0x1F_0003_0000` .. `UART4`, 48 MHz clock)

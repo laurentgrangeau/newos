@@ -1,6 +1,6 @@
-//! Userspace-only, lock-free SPSC shared-memory ring buffer (`#![forbid(unsafe_code)]`, `no_alloc`).
+//! Userspace-only, lock-free SPSC shared-memory ring buffer.
 //!
-//! Pure seL4 design: EL1 never parses ring buffers. Two EL0 processes share a mapped
+//! EL1 never parses ring buffers. Two EL0 processes share a mapped
 //! `Frame` containing an `SpscRing` and use a 64-bit kernel `Notification` capability for wakeups.
 
 use crate::SysError;

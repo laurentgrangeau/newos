@@ -1,4 +1,4 @@
-//! Raspberry Pi 5 (BCM2712) AVS TMON Thermal Sensor & Active Cooler Fan Curve (`#![forbid(unsafe_code)]`).
+//! Raspberry Pi 5 (BCM2712) AVS TMON Thermal Sensor & Active Cooler Fan Curve.
 //!
 //! Physical MMIO page: `0x10_7D5D_2000` (AVS TMON registers at offset `0x200`, `0x10_7D5D_2200`).
 

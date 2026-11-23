@@ -1,6 +1,5 @@
 #![no_std]
 #![no_main]
-#![forbid(unsafe_code)]
 
 //! Modular EL0 Root Task (`newos-init`).
 //!

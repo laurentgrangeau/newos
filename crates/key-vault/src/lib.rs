@@ -1,7 +1,6 @@
 #![no_std]
-#![forbid(unsafe_code)]
 
-//! Pure Post-Quantum (`ML-DSA-87`, NIST FIPS 204) Entropy & Signing Vault (`newos-key-vault`).
+//! ML-DSA-87 Entropy & Signing Vault (`newos-key-vault`).
 //!
 //! Designed for `newos-keyd` (PID 3):
 //! - Ephemeral **ML-DSA-87** host keypair generated at boot from health-checked HW TRNG +
@@ -47,7 +46,7 @@ pub enum VaultError {
     InvalidSignature,
 }
 
-/// Core pure-PQ cryptographic vault owning the ephemeral ML-DSA-87 host key and CSPRNG.
+/// Cryptographic vault owning the ephemeral ML-DSA-87 host key and CSPRNG.
 pub struct KeyVault<E: EntropySource> {
     csprng: ConditionedCsprng<E>,
     host_sk: SigningKey<MlDsa87>,

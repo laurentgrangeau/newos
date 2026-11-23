@@ -1,7 +1,7 @@
-//! Pure `#![forbid(unsafe_code)]`, `no_alloc` Raspberry Pi 5 RP1 Cadence GEM (`macb`) Driver.
+//! Raspberry Pi 5 RP1 Cadence GEM (`macb`) Driver.
 //!
 //! Targets the Cadence GEM Gigabit Ethernet controller inside the Raspberry Pi 5 RP1 southbridge
-//! (MMIO physical base `0x1F_0010_0000`, module ID `0x0007_0109`), running 100% in EL0
+//! (MMIO physical base `0x1F_0010_0000`, module ID `0x0007_0109`), running in EL0
 //! via capability-scoped `MmioRead32`/`MmioWrite32` and `VirtToPhys`.
 
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering, fence};
@@ -129,7 +129,7 @@ impl GemPacketBuf {
     }
 }
 
-/// Static 64-bit DMA descriptor rings & packet buffers for RP1 Cadence GEM (`#![forbid(unsafe_code)]`).
+/// Static 64-bit DMA descriptor rings & packet buffers for RP1 Cadence GEM.
 pub struct GemDma {
     rx_ring: GemDescRing,
     tx_ring: GemDescRing,

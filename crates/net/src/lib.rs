@@ -1,5 +1,4 @@
 #![no_std]
-#![forbid(unsafe_code)]
 
 //! EL0 Networking Stack (`smoltcp` IPv4/UDP/ICMP/DHCPv4/DNS + Capability-Scoped Drivers).
 //!
@@ -7,7 +6,7 @@
 //! - Raspberry Pi 5 (16 GB): RP1 Cadence GEM (`macb`) Gigabit Ethernet (`gem.rs`)
 //! - QEMU `virt` test harness: Modern VirtIO 1.0+ (v2) MMIO (`virtio.rs`)
 //!
-//! 100% `#![forbid(unsafe_code)]`, zero heap (`no_alloc`), zero network code in EL1.
+//! EL0 network stack.
 
 #[cfg(feature = "driver-gem")]
 pub mod gem;
@@ -265,7 +264,7 @@ where
     None
 }
 
-/// Fixed-capacity, zero-heap EL0 loopback Ethernet `smoltcp::phy::Device` for self-tests.
+/// Fixed-capacity EL0 loopback Ethernet `smoltcp::phy::Device` for self-tests.
 #[cfg(any(
     all(feature = "ipv4", feature = "udp"),
     all(feature = "ipv6", feature = "udp"),
@@ -368,7 +367,7 @@ impl Device for LoopbackEth {
     }
 }
 
-/// Verify the pure-Rust EL0 `smoltcp` Ethernet + IPv4 + UDP stack end-to-end (`no_alloc`).
+/// Verify the EL0 `smoltcp` Ethernet + IPv4 + UDP stack end-to-end.
 #[cfg(all(feature = "ipv4", feature = "udp"))]
 pub fn verify_smoltcp_el0_stack(mac: [u8; 6]) -> Result<usize, &'static str> {
     let mut device = LoopbackEth::new();
@@ -419,7 +418,7 @@ pub struct PingResult {
     pub target: [u8; 4],
 }
 
-/// Acquire a live IPv4 address, gateway, and DNS server via `smoltcp` DHCPv4 (`no_alloc`).
+/// Acquire a live IPv4 address, gateway, and DNS server via `smoltcp` DHCPv4.
 #[cfg(feature = "ipv4")]
 pub fn run_dhcp_v4<D: Device>(device: &mut D, mac: [u8; 6]) -> Result<NetConfig, &'static str> {
     let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
@@ -508,7 +507,7 @@ pub fn run_dns_query_with_clock<D: Device, C: NetClock>(
     }
 }
 
-/// Resolve a hostname to an IPv4 address via `smoltcp` DNS A-record query (`no_alloc`).
+/// Resolve a hostname to an IPv4 address via `smoltcp` DNS A-record query.
 #[cfg(all(feature = "ipv4", feature = "dns"))]
 pub fn run_dns_query<D: Device>(
     device: &mut D,
@@ -771,7 +770,7 @@ impl<F: FnMut() -> u64> NetClock for CycleClock<F> {
 }
 
 /// Open a live IPv4 TCP connection, send `tx_payload`, read up to `rx_out.len()` reply bytes,
-/// and close cleanly (`no_alloc`, `#![forbid(unsafe_code)]`).
+/// and close cleanly.
 #[allow(clippy::too_many_arguments)]
 #[cfg(all(feature = "ipv4", feature = "tcp"))]
 pub fn run_tcp_exchange<D: Device, C: NetClock>(
@@ -945,7 +944,7 @@ pub const fn ipv6_link_local_from_mac(mac: [u8; 6]) -> [u8; 16] {
     ]
 }
 
-/// Resolve a hostname to an IPv6 address via `smoltcp` DNS AAAA-record query (`no_alloc`).
+/// Resolve a hostname to an IPv6 address via `smoltcp` DNS AAAA-record query.
 #[cfg(all(feature = "ipv4", feature = "ipv6", feature = "dns"))]
 pub fn run_dns_query_aaaa_with_clock<D: Device, C: NetClock>(
     device: &mut D,
@@ -1010,7 +1009,7 @@ pub fn run_dns_query_aaaa_with_clock<D: Device, C: NetClock>(
     }
 }
 
-/// Verify the pure-Rust EL0 `smoltcp` Ethernet + IPv6 link-local + UDP stack end-to-end (`no_alloc`).
+/// Verify the EL0 `smoltcp` Ethernet + IPv6 link-local + UDP stack end-to-end.
 #[cfg(all(feature = "ipv6", feature = "udp"))]
 pub fn verify_smoltcp_ipv6_el0_stack(mac: [u8; 6]) -> Result<usize, &'static str> {
     let mut device = LoopbackEth::new();

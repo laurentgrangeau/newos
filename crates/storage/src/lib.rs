@@ -1,7 +1,6 @@
 #![no_std]
-#![forbid(unsafe_code)]
 
-//! Pure `#![forbid(unsafe_code)]`, `no_alloc` Raspberry Pi 5 PCIe & Block Storage Suite.
+//! Raspberry Pi 5 PCIe & Block Storage Suite.
 //!
 //! - [`pcie`]: PCIe ECAM configuration space enumerator, BAR decoder, and MSI-X capability walker
 //! - [`sdhci`]: BCM2712 microSD SDHCI 3.0 / SDR104 block driver (`0x10_00ff_f000`)
@@ -38,7 +37,7 @@ pub trait StorageDmaTransport: StorageMmioTransport {
     }
 }
 
-/// Unified `no_alloc` 512-byte sector block device trait (implemented by SDHCI & NVMe).
+/// Unified 512-byte sector block device trait (implemented by SDHCI & NVMe).
 pub trait BlockDevice {
     fn block_count(&self) -> u64;
     fn read_block(&mut self, lba: u64, dst: &mut [u8; SECTOR_SIZE]) -> Result<(), SysError>;

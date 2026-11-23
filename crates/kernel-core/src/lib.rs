@@ -1,7 +1,6 @@
 #![no_std]
-#![forbid(unsafe_code)]
 
-//! Pure, 100% memory-safe, `no_alloc` microkernel core.
+//! Microkernel core.
 //!
 //! All hardware interaction is injected via safe traits; this crate contains
 //! zero `unsafe` blocks and zero dynamic heap allocations.
@@ -28,8 +27,8 @@ use newos_abi::{Rights, ShutdownStatus, SysError};
 const USER_STACK_BASE: u64 = 0x0000_7fff_f000_0000;
 #[cfg(feature = "userspace")]
 const USER_STACK_PAGES: u64 = 16; // 64 KiB EL0 data stack
-/// 1 MiB EL0 data stack for pure-PQ `no_alloc` daemons (`newos-netd`, `newos-keyd`, `newos-sshd`)
-/// running `no_alloc` NIST Level 5 ML-DSA-87 / ML-KEM-1024 lattice math.
+/// 1 MiB EL0 data stack for daemons (`newos-netd`, `newos-keyd`, `newos-sshd`)
+/// running NIST Level 5 ML-DSA-87 / ML-KEM-1024 lattice math.
 pub const USER_PQ_STACK_PAGES: u64 = 256;
 #[cfg(feature = "userspace")]
 const USER_SHADOW_STACK_BASE: u64 = 0x0000_7fff_e000_0000;
@@ -49,7 +48,7 @@ pub struct FramebufferInfo {
     pub blue_shift: u8,
 }
 
-/// Fixed-size, `no_alloc` boot descriptor handed from `newos-hal` to `newos-kernel-core`.
+/// Fixed-size boot descriptor handed from `newos-hal` to `newos-kernel-core`.
 #[derive(Debug, Clone)]
 pub struct BootInfo {
     pub hhdm_offset: u64,
@@ -86,7 +85,7 @@ pub enum ProcessRole {
     Sshd,
 }
 
-/// Architecture-agnostic, 100% safe platform interface implemented by `newos-hal`.
+/// Architecture-agnostic platform interface implemented by `newos-hal`.
 pub trait HalPlatform: Write {
     type VSpace: VSpaceMapper;
 
@@ -141,7 +140,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
     };
     let _ = writeln!(
         platform,
-        "[newos] booting pure seL4-style 64-bit Rust microkernel (arch={}, board={}, sched={}, smp={}, userspace={}, elf_attest={}, acpi={}, no_alloc, forbid_unsafe_core)",
+        "[newos] booting microkernel (arch={}, board={}, sched={}, smp={}, userspace={}, elf_attest={}, acpi={})",
         platform.arch_name(),
         board,
         sched::ACTIVE_SCHED_POLICY.as_str(),
@@ -234,7 +233,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
         platform.timer_count(),
     );
 
-    // Phase 2: Pure seL4 Untyped retype + 4-level VSpace map / probe / unmap verification
+    // Phase 2: Untyped retype + 4-level VSpace map / probe / unmap verification
     if let Err(err) = verify_phase2_memory(platform, &mut info.untyped) {
         let _ = writeln!(platform, "[newos] FAIL: phase-2 memory self-check: {err:?}");
         platform.exit(ShutdownStatus::Failed);
@@ -246,7 +245,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
         info.untyped.remaining_bytes() / (1024 * 1024),
     );
 
-    // Phase 3: Pure seL4 CSpace, Untyped retype, badged minting & transitive CDT revoke
+    // Phase 3: CSpace, Untyped retype, badged minting & transitive CDT revoke
     match verify_phase3_cspace(&mut info.untyped) {
         Ok((occupied, revoked)) => {
             let _ = writeln!(
@@ -404,7 +403,7 @@ fn spawn_isolated_process<P: HalPlatform>(
     Ok(())
 }
 
-/// Pure `#![forbid(unsafe_code)]`, `no_alloc` ELF64 loader mapping an `ET_EXEC` or PIE `ET_DYN`
+/// ELF64 loader mapping an `ET_EXEC` or PIE `ET_DYN`
 /// binary into an isolated `VSpace` with ASLR code/stack/SCS slides and `R_AARCH64_RELATIVE` relocations.
 #[cfg(feature = "userspace")]
 fn load_elf64_into_vspace<V: VSpaceMapper>(

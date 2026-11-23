@@ -1,4 +1,4 @@
-//! Zero-allocation SSHv2 binary wire encoding/decoding helpers (`#![forbid(unsafe_code)]`).
+//! SSHv2 binary wire encoding/decoding helpers.
 
 use crate::SshError;
 
@@ -6,7 +6,7 @@ use crate::SshError;
 /// and userauth frames while keeping EL0 buffers strictly bounded).
 pub const MAX_PACKET_BODY: usize = 12_288;
 
-/// Cursor-based zero-copy SSH binary reader (RFC 4251).
+/// Cursor-based SSH binary reader (RFC 4251).
 pub struct WireReader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -61,7 +61,7 @@ impl<'a> WireReader<'a> {
     }
 }
 
-/// Fixed-buffer zero-allocation SSH binary writer (RFC 4251).
+/// Fixed-buffer SSH binary writer (RFC 4251).
 pub struct WireWriter<'a> {
     buf: &'a mut [u8],
     pos: usize,

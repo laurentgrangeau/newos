@@ -1,5 +1,4 @@
-//! Pure-std parser and validator for `newos_bench` `METRIC` output and `BENCHMARK_RESULTS.md`.
-//! Zero external dependencies, `#![forbid(unsafe_code)]`.
+//! Parser and validator for `newos_bench` `METRIC` output and `BENCHMARK_RESULTS.md`.
 
 use std::collections::BTreeMap;
 

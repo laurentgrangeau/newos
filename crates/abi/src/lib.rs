@@ -1,7 +1,6 @@
 #![no_std]
-#![forbid(unsafe_code)]
 
-//! Shared, 100% memory-safe ABI contract between the NewOS microkernel (EL1) and EL0 userspace.
+//! Shared ABI contract between the microkernel (EL1) and EL0 userspace.
 
 pub mod ring;
 #[cfg(feature = "sha3")]
@@ -190,7 +189,7 @@ impl Rights {
     }
 }
 
-/// Irreducible seL4-style kernel object types created by retyping `Untyped` memory.
+/// Kernel object types created by retyping `Untyped` memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ObjectType {

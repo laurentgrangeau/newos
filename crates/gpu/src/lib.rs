@@ -1,7 +1,6 @@
 #![no_std]
-#![forbid(unsafe_code)]
 
-//! Pure `#![forbid(unsafe_code)]`, `no_alloc` Raspberry Pi 5 Display, IOMMU & VideoCore VII GPU Suite.
+//! Raspberry Pi 5 Display, IOMMU & VideoCore VII GPU Suite.
 //!
 //! - [`FramebufferCanvas`]: Capability-scoped UEFI GOP linear 32-bit RGB framebuffer compositor
 //! - [`iommu`]: Broadcom BCM2712 IOMMU (`brcm,bcm2712-iommu`) page-table & TLB driver

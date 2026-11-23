@@ -1,4 +1,4 @@
-//! Pure, `#![forbid(unsafe_code)]`, `no_alloc` 64-bit ELF64 parser for bootstrapping `init`.
+//! 64-bit ELF64 parser for bootstrapping `init`.
 //!
 //! Only the single EL0 root task (`init`) is parsed by EL1; all subsequent
 //! processes and ELF binaries are loaded by userspace services.
@@ -43,7 +43,7 @@ pub struct LoadSegment {
     pub flags: PageFlags,
 }
 
-/// Parsed 64-bit EL0 ELF64 executable metadata (`no_alloc`, supports `ET_EXEC` and PIE `ET_DYN`).
+/// Parsed 64-bit EL0 ELF64 executable metadata (supports `ET_EXEC` and PIE `ET_DYN`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParsedElf64 {
     pub entry: VirtAddr,
@@ -71,7 +71,7 @@ impl ParsedElf64 {
         self.reloc_count
     }
 
-    /// Stream every `R_AARCH64_RELATIVE` relocation directly from `bytes` (`no_alloc`, unbounded).
+    /// Stream every `R_AARCH64_RELATIVE` relocation directly from `bytes`.
     pub fn for_each_relative_reloc<F>(&self, bytes: &[u8], mut f: F) -> Result<usize, SysError>
     where
         F: FnMut(RelativeReloc) -> Result<(), SysError>,

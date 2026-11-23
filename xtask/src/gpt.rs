@@ -1,4 +1,4 @@
-//! Pure-Rust UEFI GPT + Protective MBR disk image builder (zero external dependencies).
+//! UEFI GPT + Protective MBR disk image builder.
 //!
 //! Wraps a FAT32 EFI System Partition (ESP) image into a standard 512-byte-sector GPT disk
 //! with an EFI System Partition (`C12A7328-F81F-11D2-BA4B-00A0C93EC93B`) aligned at 1 MiB (LBA 2048).

@@ -1,4 +1,4 @@
-//! Cortex-A76 `NEON` / `FEAT_DotProd` (`sdot`) Auto-Vectorized AI Compute Kernels (`#![forbid(unsafe_code)]`).
+//! Cortex-A76 `NEON` / `FEAT_DotProd` (`sdot`) Auto-Vectorized AI Compute Kernels.
 //!
 //! Compiled with `-C target-cpu=cortex-a76` (`+neon,+dotprod,+fp16`), LLVM lowers the 4-way
 //! unrolled `i8` dot-product accumulators directly to ARMv8.2-A `sdot` SIMD instructions.
@@ -86,7 +86,7 @@ pub fn relu_inplace(data: &mut [f32]) {
     }
 }
 
-/// Fast `#![no_std]` inverse square root (`1 / sqrt(x)`) via 3 Newton-Raphson iterations
+/// Fast inverse square root (`1 / sqrt(x)`) via 3 Newton-Raphson iterations
 /// (used for `rms_norm` without requiring `libm`).
 #[inline]
 fn inv_sqrt_f32(x: f32) -> f32 {

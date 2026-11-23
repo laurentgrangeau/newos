@@ -1,6 +1,4 @@
-#![forbid(unsafe_code)]
-
-//! Pure-Rust, zero-external-dependency benchmark harness for `newos`.
+//! Benchmark harness for `newos`.
 //!
 //! Measures 28 metrics across 4 categories:
 //! - Kernel speed (9 metrics, ns/op) against production `newos-abi` and `newos-kernel-core`

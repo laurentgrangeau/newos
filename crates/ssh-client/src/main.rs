@@ -1,6 +1,4 @@
-#![forbid(unsafe_code)]
-
-//! Pure Post-Quantum SSHv2 Linux/macOS CLI Client (`newos-ssh`) — zero legacy crypto.
+//! SSHv2 CLI client (`newos-ssh`).
 //!
 //! Enforces ONLY:
 //! - `mlkem1024-sha3-512` (NIST FIPS 203 ML-KEM-1024 + SHA3-512)
@@ -100,7 +98,7 @@ fn cmd_keygen(path_arg: Option<&str>) -> Result<(), String> {
     );
     fs::write(&pub_path, &pub_line).map_err(|e| format!("write {}: {e}", pub_path.display()))?;
 
-    println!("Generated pure-PQ ML-DSA-87 keypair:");
+    println!("Generated ML-DSA-87 keypair:");
     println!("  Private seed (0600): {}", key_path.display());
     println!("  Public key:          {}", pub_path.display());
     println!(
@@ -285,7 +283,7 @@ fn main() -> ExitCode {
     let res = match args.first().map(String::as_str) {
         Some("keygen") => cmd_keygen(args.get(1).map(String::as_str)),
         Some("-h" | "--help") | None => {
-            eprintln!("newos-ssh — Pure Post-Quantum SSHv2 Client (ML-KEM-1024 + ML-DSA-87)");
+            eprintln!("newos-ssh — SSHv2 Client (ML-KEM-1024 + ML-DSA-87)");
             eprintln!("Usage:");
             eprintln!("  newos-ssh keygen [key_path]");
             eprintln!(

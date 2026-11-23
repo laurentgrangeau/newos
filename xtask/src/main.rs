@@ -665,7 +665,7 @@ fn run_host_tests(release: bool) -> Result<(), String> {
     run_checked(&mut cmd, "cargo test (host)")
 }
 
-/// Run Miri UB / aliasing / provenance checks across all host-testable `#![forbid(unsafe_code)]` crates.
+/// Run Miri UB / aliasing / provenance checks across all host-testable crates.
 fn run_miri_tests() -> Result<(), String> {
     let root = workspace_root();
     let mut cmd = Command::new("cargo");
@@ -697,7 +697,7 @@ fn run_miri_tests() -> Result<(), String> {
         "--package",
         "newos-ai",
     ]);
-    // Note (`H5`): `newos-key-vault` and `newos-ssh-proto` run multi-minute pure-PQ ML-DSA/ML-KEM
+    // Note (`H5`): `newos-key-vault` and `newos-ssh-proto` run multi-minute ML-DSA/ML-KEM
     // lattice ops under Miri's interpreter; run them separately with `cargo +nightly miri test -p ...`.
     run_checked(&mut cmd, "cargo miri test")
 }

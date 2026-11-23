@@ -1,5 +1,5 @@
 //! NIST SP 800-90B Startup Health Tests + `SHAKE256` Conditioning + Fast-Key-Erasure
-//! **ChaCha20** CSPRNG (`#![no_std]`, `no_alloc`, `#![forbid(unsafe_code)]`).
+//! **ChaCha20** CSPRNG.
 //!
 //! - **Fail-closed health checks:** Repetition Count Test (RCT) and Adaptive Proportion Test (APT)
 //!   over every 64-byte hardware TRNG seed block reject stuck, constant, or all-zero sources.
@@ -92,7 +92,7 @@ fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
     s[b] = (s[b] ^ s[c]).rotate_left(7);
 }
 
-/// Pure-Rust constant-time RFC 8439 ChaCha20 block function (ARX only, zero lookup tables).
+/// Constant-time RFC 8439 ChaCha20 block function (ARX only, zero lookup tables).
 pub(crate) fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
     let mut state = [
         0x6170_7865,

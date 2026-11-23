@@ -1,7 +1,6 @@
 #![no_std]
-#![forbid(unsafe_code)]
 
-//! Pure `#![forbid(unsafe_code)]`, `no_alloc` Raspberry Pi 5 RP1 Dual xHCI USB 3.0 / 2.0 Driver.
+//! Raspberry Pi 5 RP1 Dual xHCI USB 3.0 / 2.0 Driver.
 //!
 //! Targets the two Synopsys xHCI 1.1+ host controllers inside the RP1 southbridge:
 //! - `xHCI0`: `0x1F_0020_0000` (`CapId::BOOTSTRAP_XHCI0_MMIO`, 1x USB 3.0 + 1x USB 2.0)
@@ -108,7 +107,7 @@ struct TrbRing([Trb; RING_TRBS]);
 #[repr(C, align(64))]
 struct ErstPage([ErstEntry; 1]);
 
-/// Static aligned `no_alloc` DMA structures for an RP1 xHCI controller.
+/// Static aligned DMA structures for an RP1 xHCI controller.
 pub struct XhciDma {
     dcbaa: DcbaaPage,
     cmd_ring: TrbRing,

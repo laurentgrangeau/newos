@@ -1,14 +1,13 @@
 #![no_std]
-#![forbid(unsafe_code)]
 
-//! Pure `#![forbid(unsafe_code)]`, `no_alloc` Raspberry Pi 5 RP1 40-Pin GPIO Driver.
+//! Raspberry Pi 5 RP1 40-Pin GPIO Driver.
 //!
 //! Targets the RP1 Southbridge Bank 0 GPIO controller (`GPIO 0..=27` on the 40-pin header):
 //! - `IO_BANK0`:   `0x1F_000D_0000` (offset `+0x00000`) — per-pin `STATUS` & `CTRL` (`FUNCSEL`)
 //! - `RIO0`:       `0x1F_000E_0000` (offset `+0x10000`) — `OUT`, `OE`, `IN` + atomic `XOR`/`SET`/`CLR`
 //! - `PADS_BANK0`: `0x1F_000F_0000` (offset `+0x20000`) — per-pin pad drive, pull-up/down, Schmitt, IE/OD
 //!
-//! Runs 100% in EL0 via `CapId::BOOTSTRAP_GPIO_MMIO` (`MmioRead32`/`MmioWrite32`).
+//! Runs in EL0 via `CapId::BOOTSTRAP_GPIO_MMIO` (`MmioRead32`/`MmioWrite32`).
 
 use newos_abi::SysError;
 

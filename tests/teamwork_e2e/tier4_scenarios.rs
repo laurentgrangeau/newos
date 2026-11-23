@@ -14,7 +14,7 @@ use newos_shell_core::shell::{ExecOutcome, Record, Shell};
 
 use crate::helpers::{
     ElfSegSpec, MockShellHost, PF_R, PF_X, PT_LOAD, TokKind, Xorshift64, build_elf64,
-    collect_rs_files, find_repo_root, find_unsafe_sites, has_forbid_unsafe_code,
+    collect_rs_files, crate_forbids_unsafe_code, find_repo_root, find_unsafe_sites,
     has_safety_comment, parse_metric_lines, run_newos_bench, scan_rust_source, strip_cfg_test,
 };
 
@@ -318,21 +318,24 @@ fn t4_scenario4_multithreaded_spsc_ring_100k_streaming() {
 fn t4_scenario5_full_workspace_safety_and_unsafe_budget_audit() {
     let root = find_repo_root();
 
-    // 1. All 8 required crates enforce #![forbid(unsafe_code)]
-    for rel in [
-        "crates/abi/src/lib.rs",
-        "crates/kernel-core/src/lib.rs",
-        "crates/kernel/src/main.rs",
-        "crates/shell-core/src/lib.rs",
-        "crates/init/src/main.rs",
-        "crates/worker/src/main.rs",
-        "crates/net/src/lib.rs",
-        "crates/bench/src/main.rs",
+    // 1. All 8 required crates enforce unsafe_code = "forbid"
+    for (crate_name, rel) in [
+        ("abi", "crates/abi/src/lib.rs"),
+        ("kernel-core", "crates/kernel-core/src/lib.rs"),
+        ("kernel", "crates/kernel/src/main.rs"),
+        ("shell-core", "crates/shell-core/src/lib.rs"),
+        ("init", "crates/init/src/main.rs"),
+        ("worker", "crates/worker/src/main.rs"),
+        ("net", "crates/net/src/lib.rs"),
+        ("bench", "crates/bench/src/main.rs"),
     ] {
-        let sf = scan_rust_source(&root.join(rel));
         assert!(
-            has_forbid_unsafe_code(&sf.tokens),
-            "{rel} missing #![forbid(unsafe_code)]"
+            crate_forbids_unsafe_code(
+                &root,
+                &root.join("crates").join(crate_name),
+                &root.join(rel)
+            ),
+            "crates/{crate_name} missing unsafe_code = \"forbid\""
         );
     }
 

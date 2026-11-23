@@ -1,6 +1,6 @@
 //! PCIe ECAM Configuration Space Enumerator, BAR Decoder & MSI-X Capability Walker.
 //!
-//! Runs 100% in EL0 (`#![forbid(unsafe_code)]`, `no_alloc`) via `CapId::BOOTSTRAP_PCIE_ECAM_MMIO`.
+//! Runs in EL0 via `CapId::BOOTSTRAP_PCIE_ECAM_MMIO`.
 
 use crate::StorageMmioTransport;
 use newos_abi::SysError;

@@ -3,7 +3,7 @@
 //! Safe EL0 userspace runtime & `svc #0` syscall SDK for NewOS (Raspberry Pi 5 16 GB, `aarch64`).
 //!
 //! Confines the minimal 64-bit `svc #0` assembly trampoline inside this crate so
-//! all userspace services (`init`, drivers, apps) can enforce `#![forbid(unsafe_code)]`.
+//! all userspace services (`init`, drivers, apps) remain free of `unsafe` code.
 
 use core::arch::asm;
 use core::fmt::{self, Write};
@@ -117,7 +117,7 @@ impl Write for DebugConsole {
     }
 }
 
-/// Fixed-size stack-buffered `core::fmt::Write` console (`no_alloc`, zero `unsafe`).
+/// Fixed-size stack-buffered `core::fmt::Write` console.
 ///
 /// Coalesces `write!`/`writeln!` fragments into `<= N`-byte `DebugWrite` syscalls and
 /// flushes automatically on `Drop` (call `flush()` explicitly before diverging calls).
@@ -213,7 +213,7 @@ pub fn ipc_log_write(ep: CapId, msg: &str) -> Result<usize, SysError> {
     Ok(bytes.len())
 }
 
-/// Zero-allocation buffered `core::fmt::Write` sink for non-root processes without a direct
+/// Buffered `core::fmt::Write` sink for non-root processes without a direct
 /// `Console` capability, routing output over `CapId::BOOTSTRAP_LOG_EP` to `init`.
 pub struct IpcLogConsole<const N: usize = 256> {
     ep: CapId,
@@ -295,7 +295,7 @@ impl<const N: usize> LogSlot<N> {
     };
 }
 
-/// Zero-allocation per-sender line reassembler used by the console owner (`init`) to drain
+/// Per-sender line reassembler used by the console owner (`init`) to drain
 /// 7-byte fastpath IPC log chunks from `CapId::BOOTSTRAP_LOG_EP` into complete lines without
 /// interleaving or truncating concurrent daemons (`worker`, `netd`, `keyd`, `sshd`).
 pub struct IpcLogAssembler<const N: usize = 256> {
@@ -806,7 +806,7 @@ pub fn reboot() -> ! {
     exit_with_cap(CapId::BOOTSTRAP_POWER, ShutdownStatus::Reboot)
 }
 
-/// Define an EL0 userspace `_start` entry point delegating to a `#![forbid(unsafe_code)]` `fn() -> !`.
+/// Define an EL0 userspace `_start` entry point delegating to a safe `fn() -> !`.
 #[macro_export]
 macro_rules! entry {
     ($path:path) => {

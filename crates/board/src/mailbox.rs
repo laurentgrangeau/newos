@@ -1,7 +1,7 @@
-//! Raspberry Pi 5 (BCM2712) VideoCore Property Mailbox Driver (`#![forbid(unsafe_code)]`).
+//! Raspberry Pi 5 (BCM2712) VideoCore Property Mailbox Driver.
 //!
 //! Physical MMIO page: `0x10_7C01_3000` (Mailbox registers start at offset `0x880`).
-//! Uses a 16-byte-aligned `no_alloc` property buffer with explicit `dma_clean`/`dma_invalidate`.
+//! Uses a 16-byte-aligned property buffer with explicit `dma_clean`/`dma_invalidate`.
 
 use crate::MmioDmaTransport;
 use core::sync::atomic::{AtomicU32, Ordering, fence};
@@ -34,7 +34,7 @@ pub const TAG_GET_TEMPERATURE: u32 = 0x0003_0006;
 
 const MAX_POLL_ITERS: u32 = 200_000;
 
-/// 16-byte-aligned static DMA buffer for VideoCore Property Mailbox messages (`no_alloc`).
+/// 16-byte-aligned static DMA buffer for VideoCore Property Mailbox messages.
 #[repr(C, align(16))]
 pub struct MailboxBuf {
     words: [AtomicU32; 16],

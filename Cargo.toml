@@ -77,6 +77,7 @@ panic = "abort"
 overflow-checks = true
 
 [workspace.lints.rust]
+unsafe_code = "forbid"
 unsafe_op_in_unsafe_fn = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 

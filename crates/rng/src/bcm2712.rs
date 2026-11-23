@@ -1,4 +1,4 @@
-//! Raspberry Pi 5 (BCM2712) Broadcom `iproc-rng200` Hardware TRNG Driver (`#![forbid(unsafe_code)]`).
+//! Raspberry Pi 5 (BCM2712) Broadcom `iproc-rng200` Hardware TRNG Driver.
 //!
 //! Physical MMIO base: `0x10_7D20_8000` (scoped to `0x28` bytes via `CapId::BOOTSTRAP_RNG_MMIO`).
 //! Requires zero DMA and zero `VSpace` capability on Raspberry Pi 5.

@@ -1,6 +1,6 @@
-//! Capability-Scoped Content-Addressed Object Store (CAOS) — `#![forbid(unsafe_code)]`, `no_alloc`.
+//! Capability-Scoped Content-Addressed Object Store (CAOS).
 //!
-//! Post-UNIX storage living 100% in EL0:
+//! EL0 content-addressed storage:
 //! - Every blob is **immutable** and addressed by its 64-bit content hash (`ObjHash`),
 //!   providing automatic deduplication, lock-free reads, and zero in-place corruption.
 //! - Mutable state exists only as explicit named **Refs** (`@name -> ObjHash`) with
@@ -63,7 +63,7 @@ pub enum StoreError {
 /// Public alias for `StoreError` per `newos-shell-core` interface contract.
 pub type CaosError = StoreError;
 
-const MOTD_BYTES: &[u8] = b"NewOS: pure seL4-style 64-bit Rust microkernel (post-UNIX CAOS)";
+const MOTD_BYTES: &[u8] = b"NewOS microkernel";
 const GUIDE_BYTES: &[u8] =
     b"Try: `put \"hello\" | save @note`, `objects | where size > 20`, `procs | where pid == 1`";
 const MOTD_HASH: ObjHash = ObjHash::hash_bytes(MOTD_BYTES);
@@ -171,7 +171,7 @@ impl RefMeta {
     }
 }
 
-/// EL0 Content-Addressed Object Store (`no_alloc`, `#![forbid(unsafe_code)]`).
+/// EL0 Content-Addressed Object Store.
 ///
 /// Structure-of-Arrays (SoA) layout concentrates all live `ObjHash` entries into 3 cache lines
 /// (`hashes: [ObjHash; 24]`) and uses `Option`-backed lazy initialization to avoid zeroing

@@ -3,7 +3,7 @@
 //! Minimal, strictly audited Hardware Abstraction Layer (HAL) for NewOS on Raspberry Pi 5 (16 GB, BCM2712).
 //!
 //! All `unsafe` hardware/bootloader boundary code is isolated inside this crate,
-//! exposing 100% memory-safe abstractions to `newos-kernel-core` and `newos-kernel`.
+//! exposing safe abstractions to `newos-kernel-core` and `newos-kernel`.
 
 pub mod arch;
 pub mod board;
@@ -33,7 +33,7 @@ pub fn early_init() -> (Platform, BootInfo) {
     (platform, info)
 }
 
-/// Panic handler helper callable from `#![forbid(unsafe_code)]` `crates/kernel`.
+/// Panic handler helper callable from `crates/kernel`.
 pub fn handle_panic(info: &core::panic::PanicInfo<'_>) -> ! {
     let mut serial = arch::early_serial();
     let _ = writeln!(serial, "[newos-kernel] PANIC: {info}");
@@ -41,7 +41,7 @@ pub fn handle_panic(info: &core::panic::PanicInfo<'_>) -> ! {
 }
 
 /// Define the bootloader entry point (`_start`) and delegate immediately to a
-/// 100% safe Rust kernel entry function `fn(Platform, BootInfo) -> !`.
+/// Kernel entry function `fn(Platform, BootInfo) -> !`.
 #[macro_export]
 macro_rules! entry {
     ($path:path) => {

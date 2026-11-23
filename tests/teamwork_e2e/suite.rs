@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 #![allow(
     clippy::type_complexity,
     clippy::collapsible_if,

@@ -1,12 +1,11 @@
 #![no_std]
-#![forbid(unsafe_code)]
 
-//! Pure `#![forbid(unsafe_code)]`, `no_alloc` Raspberry Pi 5 (BCM2712) Hardware Watchdog Driver.
+//! Raspberry Pi 5 (BCM2712) Hardware Watchdog Driver.
 //!
 //! Targets the Broadcom BCM2712 Power Management / Watchdog block (`brcm,bcm2712-pm`,
 //! physical MMIO base `0x10_7D20_0000`, scoped to `0x100` bytes via `CapId::BOOTSTRAP_WDT_MMIO`).
 //!
-//! Runs 100% in EL0 via capability-scoped 32-bit MMIO reads/writes (`MmioRead32`/`MmioWrite32`).
+//! Runs in EL0 via capability-scoped 32-bit MMIO reads/writes (`MmioRead32`/`MmioWrite32`).
 
 use newos_abi::SysError;
 

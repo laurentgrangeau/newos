@@ -41,7 +41,7 @@ cargo xtask config --profile profiles/tinykernel.toml
 | `shell` | `bool` | `true`, `false` | `true` | Requires `init = true` | Enables `newos-sh` typed pipeline shell and CAOS object store inside `newos-init`. |
 | `netd` | `bool` | `true`, `false` | `true` | Requires `[net].enabled = true` and `ipv4` or `ipv6` | Builds and loads isolated EL0 network/DMA daemon (`newos-netd`). |
 | `keyd` | `bool` | `true`, `false` | `true` | Requires `"sha3"` and `"ml-dsa-87"` in `[crypto].algorithms` | Builds and loads isolated EL0 hardware-entropy & ML-DSA-87 signing vault (`newos-keyd`). |
-| `sshd` | `bool` | `true`, `false` | `true` | Requires `netd = true`, `keyd = true`, `shell = true`, and all 4 PQ algorithms in `[crypto].algorithms` | Builds and loads isolated EL0 pure-PQ SSHv2 daemon (`newos-sshd`). |
+| `sshd` | `bool` | `true`, `false` | `true` | Requires `netd = true`, `keyd = true`, `shell = true`, and all 4 PQ algorithms in `[crypto].algorithms` | Builds and loads isolated EL0 SSHv2 daemon (`newos-sshd`). |
 
 ---
 

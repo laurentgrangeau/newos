@@ -17,9 +17,9 @@ use newos_shell_core::shell::{ExecOutcome, Shell};
 
 use crate::helpers::{
     ElfSegSpec, ExitSentinel, MockShellHost, PF_R, PF_W, PF_X, PT_LOAD, TokKind,
-    YieldLimitExceeded, build_elf64, collect_rs_files, find_repo_root, find_unsafe_sites,
-    has_forbid_unsafe_code, has_safety_comment, parse_metric_lines, run_newos_bench,
-    scan_rust_source, strip_cfg_test,
+    YieldLimitExceeded, build_elf64, collect_rs_files, crate_forbids_unsafe_code, find_repo_root,
+    find_unsafe_sites, has_safety_comment, parse_metric_lines, run_newos_bench, scan_rust_source,
+    strip_cfg_test,
 };
 
 // ============================================================================
@@ -1226,13 +1226,13 @@ fn t2_safety_forbid_unsafe_code_on_all_8_safe_crates() {
     ];
 
     for (crate_name, rel_root) in safe_roots {
-        let scanned = scan_rust_source(&root.join(rel_root));
+        let crate_dir = root.join("crates").join(crate_name);
         assert!(
-            has_forbid_unsafe_code(&scanned.tokens),
-            "{rel_root} must declare #![forbid(unsafe_code)]"
+            crate_forbids_unsafe_code(&root, &crate_dir, &root.join(rel_root)),
+            "crates/{crate_name} must enforce unsafe_code = \"forbid\" (via workspace lints or crate attribute)"
         );
 
-        let src_dir = root.join("crates").join(crate_name).join("src");
+        let src_dir = crate_dir.join("src");
         for file in collect_rs_files(&src_dir) {
             let sf = scan_rust_source(&file);
             let prod = strip_cfg_test(&sf.tokens);
