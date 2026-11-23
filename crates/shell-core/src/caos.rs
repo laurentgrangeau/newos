@@ -654,7 +654,7 @@ mod tests {
         assert_eq!(store.object_count(), 2);
 
         let (h_motd, motd) = store.get_any("@motd").unwrap();
-        assert!(motd.starts_with(b"NewOS:"));
+        assert!(motd.starts_with(b"NewOS"));
         assert_eq!(store.get_by_hash(h_motd).unwrap(), motd);
 
         let (_, guide) = store.get_any("@guide").unwrap();

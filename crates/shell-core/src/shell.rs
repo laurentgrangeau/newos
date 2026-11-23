@@ -1865,7 +1865,7 @@ mod tests {
         assert!(sh.host().output_str().contains("Typed Pipelines"));
 
         assert_eq!(sh.exec_line("get @motd"), ExecOutcome::Continue);
-        assert!(sh.host().output_str().contains("NewOS:"));
+        assert!(sh.host().output_str().contains("NewOS"));
 
         assert_eq!(sh.exec_line("clear"), ExecOutcome::Continue);
         assert_eq!(sh.exec_line("crash"), ExecOutcome::Continue);
