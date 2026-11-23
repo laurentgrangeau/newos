@@ -296,6 +296,18 @@ impl UntypedInventory {
         true
     }
 
+    /// Return the index of the `UntypedRegion` with the largest remaining capacity, if any.
+    pub fn largest_region_index(&self) -> Option<usize> {
+        let mut best: Option<(usize, u64)> = None;
+        for (i, region) in self.regions.iter().enumerate().take(self.count) {
+            let rem = region.remaining();
+            if rem > 0 && best.is_none_or(|(_, best_rem)| rem > best_rem) {
+                best = Some((i, rem));
+            }
+        }
+        best.map(|(idx, _)| idx)
+    }
+
     /// Remaining uncarved bytes in a specific `UntypedRegion` (`region_index`).
     #[inline]
     pub fn region_remaining(&self, region_index: usize) -> Option<u64> {
@@ -444,14 +456,19 @@ impl PageFlags {
     };
 }
 
-/// Summary of modern 64-bit hardware memory-protection features enabled by `newos-hal`.
+/// Summary of AArch64 hardware memory-protection & speculative-execution mitigations enabled by `newos-hal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuSecurityFeatures {
-    pub wp: bool,
-    pub nxe: bool,
-    pub smep: bool,
-    pub smap: bool,
-    pub umip: bool,
+    pub pxn: bool,
+    pub uxn: bool,
+    pub pan: bool,
+    pub wx_enforced: bool,
+    pub ssbs: bool,
+    pub csv2: bool,
+    pub csv3: bool,
+    pub pac: bool,
+    pub bti: bool,
+    pub mte: bool,
 }
 
 /// Safe, architecture-agnostic 4-level page-table interface implemented by `newos-hal`.
@@ -875,5 +892,63 @@ mod tests {
 
         assert_eq!(tracker.remove(vs1, va1), Some(phys_a));
         assert!(!tracker.has_mapping_for_phys(phys_a));
+    }
+
+    #[test]
+    fn untyped_largest_region_index_picks_biggest_remaining() {
+        let mut inv = UntypedInventory::new();
+        assert_eq!(inv.largest_region_index(), None);
+        assert!(inv.push_raw_region(0x10_0000, 4 * PAGE_SIZE));
+        assert!(inv.push_raw_region(0x40_0000, 128 * PAGE_SIZE));
+        assert!(inv.push_raw_region(0x80_0000, 16 * PAGE_SIZE));
+        assert_eq!(inv.largest_region_index(), Some(1));
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Prove W^X exclusivity: `PageFlags::new_wx` NEVER produces a simultaneously writable
+    /// and executable mapping for any symbolic input combination.
+    #[kani::proof]
+    fn page_flags_wx_exclusivity() {
+        let writable: bool = kani::any();
+        let executable: bool = kani::any();
+        let user: bool = kani::any();
+        let device: bool = kani::any();
+
+        match PageFlags::new_wx(writable, executable, user, device) {
+            Ok(flags) => {
+                assert!(!(flags.writable() && flags.executable()));
+                assert_eq!(flags.writable(), writable);
+                assert_eq!(flags.executable(), executable);
+            }
+            Err(SysError::InvalidArgument) => {
+                assert!(writable && executable);
+            }
+            Err(_) => unreachable!(),
+        }
+    }
+
+    /// Prove `UntypedInventory::retype_frame` never yields overlapping frames or out-of-bounds
+    /// addresses for any valid page-aligned physical region.
+    #[kani::proof]
+    fn untyped_retype_frames_disjoint_and_in_bounds() {
+        let base_pages: u64 = kani::any();
+        let len_pages: u64 = kani::any();
+        kani::assume(base_pages > 0 && base_pages < (1u64 << 32));
+        kani::assume((2..=64).contains(&len_pages));
+
+        let base = base_pages * PAGE_SIZE;
+        let len = len_pages * PAGE_SIZE;
+        let mut inv = UntypedInventory::new();
+        assert!(inv.push_raw_region(base, len));
+
+        let f1 = inv.retype_frame().unwrap();
+        let f2 = inv.retype_frame().unwrap();
+        assert_ne!(f1.start(), f2.start());
+        assert!(f1.start().raw() >= base && f1.start().raw() + PAGE_SIZE <= base + len);
+        assert!(f2.start().raw() >= base && f2.start().raw() + PAGE_SIZE <= base + len);
     }
 }

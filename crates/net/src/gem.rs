@@ -9,7 +9,7 @@ use newos_abi::SysError;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
-use crate::virtio::VirtioTransport;
+use crate::virtio::MmioDmaTransport;
 
 const RING_SIZE: usize = 8;
 const PKT_BUF_SIZE: usize = 2048; // Divides 4096 evenly -> never crosses a 4 KiB page boundary!
@@ -70,8 +70,8 @@ where
 {
     let mid = read32(REG_MID).ok()?;
     let id = (mid >> 16) & 0xFFFF;
-    // Cadence GEM module IDs: 0x0007 (GEM_GXL / RP1 rev 0x0007_0109) or 0x0002 (GEM)
-    if id != 0x0007 && id != 0x0002 {
+    // Raspberry Pi 5 RP1 Cadence GEM_GXL module ID (`0x0007`, rev `0x0007_0109`).
+    if id != 0x0007 {
         return None;
     }
     let sa1b = read32(REG_SA1B).unwrap_or(0).to_le_bytes();
@@ -145,7 +145,7 @@ impl GemDma {
 }
 
 /// Live EL0 RP1 Cadence GEM Gigabit Ethernet `smoltcp::phy::Device`.
-pub struct GemNetDevice<'a, T: VirtioTransport> {
+pub struct GemNetDevice<'a, T: MmioDmaTransport> {
     transport: T,
     dma: &'a GemDma,
     rx_idx: usize,
@@ -154,7 +154,7 @@ pub struct GemNetDevice<'a, T: VirtioTransport> {
     pub tx_packets: u64,
 }
 
-impl<'a, T: VirtioTransport> GemNetDevice<'a, T> {
+impl<'a, T: MmioDmaTransport> GemNetDevice<'a, T> {
     pub fn init(transport: T, info: GemInfo, dma: &'a GemDma) -> Result<Self, &'static str> {
         // 1. Disable RX/TX & mask interrupts while configuring DMA rings
         transport
@@ -310,11 +310,11 @@ impl RxToken for GemRxToken<'_> {
     }
 }
 
-pub struct GemTxToken<'a, 'b, T: VirtioTransport> {
+pub struct GemTxToken<'a, 'b, T: MmioDmaTransport> {
     dev: &'a mut GemNetDevice<'b, T>,
 }
 
-impl<T: VirtioTransport> TxToken for GemTxToken<'_, '_, T> {
+impl<T: MmioDmaTransport> TxToken for GemTxToken<'_, '_, T> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -327,7 +327,7 @@ impl<T: VirtioTransport> TxToken for GemTxToken<'_, '_, T> {
     }
 }
 
-impl<'b, T: VirtioTransport> Device for GemNetDevice<'b, T> {
+impl<'b, T: MmioDmaTransport> Device for GemNetDevice<'b, T> {
     type RxToken<'a>
         = GemRxToken<'a>
     where

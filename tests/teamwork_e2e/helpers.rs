@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::OnceLock;
 
-use newos_abi::{CapId, QemuExitCode, SysError};
+use newos_abi::{CapId, ShutdownStatus, SysError};
 use newos_shell_core::shell::{RecordStream, ShellHost, SysInfo};
 
 // ============================================================================
@@ -12,7 +12,7 @@ use newos_shell_core::shell::{RecordStream, ShellHost, SysInfo};
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExitSentinel(pub QemuExitCode);
+pub struct ExitSentinel(pub ShutdownStatus);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct YieldLimitExceeded(pub usize);
@@ -151,7 +151,7 @@ impl ShellHost for MockShellHost {
         self.fault_triggers += 1;
     }
 
-    fn exit(&mut self, code: QemuExitCode) -> ! {
+    fn exit(&mut self, code: ShutdownStatus) -> ! {
         if self.exit_via_sentinel {
             std::panic::panic_any(ExitSentinel(code));
         }

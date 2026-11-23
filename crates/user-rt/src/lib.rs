@@ -9,12 +9,13 @@ use core::arch::asm;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU64, Ordering};
 use newos_abi::{
-    CAP_MINT_SET_BADGE, CapId, ObjectType, QemuExitCode, Rights, SysError, SyscallNumber,
+    CAP_MINT_SET_BADGE, CapId, ObjectType, Rights, ShutdownStatus, SysError, SyscallNumber,
 };
 
 pub const DEBUG_WRITE_MAX: usize = 1024;
 const SYS_INFO_UNCACHED: u64 = u64::MAX;
 static SYS_INFO_CACHE: AtomicU64 = AtomicU64::new(SYS_INFO_UNCACHED);
+static TIMER_FREQ_CACHE: AtomicU64 = AtomicU64::new(0);
 
 const RECOVERY_STACK_SIZE: usize = 64 * 1024;
 const RECOVERY_STACK_WORDS: usize = RECOVERY_STACK_SIZE / core::mem::size_of::<AtomicU64>();
@@ -423,6 +424,35 @@ pub fn read_cycles() -> Result<u64, SysError> {
     raw_syscall(SyscallNumber::ReadCycles, 0, 0, 0, 0)
 }
 
+/// Read the architectural ARM Generic Timer frequency (`CNTFRQ_EL0`) in Hz (cached after first call).
+///
+/// Falls back to `62_500_000` Hz (QEMU `virt`) if the syscall is unsupported or hardware reports 0.
+pub fn timer_freq_hz() -> u64 {
+    let cached = TIMER_FREQ_CACHE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let freq = match raw_syscall(SyscallNumber::TimerFreq, 0, 0, 0, 0) {
+        Ok(f) if f > 0 => f,
+        _ => 62_500_000,
+    };
+    TIMER_FREQ_CACHE.store(freq, Ordering::Relaxed);
+    freq
+}
+
+/// Terminate the calling EL0 thread cleanly without requiring a `PowerControl` capability.
+pub fn thread_exit() -> ! {
+    let _ = raw_syscall(SyscallNumber::ThreadExit, 0, 0, 0, 0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Acknowledge and unmask a hardware IRQ via a designated `IrqHandler` capability (`Rights::WRITE`).
+pub fn irq_ack(irq_cap: CapId) -> Result<u16, SysError> {
+    raw_syscall(SyscallNumber::IrqAck, irq_cap.raw(), 0, 0, 0).map(|v| v as u16)
+}
+
 /// Register an EL0 supervisor recovery entry point invoked if an EL0 hardware fault occurs.
 ///
 /// The kernel resets `SP_EL0` to the 16-byte-aligned top of `SUPERVISOR_RECOVERY_STACK`
@@ -681,7 +711,7 @@ pub fn sys_info() -> SysInfo {
 }
 
 /// Shut down the system cleanly with `code` using an explicit `PowerControl` capability (`Rights::WRITE`).
-pub fn exit_with_cap(power_cap: CapId, code: QemuExitCode) -> ! {
+pub fn exit_with_cap(power_cap: CapId, code: ShutdownStatus) -> ! {
     let _ = raw_syscall(SyscallNumber::Exit, power_cap.raw(), code as u64, 0, 0);
     loop {
         core::hint::spin_loop();
@@ -689,7 +719,7 @@ pub fn exit_with_cap(power_cap: CapId, code: QemuExitCode) -> ! {
 }
 
 /// Exit the root task cleanly with `code` via `BOOTSTRAP_POWER`.
-pub fn exit(code: QemuExitCode) -> ! {
+pub fn exit(code: ShutdownStatus) -> ! {
     exit_with_cap(CapId::BOOTSTRAP_POWER, code)
 }
 

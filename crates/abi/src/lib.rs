@@ -226,6 +226,12 @@ pub enum SyscallNumber {
     /// Map a designated `Frame` capability into a designated `VSpace` capability with W^X `Rights`:
     /// `(vspace_cap, frame_cap, vaddr, rights)`.
     FrameMap = 27,
+    /// Read the architectural Generic Timer frequency (`CNTFRQ_EL0`) in Hz.
+    TimerFreq = 28,
+    /// Terminate the calling EL0 thread cleanly without requiring a `PowerControl` capability.
+    ThreadExit = 29,
+    /// Acknowledge and unmask a hardware IRQ via a designated `IrqHandler` capability (`irq_cap`).
+    IrqAck = 30,
 }
 
 impl SyscallNumber {
@@ -259,6 +265,9 @@ impl SyscallNumber {
             25 => Some(Self::UnmapPage),
             26 => Some(Self::UntypedRetype),
             27 => Some(Self::FrameMap),
+            28 => Some(Self::TimerFreq),
+            29 => Some(Self::ThreadExit),
+            30 => Some(Self::IrqAck),
             _ => None,
         }
     }
@@ -293,12 +302,12 @@ impl SysError {
     }
 }
 
-/// Exit codes reported on PSCI `SYSTEM_OFF` shutdown (Raspberry Pi 5 & QEMU `aarch64` `virt`).
+/// Shutdown status reported on PSCI `SYSTEM_OFF` (Raspberry Pi 5 & QEMU `aarch64` `virt`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-pub enum QemuExitCode {
-    Success = 0x10,
-    Failed = 0x11,
+pub enum ShutdownStatus {
+    Success = 0,
+    Failed = 1,
 }
 
 /// Register-only IPC log chunk framing for `CapId::BOOTSTRAP_LOG_EP`.
@@ -396,13 +405,16 @@ mod tests {
             (25, SyscallNumber::UnmapPage),
             (26, SyscallNumber::UntypedRetype),
             (27, SyscallNumber::FrameMap),
+            (28, SyscallNumber::TimerFreq),
+            (29, SyscallNumber::ThreadExit),
+            (30, SyscallNumber::IrqAck),
         ];
         assert_eq!(SyscallNumber::from_u64(0), None);
         for (raw, variant) in expected_syscalls {
             assert_eq!(variant as u64, raw);
             assert_eq!(SyscallNumber::from_u64(raw), Some(variant));
         }
-        assert_eq!(SyscallNumber::from_u64(28), None);
+        assert_eq!(SyscallNumber::from_u64(31), None);
         assert_eq!(SyscallNumber::from_u64(99), None);
 
         let expected_errors = [

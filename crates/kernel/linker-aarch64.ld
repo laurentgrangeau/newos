@@ -4,15 +4,16 @@ ENTRY(_start)
 
 PHDRS
 {
-    limine_requests PT_LOAD;
-    text PT_LOAD;
-    rodata PT_LOAD;
-    data PT_LOAD;
+    limine_requests PT_LOAD FLAGS(6); /* PF_R | PF_W */
+    text            PT_LOAD FLAGS(5); /* PF_R | PF_X */
+    rodata          PT_LOAD FLAGS(4); /* PF_R */
+    data            PT_LOAD FLAGS(6); /* PF_R | PF_W */
+    dynamic         PT_DYNAMIC;
 }
 
 SECTIONS
 {
-    /* Higher-half kernel base address required by the Limine protocol on aarch64 */
+    /* Higher-half PIE base address — Limine applies KASLR slide automatically for ET_DYN kernels */
     . = 0xffffffff80000000;
 
     .limine_requests : {
@@ -33,11 +34,21 @@ SECTIONS
         *(.rodata .rodata.*)
     } :rodata
 
+    .rela.dyn : {
+        *(.rela.dyn .rela.*)
+    } :rodata
+
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
     .data : {
+        *(.data.rel.ro .data.rel.ro.*)
+        *(.got .got.*)
         *(.data .data.*)
     } :data
+
+    .dynamic : {
+        *(.dynamic)
+    } :data :dynamic
 
     .bss : {
         *(.bss .bss.*)

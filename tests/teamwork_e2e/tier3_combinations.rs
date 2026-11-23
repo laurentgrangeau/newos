@@ -1,7 +1,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use newos_abi::ring::SpscRing;
-use newos_abi::{CapId, ObjectType, QemuExitCode, Rights, SysError};
+use newos_abi::{CapId, ObjectType, ShutdownStatus, Rights, SysError};
 use newos_kernel_core::elf::parse_elf64;
 use newos_kernel_core::ipc::{IpcMessage, KernelIpcState};
 use newos_kernel_core::memory::{
@@ -325,7 +325,7 @@ fn t3_shell_interactive_repl_roundtrip_and_exit() {
             let sentinel = payload
                 .downcast_ref::<ExitSentinel>()
                 .expect("run_interactive must call host.exit(Success)");
-            assert_eq!(sentinel.0, QemuExitCode::Success);
+            assert_eq!(sentinel.0, ShutdownStatus::Success);
         }
     }
     assert_eq!(sh.store().get_any("@repl").unwrap().1, b"repl-item");

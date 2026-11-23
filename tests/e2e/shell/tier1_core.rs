@@ -3,7 +3,7 @@
 
 use core::fmt::Write as _;
 
-use newos_abi::QemuExitCode;
+use newos_abi::ShutdownStatus;
 use newos_shell_core::caos::{CaosError, MAX_OBJECTS, MAX_REFS, ObjHash, ObjectStore};
 use newos_shell_core::shell::{BufferedWriter, ExecOutcome, NullWriter, Record, Shell};
 
@@ -226,13 +226,13 @@ fn tier1_shell_exit_and_shutdown_outcomes() {
     let mut sh = Shell::new(MockShellHost::default());
     assert_eq!(
         sh.exec_line("exit"),
-        ExecOutcome::Exit(QemuExitCode::Success)
+        ExecOutcome::Exit(ShutdownStatus::Success)
     );
     assert!(sh.host_mut().take_output().contains("Shutting down NewOS"));
 
     assert_eq!(
         sh.exec_line("shutdown"),
-        ExecOutcome::Exit(QemuExitCode::Success)
+        ExecOutcome::Exit(ShutdownStatus::Success)
     );
 }
 

@@ -8,7 +8,7 @@ use core::ops::{Deref, DerefMut};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use newos_abi::{
-    CAP_MINT_SET_BADGE, CapId, ObjectType, QemuExitCode, Rights, SysError, SyscallNumber,
+    CAP_MINT_SET_BADGE, CapId, ObjectType, Rights, ShutdownStatus, SysError, SyscallNumber,
 };
 use newos_kernel_core::ipc::{KernelIpcState, MAX_ENDPOINTS, MAX_IPC_PROCS};
 use newos_kernel_core::memory::{
@@ -144,8 +144,14 @@ static RUNTIME_UNTYPED: IrqSpinLock<UntypedInventory> = IrqSpinLock::new(Untyped
 static FRAME_MAPPINGS: IrqSpinLock<FrameMappingTracker<128>> =
     IrqSpinLock::new(FrameMappingTracker::new());
 
-/// Install remaining bootstrap `UntypedInventory` for runtime `MapPage`/`UnmapPage` syscalls.
+/// Install remaining bootstrap `UntypedInventory` for runtime `MapPage`/`UnmapPage` syscalls,
+/// binding PID 0's `BOOTSTRAP_UNTYPED` cap to the largest usable physical memory region.
 pub fn set_untyped_inventory(untyped: UntypedInventory) {
+    if let Some(largest) = untyped.largest_region_index()
+        && let Ok(region_idx) = u16::try_from(largest)
+    {
+        let _ = IPC_STATE.lock().bind_bootstrap_untyped_region(region_idx);
+    }
     *RUNTIME_UNTYPED.lock() = untyped;
 }
 
@@ -168,6 +174,105 @@ impl TrapFrame {
     };
 }
 
+/// Full AArch64 Advanced SIMD (NEON) & FP register state saved/restored across EL0 context switches.
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+struct FpState {
+    fpcr: u64,
+    fpsr: u64,
+    q: [[u64; 2]; 32],
+}
+
+const _: () = assert!(core::mem::size_of::<FpState>() == 528);
+
+impl FpState {
+    const ZERO: Self = Self {
+        fpcr: 0,
+        fpsr: 0,
+        q: [[0; 2]; 32],
+    };
+}
+
+#[inline]
+pub(super) fn enable_fp_simd() {
+    // SAFETY: Setting `CPACR_EL1.FPEN = 0b11` (bits 21:20) enables FP/NEON in EL1 and EL0
+    // so EL0 SIMD instructions and EL1 `save_fp_state`/`restore_fp_state` never trap.
+    unsafe {
+        let mut cpacr: u64;
+        asm!("mrs {}, cpacr_el1", out(reg) cpacr, options(nomem, nostack));
+        cpacr |= 0b11 << 20;
+        asm!("msr cpacr_el1, {}", "isb", in(reg) cpacr, options(nomem, nostack));
+    }
+}
+
+#[inline]
+fn save_fp_state(dst: &mut FpState) {
+    let base = dst as *mut FpState as *mut u8;
+    // SAFETY: `dst` is a 16-byte-aligned, exclusively borrowed `FpState` (528 bytes) and
+    // `enable_fp_simd()` has unmasked FP/SIMD access in `CPACR_EL1`.
+    unsafe {
+        asm!(
+            "mrs {t0}, fpcr",
+            "mrs {t1}, fpsr",
+            "stp {t0}, {t1}, [{base}, #0]",
+            "stp q0,  q1,  [{base}, #16]",
+            "stp q2,  q3,  [{base}, #48]",
+            "stp q4,  q5,  [{base}, #80]",
+            "stp q6,  q7,  [{base}, #112]",
+            "stp q8,  q9,  [{base}, #144]",
+            "stp q10, q11, [{base}, #176]",
+            "stp q12, q13, [{base}, #208]",
+            "stp q14, q15, [{base}, #240]",
+            "stp q16, q17, [{base}, #272]",
+            "stp q18, q19, [{base}, #304]",
+            "stp q20, q21, [{base}, #336]",
+            "stp q22, q23, [{base}, #368]",
+            "stp q24, q25, [{base}, #400]",
+            "stp q26, q27, [{base}, #432]",
+            "stp q28, q29, [{base}, #464]",
+            "stp q30, q31, [{base}, #496]",
+            base = in(reg) base,
+            t0 = out(reg) _,
+            t1 = out(reg) _,
+            options(nostack),
+        );
+    }
+}
+
+#[inline]
+fn restore_fp_state(src: &FpState) {
+    let base = src as *const FpState as *const u8;
+    // SAFETY: `src` is a 16-byte-aligned, valid `FpState` (528 bytes) and
+    // `enable_fp_simd()` has unmasked FP/SIMD access in `CPACR_EL1`.
+    unsafe {
+        asm!(
+            "ldp {t0}, {t1}, [{base}, #0]",
+            "msr fpcr, {t0}",
+            "msr fpsr, {t1}",
+            "ldp q0,  q1,  [{base}, #16]",
+            "ldp q2,  q3,  [{base}, #48]",
+            "ldp q4,  q5,  [{base}, #80]",
+            "ldp q6,  q7,  [{base}, #112]",
+            "ldp q8,  q9,  [{base}, #144]",
+            "ldp q10, q11, [{base}, #176]",
+            "ldp q12, q13, [{base}, #208]",
+            "ldp q14, q15, [{base}, #240]",
+            "ldp q16, q17, [{base}, #272]",
+            "ldp q18, q19, [{base}, #304]",
+            "ldp q20, q21, [{base}, #336]",
+            "ldp q22, q23, [{base}, #368]",
+            "ldp q24, q25, [{base}, #400]",
+            "ldp q26, q27, [{base}, #432]",
+            "ldp q28, q29, [{base}, #464]",
+            "ldp q30, q31, [{base}, #496]",
+            base = in(reg) base,
+            t0 = out(reg) _,
+            t1 = out(reg) _,
+            options(nostack),
+        );
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IpcWaitState {
     Runnable,
@@ -185,7 +290,9 @@ struct ProcessSlot {
     reply_target: Option<usize>,
     fault_pc: u64,
     fault_sp: u64,
+    shadow_sp: u64,
     frame: TrapFrame,
+    fp: FpState,
 }
 
 impl ProcessSlot {
@@ -197,7 +304,9 @@ impl ProcessSlot {
         reply_target: None,
         fault_pc: 0,
         fault_sp: 0,
+        shadow_sp: 0,
         frame: TrapFrame::ZERO,
+        fp: FpState::ZERO,
     };
 }
 
@@ -319,13 +428,19 @@ pub fn set_sys_info(online_cpus: usize, interactive_shell: bool) {
     SYS_INFO_PACKED.store(packed, Ordering::Release);
 }
 
-pub fn register_user_process(entry_pc: u64, user_sp: u64, ttbr0: u64) -> Result<usize, SysError> {
+pub fn register_user_process(
+    entry_pc: u64,
+    user_sp: u64,
+    user_shadow_sp: u64,
+    ttbr0: u64,
+) -> Result<usize, SysError> {
     let mut table = PROCS.lock();
     if table.count >= MAX_PROCS {
         return Err(SysError::OutOfMemory);
     }
     let pid = table.count;
     let mut frame = TrapFrame::ZERO;
+    frame.x[18] = user_shadow_sp; // AArch64 Shadow Call Stack (`x18`)
     frame.elr_el1 = entry_pc;
     frame.sp_el0 = user_sp;
     frame.spsr_el1 = 0; // EL0t, DAIF unmasked
@@ -337,7 +452,9 @@ pub fn register_user_process(entry_pc: u64, user_sp: u64, ttbr0: u64) -> Result<
         reply_target: None,
         fault_pc: 0,
         fault_sp: 0,
+        shadow_sp: user_shadow_sp,
         frame,
+        fp: FpState::ZERO,
     };
     let _ = table.sched.spawn(DEFAULT_PRIORITY);
     table.count += 1;
@@ -353,12 +470,11 @@ pub fn register_user_process(entry_pc: u64, user_sp: u64, ttbr0: u64) -> Result<
 
 #[inline]
 fn switch_ttbr0(ttbr0_phys: u64, pid: usize) {
-    let asid = ((pid + 1) as u64) & 0xFF;
+    let asid = ((pid + 1) as u64) & 0xFFFF;
     let val = (asid << 48) | (ttbr0_phys & TTBR0_ADDR_MASK);
     // SAFETY: `ttbr0_phys` is a verified 4 KiB-aligned EL0 L0 page-table physical address whose
-    // user leaf PTEs are tagged with `DESC_NG = 1 << 11`. `TCR_EL1.A1 == 0` routes ASID selection
-    // through `TTBR0_EL1[63:48]`, so each PID (`1..=MAX_PROCS`) isolates its TLB entries without
-    // requiring a global `tlbi vmalle1` flush.
+    // user leaf PTEs are tagged with `DESC_NG = 1 << 11`. `TCR_EL1.A1 == 0` routes 16-bit ASID
+    // selection through `TTBR0_EL1[63:48]`, isolating per-PID TLB entries without global flushes.
     unsafe {
         asm!(
             "msr ttbr0_el1, {val}",
@@ -367,6 +483,27 @@ fn switch_ttbr0(ttbr0_phys: u64, pid: usize) {
             options(nostack),
         );
     }
+}
+
+/// Save `from`'s GPR + NEON/FP state and switch `TTBR0_EL1` + registers to `to`.
+#[inline]
+fn context_switch(table: &mut ProcTable, from: usize, to: usize, frame: &mut TrapFrame) {
+    table.procs[from].frame = *frame;
+    save_fp_state(&mut table.procs[from].fp);
+    table.current = to;
+    switch_ttbr0(table.procs[to].ttbr0, to);
+    restore_fp_state(&table.procs[to].fp);
+    *frame = table.procs[to].frame;
+}
+
+#[inline]
+fn read_cntfrq() -> u64 {
+    let freq: u64;
+    // SAFETY: Reading `CNTFRQ_EL0` in EL1 returns the architectural Generic Timer frequency in Hz.
+    unsafe {
+        asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack));
+    }
+    freq
 }
 
 #[inline]
@@ -417,8 +554,18 @@ fn init_preempt_timer() {
     arm_virtual_timer(interval);
 }
 
+/// Spectre v1 Consumption of Speculative Data Barrier (`csdb`) after bounds checks.
+#[inline(always)]
+fn spec_barrier() {
+    // SAFETY: `csdb` is an architectural hint-space barrier (NOP on older cores, speculation barrier on v8.2+).
+    unsafe {
+        asm!("csdb", options(nomem, nostack, preserves_flags));
+    }
+}
+
 /// Rust handler invoked by `__newos_irq_el0` on hardware IRQs (e.g. ARM Generic Timer preemption).
 pub extern "C" fn irq_el0_dispatch(frame: &mut TrapFrame) {
+    let iar = super::gic::acknowledge();
     if (read_cntv_ctl() & CNTV_CTL_ISTATUS) != 0 {
         let interval = TIMER_TICK_INTERVAL.load(Ordering::Acquire);
         arm_virtual_timer(interval);
@@ -427,13 +574,13 @@ pub extern "C" fn irq_el0_dispatch(frame: &mut TrapFrame) {
         if table.sched.on_timer_tick() {
             let cur = table.current;
             if let Some(next) = table.pick_next_runnable(cur) {
-                table.procs[cur].frame = *frame;
-                table.current = next;
-                switch_ttbr0(table.procs[next].ttbr0, next);
-                *frame = table.procs[next].frame;
+                context_switch(&mut table, cur, next, frame);
                 PREEMPT_PENDING.store(false, Ordering::Release);
             }
         }
+    }
+    if let Some(id) = iar {
+        super::gic::end_of_interrupt(id);
     }
 }
 
@@ -449,6 +596,7 @@ fn copy_from_user(ttbr0: u64, user_ptr: u64, len: u64, dst: &mut [u8]) -> Result
     if user_ptr == 0 || end >= USER_ADDR_LIMIT {
         return Err(SysError::InvalidArgument);
     }
+    spec_barrier();
     let count = (len as usize).min(dst.len());
     if count == 0 {
         return Ok(0);
@@ -511,13 +659,18 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
 
     if ec != 0x15 {
         // Hardware EL0 fault (e.g., `udf #0` illegal instruction EC=0x00, data/insn abort)
-        let (cur_pid, rec_pc, rec_sp) = {
+        let (cur_pid, rec_pc, rec_sp, rec_shadow_sp) = {
             let table = PROCS.lock();
             let cur = table.current;
             if cur < table.count {
-                (cur, table.procs[cur].fault_pc, table.procs[cur].fault_sp)
+                (
+                    cur,
+                    table.procs[cur].fault_pc,
+                    table.procs[cur].fault_sp,
+                    table.procs[cur].shadow_sp,
+                )
             } else {
-                (cur, 0, 0)
+                (cur, 0, 0, 0)
             }
         };
         if rec_pc != 0 && rec_sp != 0 {
@@ -531,6 +684,10 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             let _ = IPC_STATE
                 .lock()
                 .notify_signal_for(0, CapId::BOOTSTRAP_FAULT_NOTIF, 1u64 << 6);
+            // Scrub all GPRs and NEON/FP registers, then restore clean Shadow Call Stack (`x18`).
+            frame.x = [0; 31];
+            frame.x[18] = rec_shadow_sp;
+            restore_fp_state(&FpState::ZERO);
             frame.elr_el1 = rec_pc;
             frame.sp_el0 = rec_sp;
             frame.spsr_el1 = 0;
@@ -583,9 +740,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 });
             }
             if let Some(next) = table.pick_next_runnable(cur_pid) {
-                table.current = next;
-                switch_ttbr0(table.procs[next].ttbr0, next);
-                *frame = table.procs[next].frame;
+                context_switch(&mut table, cur_pid, next, frame);
                 return;
             }
         }
@@ -595,7 +750,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             "[newos-hal] UNHANDLED EL0 FAULT EC={:#x} ELR={:#018x}",
             ec, frame.elr_el1
         );
-        super::exit_qemu(QemuExitCode::Failed);
+        super::system_off(ShutdownStatus::Failed);
     }
 
     // `svc #0` syscall from EL0: x8 = num, x0..x3 = args, return (err, val) in (x0, x1)
@@ -604,6 +759,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         frame.x[1] = 0;
         return;
     };
+    spec_barrier();
 
     let a0 = frame.x[0];
     let a1 = frame.x[1];
@@ -633,10 +789,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             let mut table = PROCS.lock();
             let cur = table.current;
             if let Some(next) = table.pick_next_runnable(cur) {
-                table.procs[cur].frame = *frame;
-                table.current = next;
-                switch_ttbr0(table.procs[next].ttbr0, next);
-                *frame = table.procs[next].frame;
+                context_switch(&mut table, cur, next, frame);
             }
             return;
         }
@@ -646,12 +799,12 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 .validate_power_for(cur_pid, CapId::new(a0), Rights::WRITE)
             {
                 Ok(()) => {
-                    let code = if a1 == QemuExitCode::Success as u64 {
-                        QemuExitCode::Success
+                    let code = if a1 == ShutdownStatus::Success as u64 {
+                        ShutdownStatus::Success
                     } else {
-                        QemuExitCode::Failed
+                        ShutdownStatus::Failed
                     };
-                    super::exit_qemu(code)
+                    super::system_off(code)
                 }
                 Err(e) => Err(e),
             }
@@ -710,10 +863,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                         let _ = table.sched.block_slot(cur);
                         let _ = table.sched.wake_slot(server);
                         table.sched.select_slot(server);
-                        table.procs[cur].frame = *frame;
-                        table.current = server;
-                        switch_ttbr0(table.procs[server].ttbr0, server);
-                        *frame = table.procs[server].frame;
+                        context_switch(&mut table, cur, server, frame);
                         return;
                     }
                     if table.sched.ready_count() > 0 {
@@ -723,10 +873,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                                 let _ = table.sched.block_slot(cur);
                                 if let Some(next) = table.pick_next_runnable(cur) {
                                     drop(ipc);
-                                    table.procs[cur].frame = *frame;
-                                    table.current = next;
-                                    switch_ttbr0(table.procs[next].ttbr0, next);
-                                    *frame = table.procs[next].frame;
+                                    context_switch(&mut table, cur, next, frame);
                                     return;
                                 }
                                 // Roll back buffered message so no orphan remains in the endpoint.
@@ -790,10 +937,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                                 table.set_wait_state(cur, IpcWaitState::WaitingRecv, ep_id);
                                 let _ = table.sched.block_slot(cur);
                                 table.sched.select_slot(client);
-                                table.procs[cur].frame = *frame;
-                                table.current = client;
-                                switch_ttbr0(table.procs[client].ttbr0, client);
-                                *frame = table.procs[client].frame;
+                                context_switch(&mut table, cur, client, frame);
                                 return;
                             }
                             if table.sched.ready_count() > 0 {
@@ -801,10 +945,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                                 let _ = table.sched.block_slot(cur);
                                 if let Some(next) = table.pick_next_runnable(cur) {
                                     drop(ipc);
-                                    table.procs[cur].frame = *frame;
-                                    table.current = next;
-                                    switch_ttbr0(table.procs[next].ttbr0, next);
-                                    *frame = table.procs[next].frame;
+                                    context_switch(&mut table, cur, next, frame);
                                     return;
                                 }
                                 table.set_wait_state(cur, IpcWaitState::Runnable, 0);
@@ -944,9 +1085,13 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                             let mut untyped = RUNTIME_UNTYPED.lock();
                             let mappings_guard = FRAME_MAPPINGS.lock();
                             if !mappings_guard.has_mapping_for_phys(phys) {
+                                let vs =
+                                    super::paging::Aarch64VSpace::from_root_phys(cur_ttbr0, hhdm);
                                 if let Some(f) = reclaimed_frame {
+                                    vs.zero_frame(&f);
                                     let _ = untyped.reclaim_frame(f);
                                 } else if let Ok(f) = PhysFrame::from_aligned(phys) {
+                                    vs.zero_frame(&f);
                                     let _ = untyped.reclaim_frame(f);
                                 }
                             }
@@ -1105,6 +1250,8 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                                     if !ipc.has_live_frame_cap(pa)
                                         && !mappings.has_mapping_for_phys(pa)
                                     {
+                                        // Zero exclusively reclaimed physical frame immediately (zero-on-free).
+                                        vspace.zero_frame(&frame);
                                         let _ = untyped.reclaim_frame(frame);
                                     }
                                     Ok(0)
@@ -1215,6 +1362,37 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 })
             }
         }
+        SyscallNumber::TimerFreq => Ok(read_cntfrq()),
+        SyscallNumber::ThreadExit => {
+            let mut table = PROCS.lock();
+            table.set_wait_state(cur_pid, IpcWaitState::Runnable, 0);
+            if let Some(client) = table.procs[cur_pid].reply_target.take()
+                && client < table.count
+                && table.procs[client].active
+                && table.procs[client].wait == IpcWaitState::WaitingReply
+            {
+                table.procs[client].frame.x[0] = SysError::InvalidCapability as u64;
+                table.procs[client].frame.x[1] = 0;
+                table.procs[client].frame.x[2] = 0;
+                table.set_wait_state(client, IpcWaitState::Runnable, 0);
+                let _ = table.sched.wake_slot(client);
+            }
+            table.procs[cur_pid].active = false;
+            let _ = table.sched.exit_slot(cur_pid);
+            if let Some(next) = table.pick_next_runnable(cur_pid) {
+                context_switch(&mut table, cur_pid, next, frame);
+                return;
+            }
+            drop(table);
+            super::system_off(ShutdownStatus::Success);
+        }
+        SyscallNumber::IrqAck => IPC_STATE
+            .lock()
+            .validate_irq_for(cur_pid, CapId::new(a0), Rights::WRITE)
+            .map(|irq| {
+                super::gic::enable_irq(u32::from(irq));
+                u64::from(irq)
+            }),
     };
 
     match result {
@@ -1250,10 +1428,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         if should_preempt {
             let cur = table.current;
             if let Some(next) = table.pick_next_runnable(cur) {
-                table.procs[cur].frame = *frame;
-                table.current = next;
-                switch_ttbr0(table.procs[next].ttbr0, next);
-                *frame = table.procs[next].frame;
+                context_switch(&mut table, cur, next, frame);
             }
         }
     }
@@ -1261,7 +1436,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
 
 /// Load Process 0 (`init`)'s isolated `TTBR0_EL1` and enter EL0 via `eret`.
 pub fn start_userspace() -> ! {
-    let (ttbr0, entry_pc, user_sp) = {
+    let (ttbr0, entry_pc, user_sp, user_shadow_sp) = {
         let mut table = PROCS.lock();
         assert!(table.count > 0 && table.procs[0].active);
         table.current = 0;
@@ -1270,23 +1445,27 @@ pub fn start_userspace() -> ! {
             table.procs[0].ttbr0,
             table.procs[0].frame.elr_el1,
             table.procs[0].frame.sp_el0,
+            table.procs[0].shadow_sp,
         )
     };
 
     super::paging::ensure_ttbr0_asid_enabled();
+    enable_fp_simd();
     switch_ttbr0(ttbr0, 0);
     init_preempt_timer();
 
-    // SAFETY: `ttbr0` is active, `entry_pc` and `user_sp` point to valid W^X EL0 mappings,
-    // and `SPSR_EL1 = 0` transitions cleanly to AArch64 EL0t via `eret`.
+    // SAFETY: `ttbr0` is active, `entry_pc`, `user_sp`, and `user_shadow_sp` (`x18`) point to
+    // valid W^X EL0 mappings, and `SPSR_EL1 = 0` transitions cleanly to AArch64 EL0t via `eret`.
     unsafe {
         asm!(
             "msr sp_el0, {user_sp}",
             "msr elr_el1, {entry_pc}",
             "msr spsr_el1, xzr",
+            "mov x18, {user_shadow_sp}",
             "eret",
             user_sp = in(reg) user_sp,
             entry_pc = in(reg) entry_pc,
+            user_shadow_sp = in(reg) user_shadow_sp,
             options(noreturn),
         );
     }

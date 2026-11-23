@@ -10,8 +10,8 @@
 use core::fmt::Write;
 use core::panic::PanicInfo;
 use newos_abi::ring::SpscRing;
-use newos_abi::{CapId, QemuExitCode, SysError};
-use newos_net::{GemDma, NetConfig, NicKind, VirtioNetDma, VirtioTransport};
+use newos_abi::{CapId, ShutdownStatus, SysError};
+use newos_net::{GemDma, MmioDmaTransport, NetConfig, NicKind, VirtioNetDma};
 use newos_shell_core::shell::{NullWriter, Record, RecordStream, Shell, ShellHost, SysInfo};
 use newos_user_rt::{BufferedConsole, IpcLogAssembler};
 
@@ -21,9 +21,9 @@ pub static VIRTIO_DMA: VirtioNetDma = VirtioNetDma::new();
 pub static GEM_DMA: GemDma = GemDma::new();
 
 /// Capability-scoped MMIO + `VirtToPhys` transport for EL0 NIC drivers.
-pub struct CapVirtioTransport;
+pub struct CapMmioDmaTransport;
 
-impl VirtioTransport for CapVirtioTransport {
+impl MmioDmaTransport for CapMmioDmaTransport {
     fn read32(&self, offset: u64) -> Result<u32, SysError> {
         newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, offset)
     }
@@ -81,7 +81,7 @@ impl InitShellHost {
         if let Some(n) = nic {
             match subcmd {
                 "dhcp" => {
-                    match newos_net::live_dhcp_v4(CapVirtioTransport, n, &VIRTIO_DMA, &GEM_DMA) {
+                    match newos_net::live_dhcp_v4(CapMmioDmaTransport, n, &VIRTIO_DMA, &GEM_DMA) {
                         Ok(cfg) => {
                             self.net_cfg = Some(cfg);
                             let gw = cfg.gateway.unwrap_or([0; 4]);
@@ -126,12 +126,13 @@ impl InitShellHost {
                                 let _ = writeln!(out, "net ping: invalid IPv4 address '{raw}'");
                                 return;
                             } else {
+                                let cycles_per_ms = (newos_user_rt::timer_freq_hz() / 1_000).max(1);
                                 let mut clock = newos_net::CycleClock::new(
                                     || newos_user_rt::read_cycles().unwrap_or(0),
-                                    62_500,
+                                    cycles_per_ms,
                                 );
                                 match newos_net::live_dns_resolve_with_clock(
-                                    CapVirtioTransport,
+                                    CapMmioDmaTransport,
                                     &mut clock,
                                     n,
                                     &cfg,
@@ -153,7 +154,7 @@ impl InitShellHost {
                         }
                     };
                     match newos_net::live_icmp_ping(
-                        CapVirtioTransport,
+                        CapMmioDmaTransport,
                         n,
                         &cfg,
                         target,
@@ -188,12 +189,13 @@ impl InitShellHost {
                         return;
                     };
                     let cfg = self.net_cfg.unwrap_or(NetConfig::QEMU_DEFAULT);
+                    let cycles_per_ms = (newos_user_rt::timer_freq_hz() / 1_000).max(1);
                     let mut clock = newos_net::CycleClock::new(
                         || newos_user_rt::read_cycles().unwrap_or(0),
-                        62_500,
+                        cycles_per_ms,
                     );
                     match newos_net::live_dns_resolve_with_clock(
-                        CapVirtioTransport,
+                        CapMmioDmaTransport,
                         &mut clock,
                         n,
                         &cfg,
@@ -324,7 +326,7 @@ impl ShellHost for InitShellHost {
         newos_user_rt::trigger_user_fault()
     }
 
-    fn exit(&mut self, code: QemuExitCode) -> ! {
+    fn exit(&mut self, code: ShutdownStatus) -> ! {
         newos_user_rt::exit(code)
     }
 
@@ -382,11 +384,11 @@ extern "C" fn supervisor_recover() -> ! {
                     bits
                 );
                 out.flush();
-                newos_user_rt::exit(QemuExitCode::Success)
+                newos_user_rt::exit(ShutdownStatus::Success)
             } else {
                 let _ = writeln!(out, "[init] FAIL: unexpected fault bits {bits:#x}");
                 out.flush();
-                newos_user_rt::exit(QemuExitCode::Failed)
+                newos_user_rt::exit(ShutdownStatus::Failed)
             }
         }
         other => {
@@ -395,7 +397,7 @@ extern "C" fn supervisor_recover() -> ! {
                 "[init] FAIL: unexpected fault notification bits: {other:?}"
             );
             out.flush();
-            newos_user_rt::exit(QemuExitCode::Failed)
+            newos_user_rt::exit(ShutdownStatus::Failed)
         }
     }
 }
@@ -457,7 +459,7 @@ fn main() -> ! {
     {
         let _ = writeln!(out, "[init] FAIL: missing IPC reply from worker");
         out.flush();
-        newos_user_rt::exit(QemuExitCode::Failed);
+        newos_user_rt::exit(ShutdownStatus::Failed);
     }
     let _ = writeln!(
         out,
@@ -472,7 +474,7 @@ fn main() -> ! {
     {
         let _ = writeln!(out, "[init] FAIL: Notification capability check failed");
         out.flush();
-        newos_user_rt::exit(QemuExitCode::Failed);
+        newos_user_rt::exit(ShutdownStatus::Failed);
     }
 
     const RING_BURST: usize = 32;
@@ -484,7 +486,7 @@ fn main() -> ! {
     if ring.try_push_slice(&tx_batch) != RING_BURST {
         let _ = writeln!(out, "[init] FAIL: SpscRing batch push failed");
         out.flush();
-        newos_user_rt::exit(QemuExitCode::Failed);
+        newos_user_rt::exit(ShutdownStatus::Failed);
     }
     let _ = newos_user_rt::notify_signal(CapId::BOOTSTRAP_NOTIF, 1);
     let mut rx_batch = [0u64; RING_BURST];
@@ -494,7 +496,7 @@ fn main() -> ! {
     {
         let _ = writeln!(out, "[init] FAIL: SpscRing batch pop/notify mismatch");
         out.flush();
-        newos_user_rt::exit(QemuExitCode::Failed);
+        newos_user_rt::exit(ShutdownStatus::Failed);
     }
 
     // Hardware TTBR0_EL1 context-switch latency benchmark
@@ -518,7 +520,7 @@ fn main() -> ! {
             "[init] FAIL: EL0 CAOS & typed pipeline self-check: {msg}"
         );
         out.flush();
-        newos_user_rt::exit(QemuExitCode::Failed);
+        newos_user_rt::exit(ShutdownStatus::Failed);
     }
     let _ = writeln!(
         out,
@@ -532,7 +534,7 @@ fn main() -> ! {
         .map(|n| n.mac())
         .unwrap_or([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
     if let Some(nic) = detected_nic {
-        let cfg = match newos_net::live_dhcp_v4(CapVirtioTransport, nic, &VIRTIO_DMA, &GEM_DMA) {
+        let cfg = match newos_net::live_dhcp_v4(CapMmioDmaTransport, nic, &VIRTIO_DMA, &GEM_DMA) {
             Ok(leased) => {
                 let gw = leased.gateway.unwrap_or([0; 4]);
                 let dns = leased.dns.unwrap_or([0; 4]);
@@ -565,7 +567,7 @@ fn main() -> ! {
             Err(msg) => {
                 let _ = writeln!(out, "[init] FAIL: live DHCPv4 lease: {msg}");
                 out.flush();
-                newos_user_rt::exit(QemuExitCode::Failed);
+                newos_user_rt::exit(ShutdownStatus::Failed);
             }
         };
 
@@ -573,7 +575,7 @@ fn main() -> ! {
             .gateway
             .unwrap_or(NetConfig::QEMU_DEFAULT.gateway.unwrap_or([10, 0, 2, 2]));
         match newos_net::live_icmp_ping(
-            CapVirtioTransport,
+            CapMmioDmaTransport,
             nic,
             &cfg,
             target,
@@ -595,7 +597,7 @@ fn main() -> ! {
             Err(msg) => {
                 let _ = writeln!(out, "[init] FAIL: live ICMP ping: {msg}");
                 out.flush();
-                newos_user_rt::exit(QemuExitCode::Failed);
+                newos_user_rt::exit(ShutdownStatus::Failed);
             }
         }
     } else {
@@ -609,7 +611,7 @@ fn main() -> ! {
             Err(msg) => {
                 let _ = writeln!(out, "[init] FAIL: EL0 smoltcp stack check: {msg}");
                 out.flush();
-                newos_user_rt::exit(QemuExitCode::Failed);
+                newos_user_rt::exit(ShutdownStatus::Failed);
             }
         }
     }
@@ -618,7 +620,7 @@ fn main() -> ! {
     if newos_user_rt::mmio_read32(CapId::NULL, 0) != Err(SysError::InvalidCapability) {
         let _ = writeln!(out, "[init] FAIL: unauthorized MMIO read was not rejected");
         out.flush();
-        newos_user_rt::exit(QemuExitCode::Failed);
+        newos_user_rt::exit(ShutdownStatus::Failed);
     }
 
     // Deliberate EL0 hardware fault (`udf #0`) -> supervisor recovery
@@ -633,5 +635,5 @@ fn main() -> ! {
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     let _ = newos_user_rt::debug_log("[init] PANIC in EL0\n");
-    newos_user_rt::exit(QemuExitCode::Failed)
+    newos_user_rt::exit(ShutdownStatus::Failed)
 }

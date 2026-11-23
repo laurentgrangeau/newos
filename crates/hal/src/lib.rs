@@ -9,7 +9,7 @@ pub mod arch;
 pub mod boot;
 
 use core::fmt::Write;
-use newos_abi::QemuExitCode;
+use newos_abi::ShutdownStatus;
 use newos_kernel_core::BootInfo;
 
 pub use arch::Platform;
@@ -24,7 +24,7 @@ pub fn early_init() -> (Platform, BootInfo) {
             serial,
             "[newos-hal] ERROR: unsupported Limine base revision"
         );
-        arch::exit_qemu(QemuExitCode::Failed);
+        arch::system_off(ShutdownStatus::Failed);
     }
 
     let mut info = boot::boot_info();
@@ -36,7 +36,7 @@ pub fn early_init() -> (Platform, BootInfo) {
 pub fn handle_panic(info: &core::panic::PanicInfo<'_>) -> ! {
     let mut serial = arch::early_serial();
     let _ = writeln!(serial, "[newos-kernel] PANIC: {info}");
-    arch::exit_qemu(QemuExitCode::Failed)
+    arch::system_off(ShutdownStatus::Failed)
 }
 
 /// Define the bootloader entry point (`_start`) and delegate immediately to a

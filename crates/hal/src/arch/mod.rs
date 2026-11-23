@@ -10,6 +10,6 @@ pub fn early_serial() -> aarch64::serial::Pl011 {
     aarch64::serial::Pl011::new()
 }
 
-pub fn exit_qemu(code: newos_abi::QemuExitCode) -> ! {
-    aarch64::exit_qemu(code)
+pub fn system_off(code: newos_abi::ShutdownStatus) -> ! {
+    aarch64::system_off(code)
 }

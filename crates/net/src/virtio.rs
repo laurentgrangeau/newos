@@ -38,7 +38,7 @@ const STATUS_FEATURES_OK: u32 = 8;
 const DESC_F_WRITE: u16 = 2;
 
 /// Capability-scoped MMIO + DMA translation transport injected by EL0 `user-rt`.
-pub trait VirtioTransport {
+pub trait MmioDmaTransport {
     fn read32(&self, offset: u64) -> Result<u32, SysError>;
     fn write32(&self, offset: u64, val: u32) -> Result<(), SysError>;
     fn virt_to_phys<T>(&self, r: &T) -> Result<u64, SysError>;
@@ -160,7 +160,7 @@ impl Default for VirtioNetDma {
 }
 
 /// Live EL0 VirtIO 1.0+ (v2) network device implementing `smoltcp::phy::Device`.
-pub struct VirtioNetDevice<'a, T: VirtioTransport> {
+pub struct VirtioNetDevice<'a, T: MmioDmaTransport> {
     transport: T,
     slot_base: u64,
     dma: &'a VirtioNetDma,
@@ -172,7 +172,7 @@ pub struct VirtioNetDevice<'a, T: VirtioTransport> {
     pub tx_packets: u64,
 }
 
-impl<'a, T: VirtioTransport> VirtioNetDevice<'a, T> {
+impl<'a, T: MmioDmaTransport> VirtioNetDevice<'a, T> {
     /// Initialize a modern VirtIO-MMIO v2 network device at `slot` and arm RX/TX virtqueues.
     pub fn init(transport: T, slot: u8, dma: &'a VirtioNetDma) -> Result<Self, &'static str> {
         let base = u64::from(slot) * 0x200;
@@ -286,7 +286,7 @@ impl<'a, T: VirtioTransport> VirtioNetDevice<'a, T> {
     }
 }
 
-fn setup_queue<T: VirtioTransport>(
+fn setup_queue<T: MmioDmaTransport>(
     transport: &T,
     base: u64,
     queue_idx: u32,
@@ -354,7 +354,7 @@ impl RxToken for VirtioRxToken<'_> {
     }
 }
 
-pub struct VirtioTxToken<'a, T: VirtioTransport> {
+pub struct VirtioTxToken<'a, T: MmioDmaTransport> {
     transport: &'a T,
     slot_base: u64,
     dma: &'a VirtioNetDma,
@@ -363,7 +363,7 @@ pub struct VirtioTxToken<'a, T: VirtioTransport> {
     tx_packets: &'a mut u64,
 }
 
-impl<T: VirtioTransport> TxToken for VirtioTxToken<'_, T> {
+impl<T: MmioDmaTransport> TxToken for VirtioTxToken<'_, T> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -406,7 +406,7 @@ impl<T: VirtioTransport> TxToken for VirtioTxToken<'_, T> {
     }
 }
 
-impl<T: VirtioTransport> Device for VirtioNetDevice<'_, T> {
+impl<T: MmioDmaTransport> Device for VirtioNetDevice<'_, T> {
     type RxToken<'a>
         = VirtioRxToken<'a>
     where

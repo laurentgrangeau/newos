@@ -322,6 +322,27 @@ impl KernelIpcState {
             .bind_vspace_root(CapId::BOOTSTRAP_VSPACE, root_phys)
     }
 
+    /// Bind the largest usable `UntypedInventory` region index onto PID 0's `BOOTSTRAP_UNTYPED` cap.
+    pub fn bind_bootstrap_untyped_region(&mut self, region_index: u16) -> Result<(), SysError> {
+        self.root_cspace
+            .bind_untyped_region(CapId::BOOTSTRAP_UNTYPED, region_index)
+    }
+
+    /// Validate an `IrqHandler` capability in `pid`'s `CSpace`, returning its hardware IRQ number.
+    #[inline]
+    pub fn validate_irq_for(
+        &self,
+        pid: usize,
+        cap_id: CapId,
+        required: Rights,
+    ) -> Result<u16, SysError> {
+        let cap = self.cspace(pid)?.lookup(cap_id, required)?;
+        match cap.object {
+            CapObject::IrqHandler { irq } => Ok(irq),
+            _ => Err(SysError::InvalidArgument),
+        }
+    }
+
     /// Validate a `Console` capability in `pid`'s `CSpace` (`WRITE` for `DebugWrite`, `READ` for `DebugRead`).
     #[inline]
     pub fn validate_console_for(

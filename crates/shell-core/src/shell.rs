@@ -8,7 +8,7 @@
 //!   - `procs | where pid == 1 | count`
 
 use core::fmt::{self, Write};
-use newos_abi::{CapId, QemuExitCode, SysError};
+use newos_abi::{CapId, ShutdownStatus, SysError};
 
 use crate::caos::{MAX_BLOB_SIZE, ObjHash, ObjectMeta, ObjectStore, RefMeta, StoreError};
 
@@ -82,7 +82,7 @@ pub trait ShellHost {
     fn trigger_user_fault(&mut self) {}
 
     /// Terminate the root task (`exit` / `shutdown` in `run_interactive`).
-    fn exit(&mut self, _code: QemuExitCode) -> ! {
+    fn exit(&mut self, _code: ShutdownStatus) -> ! {
         loop {
             core::hint::spin_loop();
         }
@@ -222,7 +222,7 @@ impl<H: ShellHost> Write for HostWriter<'_, H> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecOutcome {
     Continue,
-    Exit(QemuExitCode),
+    Exit(ShutdownStatus),
 }
 
 /// Typed structured record flowing between `|` pipeline stages (zero text re-parsing).
@@ -688,7 +688,7 @@ impl<H: ShellHost> Shell<H> {
             self.host.write_debug("newos λ ");
             let len = match self.read_line_checked(&mut line_buf) {
                 Ok(n) => n,
-                Err(_) => self.host.exit(QemuExitCode::Failed),
+                Err(_) => self.host.exit(ShutdownStatus::Failed),
             };
             let line = core::str::from_utf8(&line_buf[..len]).unwrap_or("").trim();
             if line.is_empty() {
@@ -726,6 +726,9 @@ impl<H: ShellHost> Shell<H> {
 
     fn read_line_checked(&mut self, buf: &mut [u8; LINE_BUF_SIZE]) -> Result<usize, SysError> {
         let mut len = 0usize;
+        let mut utf8_pending = [0u8; 4];
+        let mut utf8_pos = 0usize;
+        let mut utf8_expected = 0usize;
         loop {
             self.drain_background_logs(&buf[..len]);
             let byte = match self.host.read_debug_byte() {
@@ -736,6 +739,28 @@ impl<H: ShellHost> Shell<H> {
                 }
                 Err(e) => return Err(e),
             };
+            if utf8_expected > 0 {
+                if (byte & 0xC0) == 0x80 {
+                    utf8_pending[utf8_pos] = byte;
+                    utf8_pos += 1;
+                    if utf8_pos == utf8_expected {
+                        if len + utf8_expected <= LINE_BUF_SIZE
+                            && let Ok(s) = core::str::from_utf8(&utf8_pending[..utf8_expected])
+                        {
+                            buf[len..len + utf8_expected]
+                                .copy_from_slice(&utf8_pending[..utf8_expected]);
+                            len += utf8_expected;
+                            self.host.write_debug(s);
+                        }
+                        utf8_pos = 0;
+                        utf8_expected = 0;
+                    }
+                    continue;
+                }
+                // Invalid continuation byte: discard partial sequence and process current byte.
+                utf8_pos = 0;
+                utf8_expected = 0;
+            }
             match byte {
                 b'\r' | b'\n' => {
                     self.host.write_debug("\n");
@@ -743,7 +768,11 @@ impl<H: ShellHost> Shell<H> {
                 }
                 0x08 | 0x7F => {
                     if len > 0 {
+                        // Pop one complete UTF-8 scalar (backing over 0x80..=0xBF continuation bytes).
                         len -= 1;
+                        while len > 0 && (buf[len] & 0xC0) == 0x80 {
+                            len -= 1;
+                        }
                         self.host.write_debug("\x08 \x08");
                     }
                 }
@@ -766,6 +795,21 @@ impl<H: ShellHost> Shell<H> {
                     if let Ok(s) = core::str::from_utf8(&tmp) {
                         self.host.write_debug(s);
                     }
+                }
+                0xC2..=0xDF => {
+                    utf8_pending[0] = byte;
+                    utf8_pos = 1;
+                    utf8_expected = 2;
+                }
+                0xE0..=0xEF => {
+                    utf8_pending[0] = byte;
+                    utf8_pos = 1;
+                    utf8_expected = 3;
+                }
+                0xF0..=0xF4 => {
+                    utf8_pending[0] = byte;
+                    utf8_pos = 1;
+                    utf8_expected = 4;
                 }
                 _ => {}
             }
@@ -815,7 +859,7 @@ impl<H: ShellHost> Shell<H> {
                 if !silent {
                     self.host.write_debug("Shutting down NewOS...\n");
                 }
-                return ExecOutcome::Exit(QemuExitCode::Success);
+                return ExecOutcome::Exit(ShutdownStatus::Success);
             }
             "clear" => {
                 if !silent {
@@ -1830,11 +1874,11 @@ mod tests {
 
         assert_eq!(
             sh.exec_line("exit"),
-            ExecOutcome::Exit(QemuExitCode::Success)
+            ExecOutcome::Exit(ShutdownStatus::Success)
         );
         assert_eq!(
             sh.exec_line("shutdown"),
-            ExecOutcome::Exit(QemuExitCode::Success)
+            ExecOutcome::Exit(ShutdownStatus::Success)
         );
     }
 
@@ -2294,5 +2338,56 @@ mod tests {
                 "eval_pipeline_ref(`{cmd}`) should be empty"
             );
         }
+    }
+
+    #[test]
+    fn read_line_supports_utf8_input_and_scalar_backspace() {
+        struct Utf8InputHost {
+            input: [u8; 32],
+            len: usize,
+            pos: usize,
+        }
+        impl ShellHost for Utf8InputHost {
+            fn write_debug(&mut self, _s: &str) {}
+            fn sys_info(&mut self) -> SysInfo {
+                SysInfo {
+                    online_cpus: 4,
+                    proc_count: 2,
+                    interactive_shell: true,
+                }
+            }
+            fn read_debug_byte(&mut self) -> Result<u8, SysError> {
+                if self.pos < self.len {
+                    let b = self.input[self.pos];
+                    self.pos += 1;
+                    Ok(b)
+                } else {
+                    Err(SysError::WouldBlock)
+                }
+            }
+        }
+
+        // Type "aλ🦀", backspace once (pops 4-byte '🦀'), type "b\n" -> "aλb"
+        let mut input = [0u8; 32];
+        let mut n = 0usize;
+        for &b in "aλ🦀".as_bytes() {
+            input[n] = b;
+            n += 1;
+        }
+        input[n] = 0x7F; // backspace
+        n += 1;
+        input[n] = b'b';
+        n += 1;
+        input[n] = b'\n';
+        n += 1;
+
+        let mut sh = Shell::new(Utf8InputHost {
+            input,
+            len: n,
+            pos: 0,
+        });
+        let mut line_buf = [0u8; LINE_BUF_SIZE];
+        let len = sh.read_line(&mut line_buf);
+        assert_eq!(core::str::from_utf8(&line_buf[..len]), Ok("aλb"));
     }
 }

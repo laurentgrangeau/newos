@@ -47,18 +47,12 @@ fn main() -> ! {
         }
     }
 
-    // Non-root process has no `PowerControl` cap or `ThreadExit` syscall; park cleanly.
-    loop {
-        if newos_user_rt::yield_now().is_err() {
-            core::hint::spin_loop();
-        }
-    }
+    // Terminate cleanly via `ThreadExit` (no `PowerControl` cap required).
+    newos_user_rt::thread_exit()
 }
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     let _ = newos_user_rt::ipc_log_write(CapId::BOOTSTRAP_LOG_EP, "[worker] PANIC in EL0\n");
-    loop {
-        let _ = newos_user_rt::yield_now();
-    }
+    newos_user_rt::thread_exit()
 }

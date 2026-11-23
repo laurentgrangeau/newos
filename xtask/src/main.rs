@@ -1,3 +1,5 @@
+mod gpt;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,6 +10,7 @@ const LIMINE_REPO: &str = "https://github.com/limine-bootloader/limine.git";
 const TARGET_TRIPLE: &str = "aarch64-unknown-none";
 const TARGET_CPU: &str = "cortex-a76";
 const EFI_FILENAME: &str = "BOOTAA64.EFI";
+const UEFI_DISK_BYTES: u64 = 64 * 1024 * 1024;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -16,21 +19,23 @@ fn main() -> ExitCode {
     let release = args.iter().any(|a| a == "--release");
 
     let result = match cmd {
-        "build" => build_iso(true, release).map(|_| ()),
+        "build" => build_uefi_disk(true, release).map(|_| ()),
         "run" => run_qemu(true, release),
         "test" => run_tests(release),
         "host-test" => run_host_tests(release),
+        "miri" => run_miri_tests(),
+        "verify" => run_kani_verify(),
         "rpi5-image" => build_rpi5_image(release).map(|_| ()),
         "bench" => run_bench(&args[1..]),
         "help" | "-h" | "--help" => {
             eprintln!(
-                "Usage: cargo xtask <rpi5-image|build|run|test|host-test|bench> [--release]\n\
+                "Usage: cargo xtask <rpi5-image|build|run|test|host-test|miri|verify|bench> [--release]\n\
                  Target: Raspberry Pi 5 16 GB (BCM2712 Cortex-A76, aarch64-unknown-none)"
             );
             Ok(())
         }
         other => Err(format!(
-            "unknown subcommand `{other}`\nUsage: cargo xtask <rpi5-image|build|run|test|host-test|bench> [--release]"
+            "unknown subcommand `{other}`\nUsage: cargo xtask <rpi5-image|build|run|test|host-test|miri|verify|bench> [--release]"
         )),
     };
 
@@ -70,7 +75,7 @@ fn run_checked(cmd: &mut Command, label: &str) -> Result<(), String> {
 fn build_kernel(root: &Path, release: bool) -> Result<PathBuf, String> {
     let linker_script = root.join("crates/kernel/linker-aarch64.ld");
     let rustflags = format!(
-        "-C link-arg=-T{} -C relocation-model=static -C target-cpu={TARGET_CPU}",
+        "-C link-arg=-T{} -C relocation-model=pie -C link-arg=-pie -C target-cpu={TARGET_CPU} -Z branch-protection=bti,pac-ret -Z sanitizer=kcfi",
         linker_script.display()
     );
 
@@ -100,8 +105,9 @@ fn build_kernel(root: &Path, release: bool) -> Result<PathBuf, String> {
 
 fn build_user_elf(root: &Path, pkg: &str, dir: &str, release: bool) -> Result<PathBuf, String> {
     let linker_script = root.join(format!("crates/{dir}/linker-aarch64.ld"));
+    let target_json = root.join("targets/aarch64-newos-user.json");
     let rustflags = format!(
-        "-C link-arg=-T{} -C relocation-model=static -C target-cpu={TARGET_CPU}",
+        "-C link-arg=-T{} -C relocation-model=pie -C link-arg=-pie -C target-cpu={TARGET_CPU} -Z fixed-x18 -Z branch-protection=bti,pac-ret -Z sanitizer=kcfi -Z sanitizer=shadow-call-stack",
         linker_script.display()
     );
 
@@ -111,7 +117,9 @@ fn build_user_elf(root: &Path, pkg: &str, dir: &str, release: bool) -> Result<Pa
         "--package",
         pkg,
         "--target",
-        TARGET_TRIPLE,
+        target_json.to_str().ok_or("invalid user target path")?,
+        "-Z",
+        "json-target-spec",
         "-Z",
         "build-std=core,compiler_builtins",
         "-Z",
@@ -120,11 +128,14 @@ fn build_user_elf(root: &Path, pkg: &str, dir: &str, release: bool) -> Result<Pa
     if release {
         cmd.arg("--release");
     }
-    run_checked(&mut cmd, &format!("cargo build ({pkg} aarch64/cortex-a76)"))?;
+    run_checked(
+        &mut cmd,
+        &format!("cargo build ({pkg} aarch64-newos-user/kcfi+scs)"),
+    )?;
 
     Ok(root
         .join("target")
-        .join(TARGET_TRIPLE)
+        .join("aarch64-newos-user")
         .join(profile_dir(release))
         .join(pkg))
 }
@@ -150,29 +161,66 @@ fn ensure_limine(root: &Path) -> Result<PathBuf, String> {
     Ok(limine_dir)
 }
 
-/// Build a pure 64-bit AArch64 UEFI bootable ISO for the local QEMU `virt` test harness.
-fn build_iso(interactive: bool, release: bool) -> Result<PathBuf, String> {
+/// Format a FAT32 EFI System Partition image from staged entries and wrap it in a UEFI GPT disk.
+fn package_gpt_esp_image(
+    disk_path: &Path,
+    esp_tmp_path: &Path,
+    vol_label: &str,
+    gpt_label: &str,
+    entries: &[PathBuf],
+) -> Result<(), String> {
+    let esp_bytes = gpt::esp_partition_bytes(UEFI_DISK_BYTES)?;
+    let esp_file = fs::File::create(esp_tmp_path).map_err(|e| format!("create ESP: {e}"))?;
+    esp_file
+        .set_len(esp_bytes)
+        .map_err(|e| format!("resize ESP: {e}"))?;
+    drop(esp_file);
+
+    let esp_str = esp_tmp_path.to_str().ok_or("invalid ESP path")?;
+    let mkfs_bin = ["/usr/sbin/mkfs.vfat", "/sbin/mkfs.vfat"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+        .unwrap_or("mkfs.vfat");
+    let mut mkfs = Command::new(mkfs_bin);
+    mkfs.args(["-F", "32", "-n", vol_label, esp_str]);
+    run_checked(&mut mkfs, "mkfs.vfat")?;
+
+    let mut mcopy = Command::new("mcopy");
+    mcopy.args(["-s", "-i", esp_str]);
+    for entry in entries {
+        mcopy.arg(entry.to_str().ok_or("bad staged path")?);
+    }
+    mcopy.arg("::/");
+    run_checked(&mut mcopy, "mcopy")?;
+
+    gpt::write_gpt_disk_image(disk_path, esp_tmp_path, UEFI_DISK_BYTES, gpt_label)?;
+    let _ = fs::remove_file(esp_tmp_path);
+    Ok(())
+}
+
+/// Build a pure 64-bit AArch64 UEFI GPT + FAT32 ESP disk image for the QEMU `virt` test harness.
+fn build_uefi_disk(interactive: bool, release: bool) -> Result<PathBuf, String> {
     let root = workspace_root();
     let kernel_elf = build_kernel(&root, release)?;
     let init_elf = build_user_elf(&root, "newos-init", "init", release)?;
     let worker_elf = build_user_elf(&root, "newos-worker", "worker", release)?;
     let limine_dir = ensure_limine(&root)?;
 
-    let iso_root = root.join("target/iso_root_aarch64");
-    if iso_root.exists() {
-        fs::remove_dir_all(&iso_root).map_err(|e| format!("failed to clean iso_root: {e}"))?;
+    let stage = root.join("target/esp_root_aarch64");
+    if stage.exists() {
+        fs::remove_dir_all(&stage).map_err(|e| format!("failed to clean esp_root: {e}"))?;
     }
 
-    let boot_limine = iso_root.join("boot/limine");
-    let efi_boot = iso_root.join("EFI/BOOT");
+    let boot_limine = stage.join("boot/limine");
+    let efi_boot = stage.join("EFI/BOOT");
     fs::create_dir_all(&boot_limine).map_err(|e| e.to_string())?;
     fs::create_dir_all(&efi_boot).map_err(|e| e.to_string())?;
 
-    fs::copy(&kernel_elf, iso_root.join("boot/newos-kernel"))
+    fs::copy(&kernel_elf, stage.join("boot/newos-kernel"))
         .map_err(|e| format!("failed to copy kernel ELF: {e}"))?;
-    fs::copy(&init_elf, iso_root.join("boot/newos-init"))
+    fs::copy(&init_elf, stage.join("boot/newos-init"))
         .map_err(|e| format!("failed to copy init ELF: {e}"))?;
-    fs::copy(&worker_elf, iso_root.join("boot/newos-worker"))
+    fs::copy(&worker_elf, stage.join("boot/newos-worker"))
         .map_err(|e| format!("failed to copy worker ELF: {e}"))?;
 
     let cmdline = if interactive {
@@ -192,40 +240,28 @@ fn build_iso(interactive: bool, release: bool) -> Result<PathBuf, String> {
     );
     fs::write(boot_limine.join("limine.conf"), limine_conf)
         .map_err(|e| format!("failed to write limine.conf: {e}"))?;
-
-    fs::copy(
-        limine_dir.join("limine-uefi-cd.bin"),
-        boot_limine.join("limine-uefi-cd.bin"),
-    )
-    .map_err(|e| format!("failed to copy limine-uefi-cd.bin: {e}"))?;
     fs::copy(limine_dir.join(EFI_FILENAME), efi_boot.join(EFI_FILENAME))
         .map_err(|e| format!("failed to copy {EFI_FILENAME}: {e}"))?;
 
-    let iso_path = root.join("target/newos-aarch64.iso");
-    let mut xorriso = Command::new("xorriso");
-    xorriso.args([
-        "-as",
-        "mkisofs",
-        "-R",
-        "-r",
-        "-J",
-        "--efi-boot",
-        "boot/limine/limine-uefi-cd.bin",
-        "-efi-boot-part",
-        "--efi-boot-image",
-        "--protective-msdos-label",
-        iso_root.to_str().ok_or("invalid iso_root path")?,
-        "-o",
-        iso_path.to_str().ok_or("invalid iso path")?,
-    ]);
-    run_checked(&mut xorriso, "xorriso")?;
+    let disk_path = root.join("target/newos-aarch64.img");
+    let esp_tmp = root.join("target/newos-aarch64-esp.fat");
+    package_gpt_esp_image(
+        &disk_path,
+        &esp_tmp,
+        "NEWOS",
+        "NEWOS ESP",
+        &[stage.join("EFI"), stage.join("boot")],
+    )?;
 
-    println!("[xtask] built pure AArch64 UEFI ISO {}", iso_path.display());
-    Ok(iso_path)
+    println!(
+        "[xtask] built pure AArch64 UEFI GPT+FAT32 ESP image {}",
+        disk_path.display()
+    );
+    Ok(disk_path)
 }
 
-/// Build a 64 MiB FAT32 boot image (`target/newos-rpi5.img`) + staging folder (`target/rpi5_boot/`)
-/// for Raspberry Pi 5 (16 GB, BCM2712 Cortex-A76, 3-pin JST Debug UART `0x10_7D00_1000`).
+/// Build a 64 MiB UEFI GPT + FAT32 ESP boot image (`target/newos-rpi5.img`) + staging folder
+/// (`target/rpi5_boot/`) for Raspberry Pi 5 (16 GB, BCM2712 Cortex-A76).
 fn build_rpi5_image(release: bool) -> Result<PathBuf, String> {
     let root = workspace_root();
     let kernel_elf = build_kernel(&root, release)?;
@@ -242,10 +278,10 @@ fn build_rpi5_image(release: bool) -> Result<PathBuf, String> {
     fs::create_dir_all(&boot_limine).map_err(|e| e.to_string())?;
     fs::create_dir_all(&efi_boot).map_err(|e| e.to_string())?;
 
-    // Raspberry Pi 5 EDK2 UEFI config.txt (place RPI_EFI.fd alongside on the FAT32 SD card)
+    // Raspberry Pi 5 EDK2 UEFI config.txt (place RPI_EFI.fd alongside on the FAT32 SD card).
+    // `disable_commandline_tags=2` is required by `worproject/rpi5-uefi` EDK2 firmware.
     let config_txt = "\
 # NewOS Raspberry Pi 5 (16 GB) UEFI + Limine Boot Config
-arm_64bit=1
 enable_uart=1
 uart_2ndstage=1
 pciex4_reset=0
@@ -281,37 +317,22 @@ serial: yes
     )
     .map_err(|e| format!("failed to copy BOOTAA64.EFI: {e}"))?;
 
-    // Create a 64 MiB FAT32 filesystem image using mkfs.vfat + mcopy (`dosfstools` + `mtools`)
     let img_path = root.join("target/newos-rpi5.img");
-    let img_file = fs::File::create(&img_path).map_err(|e| format!("create img: {e}"))?;
-    img_file
-        .set_len(64 * 1024 * 1024)
-        .map_err(|e| format!("resize img: {e}"))?;
-    drop(img_file);
-
-    let img_str = img_path.to_str().ok_or("invalid img path")?;
-    let mkfs_bin = ["/usr/sbin/mkfs.vfat", "/sbin/mkfs.vfat"]
-        .into_iter()
-        .find(|p| Path::new(p).exists())
-        .unwrap_or("mkfs.vfat");
-    let mut mkfs = Command::new(mkfs_bin);
-    mkfs.args(["-F", "32", "-n", "NEWOS", img_str]);
-    run_checked(&mut mkfs, "mkfs.vfat")?;
-
-    let mut mcopy = Command::new("mcopy");
-    mcopy.args([
-        "-s",
-        "-i",
-        img_str,
-        stage.join("config.txt").to_str().ok_or("bad path")?,
-        stage.join("EFI").to_str().ok_or("bad path")?,
-        stage.join("boot").to_str().ok_or("bad path")?,
-        "::/",
-    ]);
-    run_checked(&mut mcopy, "mcopy")?;
+    let esp_tmp = root.join("target/newos-rpi5-esp.fat");
+    package_gpt_esp_image(
+        &img_path,
+        &esp_tmp,
+        "NEWOS",
+        "NEWOS RPI5 ESP",
+        &[
+            stage.join("config.txt"),
+            stage.join("EFI"),
+            stage.join("boot"),
+        ],
+    )?;
 
     println!(
-        "[xtask] built Raspberry Pi 5 FAT32 boot image: {}",
+        "[xtask] built Raspberry Pi 5 UEFI GPT+FAT32 ESP boot image: {}",
         img_path.display()
     );
     println!("[xtask] staging directory: {}", stage.display());
@@ -340,6 +361,38 @@ fn run_host_tests(release: bool) -> Result<(), String> {
         cmd.arg("--release");
     }
     run_checked(&mut cmd, "cargo test (host)")
+}
+
+/// Run Miri UB / aliasing / provenance checks across all host-testable `#![forbid(unsafe_code)]` crates.
+fn run_miri_tests() -> Result<(), String> {
+    let root = workspace_root();
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&root).args([
+        "miri",
+        "test",
+        "--package",
+        "newos-abi",
+        "--package",
+        "newos-kernel-core",
+        "--package",
+        "newos-shell-core",
+        "--package",
+        "newos-net",
+    ]);
+    run_checked(&mut cmd, "cargo miri test")
+}
+
+/// Run Kani bounded model checking proofs (`#[cfg(kani)]`) on `SpscRing`, `CNode`, and `UntypedInventory`.
+fn run_kani_verify() -> Result<(), String> {
+    let root = workspace_root();
+    for pkg in ["newos-abi", "newos-kernel-core"] {
+        let mut cmd = Command::new("cargo");
+        cmd.current_dir(&root).args(["kani", "--package", pkg]);
+        run_checked(&mut cmd, &format!("cargo kani ({pkg})")).map_err(|e| {
+            format!("{e} (install with `cargo install --locked kani-verifier && cargo kani setup`)")
+        })?;
+    }
+    Ok(())
 }
 
 fn run_bench(raw_args: &[String]) -> Result<(), String> {
@@ -494,9 +547,12 @@ fn find_firmware() -> Result<&'static str, String> {
 }
 
 fn run_qemu(interactive: bool, release: bool) -> Result<(), String> {
-    let iso_path = build_iso(interactive, release)?;
+    let disk_path = build_uefi_disk(interactive, release)?;
     let firmware = find_firmware()?;
-    let iso_str = iso_path.to_str().ok_or("invalid iso path")?;
+    let disk_str = disk_path.to_str().ok_or("invalid disk path")?;
+
+    let pflash_arg = format!("if=pflash,format=raw,readonly=on,file={firmware}");
+    let boot_drive_arg = format!("if=none,id=bootdisk,format=raw,readonly=on,file={disk_str}");
 
     let mut qemu = Command::new("qemu-system-aarch64");
     qemu.args([
@@ -519,10 +575,12 @@ fn run_qemu(interactive: bool, release: bool) -> Result<(), String> {
         "user,id=net0",
         "-device",
         "virtio-net-device,netdev=net0",
-        "-bios",
-        firmware,
-        "-cdrom",
-        iso_str,
+        "-drive",
+        &pflash_arg,
+        "-drive",
+        &boot_drive_arg,
+        "-device",
+        "virtio-blk-device,drive=bootdisk",
     ]);
     let status = qemu
         .status()

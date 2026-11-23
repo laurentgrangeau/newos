@@ -2,8 +2,8 @@
 
 use limine::memmap::MEMMAP_USABLE;
 use limine::request::{
-    ExecutableFileRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, MpResponse,
-    RsdpRequest,
+    ExecutableAddressRequest, ExecutableFileRequest, HhdmRequest, MemmapRequest, ModulesRequest,
+    MpRequest, MpResponse, RsdpRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 use newos_kernel_core::BootInfo;
@@ -51,6 +51,11 @@ static MODULES_REQUEST: ModulesRequest = ModulesRequest::new();
 #[cfg_attr(target_os = "none", unsafe(link_section = ".requests"))]
 static EXEC_FILE_REQUEST: ExecutableFileRequest = ExecutableFileRequest::new();
 
+// SAFETY: Limine scans `.requests` in the bare-metal ELF image for `ExecutableAddressRequest` (KASLR base).
+#[used]
+#[cfg_attr(target_os = "none", unsafe(link_section = ".requests"))]
+static EXEC_ADDR_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
+
 // SAFETY: Limine scans `.requests_end_marker` in the bare-metal ELF image.
 #[used]
 #[cfg_attr(target_os = "none", unsafe(link_section = ".requests_end_marker"))]
@@ -69,6 +74,10 @@ pub fn mp_response() -> Option<&'static MpResponse> {
 /// Extract a safe, `no_alloc` boot descriptor and bootstrap `UntypedInventory` from Limine.
 pub fn boot_info() -> BootInfo {
     let hhdm_offset = HHDM_REQUEST.response().map(|resp| resp.offset).unwrap_or(0);
+    let kernel_virt_base = EXEC_ADDR_REQUEST
+        .response()
+        .map(|resp| resp.virtual_base)
+        .unwrap_or(0);
 
     let mut untyped = UntypedInventory::new();
     if let Some(mmap) = MEMORY_MAP_REQUEST.response() {
@@ -108,6 +117,7 @@ pub fn boot_info() -> BootInfo {
 
     BootInfo {
         hhdm_offset,
+        kernel_virt_base,
         untyped,
         cpu_count,
         rsdp_addr,

@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
 use newos_abi::ring::SpscRing;
-use newos_abi::{CapId, ObjectType, QemuExitCode, Rights, SysError, SyscallNumber};
+use newos_abi::{CapId, ObjectType, ShutdownStatus, Rights, SysError, SyscallNumber};
 use newos_kernel_core::cspace::{CNode, CapObject, Capability};
 use newos_kernel_core::elf::{MAX_LOAD_SEGMENTS, parse_elf64};
 use newos_kernel_core::ipc::{IpcMessage, KernelIpcState};
@@ -932,11 +932,11 @@ fn t1_shell_builtins_and_exit_outcomes() {
     assert_eq!(sh.exec_line("clear"), ExecOutcome::Continue);
     assert_eq!(
         sh.exec_line("exit"),
-        ExecOutcome::Exit(QemuExitCode::Success)
+        ExecOutcome::Exit(ShutdownStatus::Success)
     );
     assert_eq!(
         sh.exec_line("shutdown"),
-        ExecOutcome::Exit(QemuExitCode::Success)
+        ExecOutcome::Exit(ShutdownStatus::Success)
     );
 }
 

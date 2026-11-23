@@ -13,7 +13,7 @@ pub mod gem;
 pub mod virtio;
 
 pub use gem::{GemDma, GemInfo, GemNetDevice, probe_cadence_gem};
-pub use virtio::{VirtioNetDevice, VirtioNetDma, VirtioTransport};
+pub use virtio::{MmioDmaTransport, VirtioNetDevice, VirtioNetDma};
 
 use newos_abi::SysError;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
@@ -23,7 +23,7 @@ use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     DnsQueryType, EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr,
-    Ipv4Address,
+    Ipv4Address, Ipv6Address,
 };
 
 const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976; // "virt"
@@ -464,7 +464,7 @@ pub fn run_icmp_ping<D: Device>(
 }
 
 /// High-level live DHCPv4 acquisition over either VirtIO-net (QEMU) or RP1 Cadence GEM (Pi 5).
-pub fn live_dhcp_v4<T: VirtioTransport>(
+pub fn live_dhcp_v4<T: MmioDmaTransport>(
     transport: T,
     nic: NicKind,
     virtio_dma: &VirtioNetDma,
@@ -486,7 +486,7 @@ pub fn live_dhcp_v4<T: VirtioTransport>(
 }
 
 /// High-level live ICMP Echo ping over either VirtIO-net (QEMU) or RP1 Cadence GEM (Pi 5).
-pub fn live_icmp_ping<T: VirtioTransport>(
+pub fn live_icmp_ping<T: MmioDmaTransport>(
     transport: T,
     nic: NicKind,
     cfg: &NetConfig,
@@ -511,7 +511,7 @@ pub fn live_icmp_ping<T: VirtioTransport>(
 
 /// High-level live DNS A-record resolution using a real monotonic `NetClock`.
 #[allow(clippy::too_many_arguments)]
-pub fn live_dns_resolve_with_clock<T: VirtioTransport, C: NetClock>(
+pub fn live_dns_resolve_with_clock<T: MmioDmaTransport, C: NetClock>(
     transport: T,
     clock: &mut C,
     nic: NicKind,
@@ -537,7 +537,7 @@ pub fn live_dns_resolve_with_clock<T: VirtioTransport, C: NetClock>(
 }
 
 /// High-level live DNS A-record resolution over either VirtIO-net (QEMU) or RP1 Cadence GEM (Pi 5).
-pub fn live_dns_resolve<T: VirtioTransport>(
+pub fn live_dns_resolve<T: MmioDmaTransport>(
     transport: T,
     nic: NicKind,
     cfg: &NetConfig,
@@ -686,7 +686,7 @@ pub fn run_tcp_exchange<D: Device, C: NetClock>(
 
 /// High-level live IPv4 TCP exchange over VirtIO-net (QEMU) or RP1 Cadence GEM (Pi 5).
 #[allow(clippy::too_many_arguments)]
-pub fn live_tcp_exchange<T: VirtioTransport, C: NetClock>(
+pub fn live_tcp_exchange<T: MmioDmaTransport, C: NetClock>(
     transport: T,
     clock: &mut C,
     nic: NicKind,
@@ -737,6 +737,134 @@ pub fn live_tcp_exchange<T: VirtioTransport, C: NetClock>(
     }
 }
 
+/// Derive an RFC 4291 EUI-64 IPv6 link-local address (`fe80::/64`) from a 48-bit MAC address.
+pub const fn ipv6_link_local_from_mac(mac: [u8; 6]) -> [u8; 16] {
+    [
+        0xfe,
+        0x80,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        mac[0] ^ 0x02,
+        mac[1],
+        mac[2],
+        0xff,
+        0xfe,
+        mac[3],
+        mac[4],
+        mac[5],
+    ]
+}
+
+/// Resolve a hostname to an IPv6 address via `smoltcp` DNS AAAA-record query (`no_alloc`).
+pub fn run_dns_query_aaaa_with_clock<D: Device, C: NetClock>(
+    device: &mut D,
+    clock: &mut C,
+    mac: [u8; 6],
+    cfg: &NetConfig,
+    hostname: &str,
+    timeout_ms: i64,
+) -> Result<[u8; 16], &'static str> {
+    let start_ms = clock.now_millis();
+    let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    let mut iface = Interface::new(config, device, Instant::from_millis(start_ms));
+    iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(
+            IpAddress::Ipv4(Ipv4Address::from(cfg.ip)),
+            cfg.prefix_len,
+        ));
+        let _ = addrs.push(IpCidr::new(
+            IpAddress::Ipv6(Ipv6Address::from(ipv6_link_local_from_mac(mac))),
+            64,
+        ));
+    });
+    if let Some(gw) = cfg.gateway {
+        let _ = iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::from(gw));
+    }
+
+    let dns_ip = cfg.dns.unwrap_or([1, 1, 1, 1]);
+    let servers = [IpAddress::Ipv4(Ipv4Address::from(dns_ip))];
+    let mut queries = [None; 1];
+    let dns_sock = dns::Socket::new(&servers, &mut queries[..]);
+
+    let mut storage = [SocketStorage::EMPTY; 1];
+    let mut sockets = SocketSet::new(&mut storage[..]);
+    let handle = sockets.add(dns_sock);
+
+    let query = sockets
+        .get_mut::<dns::Socket>(handle)
+        .start_query(iface.context(), hostname, DnsQueryType::Aaaa)
+        .map_err(|_| "dns aaaa start_query failed")?;
+
+    loop {
+        let now_ms = clock.now_millis();
+        if now_ms.saturating_sub(start_ms) > timeout_ms {
+            return Err("dns aaaa query timed out");
+        }
+        let _ = iface.poll(Instant::from_millis(now_ms), device, &mut sockets);
+        match sockets
+            .get_mut::<dns::Socket>(handle)
+            .get_query_result(query)
+        {
+            Ok(addrs) => {
+                if let Some(IpAddress::Ipv6(v6)) = addrs.first() {
+                    return Ok(v6.octets());
+                }
+                return Err("dns returned no IPv6 address");
+            }
+            Err(dns::GetQueryResultError::Pending) => {}
+            Err(dns::GetQueryResultError::Failed) => return Err("dns aaaa query failed"),
+        }
+    }
+}
+
+/// Verify the pure-Rust EL0 `smoltcp` Ethernet + IPv6 link-local + UDP stack end-to-end (`no_alloc`).
+pub fn verify_smoltcp_ipv6_el0_stack(mac: [u8; 6]) -> Result<usize, &'static str> {
+    let mut device = LoopbackEth::new();
+    let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
+    let ll = ipv6_link_local_from_mac(mac);
+    iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::from(ll)), 64));
+    });
+
+    let mut rx_meta = [PacketMetadata::EMPTY; 2];
+    let mut rx_data = [0u8; 128];
+    let mut tx_meta = [PacketMetadata::EMPTY; 2];
+    let mut tx_data = [0u8; 128];
+    let mut udp_sock = udp::Socket::new(
+        PacketBuffer::new(&mut rx_meta[..], &mut rx_data[..]),
+        PacketBuffer::new(&mut tx_meta[..], &mut tx_data[..]),
+    );
+    udp_sock.bind(5353).map_err(|_| "ipv6 udp bind failed")?;
+
+    let mut storage = [SocketStorage::EMPTY; 1];
+    let mut sockets = SocketSet::new(&mut storage[..]);
+    let handle = sockets.add(udp_sock);
+
+    // Send UDP packet to link-local all-nodes multicast (`ff02::1`) — emits IPv6 frame immediately.
+    let all_nodes = Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+    sockets
+        .get_mut::<udp::Socket>(handle)
+        .send_slice(b"newos-ipv6", (IpAddress::Ipv6(all_nodes), 5353))
+        .map_err(|_| "ipv6 udp send failed")?;
+
+    let _ = iface.poll(Instant::from_millis(10), &mut device, &mut sockets);
+    if device.len < 62 {
+        return Err("expected IPv6 Ethernet frame from smoltcp");
+    }
+    // EtherType 0x86DD (IPv6)
+    if device.buf[12..14] != [0x86, 0xDD] {
+        return Err("expected IPv6 EtherType 0x86DD");
+    }
+    Ok(device.len)
+}
+
 /// Parse a dotted-quad IPv4 string (`"1.1.1.1"`) without heap allocation.
 pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     let mut out = [0u8; 4];
@@ -764,6 +892,20 @@ mod tests {
     }
 
     #[test]
+    fn smoltcp_ipv6_link_local_eui64_and_udp_frame() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let ll = ipv6_link_local_from_mac(mac);
+        assert_eq!(
+            ll,
+            [
+                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x50, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x56
+            ]
+        );
+        let frame_len = verify_smoltcp_ipv6_el0_stack(mac).expect("smoltcp ipv6 self-test");
+        assert!(frame_len >= 62);
+    }
+
+    #[test]
     fn virtio_probe_finds_net_device_and_mac() {
         let info = probe_virtio_net(|off| match off {
             0x400 => Ok(VIRTIO_MMIO_MAGIC),
@@ -785,7 +927,7 @@ mod tests {
         dmacfg: AtomicU32,
     }
 
-    impl VirtioTransport for &MockGemTransport {
+    impl MmioDmaTransport for &MockGemTransport {
         fn read32(&self, offset: u64) -> Result<u32, SysError> {
             match offset {
                 gem::REG_MID => Ok(0x0007_0109), // Raspberry Pi 5 RP1 Cadence GEM rev 1p09

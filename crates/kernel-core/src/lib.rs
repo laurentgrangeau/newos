@@ -6,11 +6,14 @@
 //! All hardware interaction is injected via safe traits; this crate contains
 //! zero `unsafe` blocks and zero dynamic heap allocations.
 
+pub mod acpi;
 pub mod cspace;
 pub mod elf;
 pub mod ipc;
 pub mod memory;
 pub mod sched;
+pub mod sha256;
+pub mod smmu;
 
 pub use ipc::{IpcMessage, IpcStats, KernelIpcState};
 
@@ -19,15 +22,18 @@ use cspace::{CNode, CapObject, Capability};
 use memory::{
     CpuSecurityFeatures, PAGE_SIZE, PageFlags, PhysAddr, UntypedInventory, VSpaceMapper, VirtAddr,
 };
-use newos_abi::{QemuExitCode, Rights, SysError};
+use newos_abi::{Rights, ShutdownStatus, SysError};
 
 const USER_STACK_BASE: u64 = 0x0000_7fff_f000_0000;
-const USER_STACK_PAGES: u64 = 16; // 64 KiB EL0 stack
+const USER_STACK_PAGES: u64 = 16; // 64 KiB EL0 data stack
+const USER_SHADOW_STACK_BASE: u64 = 0x0000_7fff_e000_0000;
+const USER_SHADOW_STACK_PAGES: u64 = 2; // 8 KiB EL0 Shadow Call Stack (`x18`, grows upward)
 
 /// Fixed-size, `no_alloc` boot descriptor handed from `newos-hal` to `newos-kernel-core`.
 #[derive(Debug, Clone, Copy)]
 pub struct BootInfo {
     pub hhdm_offset: u64,
+    pub kernel_virt_base: u64,
     pub untyped: UntypedInventory,
     pub cpu_count: usize,
     pub rsdp_addr: u64,
@@ -66,13 +72,18 @@ pub trait HalPlatform: Write {
     fn register_user_process(
         &mut self,
         entry: VirtAddr,
-        user_rsp: VirtAddr,
+        user_sp: VirtAddr,
+        user_shadow_sp: VirtAddr,
         vspace_root: PhysAddr,
     ) -> Result<usize, SysError>;
+    /// Return a 64-bit entropy word for ASLR stack/PIE randomization (defaults to 0 in mocks).
+    fn random_u64(&mut self) -> u64 {
+        0
+    }
     /// Hand remaining bootstrap `UntypedInventory` to the HAL for runtime `MapPage`/`UnmapPage` syscalls.
     fn install_runtime_untyped(&mut self, _untyped: UntypedInventory) {}
     fn start_userspace(&mut self) -> !;
-    fn exit(&mut self, code: QemuExitCode) -> !;
+    fn exit(&mut self, code: ShutdownStatus) -> !;
 }
 
 /// Microkernel boot entry: verify Phases 1–3 + SMP, then load isolated EL0 `init` & `worker`.
@@ -91,8 +102,9 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
     );
     let _ = writeln!(
         platform,
-        "[newos] HHDM={:#018x}, RAM={} MiB ({} untyped regions), SMP={}/{} CPUs online, RSDP={:#x}",
+        "[newos] HHDM={:#018x}, KASLR_BASE={:#018x}, RAM={} MiB ({} untyped regions), SMP={}/{} CPUs online, RSDP={:#x}",
         info.hhdm_offset,
+        info.kernel_virt_base,
         info.usable_mib(),
         info.untyped.region_count(),
         platform.online_cpus(),
@@ -101,12 +113,17 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
     );
     let _ = writeln!(
         platform,
-        "[newos] CPU hardening: WP={}, NXE={}, SMEP={}, SMAP={}, UMIP={} (bsp_cpu_id={})",
-        sec.wp,
-        sec.nxe,
-        sec.smep,
-        sec.smap,
-        sec.umip,
+        "[newos] CPU hardening: PXN={}, UXN={}, PAN={}, W^X={}, SSBS={}, CSV2={}, CSV3={}, PAC={}, BTI={}, MTE={} (bsp_cpu_id={})",
+        sec.pxn,
+        sec.uxn,
+        sec.pan,
+        sec.wx_enforced,
+        sec.ssbs,
+        sec.csv2,
+        sec.csv3,
+        sec.pac,
+        sec.bti,
+        sec.mte,
         platform.current_cpu_id(),
     );
 
@@ -115,7 +132,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
             platform,
             "[newos] FAIL: SMP secondary cores did not come online"
         );
-        platform.exit(QemuExitCode::Failed);
+        platform.exit(ShutdownStatus::Failed);
     }
 
     // Phase 1: VBAR_EL1 #BRK & ARM Generic Timer verification
@@ -123,7 +140,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
     platform.trigger_breakpoint();
     if platform.breakpoint_count() != before_bp + 1 {
         let _ = writeln!(platform, "[newos] FAIL: VBAR_EL1 brk #0 self-check failed");
-        platform.exit(QemuExitCode::Failed);
+        platform.exit(ShutdownStatus::Failed);
     }
 
     let before_timer = platform.timer_count();
@@ -144,7 +161,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
     // Phase 2: Pure seL4 Untyped retype + 4-level VSpace map / probe / unmap verification
     if let Err(err) = verify_phase2_memory(platform, &mut info.untyped) {
         let _ = writeln!(platform, "[newos] FAIL: phase-2 memory self-check: {err:?}");
-        platform.exit(QemuExitCode::Failed);
+        platform.exit(ShutdownStatus::Failed);
     }
     let _ = writeln!(
         platform,
@@ -163,7 +180,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
         }
         Err(err) => {
             let _ = writeln!(platform, "[newos] FAIL: phase-3 CSpace self-check: {err:?}");
-            platform.exit(QemuExitCode::Failed);
+            platform.exit(ShutdownStatus::Failed);
         }
     }
 
@@ -173,14 +190,14 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
             platform,
             "[newos] FAIL: missing Limine boot module `newos-init`"
         );
-        platform.exit(QemuExitCode::Failed);
+        platform.exit(ShutdownStatus::Failed);
     };
     let Some(worker_bytes) = info.worker_module else {
         let _ = writeln!(
             platform,
             "[newos] FAIL: missing Limine boot module `newos-worker`"
         );
-        platform.exit(QemuExitCode::Failed);
+        platform.exit(ShutdownStatus::Failed);
     };
 
     match spawn_isolated_process(platform, "init", init_bytes, &mut info.untyped)
@@ -195,7 +212,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
                 platform,
                 "[newos] FAIL: failed to spawn EL0 processes: {err:?}"
             );
-            platform.exit(QemuExitCode::Failed);
+            platform.exit(ShutdownStatus::Failed);
         }
     }
 }
@@ -206,26 +223,44 @@ fn spawn_isolated_process<P: HalPlatform>(
     elf_bytes: &[u8],
     untyped: &mut UntypedInventory,
 ) -> Result<(), SysError> {
+    let sha_prefix = sha256::digest_prefix_u64(elf_bytes);
+    let entropy = platform.random_u64();
+    let stack_slide = (entropy & 0xFF) * PAGE_SIZE;
+    let pie_base = 0x0040_0000u64 + (((entropy >> 8) & 0xFF) * PAGE_SIZE);
+    let shadow_slide = ((entropy >> 16) & 0xFF) * PAGE_SIZE;
     let mut user_vspace = platform.create_user_vspace(untyped)?;
-    let (entry, user_rsp, segs) = load_elf64_into_vspace(&mut user_vspace, elf_bytes, untyped)?;
+    let (entry, user_sp, user_shadow_sp, segs) = load_elf64_into_vspace(
+        &mut user_vspace,
+        elf_bytes,
+        untyped,
+        pie_base,
+        stack_slide,
+        shadow_slide,
+    )?;
     let root = user_vspace.root_phys();
-    let pid = platform.register_user_process(entry, user_rsp, root)?;
+    let pid = platform.register_user_process(entry, user_sp, user_shadow_sp, root)?;
     let _ = writeln!(
         platform,
-        "[newos] spawned EL0 `{name}` (pid={pid}, ttbr0={:#018x}, entry={:#018x}, segs={segs})",
+        "[newos] spawned EL0 `{name}` (pid={pid}, ttbr0={:#018x}, entry={:#018x}, sp={:#018x}, scs={:#018x}, segs={segs}, sha256={sha_prefix:#018x})",
         root.raw(),
         entry.raw(),
+        user_sp.raw(),
+        user_shadow_sp.raw(),
     );
     Ok(())
 }
 
-/// Pure `#![forbid(unsafe_code)]`, `no_alloc` ELF64 loader mapping a binary into an isolated `VSpace`.
+/// Pure `#![forbid(unsafe_code)]`, `no_alloc` ELF64 loader mapping an `ET_EXEC` or PIE `ET_DYN`
+/// binary into an isolated `VSpace` with ASLR code/stack/SCS slides and `R_AARCH64_RELATIVE` relocations.
 fn load_elf64_into_vspace<V: VSpaceMapper>(
     vspace: &mut V,
     elf_bytes: &[u8],
     untyped: &mut UntypedInventory,
-) -> Result<(VirtAddr, VirtAddr, usize), SysError> {
-    let parsed = elf::parse_elf64(elf_bytes)?;
+    pie_base: u64,
+    stack_slide: u64,
+    shadow_slide: u64,
+) -> Result<(VirtAddr, VirtAddr, VirtAddr, usize), SysError> {
+    let parsed = elf::parse_elf64_with_base(elf_bytes, pie_base)?;
 
     for seg in parsed.segments() {
         if seg.mem_size == 0 {
@@ -267,17 +302,54 @@ fn load_elf64_into_vspace<V: VSpaceMapper>(
         }
     }
 
-    // Map 64 KiB EL0 stack (USER | RW | UXN/PXN)
+    // Apply `R_AARCH64_RELATIVE` relocations for PIE (`ET_DYN`) binaries before entering EL0.
+    if parsed.is_pie {
+        parsed.for_each_relative_reloc(elf_bytes, |reloc| {
+            let target_va = parsed
+                .load_base
+                .checked_add(reloc.offset)
+                .ok_or(SysError::InvalidArgument)?;
+            let va = VirtAddr::new_canonical(target_va)?;
+            let (pa, flags) = vspace.translate(va).ok_or(SysError::InvalidArgument)?;
+            if !flags.user || !flags.writable {
+                return Err(SysError::InsufficientRights);
+            }
+            let page_pa = PhysAddr::new(pa.raw() & !memory::PAGE_MASK);
+            let page_off = (pa.raw() & memory::PAGE_MASK) as usize;
+            let frame = memory::PhysFrame::from_aligned(page_pa)?;
+            let relocated = (parsed.load_base as i64).wrapping_add(reloc.addend) as u64;
+            vspace.write_frame_bytes(&frame, page_off, &relocated.to_le_bytes())
+        })?;
+    }
+
+    // Map 64 KiB EL0 stack (USER | RW | UXN/PXN) with ASLR slide (page-aligned downward offset)
+    let stack_base = USER_STACK_BASE.saturating_sub(stack_slide & !memory::PAGE_MASK);
     let stack_flags = PageFlags::new_wx(true, false, true, false)?;
     for page in 0..USER_STACK_PAGES {
         let frame = untyped.retype_frame()?;
         vspace.zero_frame(&frame);
-        let virt = VirtAddr::new_page_aligned(USER_STACK_BASE + page * PAGE_SIZE)?;
+        let virt = VirtAddr::new_page_aligned(stack_base + page * PAGE_SIZE)?;
         vspace.map_4k(virt, frame, stack_flags, untyped)?;
     }
 
-    let user_rsp = VirtAddr::new_canonical(USER_STACK_BASE + USER_STACK_PAGES * PAGE_SIZE)?;
-    Ok((parsed.entry, user_rsp, parsed.segment_count()))
+    let user_sp = VirtAddr::new_canonical(stack_base + USER_STACK_PAGES * PAGE_SIZE)?;
+
+    // Map 8 KiB EL0 Shadow Call Stack (`x18`, grows upward, USER | RW | UXN/PXN) with ASLR slide
+    let shadow_base = USER_SHADOW_STACK_BASE.saturating_sub(shadow_slide & !memory::PAGE_MASK);
+    for page in 0..USER_SHADOW_STACK_PAGES {
+        let frame = untyped.retype_frame()?;
+        vspace.zero_frame(&frame);
+        let virt = VirtAddr::new_page_aligned(shadow_base + page * PAGE_SIZE)?;
+        vspace.map_4k(virt, frame, stack_flags, untyped)?;
+    }
+    let user_shadow_sp = VirtAddr::new_canonical(shadow_base)?;
+
+    Ok((
+        parsed.entry,
+        user_sp,
+        user_shadow_sp,
+        parsed.segment_count(),
+    ))
 }
 
 fn verify_phase2_memory<P: HalPlatform>(
@@ -368,6 +440,7 @@ mod tests {
         assert!(untyped.push_raw_region(0x10_0000, 256 * 1024 * 1024));
         let info = BootInfo {
             hhdm_offset: 0xffff_8000_0000_0000,
+            kernel_virt_base: 0xffff_ffff_8000_0000,
             untyped,
             cpu_count: 4,
             rsdp_addr: 0x000e_0000,

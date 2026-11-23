@@ -369,6 +369,23 @@ impl<const SLOTS: usize> CNode<SLOTS> {
         }
     }
 
+    /// Bind the target `UntypedInventory` region index on an existing `CapObject::Untyped` cap during boot.
+    pub fn bind_untyped_region(&mut self, id: CapId, region_index: u16) -> Result<(), SysError> {
+        let (idx, _) = self.validate_cap(id)?;
+        let Some(cap) = self.slots[idx].cap.as_mut() else {
+            return Err(SysError::InvalidCapability);
+        };
+        match &mut cap.object {
+            CapObject::Untyped {
+                region_index: slot_region,
+            } => {
+                *slot_region = region_index;
+                Ok(())
+            }
+            _ => Err(SysError::InvalidArgument),
+        }
+    }
+
     /// Resolve a `CapId` and verify it carries at least `required` rights.
     #[inline(always)]
     pub fn lookup(&self, id: CapId, required: Rights) -> Result<&Capability, SysError> {
@@ -1323,5 +1340,64 @@ mod tests {
             c80.lookup(child70, Rights::NONE),
             Err(SysError::InvalidCapability)
         );
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Prove monotonic rights attenuation: `CNode::mint` NEVER grants any bit not in parent rights,
+    /// and a non-zero badge can NEVER be overwritten.
+    #[kani::proof]
+    fn cnode_mint_monotonic_attenuation_and_badge_immutability() {
+        let mut cnode: CNode<8> = CNode::new();
+        let orig_bits: u8 = kani::any();
+        let mask_bits: u8 = kani::any();
+        let badge1: u64 = kani::any();
+        let badge2: u64 = kani::any();
+        kani::assume(badge1 != 0);
+
+        let orig = Rights::from_bits_truncate(orig_bits).union(Rights::GRANT);
+        let mask = Rights::from_bits_truncate(mask_bits);
+
+        let root = cnode
+            .insert_root(Capability::new(CapObject::Endpoint { id: 1 }, orig))
+            .unwrap();
+        let minted = cnode.mint(root, 2, mask, Some(badge1)).unwrap();
+        let cap = cnode.lookup(minted, Rights::NONE).unwrap();
+
+        // Monotonicity: minted rights are strictly a subset of parent rights
+        assert_eq!(cap.rights.bits() & !orig.bits(), 0);
+        assert_eq!(cap.rights.bits(), orig.bits() & mask.bits());
+        assert_eq!(cap.badge, badge1);
+
+        // Badge immutability: attempting to re-badge an already badged cap must fail
+        if cap.rights.contains(Rights::GRANT) {
+            assert_eq!(
+                cnode.mint(minted, 3, mask, Some(badge2)),
+                Err(SysError::InsufficientRights)
+            );
+        }
+    }
+
+    /// Prove generational `CapId` safety: deleting a slot permanently invalidates the old handle
+    /// even after the exact same slot is reused.
+    #[kani::proof]
+    fn cnode_stale_generation_rejected_after_reuse() {
+        let mut cnode: CNode<4> = CNode::new();
+        let id1 = cnode
+            .insert_root(Capability::new(CapObject::Endpoint { id: 1 }, Rights::ALL))
+            .unwrap();
+        cnode.delete(id1).unwrap();
+        let id2 = cnode
+            .insert_root(Capability::new(CapObject::Endpoint { id: 2 }, Rights::ALL))
+            .unwrap();
+        assert_ne!(id1, id2);
+        assert_eq!(
+            cnode.lookup(id1, Rights::NONE),
+            Err(SysError::InvalidCapability)
+        );
+        assert!(cnode.lookup(id2, Rights::NONE).is_ok());
     }
 }

@@ -3,7 +3,7 @@
 
 use core::fmt::Write as _;
 
-use newos_abi::QemuExitCode;
+use newos_abi::ShutdownStatus;
 use newos_shell_core::caos::{CaosError, ObjHash, ObjectStore};
 use newos_shell_core::shell::{BufferedWriter, ExecOutcome, Record, Shell};
 
@@ -69,7 +69,7 @@ fn tier4_shell_full_interactive_operator_deploy_rollback_seal_session() {
     assert!(hist_out.contains("ping 0xCAFE"));
 
     let (exit_outcome, exit_out) = run(&mut sh, "exit");
-    assert_eq!(exit_outcome, ExecOutcome::Exit(QemuExitCode::Success));
+    assert_eq!(exit_outcome, ExecOutcome::Exit(ShutdownStatus::Success));
     assert!(exit_out.contains("Shutting down NewOS"));
 }
 

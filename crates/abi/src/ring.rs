@@ -383,3 +383,38 @@ mod tests {
         let _ = ring.try_pop_slice(&mut out);
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Prove that `SpscRing<4>` never panics or overflows even under arbitrary corrupted peer
+    /// indices, and preserves exact FIFO ordering for valid producer/consumer sequences.
+    #[kani::proof]
+    fn spsc_ring_fifo_and_corrupted_peer_safety() {
+        let ring = SpscRing::<4>::new();
+        let a: u64 = kani::any();
+        let b: u64 = kani::any();
+        let c: u64 = kani::any();
+
+        assert_eq!(ring.try_push(a), Ok(()));
+        assert_eq!(ring.try_push(b), Ok(()));
+        assert_eq!(ring.try_push(c), Ok(()));
+        assert_eq!(ring.try_push(0), Err(SysError::WouldBlock));
+        assert_eq!(ring.try_pop(), Some(a));
+        assert_eq!(ring.try_pop(), Some(b));
+        assert_eq!(ring.try_pop(), Some(c));
+        assert_eq!(ring.try_pop(), None);
+
+        // Corrupt producer/consumer indices arbitrarily (untrusted peer model)
+        let bad_tail: usize = kani::any();
+        let bad_head: usize = kani::any();
+        ring.producer.tail.store(bad_tail, Ordering::Relaxed);
+        ring.consumer.head.store(bad_head, Ordering::Relaxed);
+        let _ = ring.len();
+        let _ = ring.is_empty();
+        let _ = ring.is_full();
+        let _ = ring.try_push(a);
+        let _ = ring.try_pop();
+    }
+}

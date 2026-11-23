@@ -31,7 +31,6 @@ apt-get install -y --no-install-recommends \
   qemu-system-arm \
   qemu-utils \
   qemu-efi-aarch64 \
-  xorriso \
   mtools \
   dosfstools \
   libssl-dev
@@ -57,8 +56,8 @@ export PATH="${CARGO_HOME}/bin:${PATH}"
 rustup component add rust-src llvm-tools-preview clippy rustfmt
 rustup target add aarch64-unknown-none
 
-# Install common Rust OS-dev cargo utilities
-cargo install bootimage cargo-binutils
+# Install Rust OS-dev cargo utilities
+cargo install cargo-binutils
 
 # Make /opt/rust usable by any SSH user on this dev VM
 chmod -R a+rwX /opt/rust

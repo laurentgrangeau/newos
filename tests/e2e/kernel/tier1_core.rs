@@ -4,7 +4,7 @@
 use std::thread;
 
 use newos_abi::ring::SpscRing;
-use newos_abi::{CapId, ObjectType, QemuExitCode, Rights, SysError, SyscallNumber};
+use newos_abi::{CapId, ObjectType, Rights, ShutdownStatus, SysError, SyscallNumber};
 use newos_kernel_core::BootInfo;
 use newos_kernel_core::cspace::{CNode, CapObject, Capability};
 use newos_kernel_core::elf::{MAX_LOAD_SEGMENTS, parse_elf64};
@@ -118,8 +118,8 @@ fn tier1_abi_object_type_and_qemu_exit_discriminants() {
     assert_eq!(ObjectType::IrqHandler as u8, 8);
     assert_eq!(ObjectType::MmioRegion as u8, 9);
 
-    assert_eq!(QemuExitCode::Success as u32, 0x10);
-    assert_eq!(QemuExitCode::Failed as u32, 0x11);
+    assert_eq!(ShutdownStatus::Success as u32, 0);
+    assert_eq!(ShutdownStatus::Failed as u32, 1);
 }
 
 // ============================================================================

@@ -2,7 +2,7 @@
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_bytes, write_volatile};
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use newos_abi::SysError;
 use newos_kernel_core::memory::{
     HUGE_PAGE_MASK_2M, PAGE_SIZE, PageFlags, PhysAddr, PhysFrame, PhysFrame2M, UntypedInventory,
@@ -17,12 +17,19 @@ const DESC_SH_INNER: u64 = 0b11 << 8; // Inner Shareable
 const DESC_AP_EL0_RW: u64 = 0b01 << 6;
 const DESC_AP_EL1_RO: u64 = 0b10 << 6;
 const DESC_AP_EL0_RO: u64 = 0b11 << 6;
+const DESC_GP: u64 = 1 << 50; // Guarded Page (ARMv8.5-A FEAT_BTI)
 const DESC_PXN: u64 = 1 << 53; // Privileged Execute Never (SMEP equivalent)
 const DESC_UXN: u64 = 1 << 54; // Unprivileged Execute Never (NX for EL0)
 const DESC_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 const DESC_2M_ADDR_MASK: u64 = 0x0000_FFFF_FFE0_0000;
 
 static CACHED_DEVICE_MAIR_IDX: AtomicU8 = AtomicU8::new(u8::MAX);
+static BTI_GUARDED_PAGES: AtomicBool = AtomicBool::new(false);
+
+/// Enable ARMv8.5-A Guarded Page (`DESC_GP`) marking on executable PTEs when hardware advertises `FEAT_BTI`.
+pub fn enable_bti_guarded_pages() {
+    BTI_GUARDED_PAGES.store(true, Ordering::Release);
+}
 
 #[inline]
 fn device_mair_index() -> u64 {
@@ -73,15 +80,25 @@ fn tlbi_va(virt: VirtAddr) {
     }
 }
 
-/// Ensure `TTBR0_EL1` supplies the active ASID (`TCR_EL1.A1 == 0`) and flush stale boot TLB entries once.
+/// Ensure `TTBR0_EL1` supplies the active ASID (`TCR_EL1.A1 == 0`), enable 16-bit ASIDs
+/// (`TCR_EL1.AS = 1`) when advertised by `ID_AA64MMFR0_EL1.ASIDBits`, and flush stale boot TLBs.
 pub fn ensure_ttbr0_asid_enabled() {
-    // SAFETY: Configuring `TCR_EL1.A1 = 0` and executing a one-time EL1 TLB invalidation
-    // before entering EL0 guarantees `TTBR0_EL1[63:48]` tags all `DESC_NG` user mappings.
+    // SAFETY: Configuring `TCR_EL1.A1 = 0`, enabling 16-bit ASIDs when supported by hardware,
+    // and executing a one-time EL1 TLB invalidation before entering EL0 guarantees
+    // `TTBR0_EL1[63:48]` tags all `DESC_NG` user mappings.
     unsafe {
+        let mmfr0: u64;
+        asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0, options(nomem, nostack, preserves_flags));
+        let supports_16bit_asid = ((mmfr0 >> 4) & 0xF) == 0b0010;
+
         let mut tcr: u64;
         asm!("mrs {}, tcr_el1", out(reg) tcr, options(nomem, nostack, preserves_flags));
-        if (tcr & (1u64 << 22)) != 0 {
-            tcr &= !(1u64 << 22);
+        let mut new_tcr = tcr & !(1u64 << 22); // A1 = 0 (TTBR0_EL1 defines ASID)
+        if supports_16bit_asid {
+            new_tcr |= 1u64 << 36; // AS = 1 (16-bit ASID)
+        }
+        if new_tcr != tcr {
+            tcr = new_tcr;
             asm!("msr tcr_el1, {}", in(reg) tcr, options(nostack, preserves_flags));
             asm!("isb", options(nostack, preserves_flags));
         }
@@ -243,11 +260,16 @@ impl VSpaceMapper for Aarch64VSpace {
         }
         if !flags.executable {
             pte |= DESC_PXN | DESC_UXN;
-        } else if flags.user {
-            // EL0 executable pages are NEVER executable by EL1 (hardware SMEP equivalent)
-            pte |= DESC_PXN;
         } else {
-            pte |= DESC_UXN;
+            if BTI_GUARDED_PAGES.load(Ordering::Acquire) {
+                pte |= DESC_GP;
+            }
+            if flags.user {
+                // EL0 executable pages are NEVER executable by EL1 (hardware PXN)
+                pte |= DESC_PXN;
+            } else {
+                pte |= DESC_UXN;
+            }
         }
 
         self.write_desc(l3, i3, pte)?;
@@ -436,6 +458,36 @@ impl VSpaceMapper for Aarch64VSpace {
             core::ptr::copy_nonoverlapping(src.as_ptr(), dst.add(offset), src.len());
         }
         Ok(())
+    }
+}
+
+/// Clean data cache lines to Point of Coherency (`dc cvac`) before outbound DMA.
+pub fn dma_clean_range(start_va: u64, len: usize) {
+    const CACHE_LINE: u64 = 64;
+    let mut addr = start_va & !(CACHE_LINE - 1);
+    let end = start_va.saturating_add(len as u64);
+    // SAFETY: `dc cvac` cleans cache lines for a valid mapped virtual address range to PoC.
+    unsafe {
+        while addr < end {
+            asm!("dc cvac, {}", in(reg) addr, options(nostack, preserves_flags));
+            addr = addr.saturating_add(CACHE_LINE);
+        }
+        asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+/// Clean & invalidate data cache lines to Point of Coherency (`dc civac`) for inbound DMA.
+pub fn dma_invalidate_range(start_va: u64, len: usize) {
+    const CACHE_LINE: u64 = 64;
+    let mut addr = start_va & !(CACHE_LINE - 1);
+    let end = start_va.saturating_add(len as u64);
+    // SAFETY: `dc civac` cleans and invalidates cache lines for a valid mapped virtual address range.
+    unsafe {
+        while addr < end {
+            asm!("dc civac, {}", in(reg) addr, options(nostack, preserves_flags));
+            addr = addr.saturating_add(CACHE_LINE);
+        }
+        asm!("dsb sy", options(nostack, preserves_flags));
     }
 }
 
