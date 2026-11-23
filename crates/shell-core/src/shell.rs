@@ -880,7 +880,11 @@ impl<H: ShellHost> Shell<H> {
                 let obj_count = self.store.object_count();
                 if !silent {
                     let mut row = AsciiLine::<96>::new();
-                    row.push_str("NewOS 0.1.0 aarch64 seL4 (SMP=");
+                    row.push_str(concat!(
+                        "NewOS ",
+                        env!("CARGO_PKG_VERSION"),
+                        " aarch64 seL4 (SMP="
+                    ));
                     row.push_u64(u64::from(info.online_cpus));
                     row.push_str(" CPUs, ");
                     row.push_u64(u64::from(info.proc_count));
