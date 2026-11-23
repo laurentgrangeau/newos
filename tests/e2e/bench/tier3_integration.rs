@@ -87,12 +87,32 @@ fn ensure_bench_binary() -> String {
             let shell_rlib = out_dir.join("libnewos_shell_core.rlib");
             let bin_path = out_dir.join("newos_bench");
 
+            let crypto_rlib = out_dir.join("libnewos_crypto.rlib");
             let dep_flag = format!("dependency={}", out_dir.display());
+            let ext_crypto = format!("newos_crypto={}", crypto_rlib.display());
             let ext_abi = format!("newos_abi={}", abi_rlib.display());
             let ext_kernel = format!("newos_kernel_core={}", kernel_rlib.display());
             let ext_shell = format!("newos_shell_core={}", shell_rlib.display());
 
-            let steps: [(&str, Vec<String>); 4] = [
+            let steps: [(&str, Vec<String>); 5] = [
+                (
+                    "newos_crypto",
+                    vec![
+                        "--edition".into(),
+                        "2024".into(),
+                        "-C".into(),
+                        "opt-level=3".into(),
+                        "--crate-name".into(),
+                        "newos_crypto".into(),
+                        "--crate-type".into(),
+                        "lib".into(),
+                        "--cfg".into(),
+                        "feature=\"sha3\"".into(),
+                        "crates/crypto/src/lib.rs".into(),
+                        "-o".into(),
+                        crypto_rlib.display().to_string(),
+                    ],
+                ),
                 (
                     "newos_abi",
                     vec![
@@ -104,7 +124,13 @@ fn ensure_bench_binary() -> String {
                         "newos_abi".into(),
                         "--crate-type".into(),
                         "lib".into(),
+                        "--cfg".into(),
+                        "feature=\"sha3\"".into(),
                         "crates/abi/src/lib.rs".into(),
+                        "-L".into(),
+                        dep_flag.clone(),
+                        "--extern".into(),
+                        ext_crypto.clone(),
                         "-o".into(),
                         abi_rlib.display().to_string(),
                     ],
@@ -120,6 +146,10 @@ fn ensure_bench_binary() -> String {
                         "newos_kernel_core".into(),
                         "--crate-type".into(),
                         "lib".into(),
+                        "--cfg".into(),
+                        "feature=\"smp\"".into(),
+                        "--cfg".into(),
+                        "feature=\"sched-priority-rr\"".into(),
                         "crates/kernel-core/src/lib.rs".into(),
                         "-L".into(),
                         dep_flag.clone(),

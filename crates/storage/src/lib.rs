@@ -7,8 +7,11 @@
 //! - [`sdhci`]: BCM2712 microSD SDHCI 3.0 / SDR104 block driver (`0x10_00ff_f000`)
 //! - [`nvme`]: NVMe 1.4 PCIe SSD block driver (for Raspberry Pi 5 PCIe 2.0 x1 FFC connector)
 
+#[cfg(feature = "nvme")]
 pub mod nvme;
+#[cfg(feature = "pcie")]
 pub mod pcie;
+#[cfg(feature = "sdhci")]
 pub mod sdhci;
 
 use newos_abi::SysError;
@@ -42,10 +45,12 @@ pub trait BlockDevice {
     fn write_block(&mut self, lba: u64, src: &[u8; SECTOR_SIZE]) -> Result<(), SysError>;
 }
 
+#[cfg(feature = "caos-snapshot")]
 const SNAPSHOT_MAGIC: [u8; 4] = *b"CAOS";
 
 /// Persist a serialized CAOS snapshot payload starting at `start_lba` with a 16-byte header
 /// (`magic = "CAOS"`, `len: u32`, `sha3_prefix: u64`) followed by payload bytes across 512 B sectors.
+#[cfg(feature = "caos-snapshot")]
 pub fn write_caos_snapshot<D: BlockDevice>(
     dev: &mut D,
     start_lba: u64,
@@ -59,7 +64,7 @@ pub fn write_caos_snapshot<D: BlockDevice>(
         return Err(SysError::OutOfMemory);
     }
 
-    let digest = newos_abi::sha3::digest_prefix_u64(payload);
+    let digest = newos_crypto::sha3::digest_prefix_u64(payload);
     let mut header = [0u8; 16];
     header[0..4].copy_from_slice(&SNAPSHOT_MAGIC);
     header[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -85,6 +90,7 @@ pub fn write_caos_snapshot<D: BlockDevice>(
 }
 
 /// Read and SHA3-512-verify a CAOS snapshot from `start_lba` into `dst`, returning payload length.
+#[cfg(feature = "caos-snapshot")]
 pub fn read_caos_snapshot<D: BlockDevice>(
     dev: &mut D,
     start_lba: u64,
@@ -121,13 +127,14 @@ pub fn read_caos_snapshot<D: BlockDevice>(
         read += take;
     }
 
-    if newos_abi::sha3::digest_prefix_u64(&dst[..payload_len]) != expected_digest {
+    if newos_crypto::sha3::digest_prefix_u64(&dst[..payload_len]) != expected_digest {
         return Err(SysError::InvalidArgument);
     }
     Ok(payload_len)
 }
 
 #[cfg(test)]
+#[cfg(feature = "caos-snapshot")]
 mod tests {
     use super::*;
 

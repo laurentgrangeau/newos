@@ -999,10 +999,12 @@ fn build_newos_bench_once() -> &'static PathBuf {
             std::env::temp_dir().join(format!("newos_e2e_bench_bin_{}", std::process::id()));
         fs::create_dir_all(&out_dir).expect("create temp dir for newos_bench");
 
+        let crypto_rlib = out_dir.join("libnewos_crypto.rlib");
         let abi_rlib = out_dir.join("libnewos_abi.rlib");
         let kc_rlib = out_dir.join("libnewos_kernel_core.rlib");
         let sc_rlib = out_dir.join("libnewos_shell_core.rlib");
         let bench_bin = out_dir.join("newos_bench");
+        let dep_flag = format!("dependency={}", out_dir.display());
 
         let run_rustc = |args: &[String]| {
             let out = Command::new("rustc")
@@ -1025,9 +1027,31 @@ fn build_newos_bench_once() -> &'static PathBuf {
             "-C".into(),
             "opt-level=3".into(),
             "--crate-name".into(),
+            "newos_crypto".into(),
+            "--crate-type".into(),
+            "lib".into(),
+            "--cfg".into(),
+            "feature=\"sha3\"".into(),
+            "crates/crypto/src/lib.rs".into(),
+            "-o".into(),
+            crypto_rlib.display().to_string(),
+        ]);
+
+        run_rustc(&[
+            "--edition".into(),
+            "2024".into(),
+            "-C".into(),
+            "opt-level=3".into(),
+            "--crate-name".into(),
             "newos_abi".into(),
             "--crate-type".into(),
             "lib".into(),
+            "--cfg".into(),
+            "feature=\"sha3\"".into(),
+            "-L".into(),
+            dep_flag.clone(),
+            "--extern".into(),
+            format!("newos_crypto={}", crypto_rlib.display()),
             "crates/abi/src/lib.rs".into(),
             "-o".into(),
             abi_rlib.display().to_string(),
@@ -1038,6 +1062,12 @@ fn build_newos_bench_once() -> &'static PathBuf {
             "2024".into(),
             "-C".into(),
             "opt-level=3".into(),
+            "--cfg".into(),
+            "feature=\"smp\"".into(),
+            "--cfg".into(),
+            "feature=\"sched-priority-rr\"".into(),
+            "-L".into(),
+            dep_flag.clone(),
             "--crate-name".into(),
             "newos_kernel_core".into(),
             "--crate-type".into(),
@@ -1058,6 +1088,8 @@ fn build_newos_bench_once() -> &'static PathBuf {
             "newos_shell_core".into(),
             "--crate-type".into(),
             "lib".into(),
+            "-L".into(),
+            dep_flag.clone(),
             "crates/shell-core/src/lib.rs".into(),
             "--extern".into(),
             format!("newos_abi={}", abi_rlib.display()),
@@ -1072,6 +1104,8 @@ fn build_newos_bench_once() -> &'static PathBuf {
             "opt-level=3".into(),
             "--crate-name".into(),
             "newos_bench".into(),
+            "-L".into(),
+            dep_flag,
             "crates/bench/src/main.rs".into(),
             "--extern".into(),
             format!("newos_abi={}", abi_rlib.display()),

@@ -4,8 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["bcm2712", "virtio", "csprng"]
+bcm2712 = []
+virtio = []
+csprng = ["dep:newos-crypto"]
+
 [dependencies]
-newos-abi = { workspace = true }
+newos-abi = { workspace = true, default-features = false }
+newos-crypto = { workspace = true, default-features = false, features = ["sha3"], optional = true }
 
 [lints]
 workspace = true

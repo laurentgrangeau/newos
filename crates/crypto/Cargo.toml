@@ -1,0 +1,22 @@
+[package]
+name = "newos-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["suite-pq-level5"]
+sha3 = []
+chacha20-poly1305 = ["dep:subtle", "dep:zeroize"]
+ml-kem-1024 = ["dep:ml-kem", "dep:zeroize"]
+ml-dsa-87 = ["dep:ml-dsa", "dep:zeroize"]
+suite-pq-level5 = ["sha3", "chacha20-poly1305", "ml-kem-1024", "ml-dsa-87"]
+
+[dependencies]
+ml-dsa = { version = "0.1", default-features = false, features = ["zeroize"], optional = true }
+ml-kem = { version = "0.3", default-features = false, features = ["zeroize"], optional = true }
+subtle = { version = "2", default-features = false, optional = true }
+zeroize = { version = "1", default-features = false, features = ["derive"], optional = true }
+
+[lints]
+workspace = true

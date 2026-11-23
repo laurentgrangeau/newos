@@ -10,7 +10,7 @@
 //!   bytes via `SHAKE256(key || hw_entropy)` every 64 KiB of generated output.
 
 use crate::{EntropySource, RngError};
-use newos_abi::sha3::shake256;
+use newos_crypto::sha3::shake256;
 
 /// Hardware TRNG seed block size in bytes (512 bits).
 pub const SEED_BLOCK_BYTES: usize = 64;

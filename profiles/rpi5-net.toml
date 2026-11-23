@@ -1,0 +1,46 @@
+# NewOS Raspberry Pi 5 Network + Storage Appliance Profile
+# Dual-stack IPv4 + IPv6 networking + shell + SDHCI/NVMe storage,
+# with ZERO SSH, ZERO cryptography, ZERO GPU, and ZERO AI drivers.
+
+[target]
+arch = "aarch64"           # Valid: "aarch64"
+board = "rpi5"             # Valid: "rpi5" | "qemu-virt"
+cpu = "cortex-a76"         # Valid: any LLVM AArch64 target-cpu (e.g. "cortex-a76", "generic")
+
+[kernel]
+scheduler = "priority-rr"  # Valid: "priority-rr" | "round-robin" | "fifo" (cooperative)
+smp = true                 # Valid: true | false (false = single-core uniprocessor)
+userspace = true           # Valid: true | false (false = pure EL1 kernel, no EL0 ELFs)
+elf_attestation = false    # Valid: true | false (requires "sha3" in [crypto].algorithms)
+acpi = true                # Valid: true | false (false = static BoardDescriptor only)
+
+[userspace]
+init = true                # Valid: true | false (requires [kernel].userspace = true)
+worker = false             # Valid: true | false (requires [kernel].userspace = true)
+shell = true               # Valid: true | false (requires init = true)
+netd = true                # Valid: true | false (requires [net].enabled = true and ipv4 or ipv6)
+keyd = false               # Valid: true | false (requires "sha3" and "ml-dsa-87" in [crypto])
+sshd = false               # Valid: true | false (requires netd, keyd, shell, and all 4 PQ crypto algs)
+
+[net]
+enabled = true             # Valid: true | false (master switch for networking)
+ipv4 = true                # Valid: true | false (IPv4, ARP, DHCPv4; independent of ipv6)
+ipv6 = true                # Valid: true | false (IPv6, EUI-64 link-local, NDP, routing; independent of ipv4)
+tcp = true                 # Valid: true | false (TCP sockets)
+udp = true                 # Valid: true | false (UDP sockets)
+icmp = true                # Valid: true | false (ICMPv4 / ICMPv6 sockets)
+dns = true                 # Valid: true | false (DNS A / AAAA resolver)
+drivers = ["gem"]          # Valid subset: ["gem", "virtio"] (RP1 Cadence GEM, QEMU VirtIO-Net v2)
+
+[crypto]
+algorithms = []            # Valid subset: ["sha3", "chacha20-poly1305", "ml-kem-1024", "ml-dsa-87"]
+
+[drivers]
+storage = ["pcie", "sdhci", "nvme"]    # Valid subset: ["pcie", "sdhci", "nvme", "caos-snapshot"] (caos-snapshot needs "sha3")
+rng = ["bcm2712"]                      # Valid subset: ["bcm2712", "virtio", "csprng"] (csprng needs "sha3")
+gpu = []                               # Valid subset: ["v3d", "iommu"]
+ai = []                                # Valid subset: ["compute", "hailo"]
+usb = []                               # Valid subset: ["xhci"]
+gpio = []                              # Valid subset: ["rp1"]
+wdt = ["bcm2712"]                      # Valid subset: ["bcm2712"]
+board = ["mailbox", "thermal", "rtc"]  # Valid subset: ["mailbox", "thermal", "rtc", "rp1-bus"]

@@ -516,6 +516,7 @@ pub fn system_off(code: ShutdownStatus) -> ! {
 }
 
 pub struct Aarch64Platform {
+    board: &'static crate::board::BoardDescriptor,
     serial: serial::Pl011,
     vspace: paging::Aarch64VSpace,
     online_cpus: usize,
@@ -535,6 +536,7 @@ struct AcpiHardware {
 
 /// Read `dst.len()` bytes from physical memory `phys_addr` using HHDM if already mapped,
 /// or by temporarily mapping each 4 KiB page read-only at `ACPI_SCRATCH_VIRT`.
+#[cfg(feature = "acpi")]
 fn read_phys_bytes(
     vspace: &mut paging::Aarch64VSpace,
     untyped: &mut UntypedInventory,
@@ -594,6 +596,7 @@ fn read_phys_bytes(
 }
 
 /// Inspect ACPI RSDP -> XSDT -> FADT / SPCR / MADT / GTDT / MCFG from physical memory.
+#[cfg(feature = "acpi")]
 fn probe_acpi_hardware(
     vspace: &mut paging::Aarch64VSpace,
     untyped: &mut UntypedInventory,
@@ -727,28 +730,24 @@ fn probe_acpi_hardware(
 impl Aarch64Platform {
     pub fn init(info: &mut BootInfo) -> Self {
         use newos_kernel_core::memory::{PageFlags, PhysFrame, VSpaceMapper};
+        let board = crate::board::select_board(info.qemu_virt);
         let mut vspace = paging::Aarch64VSpace::from_current_ttbr1(info.hhdm_offset);
 
-        // Discover hardware dynamically from ACPI (FADT/SPCR/MADT/GTDT/MCFG),
-        // falling back to board defaults (Raspberry Pi 5 vs QEMU `virt`).
+        // Discover hardware dynamically from ACPI (FADT/SPCR/MADT/GTDT/MCFG) when enabled,
+        // falling back to the active `BoardDescriptor`.
+        #[cfg(feature = "acpi")]
         let acpi = probe_acpi_hardware(
             &mut vspace,
             &mut info.untyped,
             info.hhdm_offset,
             info.rsdp_addr,
         );
+        #[cfg(not(feature = "acpi"))]
+        let acpi = AcpiHardware::default();
 
-        // Select PL011 MMIO physical base (ACPI SPCR -> board fallback):
-        // - Default: Raspberry Pi 5 (16 GB, BCM2712 3-pin JST Debug UART): `0x10_7D00_1000`
-        // - Local test harness (`qemu` cmdline): QEMU `virt`: `0x0900_0000`
-        const RPI5_UART_PHYS: u64 = 0x10_7D00_1000;
-        const QEMU_UART_PHYS: u64 = 0x0900_0000;
+        // Select PL011 MMIO physical base (ACPI SPCR -> board descriptor fallback):
         const UART_VIRT: u64 = 0xffff_b000_0000_0000;
-        let uart_phys = acpi.spcr_uart_base.unwrap_or(if info.qemu_virt {
-            QEMU_UART_PHYS
-        } else {
-            RPI5_UART_PHYS
-        });
+        let uart_phys = acpi.spcr_uart_base.unwrap_or(board.uart.phys_base);
         if let Ok(uart_virt) = VirtAddr::new_page_aligned(UART_VIRT)
             && let Ok(frame) = PhysFrame::from_aligned(PhysAddr::new(uart_phys))
             && let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
@@ -890,22 +889,11 @@ impl Aarch64Platform {
             None
         };
 
-        // Map GICv2 / GIC-400 Distributor & CPU Interface (ACPI MADT -> board fallback):
-        // - Default: Raspberry Pi 5 BCM2712 GIC-400: GICD `0x10_7FFF_9000`, GICC `0x10_7FFF_A000`
-        // - QEMU `virt` GICv2:                      GICD `0x0800_0000`,    GICC `0x0801_0000`
-        const RPI5_GICD_PHYS: u64 = 0x10_7FFF_9000;
-        const RPI5_GICC_PHYS: u64 = 0x10_7FFF_A000;
-        const QEMU_GICD_PHYS: u64 = 0x0800_0000;
-        const QEMU_GICC_PHYS: u64 = 0x0801_0000;
+        // Map GICv2 / GIC-400 Distributor & CPU Interface (ACPI MADT -> board descriptor fallback):
         const GICD_VIRT: u64 = 0xffff_b002_0000_0000;
         const GICC_VIRT: u64 = 0xffff_b002_0000_1000;
-        let (default_gicd, default_gicc) = if info.qemu_virt {
-            (QEMU_GICD_PHYS, QEMU_GICC_PHYS)
-        } else {
-            (RPI5_GICD_PHYS, RPI5_GICC_PHYS)
-        };
-        let gicd_phys = acpi.gicd_base.unwrap_or(default_gicd);
-        let gicc_phys = acpi.gicc_base.unwrap_or(default_gicc);
+        let gicd_phys = acpi.gicd_base.unwrap_or(board.gicd.phys_base);
+        let gicc_phys = acpi.gicc_base.unwrap_or(board.gicc.phys_base);
         let virt_timer_irq = acpi.virt_timer_irq.unwrap_or(gic::IRQ_VIRTUAL_TIMER);
         if let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
             && let Ok(gicd_va) = VirtAddr::new_page_aligned(GICD_VIRT)
@@ -922,10 +910,10 @@ impl Aarch64Platform {
             gic::init(GICD_VIRT, GICC_VIRT, virt_timer_irq);
         }
 
-        // Select PSCI conduit from ACPI FADT `ARM_BOOT_ARCH` when available; fallback to board default.
+        // Select PSCI conduit from ACPI FADT `ARM_BOOT_ARCH` when available; fallback to board descriptor.
         let use_smc = match acpi.psci_use_hvc {
             Some(use_hvc) => !use_hvc,
-            None => !info.qemu_virt,
+            None => board.psci_use_smc,
         };
         PSCI_USE_SMC.store(use_smc, Ordering::Release);
 
@@ -1155,13 +1143,17 @@ impl Aarch64Platform {
                 syscall::register_init_mmio_cap(27, PhysAddr::new(fb.phys_addr), len);
             }
         }
+        #[cfg(feature = "smp")]
         let online_cpus = smp::bring_up_aps();
+        #[cfg(not(feature = "smp"))]
+        let online_cpus = 1usize;
         syscall::set_sys_info(online_cpus, info.interactive_shell);
 
         let mut serial = serial::Pl011::new();
         let _ = writeln!(
             serial,
-            "[newos-hal] ACPI/GIC: uart={:#x} gicd={:#x} gicc={:#x} (v{}, cpus={}) timer_irq={} psci={} ecam={:#x} ap_sgi_acks={}",
+            "[newos-hal] board={} ACPI/GIC: uart={:#x} gicd={:#x} gicc={:#x} (v{}, cpus={}) timer_irq={} psci={} ecam={:#x} ap_sgi_acks={}",
+            board.name,
             uart_phys,
             gicd_phys,
             gicc_phys,
@@ -1173,6 +1165,7 @@ impl Aarch64Platform {
             smp::ap_sgi_ack_count(),
         );
         Self {
+            board,
             serial,
             vspace,
             online_cpus,
@@ -1190,7 +1183,11 @@ impl HalPlatform for Aarch64Platform {
     type VSpace = paging::Aarch64VSpace;
 
     fn arch_name(&self) -> &'static str {
-        "aarch64"
+        self.board.arch
+    }
+
+    fn board_name(&self) -> &'static str {
+        self.board.name
     }
 
     fn security_features(&self) -> CpuSecurityFeatures {

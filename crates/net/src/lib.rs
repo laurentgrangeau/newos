@@ -9,25 +9,97 @@
 //!
 //! 100% `#![forbid(unsafe_code)]`, zero heap (`no_alloc`), zero network code in EL1.
 
+#[cfg(feature = "driver-gem")]
 pub mod gem;
+#[cfg(all(feature = "tcp", any(feature = "ipv4", feature = "ipv6")))]
 pub mod stack;
+#[cfg(feature = "driver-virtio")]
 pub mod virtio;
 
+#[cfg(feature = "driver-gem")]
 pub use gem::{GemDma, GemInfo, GemNetDevice, probe_cadence_gem};
 pub use smoltcp::phy::Device as NetDevice;
+#[cfg(all(feature = "tcp", any(feature = "ipv4", feature = "ipv6")))]
 pub use stack::{NetStack, NetStackStorage, SSH_PORT, TCP_BUF_SIZE, TcpEvent};
-pub use virtio::{MmioDmaTransport, VirtioNetDevice, VirtioNetDma};
+#[cfg(feature = "driver-virtio")]
+pub use virtio::{VirtioNetDevice, VirtioNetDma};
 
 use newos_abi::SysError;
+
+/// Capability-scoped MMIO + DMA translation & cache-coherency transport injected by EL0 `user-rt`.
+pub trait MmioDmaTransport {
+    fn read32(&self, offset: u64) -> Result<u32, SysError>;
+    fn write32(&self, offset: u64, val: u32) -> Result<(), SysError>;
+    fn virt_to_phys<T>(&self, r: &T) -> Result<u64, SysError>;
+
+    /// Clean data cache lines (`dc cvac`) for `r` before outbound non-coherent DMA.
+    fn dma_clean<T>(&self, _r: &T) -> Result<(), SysError> {
+        Ok(())
+    }
+
+    /// Clean & invalidate data cache lines (`dc civac`) for `r` before/after inbound non-coherent DMA.
+    fn dma_invalidate<T>(&self, _r: &T) -> Result<(), SysError> {
+        Ok(())
+    }
+}
+#[cfg(any(
+    all(feature = "ipv4", feature = "udp"),
+    all(feature = "ipv4", feature = "icmp"),
+    all(feature = "ipv4", feature = "dns"),
+    all(feature = "ipv4", feature = "tcp"),
+    all(feature = "ipv6", feature = "udp"),
+))]
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+#[cfg(any(
+    all(feature = "ipv4", feature = "udp"),
+    all(feature = "ipv4", feature = "icmp"),
+    all(feature = "ipv4", feature = "dns"),
+    all(feature = "ipv4", feature = "tcp"),
+    all(feature = "ipv6", feature = "udp"),
+))]
+use smoltcp::phy::Device;
+#[cfg(any(
+    all(feature = "ipv4", feature = "udp"),
+    all(feature = "ipv6", feature = "udp"),
+))]
+use smoltcp::phy::{DeviceCapabilities, Medium, RxToken, TxToken};
+#[cfg(feature = "ipv4")]
+use smoltcp::socket::dhcpv4;
+#[cfg(feature = "dns")]
+use smoltcp::socket::dns;
+#[cfg(feature = "icmp")]
+use smoltcp::socket::icmp;
+#[cfg(all(feature = "ipv4", feature = "tcp"))]
+use smoltcp::socket::tcp;
+#[cfg(feature = "udp")]
 use smoltcp::socket::udp::{self, PacketBuffer, PacketMetadata};
-use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
+#[cfg(any(
+    all(feature = "ipv4", feature = "udp"),
+    all(feature = "ipv4", feature = "icmp"),
+    all(feature = "ipv4", feature = "dns"),
+    all(feature = "ipv4", feature = "tcp"),
+    all(feature = "ipv6", feature = "udp"),
+))]
 use smoltcp::time::Instant;
-use smoltcp::wire::{
-    DnsQueryType, EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr,
-    Ipv4Address, Ipv6Address,
-};
+#[cfg(feature = "dns")]
+use smoltcp::wire::DnsQueryType;
+#[cfg(feature = "ipv4")]
+use smoltcp::wire::Ipv4Address;
+#[cfg(any(
+    all(feature = "ipv4", feature = "ipv6", feature = "dns"),
+    all(feature = "ipv6", feature = "udp"),
+))]
+use smoltcp::wire::Ipv6Address;
+#[cfg(any(
+    all(feature = "ipv4", feature = "udp"),
+    all(feature = "ipv4", feature = "icmp"),
+    all(feature = "ipv4", feature = "dns"),
+    all(feature = "ipv4", feature = "tcp"),
+    all(feature = "ipv6", feature = "udp"),
+))]
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
+#[cfg(all(feature = "ipv4", feature = "icmp"))]
+use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr};
 
 const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976; // "virt"
 const VIRTIO_DEVICE_NET: u32 = 1;
@@ -53,22 +125,32 @@ pub struct VirtioNetInfo {
 /// Unified detected EL0 NIC (Raspberry Pi 5 RP1 Cadence GEM or QEMU VirtIO-MMIO v2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NicKind {
+    #[cfg(feature = "driver-virtio")]
     Virtio(VirtioNetInfo),
+    #[cfg(feature = "driver-gem")]
     CadenceGem(GemInfo),
 }
 
 impl NicKind {
     pub fn mac(&self) -> [u8; 6] {
         match self {
+            #[cfg(feature = "driver-virtio")]
             NicKind::Virtio(v) => v.mac,
+            #[cfg(feature = "driver-gem")]
             NicKind::CadenceGem(g) => g.mac,
+            #[cfg(all(not(feature = "driver-virtio"), not(feature = "driver-gem")))]
+            _ => [0; 6],
         }
     }
 
     pub fn driver_name(&self) -> &'static str {
         match self {
+            #[cfg(feature = "driver-virtio")]
             NicKind::Virtio(_) => "virtio-net-v2",
+            #[cfg(feature = "driver-gem")]
             NicKind::CadenceGem(_) => "rpi5-rp1-gem",
+            #[cfg(all(not(feature = "driver-virtio"), not(feature = "driver-gem")))]
+            _ => "none",
         }
     }
 }
@@ -91,17 +173,59 @@ impl NetConfig {
     };
 }
 
+/// Active IPv6 network configuration (EUI-64 link-local `fe80::/64`, optional global unicast,
+/// gateway, and recursive DNS server).
+#[cfg(feature = "ipv6")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv6Config {
+    pub link_local: [u8; 16],
+    pub global: Option<([u8; 16], u8)>,
+    pub gateway: Option<[u8; 16]>,
+    pub dns: Option<[u8; 16]>,
+}
+
+#[cfg(feature = "ipv6")]
+impl Ipv6Config {
+    /// Derive a link-local-only IPv6 configuration (`fe80::/64`) from an Ethernet MAC address.
+    pub const fn from_mac(mac: [u8; 6]) -> Self {
+        Self {
+            link_local: ipv6_link_local_from_mac(mac),
+            global: None,
+            gateway: None,
+            dns: None,
+        }
+    }
+
+    pub const fn with_global(mut self, addr: [u8; 16], prefix_len: u8) -> Self {
+        self.global = Some((addr, prefix_len));
+        self
+    }
+
+    pub const fn with_gateway(mut self, gw: [u8; 16]) -> Self {
+        self.gateway = Some(gw);
+        self
+    }
+
+    pub const fn with_dns(mut self, dns: [u8; 16]) -> Self {
+        self.dns = Some(dns);
+        self
+    }
+}
+
 /// Probe for either a VirtIO-MMIO network device or a Raspberry Pi 5 RP1 Cadence GEM controller.
 pub fn probe_nic<F>(mut read32: F) -> Option<NicKind>
 where
     F: FnMut(u64) -> Result<u32, SysError>,
 {
+    #[cfg(feature = "driver-virtio")]
     if let Some(v) = probe_virtio_net(&mut read32) {
         return Some(NicKind::Virtio(v));
     }
+    #[cfg(feature = "driver-gem")]
     if let Some(g) = probe_cadence_gem(&mut read32) {
         return Some(NicKind::CadenceGem(g));
     }
+    let _ = &mut read32;
     None
 }
 
@@ -142,11 +266,19 @@ where
 }
 
 /// Fixed-capacity, zero-heap EL0 loopback Ethernet `smoltcp::phy::Device` for self-tests.
+#[cfg(any(
+    all(feature = "ipv4", feature = "udp"),
+    all(feature = "ipv6", feature = "udp"),
+))]
 struct LoopbackEth {
     buf: [u8; 512],
     len: usize,
 }
 
+#[cfg(any(
+    all(feature = "ipv4", feature = "udp"),
+    all(feature = "ipv6", feature = "udp"),
+))]
 impl LoopbackEth {
     const fn new() -> Self {
         Self {
@@ -156,11 +288,19 @@ impl LoopbackEth {
     }
 }
 
+#[cfg(any(
+    all(feature = "ipv4", feature = "udp"),
+    all(feature = "ipv6", feature = "udp"),
+))]
 struct LoopRx<'a> {
     data: &'a mut [u8],
     len: &'a mut usize,
 }
 
+#[cfg(any(
+    all(feature = "ipv4", feature = "udp"),
+    all(feature = "ipv6", feature = "udp"),
+))]
 impl RxToken for LoopRx<'_> {
     fn consume<R, F>(self, f: F) -> R
     where
@@ -172,11 +312,19 @@ impl RxToken for LoopRx<'_> {
     }
 }
 
+#[cfg(any(
+    all(feature = "ipv4", feature = "udp"),
+    all(feature = "ipv6", feature = "udp"),
+))]
 struct LoopTx<'a> {
     data: &'a mut [u8],
     len: &'a mut usize,
 }
 
+#[cfg(any(
+    all(feature = "ipv4", feature = "udp"),
+    all(feature = "ipv6", feature = "udp"),
+))]
 impl TxToken for LoopTx<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
@@ -189,6 +337,10 @@ impl TxToken for LoopTx<'_> {
     }
 }
 
+#[cfg(any(
+    all(feature = "ipv4", feature = "udp"),
+    all(feature = "ipv6", feature = "udp"),
+))]
 impl Device for LoopbackEth {
     type RxToken<'a> = LoopRx<'a>;
     type TxToken<'a> = LoopTx<'a>;
@@ -217,6 +369,7 @@ impl Device for LoopbackEth {
 }
 
 /// Verify the pure-Rust EL0 `smoltcp` Ethernet + IPv4 + UDP stack end-to-end (`no_alloc`).
+#[cfg(all(feature = "ipv4", feature = "udp"))]
 pub fn verify_smoltcp_el0_stack(mac: [u8; 6]) -> Result<usize, &'static str> {
     let mut device = LoopbackEth::new();
     let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
@@ -267,6 +420,7 @@ pub struct PingResult {
 }
 
 /// Acquire a live IPv4 address, gateway, and DNS server via `smoltcp` DHCPv4 (`no_alloc`).
+#[cfg(feature = "ipv4")]
 pub fn run_dhcp_v4<D: Device>(device: &mut D, mac: [u8; 6]) -> Result<NetConfig, &'static str> {
     let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     let mut iface = Interface::new(config, device, Instant::from_millis(0));
@@ -294,6 +448,7 @@ pub fn run_dhcp_v4<D: Device>(device: &mut D, mac: [u8; 6]) -> Result<NetConfig,
 }
 
 /// Resolve a hostname to an IPv4 address via `smoltcp` DNS A-record query using a real `NetClock`.
+#[cfg(all(feature = "ipv4", feature = "dns"))]
 pub fn run_dns_query_with_clock<D: Device, C: NetClock>(
     device: &mut D,
     clock: &mut C,
@@ -354,6 +509,7 @@ pub fn run_dns_query_with_clock<D: Device, C: NetClock>(
 }
 
 /// Resolve a hostname to an IPv4 address via `smoltcp` DNS A-record query (`no_alloc`).
+#[cfg(all(feature = "ipv4", feature = "dns"))]
 pub fn run_dns_query<D: Device>(
     device: &mut D,
     mac: [u8; 6],
@@ -373,6 +529,7 @@ pub fn run_dns_query<D: Device>(
 }
 
 /// Perform a live ARP + ICMP Echo Request/Reply round-trip to `target` over any `smoltcp` `Device`.
+#[cfg(all(feature = "ipv4", feature = "icmp"))]
 pub fn run_icmp_ping<D: Device>(
     device: &mut D,
     mac: [u8; 6],
@@ -467,6 +624,7 @@ pub fn run_icmp_ping<D: Device>(
 }
 
 /// High-level live DHCPv4 acquisition over either VirtIO-net (QEMU) or RP1 Cadence GEM (Pi 5).
+#[cfg(all(feature = "ipv4", feature = "driver-virtio", feature = "driver-gem"))]
 pub fn live_dhcp_v4<T: MmioDmaTransport>(
     transport: T,
     nic: NicKind,
@@ -489,6 +647,12 @@ pub fn live_dhcp_v4<T: MmioDmaTransport>(
 }
 
 /// High-level live ICMP Echo ping over either VirtIO-net (QEMU) or RP1 Cadence GEM (Pi 5).
+#[cfg(all(
+    feature = "ipv4",
+    feature = "icmp",
+    feature = "driver-virtio",
+    feature = "driver-gem"
+))]
 pub fn live_icmp_ping<T: MmioDmaTransport>(
     transport: T,
     nic: NicKind,
@@ -514,6 +678,12 @@ pub fn live_icmp_ping<T: MmioDmaTransport>(
 
 /// High-level live DNS A-record resolution using a real monotonic `NetClock`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(all(
+    feature = "ipv4",
+    feature = "dns",
+    feature = "driver-virtio",
+    feature = "driver-gem"
+))]
 pub fn live_dns_resolve_with_clock<T: MmioDmaTransport, C: NetClock>(
     transport: T,
     clock: &mut C,
@@ -540,6 +710,12 @@ pub fn live_dns_resolve_with_clock<T: MmioDmaTransport, C: NetClock>(
 }
 
 /// High-level live DNS A-record resolution over either VirtIO-net (QEMU) or RP1 Cadence GEM (Pi 5).
+#[cfg(all(
+    feature = "ipv4",
+    feature = "dns",
+    feature = "driver-virtio",
+    feature = "driver-gem"
+))]
 pub fn live_dns_resolve<T: MmioDmaTransport>(
     transport: T,
     nic: NicKind,
@@ -597,6 +773,7 @@ impl<F: FnMut() -> u64> NetClock for CycleClock<F> {
 /// Open a live IPv4 TCP connection, send `tx_payload`, read up to `rx_out.len()` reply bytes,
 /// and close cleanly (`no_alloc`, `#![forbid(unsafe_code)]`).
 #[allow(clippy::too_many_arguments)]
+#[cfg(all(feature = "ipv4", feature = "tcp"))]
 pub fn run_tcp_exchange<D: Device, C: NetClock>(
     device: &mut D,
     clock: &mut C,
@@ -689,6 +866,12 @@ pub fn run_tcp_exchange<D: Device, C: NetClock>(
 
 /// High-level live IPv4 TCP exchange over VirtIO-net (QEMU) or RP1 Cadence GEM (Pi 5).
 #[allow(clippy::too_many_arguments)]
+#[cfg(all(
+    feature = "ipv4",
+    feature = "tcp",
+    feature = "driver-virtio",
+    feature = "driver-gem"
+))]
 pub fn live_tcp_exchange<T: MmioDmaTransport, C: NetClock>(
     transport: T,
     clock: &mut C,
@@ -763,6 +946,7 @@ pub const fn ipv6_link_local_from_mac(mac: [u8; 6]) -> [u8; 16] {
 }
 
 /// Resolve a hostname to an IPv6 address via `smoltcp` DNS AAAA-record query (`no_alloc`).
+#[cfg(all(feature = "ipv4", feature = "ipv6", feature = "dns"))]
 pub fn run_dns_query_aaaa_with_clock<D: Device, C: NetClock>(
     device: &mut D,
     clock: &mut C,
@@ -827,6 +1011,7 @@ pub fn run_dns_query_aaaa_with_clock<D: Device, C: NetClock>(
 }
 
 /// Verify the pure-Rust EL0 `smoltcp` Ethernet + IPv6 link-local + UDP stack end-to-end (`no_alloc`).
+#[cfg(all(feature = "ipv6", feature = "udp"))]
 pub fn verify_smoltcp_ipv6_el0_stack(mac: [u8; 6]) -> Result<usize, &'static str> {
     let mut device = LoopbackEth::new();
     let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
@@ -883,6 +1068,16 @@ pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
 }
 
 #[cfg(test)]
+#[cfg(all(
+    feature = "ipv4",
+    feature = "ipv6",
+    feature = "tcp",
+    feature = "udp",
+    feature = "icmp",
+    feature = "dns",
+    feature = "driver-gem",
+    feature = "driver-virtio"
+))]
 mod tests {
     use super::*;
     use core::sync::atomic::{AtomicU32, Ordering};

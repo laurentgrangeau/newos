@@ -7,7 +7,9 @@
 //! - [`iommu`]: Broadcom BCM2712 IOMMU (`brcm,bcm2712-iommu`) page-table & TLB driver
 //! - [`v3d`]: Broadcom VideoCore VII (V3D 7.1) probe & Compute Shader Dispatch (CSD) driver
 
+#[cfg(feature = "iommu")]
 pub mod iommu;
+#[cfg(feature = "v3d")]
 pub mod v3d;
 
 use newos_abi::SysError;

@@ -10,9 +10,13 @@
 //! - [`rtc`]: Raspberry Pi 5 RTC epoch / Gregorian calendar & alarm driver
 //! - [`rp1_bus`]: RP1 40-pin header PL011 UART, DesignWare I2C, DesignWare SPI, and RP1 PWM
 
+#[cfg(feature = "mailbox")]
 pub mod mailbox;
+#[cfg(feature = "rp1-bus")]
 pub mod rp1_bus;
+#[cfg(feature = "rtc")]
 pub mod rtc;
+#[cfg(feature = "thermal")]
 pub mod thermal;
 
 use newos_abi::SysError;

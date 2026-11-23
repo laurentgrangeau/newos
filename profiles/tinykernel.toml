@@ -1,0 +1,46 @@
+# NewOS Minimal-TCB Profile (Pure EL1 Microkernel)
+# Pure EL1 microkernel only: FIFO scheduler, uniprocessor (no SMP), no ACPI,
+# no userspace ELFs, no shell, no networking, no SSH, no cryptography, no drivers.
+
+[target]
+arch = "aarch64"           # Valid: "aarch64"
+board = "rpi5"             # Valid: "rpi5" | "qemu-virt"
+cpu = "cortex-a76"         # Valid: any LLVM AArch64 target-cpu (e.g. "cortex-a76", "generic")
+
+[kernel]
+scheduler = "fifo"         # Valid: "priority-rr" | "round-robin" | "fifo" (cooperative)
+smp = false                # Valid: true | false (false = single-core uniprocessor)
+userspace = false          # Valid: true | false (false = pure EL1 kernel, no EL0 ELFs)
+elf_attestation = false    # Valid: true | false (requires "sha3" in [crypto].algorithms)
+acpi = false               # Valid: true | false (false = static BoardDescriptor only)
+
+[userspace]
+init = false               # Valid: true | false (requires [kernel].userspace = true)
+worker = false             # Valid: true | false (requires [kernel].userspace = true)
+shell = false              # Valid: true | false (requires init = true)
+netd = false               # Valid: true | false (requires [net].enabled = true and ipv4 or ipv6)
+keyd = false               # Valid: true | false (requires "sha3" and "ml-dsa-87" in [crypto])
+sshd = false               # Valid: true | false (requires netd, keyd, shell, and all 4 PQ crypto algs)
+
+[net]
+enabled = false            # Valid: true | false (master switch for networking)
+ipv4 = false               # Valid: true | false (IPv4, ARP, DHCPv4; independent of ipv6)
+ipv6 = false               # Valid: true | false (IPv6, EUI-64 link-local, NDP, routing; independent of ipv4)
+tcp = false                # Valid: true | false (TCP sockets)
+udp = false                # Valid: true | false (UDP sockets)
+icmp = false               # Valid: true | false (ICMPv4 / ICMPv6 sockets)
+dns = false                # Valid: true | false (DNS A / AAAA resolver)
+drivers = []               # Valid subset: ["gem", "virtio"] (RP1 Cadence GEM, QEMU VirtIO-Net v2)
+
+[crypto]
+algorithms = []            # Valid subset: ["sha3", "chacha20-poly1305", "ml-kem-1024", "ml-dsa-87"]
+
+[drivers]
+storage = []               # Valid subset: ["pcie", "sdhci", "nvme", "caos-snapshot"] (caos-snapshot needs "sha3")
+rng = []                   # Valid subset: ["bcm2712", "virtio", "csprng"] (csprng needs "sha3")
+gpu = []                   # Valid subset: ["v3d", "iommu"]
+ai = []                    # Valid subset: ["compute", "hailo"]
+usb = []                   # Valid subset: ["xhci"]
+gpio = []                  # Valid subset: ["rp1"]
+wdt = []                   # Valid subset: ["bcm2712"]
+board = []                 # Valid subset: ["mailbox", "thermal", "rtc", "rp1-bus"]

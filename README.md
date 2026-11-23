@@ -1,6 +1,6 @@
 # NewOS
 
-> **Release:** [`v0.5.0`](https://github.com/laurentgrangeau/newos/releases/tag/v0.5.0) · `main` is on `0.6.0` development.
+> **Release:** [`v0.6.0`](https://github.com/laurentgrangeau/newos/releases/tag/v0.6.0) — Modular seL4-style system composition & minimal-TCB profiles, trait-based `newos-crypto`, pluggable schedulers & independent IPv4/IPv6 dual-stack networking.
 
 A pure **seL4-style 64-bit capability microkernel** and **post-UNIX EL0 environment** written in modern Rust — built solely for the **Raspberry Pi 5 16 GB** (`aarch64` / ARMv8.2-A quad-core BCM2712 Cortex-A76, with QEMU `aarch64` `virt` retained as a local test harness). Built with **zero kernel heap (`no_alloc` in EL1)**, **100% memory-safe Rust APIs (`#![forbid(unsafe_code)]` across core, board/GPIO/watchdog/storage/USB/GPU/AI drivers, networking, RNG, PQ-SSH, shell, userspace & benchmarks)**, **Kernel PIE + Limine KASLR**, **Userspace PIE + full ASLR + KCFI + LLVM ShadowCallStack (`x18`)**, **true quad-core SMP EL0 scheduling with GICv2 SGI wakeups & cross-core blocking IPC**, **isolated `TTBR0_EL1` address spaces (16-bit ASIDs + full NEON/FP save/restore)**, **EL0 crash isolation**, **live ACPI hardware discovery (`FADT`/`SPCR`/`MADT`/`GTDT`/`MCFG`)**, a **full Raspberry Pi 5 (16 GB) EL0 hardware driver stack** (**BCM2712 Watchdog**, **RP1 40-pin GPIO**, **VideoCore Mailbox**, **AVS TMON Thermal & Active Cooler Fan**, **RTC**, **RP1 UART/I2C/SPI/PWM**, **BCM2712 MIP MSI-X**, **PCIe ECAM**, **microSD SDHCI**, **NVMe 1.4**, **RP1 Dual xHCI USB 3.0**, **UEFI GOP Framebuffer**, **`brcm,bcm2712-iommu`**, **VideoCore VII V3D 7.1**, **Cortex-A76 NEON/DotProd AI Compute**, and **Hailo-8/8L/10H PCIe NPU**), a **3-process privilege-separated Pure Post-Quantum SSHv2 server (`newos-netd` + `newos-keyd` + `newos-sshd`)** with **hardware TRNG (`BCM2712 iproc-rng200` / `VirtIO-RNG`)**, an **EL0 `smoltcp` IPv4/IPv6 TCP/IP stack + RP1 Cadence GEM Gigabit Ethernet driver** (plus VirtIO 1.0+ for QEMU testing), a **FIPS 202 `SHA3-512` Content-Addressed Object Store (CAOS)**, and a **UTF-8 Typed Pipeline Shell (`newos-sh`)**.
 
@@ -151,13 +151,21 @@ sequenceDiagram
 ```text
 newos/
 ├── rust-toolchain.toml          # Nightly toolchain + rust-src, llvm-tools-preview, aarch64-unknown-none
-├── Cargo.toml                   # Workspace manifest (v0.6.0; v0.5.0 released)
+├── Cargo.toml                   # Workspace manifest (v0.6.0)
 ├── BENCHMARK_RESULTS.md         # Reproducible 28-metric before/after kernel, shell & IPC benchmarks
+├── profiles/                    # Declarative TOML system composition & TCB profiles (inline-commented) & OPTIONS.md
+│   ├── OPTIONS.md               # Exhaustive reference of all 31 profile options, valid values & dependencies
+│   ├── tinykernel.toml          # Pure EL1 microkernel (FIFO, UP, no userspace, no net, no crypto, no drivers)
+│   ├── minimal-init.toml        # EL1 kernel + bare EL0 `newos-init` (no shell, no net, no SSH, no crypto)
+│   ├── rpi5-net.toml            # Raspberry Pi 5 + shell + dual-stack IPv4/IPv6 + storage (zero SSH/crypto/GPU/AI)
+│   ├── rpi5-full.toml           # Full Raspberry Pi 5 system (all subsystems, drivers & pure-PQ SSH)
+│   └── qemu-virt-full.toml      # Full QEMU `virt` test harness profile
 ├── targets/
 │   └── aarch64-newos-user.json  # Custom Cortex-A76 EL0 PIE target spec enabling KCFI + LLVM ShadowCallStack (x18)
-├── xtask/                       # Build automation: pure UEFI GPT+FAT32 ESP images, QEMU, Miri, Kani & benchmarks
+├── xtask/                       # Build automation: system composition resolver, feature-matrix, UEFI GPT+FAT32 ESP images, QEMU, Miri, Kani & benchmarks
 ├── crates/
-│   ├── abi/                     # #![no_std], #![forbid(unsafe_code)] — Syscalls, CapId, Rights, DmaCacheOp, cpu_isa, SpscRing, FIPS 202 SHA3-512/SHAKE256
+│   ├── crypto/                  # #![no_std], no_alloc, #![forbid(unsafe_code)] — Modular crypto traits & feature-gated algorithms (SHA3, ChaCha20-Poly1305, ML-KEM-1024, ML-DSA-87)
+│   ├── abi/                     # #![no_std], #![forbid(unsafe_code)] — Syscalls, CapId, Rights, DmaCacheOp, cpu_isa, SpscRing (optional `sha3`)
 │   ├── hal/                     # #![no_std], no_alloc — Minimal audited unsafe TCB (aarch64, GIC-400, BCM2712 MIP, quad-core SMP, ACPI, PMUv3, MMIO)
 │   ├── kernel-core/             # #![no_std], no_alloc, #![forbid(unsafe_code)] — Untyped, CSpace/CDT, ELF64 PIE, ACPI, IPC, Sched + Kani proofs
 │   ├── kernel/                  # #![no_std], #![no_main], #![forbid(unsafe_code)] — Thin EL1 kernel binary
@@ -201,6 +209,37 @@ Selected highlights from the `v0.1.0` optimization pass:
 cargo xtask bench             # Human-readable table
 cargo xtask bench --markdown  # Markdown table
 cargo xtask bench --json      # Machine-readable JSON
+```
+
+## Modular System Composition & TCB Profiles (`profiles/*.toml`)
+
+Following seL4's **minimal-TCB and explicit system composition** philosophy (akin to seL4 Microkit / CAmkES), NewOS uses declarative TOML profiles to specify the exact EL1 microkernel TCB and the exact set of isolated EL0 protection domains, drivers, and cryptographic primitives assembled into a boot image — from a **pure EL1 minimal-TCB microkernel** (`tinykernel.toml`: FIFO scheduler, uniprocessor, no ACPI, zero EL0 binaries, zero networking, zero crypto, zero drivers) to a **custom appliance** or a **full Raspberry Pi 5 system**:
+
+- **Pluggable EL1 Microkernel Core (`newos-kernel-core`):** Compile-time scheduler policy selection (`priority-rr`, `round-robin`, or cooperative `fifo`), `smp` vs uniprocessor toggle, and optional `userspace`, `elf-attestation`, and `acpi`.
+- **Pluggable Board / CPU Abstraction (`newos-hal`):** `BoardDescriptor` decouples SoC MMIO maps (`board-rpi5`, `board-qemu-virt`) from CPU architecture code (`arch-aarch64`), making future boards and CPUs drop-in additions.
+- **Modular Cryptography (`newos-crypto`):** Trait-based abstractions (`Hasher`, `Xof`, `AeadCipher`, `Kem`, `SignatureScheme`) with per-algorithm Cargo features (`sha3`, `chacha20-poly1305`, `ml-kem-1024`, `ml-dsa-87`). Set `algorithms = []` for a 100% crypto-free TCB.
+- **Independent IPv4 / IPv6 / Dual-Stack Networking (`newos-net`, `newos-netd`):** Toggle `ipv4` (DHCPv4/static), `ipv6` (EUI-64 link-local `fe80::/64`, NDP, global unicast, routing), or both dual-stack, plus individual protocol (`tcp`, `udp`, `icmp`, `dns`) and NIC driver (`gem`, `virtio`) features.
+- **Granular EL0 Driver Feature Gates:** Independently include or omit drivers across `storage`, `rng`, `gpu`, `ai`, `usb`, `gpio`, `wdt`, and `board`.
+
+Every profile file is exhaustively inline-commented with all valid choices and capability/feature dependencies (see also [`profiles/OPTIONS.md`](profiles/OPTIONS.md)):
+
+```bash
+# List all 31 supported profile options and valid values
+cargo xtask config --list-options
+
+# Inspect a resolved system composition & TCB manifest (with optional CLI overrides)
+cargo xtask config --profile profiles/tinykernel.toml
+cargo xtask config --profile profiles/rpi5-full.toml --ipv6-only --no-crypto
+
+# Run the 15-configuration feature matrix (zero-crypto, tinykernel/FIFO, IPv4-only, IPv6-only, dual-stack, minimal drivers)
+cargo xtask feature-matrix
+
+# Build custom Raspberry Pi 5 images or boot profiles in QEMU
+cargo xtask rpi5-image --profile profiles/tinykernel.toml --release     # Pure EL1 kernel (0 modules)
+cargo xtask rpi5-image --profile profiles/minimal-init.toml --release   # EL1 + bare EL0 init (1 module)
+cargo xtask rpi5-image --profile profiles/rpi5-net.toml --release       # Dual-stack net + storage, zero SSH/crypto
+cargo xtask rpi5-image --profile profiles/rpi5-full.toml --release      # Full Raspberry Pi 5 system
+cargo xtask run --profile profiles/tinykernel.toml --board qemu-virt --release
 ```
 
 ## Raspberry Pi 5 (16 GB) Deployment

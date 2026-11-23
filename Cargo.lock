@@ -194,6 +194,9 @@ dependencies = [
 [[package]]
 name = "newos-abi"
 version = "0.6.0"
+dependencies = [
+ "newos-crypto",
+]
 
 [[package]]
 name = "newos-ai"
@@ -216,6 +219,16 @@ name = "newos-board"
 version = "0.6.0"
 dependencies = [
  "newos-abi",
+]
+
+[[package]]
+name = "newos-crypto"
+version = "0.6.0"
+dependencies = [
+ "ml-dsa",
+ "ml-kem",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -273,6 +286,7 @@ name = "newos-kernel-core"
 version = "0.6.0"
 dependencies = [
  "newos-abi",
+ "newos-crypto",
 ]
 
 [[package]]
@@ -281,6 +295,7 @@ version = "0.6.0"
 dependencies = [
  "ml-dsa",
  "newos-abi",
+ "newos-crypto",
  "newos-rng",
  "subtle",
  "zeroize",
@@ -318,6 +333,7 @@ name = "newos-rng"
 version = "0.6.0"
 dependencies = [
  "newos-abi",
+ "newos-crypto",
 ]
 
 [[package]]
@@ -345,6 +361,7 @@ dependencies = [
  "ml-dsa",
  "ml-kem",
  "newos-abi",
+ "newos-crypto",
  "subtle",
  "zeroize",
 ]
@@ -363,6 +380,7 @@ name = "newos-storage"
 version = "0.6.0"
 dependencies = [
  "newos-abi",
+ "newos-crypto",
 ]
 
 [[package]]

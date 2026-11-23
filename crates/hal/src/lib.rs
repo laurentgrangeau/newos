@@ -6,6 +6,7 @@
 //! exposing 100% memory-safe abstractions to `newos-kernel-core` and `newos-kernel`.
 
 pub mod arch;
+pub mod board;
 pub mod boot;
 
 use core::fmt::Write;

@@ -6,8 +6,10 @@
 //! All hardware interaction is injected via safe traits; this crate contains
 //! zero `unsafe` blocks and zero dynamic heap allocations.
 
+#[cfg(feature = "acpi")]
 pub mod acpi;
 pub mod cspace;
+#[cfg(feature = "userspace")]
 pub mod elf;
 pub mod ipc;
 pub mod memory;
@@ -17,17 +19,21 @@ pub use ipc::{IpcMessage, IpcStats, KernelIpcState};
 
 use core::fmt::Write;
 use cspace::{CNode, CapObject, Capability};
-use memory::{
-    CpuSecurityFeatures, PAGE_SIZE, PageFlags, PhysAddr, UntypedInventory, VSpaceMapper, VirtAddr,
-};
+#[cfg(feature = "userspace")]
+use memory::PAGE_SIZE;
+use memory::{CpuSecurityFeatures, PageFlags, PhysAddr, UntypedInventory, VSpaceMapper, VirtAddr};
 use newos_abi::{Rights, ShutdownStatus, SysError};
 
+#[cfg(feature = "userspace")]
 const USER_STACK_BASE: u64 = 0x0000_7fff_f000_0000;
+#[cfg(feature = "userspace")]
 const USER_STACK_PAGES: u64 = 16; // 64 KiB EL0 data stack
 /// 1 MiB EL0 data stack for pure-PQ `no_alloc` daemons (`newos-netd`, `newos-keyd`, `newos-sshd`)
 /// running `no_alloc` NIST Level 5 ML-DSA-87 / ML-KEM-1024 lattice math.
 pub const USER_PQ_STACK_PAGES: u64 = 256;
+#[cfg(feature = "userspace")]
 const USER_SHADOW_STACK_BASE: u64 = 0x0000_7fff_e000_0000;
+#[cfg(feature = "userspace")]
 const USER_SHADOW_STACK_PAGES: u64 = 2; // 8 KiB EL0 Shadow Call Stack (`x18`, grows upward)
 
 /// Linear UEFI GOP / Limine framebuffer geometry discovered at boot.
@@ -85,6 +91,9 @@ pub trait HalPlatform: Write {
     type VSpace: VSpaceMapper;
 
     fn arch_name(&self) -> &'static str;
+    fn board_name(&self) -> &'static str {
+        "generic"
+    }
     fn security_features(&self) -> CpuSecurityFeatures;
     /// Return packed ARMv8.2-A ISA feature bitmask + PA width + D-cache line size (`newos_abi::cpu_isa`).
     fn cpu_isa_features(&self) -> u64 {
@@ -123,16 +132,23 @@ pub trait HalPlatform: Write {
 /// Microkernel boot entry: verify Phases 1–3 + SMP, then load isolated EL0 `init` & `worker`.
 pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
     let sec = platform.security_features();
-    let board = if info.qemu_virt {
+    let board = if platform.board_name() != "generic" {
+        platform.board_name()
+    } else if info.qemu_virt {
         "qemu-virt-test"
     } else {
         "rpi5-16gb"
     };
     let _ = writeln!(
         platform,
-        "[newos] booting pure seL4-style 64-bit Rust microkernel (arch={}, board={}, no_alloc, forbid_unsafe_core)",
+        "[newos] booting pure seL4-style 64-bit Rust microkernel (arch={}, board={}, sched={}, smp={}, userspace={}, elf_attest={}, acpi={}, no_alloc, forbid_unsafe_core)",
         platform.arch_name(),
         board,
+        sched::ACTIVE_SCHED_POLICY.as_str(),
+        cfg!(feature = "smp"),
+        cfg!(feature = "userspace"),
+        cfg!(feature = "elf-attestation"),
+        cfg!(feature = "acpi"),
     );
     let _ = writeln!(
         platform,
@@ -186,6 +202,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
         );
     }
 
+    #[cfg(feature = "smp")]
     if platform.online_cpus() != info.cpu_count {
         let _ = writeln!(
             platform,
@@ -243,82 +260,104 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
         }
     }
 
-    // Phase 4+: Load `init` (PID 0) and `worker` (PID 1) into SEPARATE isolated EL0 VSpaces!
-    let Some(init_bytes) = info.init_module else {
+    // Phase 4+: Pure EL1 tinykernel mode (no userspace) OR optional EL0 module bootstrap.
+    #[cfg(not(feature = "userspace"))]
+    {
         let _ = writeln!(
             platform,
-            "[newos] FAIL: missing Limine boot module `newos-init`"
+            "[newos] pure EL1 tinykernel boot complete (userspace=false, sched={}, smp={})",
+            sched::ACTIVE_SCHED_POLICY.as_str(),
+            cfg!(feature = "smp"),
         );
-        platform.exit(ShutdownStatus::Failed);
-    };
-    let Some(worker_bytes) = info.worker_module else {
-        let _ = writeln!(
-            platform,
-            "[newos] FAIL: missing Limine boot module `newos-worker`"
-        );
-        platform.exit(ShutdownStatus::Failed);
-    };
+        if info.qemu_virt {
+            platform.exit(ShutdownStatus::Success)
+        } else {
+            loop {
+                platform.wait_for_interrupt();
+            }
+        }
+    }
 
-    match spawn_isolated_process(
-        platform,
-        ProcessRole::Init,
-        "init",
-        init_bytes,
-        &mut info.untyped,
-    )
-    .and_then(|_| {
-        spawn_isolated_process(
-            platform,
-            ProcessRole::Worker,
-            "worker",
-            worker_bytes,
-            &mut info.untyped,
-        )
-    })
-    .and_then(|_| {
-        if let Some(netd) = info.netd_module {
-            spawn_isolated_process(
-                platform,
-                ProcessRole::Netd,
-                "newos-netd",
-                netd,
-                &mut info.untyped,
-            )?;
-        }
-        if let Some(keyd) = info.keyd_module {
-            spawn_isolated_process(
-                platform,
-                ProcessRole::Keyd,
-                "newos-keyd",
-                keyd,
-                &mut info.untyped,
-            )?;
-        }
-        if let Some(sshd) = info.sshd_module {
-            spawn_isolated_process(
-                platform,
-                ProcessRole::Sshd,
-                "newos-sshd",
-                sshd,
-                &mut info.untyped,
-            )?;
-        }
-        Ok(())
-    }) {
-        Ok(()) => {
-            platform.install_runtime_untyped(info.untyped);
-            platform.start_userspace()
-        }
-        Err(err) => {
+    #[cfg(feature = "userspace")]
+    {
+        let Some(init_bytes) = info.init_module else {
             let _ = writeln!(
                 platform,
-                "[newos] FAIL: failed to spawn EL0 processes: {err:?}"
+                "[newos] no EL0 init module supplied; pure EL1 kernel boot complete"
             );
-            platform.exit(ShutdownStatus::Failed);
+            if info.qemu_virt {
+                platform.exit(ShutdownStatus::Success)
+            } else {
+                loop {
+                    platform.wait_for_interrupt();
+                }
+            }
+        };
+
+        let spawn_result = spawn_isolated_process(
+            platform,
+            ProcessRole::Init,
+            "init",
+            init_bytes,
+            &mut info.untyped,
+        )
+        .and_then(|_| {
+            if let Some(worker_bytes) = info.worker_module {
+                spawn_isolated_process(
+                    platform,
+                    ProcessRole::Worker,
+                    "worker",
+                    worker_bytes,
+                    &mut info.untyped,
+                )?;
+            }
+            if let Some(netd) = info.netd_module {
+                spawn_isolated_process(
+                    platform,
+                    ProcessRole::Netd,
+                    "newos-netd",
+                    netd,
+                    &mut info.untyped,
+                )?;
+            }
+            if let Some(keyd) = info.keyd_module {
+                spawn_isolated_process(
+                    platform,
+                    ProcessRole::Keyd,
+                    "newos-keyd",
+                    keyd,
+                    &mut info.untyped,
+                )?;
+            }
+            if let Some(sshd) = info.sshd_module {
+                spawn_isolated_process(
+                    platform,
+                    ProcessRole::Sshd,
+                    "newos-sshd",
+                    sshd,
+                    &mut info.untyped,
+                )?;
+            }
+            Ok(())
+        });
+
+        match spawn_result {
+            Ok(()) => {
+                platform.install_runtime_untyped(info.untyped);
+                platform.start_userspace()
+            }
+            Err(err) => {
+                let _ = writeln!(
+                    platform,
+                    "[newos] FAIL: failed to spawn EL0 processes: {err:?}"
+                );
+                platform.exit(ShutdownStatus::Failed);
+            }
         }
     }
 }
 
+#[cfg(feature = "userspace")]
 fn spawn_isolated_process<P: HalPlatform>(
     platform: &mut P,
     role: ProcessRole,
@@ -326,7 +365,10 @@ fn spawn_isolated_process<P: HalPlatform>(
     elf_bytes: &[u8],
     untyped: &mut UntypedInventory,
 ) -> Result<(), SysError> {
-    let sha_prefix = newos_abi::sha3::digest_prefix_u64(elf_bytes);
+    #[cfg(feature = "elf-attestation")]
+    let sha_prefix = newos_crypto::sha3::digest_prefix_u64(elf_bytes);
+    #[cfg(not(feature = "elf-attestation"))]
+    let sha_prefix: u64 = 0;
     let entropy = platform.random_u64();
     let stack_slide = (entropy & 0xFF) * PAGE_SIZE;
     let pie_base = 0x0040_0000u64 + (((entropy >> 8) & 0xFF) * PAGE_SIZE);
@@ -364,6 +406,7 @@ fn spawn_isolated_process<P: HalPlatform>(
 
 /// Pure `#![forbid(unsafe_code)]`, `no_alloc` ELF64 loader mapping an `ET_EXEC` or PIE `ET_DYN`
 /// binary into an isolated `VSpace` with ASLR code/stack/SCS slides and `R_AARCH64_RELATIVE` relocations.
+#[cfg(feature = "userspace")]
 fn load_elf64_into_vspace<V: VSpaceMapper>(
     vspace: &mut V,
     elf_bytes: &[u8],

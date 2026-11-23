@@ -1,0 +1,45 @@
+# NewOS QEMU `virt` Full Test Harness Profile
+# Mirrors `rpi5-full.toml` targeting QEMU `aarch64` `virt` (`-cpu cortex-a76`).
+
+[target]
+arch = "aarch64"           # Valid: "aarch64"
+board = "qemu-virt"        # Valid: "rpi5" | "qemu-virt"
+cpu = "cortex-a76"         # Valid: any LLVM AArch64 target-cpu (e.g. "cortex-a76", "generic")
+
+[kernel]
+scheduler = "priority-rr"  # Valid: "priority-rr" | "round-robin" | "fifo" (cooperative)
+smp = true                 # Valid: true | false (false = single-core uniprocessor)
+userspace = true           # Valid: true | false (false = pure EL1 kernel, no EL0 ELFs)
+elf_attestation = true     # Valid: true | false (requires "sha3" in [crypto].algorithms)
+acpi = true                # Valid: true | false (false = static BoardDescriptor only)
+
+[userspace]
+init = true                # Valid: true | false (requires [kernel].userspace = true)
+worker = true              # Valid: true | false (requires [kernel].userspace = true)
+shell = true               # Valid: true | false (requires init = true)
+netd = true                # Valid: true | false (requires [net].enabled = true and ipv4 or ipv6)
+keyd = true                # Valid: true | false (requires "sha3" and "ml-dsa-87" in [crypto])
+sshd = true                # Valid: true | false (requires netd, keyd, shell, and all 4 PQ crypto algs)
+
+[net]
+enabled = true             # Valid: true | false (master switch for networking)
+ipv4 = true                # Valid: true | false (IPv4, ARP, DHCPv4; independent of ipv6)
+ipv6 = true                # Valid: true | false (IPv6, EUI-64 link-local, NDP, routing; independent of ipv4)
+tcp = true                 # Valid: true | false (TCP sockets)
+udp = true                 # Valid: true | false (UDP sockets)
+icmp = true                # Valid: true | false (ICMPv4 / ICMPv6 sockets)
+dns = true                 # Valid: true | false (DNS A / AAAA resolver)
+drivers = ["gem", "virtio"]  # Valid subset: ["gem", "virtio"] (RP1 Cadence GEM, QEMU VirtIO-Net v2)
+
+[crypto]
+algorithms = ["sha3", "chacha20-poly1305", "ml-kem-1024", "ml-dsa-87"]  # Valid subset or [] for zero crypto
+
+[drivers]
+storage = ["pcie", "sdhci", "nvme", "caos-snapshot"]  # Valid subset: ["pcie", "sdhci", "nvme", "caos-snapshot"] (caos-snapshot needs "sha3")
+rng = ["bcm2712", "virtio", "csprng"]                 # Valid subset: ["bcm2712", "virtio", "csprng"] (csprng needs "sha3")
+gpu = ["v3d", "iommu"]                                # Valid subset: ["v3d", "iommu"]
+ai = ["compute", "hailo"]                             # Valid subset: ["compute", "hailo"]
+usb = ["xhci"]                                        # Valid subset: ["xhci"]
+gpio = ["rp1"]                                        # Valid subset: ["rp1"]
+wdt = ["bcm2712"]                                     # Valid subset: ["bcm2712"]
+board = ["mailbox", "thermal", "rtc", "rp1-bus"]      # Valid subset: ["mailbox", "thermal", "rtc", "rp1-bus"]

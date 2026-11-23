@@ -4,8 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["compute", "hailo"]
+compute = []
+hailo = ["dep:newos-abi"]
+
 [dependencies]
-newos-abi = { workspace = true }
+newos-abi = { workspace = true, default-features = false, optional = true }
 
 [lints]
 workspace = true

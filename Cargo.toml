@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "xtask",
+    "crates/crypto",
     "crates/abi",
     "crates/hal",
     "crates/kernel-core",
@@ -30,6 +31,7 @@ members = [
 ]
 default-members = [
     "xtask",
+    "crates/crypto",
     "crates/abi",
     "crates/kernel-core",
     "crates/shell-core",
@@ -57,6 +59,7 @@ version = "0.6.0"
 [workspace.dependencies]
 limine = "0.6.5"
 newos-abi = { path = "crates/abi" }
+newos-crypto = { path = "crates/crypto" }
 newos-hal = { path = "crates/hal" }
 newos-kernel-core = { path = "crates/kernel-core" }
 newos-key-vault = { path = "crates/key-vault" }

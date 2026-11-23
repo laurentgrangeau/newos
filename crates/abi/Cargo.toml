@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["sha3"]
+sha3 = ["dep:newos-crypto"]
+
 [dependencies]
+newos-crypto = { workspace = true, default-features = false, features = ["sha3"], optional = true }
 
 [lints]
 workspace = true

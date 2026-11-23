@@ -10,5 +10,7 @@
 //! - [`hailo`]: External PCIe 2.0 x1 FFC **Raspberry Pi AI HAT+ / AI Kit** NPU driver
 //!   (**Hailo-8** 26 TOPS, **Hailo-8L** 13 TOPS, and **Hailo-10H**).
 
+#[cfg(feature = "compute")]
 pub mod compute;
+#[cfg(feature = "hailo")]
 pub mod hailo;

@@ -275,61 +275,104 @@ impl<const N: usize> Drop for IpcLogConsole<N> {
     }
 }
 
-/// Zero-allocation line reassembler used by the console owner (`init`) to drain
-/// 7-byte fastpath IPC log chunks from `CapId::BOOTSTRAP_LOG_EP` into complete lines.
-pub struct IpcLogAssembler<const N: usize = 256> {
-    buf: [u8; N],
+/// Number of concurrent sender reassembly slots in [`IpcLogAssembler`].
+const MAX_LOG_ASSEMBLER_SLOTS: usize = 6;
+
+#[derive(Clone, Copy)]
+struct LogSlot<const N: usize> {
+    badge: u64,
+    in_use: bool,
     len: usize,
-    active_badge: Option<u64>,
+    buf: [u8; N],
+}
+
+impl<const N: usize> LogSlot<N> {
+    const EMPTY: Self = Self {
+        badge: 0,
+        in_use: false,
+        len: 0,
+        buf: [0; N],
+    };
+}
+
+/// Zero-allocation per-sender line reassembler used by the console owner (`init`) to drain
+/// 7-byte fastpath IPC log chunks from `CapId::BOOTSTRAP_LOG_EP` into complete lines without
+/// interleaving or truncating concurrent daemons (`worker`, `netd`, `keyd`, `sshd`).
+pub struct IpcLogAssembler<const N: usize = 256> {
+    slots: [LogSlot<N>; MAX_LOG_ASSEMBLER_SLOTS],
     pending_chunk: [u8; newos_abi::log_ipc::MAX_CHUNK_BYTES],
     pending_off: usize,
     pending_len: usize,
     pending_badge: u64,
-    stashed_msg: Option<(u64, u64)>,
 }
 
 impl<const N: usize> IpcLogAssembler<N> {
     pub const fn new() -> Self {
         Self {
-            buf: [0u8; N],
-            len: 0,
-            active_badge: None,
+            slots: [LogSlot::EMPTY; MAX_LOG_ASSEMBLER_SLOTS],
             pending_chunk: [0u8; newos_abi::log_ipc::MAX_CHUNK_BYTES],
             pending_off: 0,
             pending_len: 0,
             pending_badge: 0,
-            stashed_msg: None,
         }
     }
 
-    fn emit_line(&mut self, out: &mut [u8]) -> Option<(u64, usize)> {
-        let badge = self.active_badge.unwrap_or(0);
-        let n = self.len.min(out.len());
-        out[..n].copy_from_slice(&self.buf[..n]);
-        self.len = 0;
-        self.active_badge = None;
+    fn emit_slot(&mut self, slot_idx: usize, out: &mut [u8]) -> Option<(u64, usize)> {
+        let slot = &mut self.slots[slot_idx];
+        let badge = slot.badge;
+        let n = slot.len.min(out.len());
+        out[..n].copy_from_slice(&slot.buf[..n]);
+        slot.len = 0;
+        slot.in_use = false;
         Some((badge, n))
     }
 
+    /// Find the existing slot for `badge` or allocate a free one.
+    /// Returns `Err(evict_idx)` if all slots are occupied so the caller can flush `evict_idx` first.
+    fn find_or_alloc_slot(&mut self, badge: u64) -> Result<usize, usize> {
+        let mut free_idx = None;
+        for (i, slot) in self.slots.iter().enumerate() {
+            if slot.in_use && slot.badge == badge {
+                return Ok(i);
+            }
+            if !slot.in_use && free_idx.is_none() {
+                free_idx = Some(i);
+            }
+        }
+        if let Some(idx) = free_idx {
+            self.slots[idx].badge = badge;
+            self.slots[idx].in_use = true;
+            self.slots[idx].len = 0;
+            Ok(idx)
+        } else {
+            Err(0)
+        }
+    }
+
     fn feed_pending_chunk(&mut self, out: &mut [u8]) -> Option<(u64, usize)> {
+        if self.pending_off >= self.pending_len {
+            return None;
+        }
+        let slot_idx = match self.find_or_alloc_slot(self.pending_badge) {
+            Ok(idx) => idx,
+            Err(evict_idx) => return self.emit_slot(evict_idx, out),
+        };
         while self.pending_off < self.pending_len {
             let b = self.pending_chunk[self.pending_off];
             self.pending_off += 1;
-            if self.active_badge.is_none() {
-                self.active_badge = Some(self.pending_badge);
-            }
             if b == b'\n' {
-                return self.emit_line(out);
+                return self.emit_slot(slot_idx, out);
             }
             if b == b'\r' || (b < 0x20 && b != b'\t') || b == 0x7F {
                 continue;
             }
-            if self.len < N {
-                self.buf[self.len] = b;
-                self.len += 1;
+            let slot = &mut self.slots[slot_idx];
+            if slot.len < N {
+                slot.buf[slot.len] = b;
+                slot.len += 1;
             }
-            if self.len == N {
-                return self.emit_line(out);
+            if slot.len == N {
+                return self.emit_slot(slot_idx, out);
             }
         }
         None
@@ -345,21 +388,10 @@ impl<const N: usize> IpcLogAssembler<N> {
         }
 
         loop {
-            let (badge, payload) = match self.stashed_msg.take() {
-                Some(msg) => msg,
-                None => match ipc_recv(ep) {
-                    Ok(msg) => msg,
-                    Err(_) => return None,
-                },
+            let (badge, payload) = match ipc_recv(ep) {
+                Ok(msg) => msg,
+                Err(_) => return None,
             };
-
-            if let Some(cur) = self.active_badge
-                && cur != badge
-                && self.len > 0
-            {
-                self.stashed_msg = Some((badge, payload));
-                return self.emit_line(out);
-            }
 
             let (chunk, chunk_len) = newos_abi::log_ipc::decode_chunk(payload);
             self.pending_chunk = chunk;

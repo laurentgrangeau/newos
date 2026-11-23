@@ -5,12 +5,20 @@
 //! TCP listener (port 22) with 32 KiB RX/TX ring buffers sized for ML-KEM-1024 + ML-DSA-87
 //! post-quantum SSH handshakes.
 
+#[cfg(feature = "ipv6")]
+use crate::Ipv6Config;
 use crate::NetConfig;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::Device;
-use smoltcp::socket::{dhcpv4, tcp};
+#[cfg(feature = "ipv4")]
+use smoltcp::socket::dhcpv4;
+use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+#[cfg(feature = "ipv4")]
+use smoltcp::wire::Ipv4Address;
+#[cfg(feature = "ipv6")]
+use smoltcp::wire::Ipv6Address;
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
 /// Static TCP socket buffer size (32 KiB each for RX and TX) to absorb ML-KEM-1024 (1568 B)
 /// and ML-DSA-87 (2592 B pk + 4627 B sig) SSH handshake packets without stalls.
@@ -51,22 +59,26 @@ impl NetStackStorage<'_> {
     }
 }
 
-/// Long-lived EL0 `smoltcp` IPv4/DHCPv4/TCP listener stack (`#![forbid(unsafe_code)]`, `no_alloc`).
+/// Long-lived EL0 `smoltcp` IPv4/IPv6 dual-stack TCP listener (`#![forbid(unsafe_code)]`, `no_alloc`).
 pub struct NetStack<'a, D: Device> {
     device: D,
     iface: Interface,
     sockets: SocketSet<'a>,
+    #[cfg(feature = "ipv4")]
     dhcp_handle: SocketHandle,
     tcp_handle: SocketHandle,
+    #[cfg(feature = "ipv4")]
     initial_cfg: NetConfig,
     cfg: NetConfig,
+    #[cfg(feature = "ipv6")]
+    ipv6_cfg: Ipv6Config,
     listen_port: u16,
     was_connected: bool,
 }
 
 impl<'a, D: Device> NetStack<'a, D> {
     /// Construct a persistent `NetStack` over an already-initialized `smoltcp` `Device`,
-    /// binding a TCP listener on `listen_port` (typically 22) and starting DHCPv4.
+    /// binding a TCP listener on `listen_port` (typically 22) and configuring IPv4/IPv6.
     pub fn new(
         mut device: D,
         mac: [u8; 6],
@@ -85,9 +97,17 @@ impl<'a, D: Device> NetStack<'a, D> {
         seed = (seed ^ (seed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         config.random_seed = seed ^ (seed >> 31);
         let mut iface = Interface::new(config, &mut device, Instant::from_millis(now_ms));
-        Self::apply_ip_config(&mut iface, &initial_cfg);
+        #[cfg(feature = "ipv6")]
+        let ipv6_cfg = Ipv6Config::from_mac(mac);
+        Self::apply_ip_config(
+            &mut iface,
+            &initial_cfg,
+            #[cfg(feature = "ipv6")]
+            &ipv6_cfg,
+        );
 
         let mut sockets = SocketSet::new(&mut storage.sockets[..]);
+        #[cfg(feature = "ipv4")]
         let dhcp_handle = sockets.add(dhcpv4::Socket::new());
 
         let mut tcp_sock = tcp::Socket::new(
@@ -104,32 +124,84 @@ impl<'a, D: Device> NetStack<'a, D> {
             device,
             iface,
             sockets,
+            #[cfg(feature = "ipv4")]
             dhcp_handle,
             tcp_handle,
+            #[cfg(feature = "ipv4")]
             initial_cfg,
             cfg: initial_cfg,
+            #[cfg(feature = "ipv6")]
+            ipv6_cfg,
             listen_port,
             was_connected: false,
         }
     }
 
-    fn apply_ip_config(iface: &mut Interface, cfg: &NetConfig) {
+    #[cfg(feature = "ipv6")]
+    /// Update the active IPv6 configuration (link-local, optional global unicast, gateway, DNS)
+    /// and immediately reprogram the underlying `smoltcp` interface.
+    pub fn set_ipv6_config(&mut self, ipv6_cfg: Ipv6Config) {
+        self.ipv6_cfg = ipv6_cfg;
+        Self::apply_ip_config(&mut self.iface, &self.cfg, &self.ipv6_cfg);
+    }
+
+    #[cfg(feature = "ipv6")]
+    #[inline]
+    pub fn ipv6_config(&self) -> Ipv6Config {
+        self.ipv6_cfg
+    }
+
+    fn apply_ip_config(
+        iface: &mut Interface,
+        cfg: &NetConfig,
+        #[cfg(feature = "ipv6")] ipv6_cfg: &Ipv6Config,
+    ) {
+        #[cfg(not(feature = "ipv4"))]
+        let _ = cfg;
         iface.update_ip_addrs(|addrs| {
             addrs.clear();
-            let _ = addrs.push(IpCidr::new(
-                IpAddress::Ipv4(Ipv4Address::from(cfg.ip)),
-                cfg.prefix_len,
-            ));
+            #[cfg(feature = "ipv4")]
+            if cfg.ip != [0, 0, 0, 0] {
+                let _ = addrs.push(IpCidr::new(
+                    IpAddress::Ipv4(Ipv4Address::from(cfg.ip)),
+                    cfg.prefix_len,
+                ));
+            }
+            #[cfg(feature = "ipv6")]
+            {
+                let _ = addrs.push(IpCidr::new(
+                    IpAddress::Ipv6(Ipv6Address::from(ipv6_cfg.link_local)),
+                    64,
+                ));
+                if let Some((global, prefix)) = ipv6_cfg.global {
+                    let _ = addrs.push(IpCidr::new(
+                        IpAddress::Ipv6(Ipv6Address::from(global)),
+                        prefix,
+                    ));
+                }
+            }
         });
-        iface.routes_mut().remove_default_ipv4_route();
-        if let Some(gw) = cfg.gateway {
-            let _ = iface
-                .routes_mut()
-                .add_default_ipv4_route(Ipv4Address::from(gw));
+        #[cfg(feature = "ipv4")]
+        {
+            iface.routes_mut().remove_default_ipv4_route();
+            if let Some(gw) = cfg.gateway {
+                let _ = iface
+                    .routes_mut()
+                    .add_default_ipv4_route(Ipv4Address::from(gw));
+            }
+        }
+        #[cfg(feature = "ipv6")]
+        {
+            iface.routes_mut().remove_default_ipv6_route();
+            if let Some(gw) = ipv6_cfg.gateway {
+                let _ = iface
+                    .routes_mut()
+                    .add_default_ipv6_route(Ipv6Address::from(gw));
+            }
         }
     }
 
-    /// Drive `smoltcp` RX/TX, DHCPv4 lease state, and automatic TCP re-listen.
+    /// Drive `smoltcp` RX/TX, DHCPv4 lease state (when `ipv4` is enabled), and automatic TCP re-listen.
     pub fn poll(&mut self, now_ms: i64) -> TcpEvent {
         let _ = self.iface.poll(
             Instant::from_millis(now_ms),
@@ -138,6 +210,7 @@ impl<'a, D: Device> NetStack<'a, D> {
         );
 
         // Handle DHCPv4 lease acquisition / renewal
+        #[cfg(feature = "ipv4")]
         if let Some(ev) = self
             .sockets
             .get_mut::<dhcpv4::Socket>(self.dhcp_handle)
@@ -151,18 +224,23 @@ impl<'a, D: Device> NetStack<'a, D> {
                         gateway: leased.router.map(|r| r.octets()),
                         dns: leased.dns_servers.first().map(|d| d.octets()),
                     };
-                    Self::apply_ip_config(&mut self.iface, &self.cfg);
+                    Self::apply_ip_config(
+                        &mut self.iface,
+                        &self.cfg,
+                        #[cfg(feature = "ipv6")]
+                        &self.ipv6_cfg,
+                    );
                 }
                 dhcpv4::Event::Deconfigured => {
                     // Revert to the caller-supplied initial configuration (never hardcode QEMU's
                     // 10.0.2.15/24 on non-QEMU hardware, `N16`).
                     self.cfg = self.initial_cfg;
-                    if self.cfg.ip == [0, 0, 0, 0] {
-                        self.iface.update_ip_addrs(|addrs| addrs.clear());
-                        self.iface.routes_mut().remove_default_ipv4_route();
-                    } else {
-                        Self::apply_ip_config(&mut self.iface, &self.cfg);
-                    }
+                    Self::apply_ip_config(
+                        &mut self.iface,
+                        &self.cfg,
+                        #[cfg(feature = "ipv6")]
+                        &self.ipv6_cfg,
+                    );
                 }
             }
         }
@@ -353,6 +431,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ipv4")]
     fn persistent_netstack_handles_pq_sized_ssh_exchange_and_relistens() {
         let mut storage = NetStackStorage::new();
         let server_cfg = NetConfig {
@@ -455,5 +534,91 @@ mod tests {
             assert_eq!(s_recv, client_payload);
             assert!(saw_disconnected, "round {round} should emit Disconnected");
         }
+    }
+
+    #[test]
+    #[cfg(feature = "ipv6")]
+    fn persistent_netstack_handles_ipv6_tcp_exchange() {
+        let mut storage = NetStackStorage::new();
+        let server_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x11];
+        let server_v6 = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let client_v6 = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+
+        let mut server = NetStack::new(
+            WireEnd::new(),
+            server_mac,
+            NetConfig::QEMU_DEFAULT,
+            SSH_PORT,
+            0,
+            &mut storage,
+        );
+        server.set_ipv6_config(Ipv6Config {
+            link_local: server_v6,
+            global: None,
+            gateway: None,
+            dns: None,
+        });
+
+        let mut client_dev = WireEnd::new();
+        let mut client_iface = Interface::new(
+            Config::new(HardwareAddress::Ethernet(EthernetAddress([
+                0x02, 0x00, 0x00, 0x00, 0x00, 0x22,
+            ]))),
+            &mut client_dev,
+            Instant::from_millis(0),
+        );
+        client_iface.update_ip_addrs(|a| {
+            let _ = a.push(IpCidr::new(
+                IpAddress::Ipv6(Ipv6Address::from(client_v6)),
+                64,
+            ));
+        });
+        let mut c_rx = [0u8; 4096];
+        let mut c_tx = [0u8; 4096];
+        let mut c_storage = [SocketStorage::EMPTY; 1];
+        let mut c_sockets = SocketSet::new(&mut c_storage[..]);
+        let c_handle = c_sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut c_rx[..]),
+            tcp::SocketBuffer::new(&mut c_tx[..]),
+        ));
+        c_sockets
+            .get_mut::<tcp::Socket>(c_handle)
+            .connect(
+                client_iface.context(),
+                (IpAddress::Ipv6(Ipv6Address::from(server_v6)), SSH_PORT),
+                41_000,
+            )
+            .unwrap();
+
+        let msg = b"hello-newos-ipv6-tcp!";
+        let mut sent = false;
+        let mut got = [0u8; 64];
+        let mut got_len = 0usize;
+        let mut saw_connected = false;
+
+        for step in 0..300i64 {
+            let now = step * 10;
+            let _ = client_iface.poll(Instant::from_millis(now), &mut client_dev, &mut c_sockets);
+            pump_wire(&mut client_dev, &mut server.device);
+            if matches!(server.poll(now), TcpEvent::Connected) {
+                saw_connected = true;
+            }
+            pump_wire(&mut client_dev, &mut server.device);
+
+            let cs = c_sockets.get_mut::<tcp::Socket>(c_handle);
+            if !sent && cs.can_send() {
+                assert_eq!(cs.send_slice(msg).unwrap(), msg.len());
+                sent = true;
+            }
+            if got_len < msg.len() {
+                got_len += server.recv(&mut got[got_len..]);
+            }
+            if got_len == msg.len() {
+                break;
+            }
+        }
+
+        assert!(saw_connected, "IPv6 TCP client should connect");
+        assert_eq!(&got[..got_len], msg);
     }
 }

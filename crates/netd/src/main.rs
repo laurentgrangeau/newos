@@ -17,17 +17,25 @@ use core::fmt::Write;
 use core::panic::PanicInfo;
 use newos_abi::{CapId, SysError, net_ipc};
 use newos_net::{
-    CycleClock, GemDma, GemNetDevice, MmioDmaTransport, NetClock, NetConfig, NetDevice, NetStack,
-    NetStackStorage, NicKind, SSH_PORT, TcpEvent, VirtioNetDevice, VirtioNetDma,
+    CycleClock, MmioDmaTransport, NetClock, NetConfig, NetDevice, NetStack, NetStackStorage,
+    NicKind, SSH_PORT, TcpEvent,
 };
+#[cfg(feature = "driver-gem")]
+use newos_net::{GemDma, GemNetDevice};
+#[cfg(feature = "driver-virtio")]
+use newos_net::{VirtioNetDevice, VirtioNetDma};
 use newos_user_rt::IpcLogConsole;
 
 /// Static EL0 DMA rings & packet buffers (`Sync` via atomics, 100% `#![forbid(unsafe_code)]`).
+#[cfg(feature = "driver-virtio")]
 static VIRTIO_DMA: VirtioNetDma = VirtioNetDma::new();
+#[cfg(feature = "driver-gem")]
 static GEM_DMA: GemDma = GemDma::new();
 
+#[cfg(any(feature = "driver-virtio", feature = "driver-gem"))]
 struct CapNetTransport;
 
+#[cfg(any(feature = "driver-virtio", feature = "driver-gem"))]
 impl MmioDmaTransport for CapNetTransport {
     fn read32(&self, offset: u64) -> Result<u32, SysError> {
         newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, offset)
@@ -190,8 +198,10 @@ fn main() -> ! {
     let mac = nic.mac();
     let _ = writeln!(
         out,
-        "[netd] online ({}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, tcp=:{} cntfrq={}Hz)",
+        "[netd] online ({}, ipv4={}, ipv6={}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, tcp=:{} cntfrq={}Hz)",
         nic.driver_name(),
+        cfg!(feature = "ipv4"),
+        cfg!(feature = "ipv6"),
         mac[0],
         mac[1],
         mac[2],
@@ -206,6 +216,7 @@ fn main() -> ! {
     let mut storage = NetStackStorage::new();
     let now_ms = clock.now_millis();
     match nic {
+        #[cfg(feature = "driver-virtio")]
         NicKind::Virtio(v) => match VirtioNetDevice::init(CapNetTransport, v.slot, &VIRTIO_DMA) {
             Ok(dev) => {
                 let stack = NetStack::new(
@@ -224,6 +235,7 @@ fn main() -> ! {
                 newos_user_rt::thread_exit();
             }
         },
+        #[cfg(feature = "driver-gem")]
         NicKind::CadenceGem(g) => match GemNetDevice::init(CapNetTransport, g, &GEM_DMA) {
             Ok(dev) => {
                 let stack = NetStack::new(
@@ -242,6 +254,8 @@ fn main() -> ! {
                 newos_user_rt::thread_exit();
             }
         },
+        #[cfg(all(not(feature = "driver-virtio"), not(feature = "driver-gem")))]
+        _ => newos_user_rt::thread_exit(),
     }
 }
 

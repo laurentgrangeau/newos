@@ -231,6 +231,35 @@ pub fn shake256(input: &[u8], out: &mut [u8]) {
     }
 }
 
+/// Marker type implementing [`crate::Hasher`] for FIPS 202 `SHA3-512`.
+pub struct Sha3_512;
+
+impl crate::Hasher<DIGEST_BYTES> for Sha3_512 {
+    const NAME: &'static str = "sha3-512";
+
+    #[inline]
+    fn hash(data: &[u8]) -> [u8; DIGEST_BYTES] {
+        sha3_512(data)
+    }
+
+    #[inline]
+    fn digest_prefix_u64(data: &[u8]) -> u64 {
+        digest_prefix_u64(data)
+    }
+}
+
+/// Marker type implementing [`crate::Xof`] for FIPS 202 `SHAKE256`.
+pub struct Shake256;
+
+impl crate::Xof for Shake256 {
+    const NAME: &'static str = "shake256";
+
+    #[inline]
+    fn derive(input: &[u8], out: &mut [u8]) {
+        shake256(input, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

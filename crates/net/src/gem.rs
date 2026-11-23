@@ -9,7 +9,7 @@ use newos_abi::SysError;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
-use crate::virtio::MmioDmaTransport;
+use crate::MmioDmaTransport;
 
 const RING_SIZE: usize = 8;
 const PKT_BUF_SIZE: usize = 2048; // Divides 4096 evenly -> never crosses a 4 KiB page boundary!

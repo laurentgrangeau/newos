@@ -480,9 +480,19 @@ impl ProcTable {
         if self.count <= 1 {
             return None;
         }
-        for _ in 0..self.count {
-            let _ = self.sched.schedule_next()?;
-            let next = self.sched.current_slot()?;
+        // SMP-safe lookup: scan only genuinely `Ready` slots without demoting any
+        // thread currently `Running` on another CPU.
+        if let Some(next) = self.sched.pick_next_ready(from)
+            && next != from
+            && self.procs[next].active
+            && self.procs[next].wait == IpcWaitState::Runnable
+            && self.procs[next].running_on.is_none()
+        {
+            return Some(next);
+        }
+        // Fallback linear scan in case a runnable slot was temporarily out of sync.
+        for offset in 1..self.count {
+            let next = (from + offset) % self.count;
             if next != from
                 && self.procs[next].active
                 && self.procs[next].wait == IpcWaitState::Runnable
@@ -1049,8 +1059,9 @@ fn park_cpu_until_runnable(frame: &mut TrapFrame) {
                 }
                 return;
             }
+            // Publish idle bit while still holding `PROCS` so no concurrent wakeup SGI is lost.
+            super::smp::mark_ap_idle(this_cpu, true);
         }
-        super::smp::mark_ap_idle(this_cpu, true);
         // SAFETY: Low-power WFI with IRQs masked (wakes on pending SGI/IRQ), then unmask to service it.
         unsafe {
             asm!(
@@ -1283,7 +1294,6 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                         table.set_wait_state(cur, IpcWaitState::WaitingReply, ep_id);
                         let _ = table.sched.block_slot(cur);
                         let _ = table.sched.wake_slot(server);
-                        table.sched.select_slot(server);
                         context_switch(&mut table, cur, server, frame);
                         return;
                     }
@@ -1316,7 +1326,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                                 let _ = ipc.ipc_recv_resolved(ep_id);
                                 table.set_wait_state(cur, IpcWaitState::Runnable, 0);
                                 let _ = table.sched.wake_slot(cur);
-                                table.sched.select_slot(cur);
+                                table.sched.mark_running(cur);
                                 Err(SysError::WouldBlock)
                             }
                             Err(e) => Err(e),
@@ -1389,7 +1399,6 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                                 drop(ipc);
                                 table.set_wait_state(cur, IpcWaitState::WaitingRecv, ep_id);
                                 let _ = table.sched.block_slot(cur);
-                                table.sched.select_slot(client);
                                 context_switch(&mut table, cur, client, frame);
                                 return;
                             }
@@ -1403,7 +1412,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                                 }
                                 table.set_wait_state(cur, IpcWaitState::Runnable, 0);
                                 let _ = table.sched.wake_slot(cur);
-                                table.sched.select_slot(cur);
+                                table.sched.mark_running(cur);
                             }
                             Err(SysError::WouldBlock)
                         }
@@ -1981,14 +1990,21 @@ pub fn ap_enter_scheduler() -> ! {
 
         let claimed = {
             let mut table = PROCS.lock();
-            table.claim_any_runnable(cpu_id).map(|pid| {
-                let p = &table.procs[pid];
-                (pid, p.ttbr0, p.tpidr_el0, p.frame, p.fp)
-            })
+            match table.claim_any_runnable(cpu_id) {
+                Some(pid) => {
+                    super::smp::mark_ap_idle(cpu_id, false);
+                    let p = &table.procs[pid];
+                    Some((pid, p.ttbr0, p.tpidr_el0, p.frame, p.fp))
+                }
+                None => {
+                    // Publish idle bit while still holding `PROCS` so no wakeup SGI is lost.
+                    super::smp::mark_ap_idle(cpu_id, true);
+                    None
+                }
+            }
         };
 
         if let Some((pid, ttbr0, tpidr_el0, saved_frame, fp)) = claimed {
-            super::smp::mark_ap_idle(cpu_id, false);
             switch_ttbr0(ttbr0, pid);
             write_tpidr_el0(tpidr_el0);
             restore_fp_state(&fp);
@@ -1999,7 +2015,6 @@ pub fn ap_enter_scheduler() -> ! {
             unsafe { __newos_el0_enter_frame(&raw const saved_frame) }
         }
 
-        super::smp::mark_ap_idle(cpu_id, true);
         // SAFETY: Park idle secondary Cortex-A76 core in low-power WFI until SGI/IRQ wakes it,
         // then unmask IRQs briefly so the GICv2 SGI handler can acknowledge it.
         unsafe {

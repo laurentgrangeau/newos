@@ -4,9 +4,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["ipv4", "ipv6", "tcp", "udp", "icmp", "dns", "driver-gem", "driver-virtio"]
+ipv4 = ["smoltcp/proto-ipv4", "smoltcp/proto-dhcpv4", "smoltcp/socket-dhcpv4"]
+ipv6 = ["smoltcp/proto-ipv6"]
+tcp = ["smoltcp/socket-tcp"]
+udp = ["smoltcp/socket-udp"]
+icmp = ["smoltcp/socket-icmp"]
+dns = ["smoltcp/proto-dns", "smoltcp/socket-dns"]
+driver-gem = []
+driver-virtio = []
+
 [dependencies]
-newos-abi = { workspace = true }
-smoltcp = { version = "0.12", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-ipv6", "proto-dhcpv4", "proto-dns", "socket-tcp", "socket-udp", "socket-icmp", "socket-dhcpv4", "socket-dns"] }
+newos-abi = { workspace = true, default-features = false }
+smoltcp = { version = "0.12", default-features = false, features = ["medium-ethernet"] }
 
 [lints]
 workspace = true

@@ -4,10 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["shell", "net", "ipv4", "ipv6", "ssh", "worker-supervisor"]
+shell = ["dep:newos-shell-core", "dep:newos-net"]
+net = ["dep:newos-net"]
+ipv4 = ["net", "newos-net/ipv4"]
+ipv6 = ["net", "newos-net/ipv6"]
+ssh = ["shell", "net"]
+worker-supervisor = []
+
 [dependencies]
-newos-abi = { workspace = true }
-newos-net = { workspace = true }
-newos-shell-core = { workspace = true }
+newos-abi = { workspace = true, default-features = false }
+newos-net = { workspace = true, default-features = false, features = ["tcp", "udp", "icmp", "dns", "driver-gem", "driver-virtio"], optional = true }
+newos-shell-core = { workspace = true, optional = true }
 newos-user-rt = { workspace = true }
 
 [lints]

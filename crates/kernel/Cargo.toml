@@ -4,9 +4,31 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = [
+    "arch-aarch64",
+    "board-rpi5",
+    "board-qemu-virt",
+    "smp",
+    "userspace",
+    "elf-attestation",
+    "acpi",
+    "sched-priority-rr",
+]
+arch-aarch64 = ["newos-hal/arch-aarch64"]
+board-rpi5 = ["newos-hal/board-rpi5"]
+board-qemu-virt = ["newos-hal/board-qemu-virt"]
+smp = ["newos-hal/smp", "newos-kernel-core/smp"]
+userspace = ["newos-hal/userspace", "newos-kernel-core/userspace"]
+elf-attestation = ["newos-kernel-core/elf-attestation"]
+acpi = ["newos-hal/acpi", "newos-kernel-core/acpi"]
+sched-priority-rr = ["newos-kernel-core/sched-priority-rr"]
+sched-round-robin = ["newos-kernel-core/sched-round-robin"]
+sched-fifo = ["newos-kernel-core/sched-fifo"]
+
 [dependencies]
-newos-hal = { workspace = true }
-newos-kernel-core = { workspace = true }
+newos-hal = { workspace = true, default-features = false }
+newos-kernel-core = { workspace = true, default-features = false }
 
 [lints]
 workspace = true

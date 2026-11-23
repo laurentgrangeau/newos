@@ -1,5 +1,7 @@
 mod gpt;
+mod profile;
 
+use profile::BuildProfile;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,34 +11,81 @@ const LIMINE_BRANCH: &str = "v9.x-binary";
 const LIMINE_REPO: &str = "https://github.com/limine-bootloader/limine.git";
 // Soft-float target for EL1 kernel so LLVM never emits NEON/FP instructions on syscall/IRQ paths (`H2`).
 const KERNEL_TARGET_TRIPLE: &str = "aarch64-unknown-none-softfloat";
-const TARGET_CPU: &str = "cortex-a76";
 const EFI_FILENAME: &str = "BOOTAA64.EFI";
 const UEFI_DISK_BYTES: u64 = 64 * 1024 * 1024;
+
+fn resolve_profile(
+    root: &Path,
+    args: &[String],
+    default_board: &str,
+) -> Result<BuildProfile, String> {
+    let mut profile_path: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--profile" {
+            i += 1;
+            let raw = args
+                .get(i)
+                .ok_or_else(|| "missing path after `--profile`".to_string())?;
+            let p = PathBuf::from(raw);
+            profile_path = Some(if p.is_absolute() { p } else { root.join(p) });
+        }
+        i += 1;
+    }
+    let mut profile = match profile_path {
+        Some(path) => BuildProfile::from_file(&path)?,
+        None => BuildProfile::default_full(default_board),
+    };
+    profile.apply_cli_overrides(args)?;
+    profile.validate()?;
+    Ok(profile)
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("help");
 
     let release = args.iter().any(|a| a == "--release");
+    let root = workspace_root();
 
     let result = match cmd {
-        "build" => build_uefi_disk(true, release).map(|_| ()),
-        "run" => run_qemu(true, release),
+        "config" => {
+            if args.iter().any(|a| a == "--list-options") {
+                print!("{}", BuildProfile::list_all_options());
+                Ok(())
+            } else {
+                resolve_profile(&root, &args[1..], "rpi5").map(|p| {
+                    print!("{}", p.render_system_composition());
+                })
+            }
+        }
+        "feature-matrix" => run_feature_matrix(&root),
+        "build" => resolve_profile(&root, &args[1..], "qemu-virt")
+            .and_then(|p| build_uefi_disk(&p, true, release).map(|_| ())),
+        "run" => resolve_profile(&root, &args[1..], "qemu-virt")
+            .and_then(|p| run_qemu(&p, true, release)),
         "test" => run_tests(release),
         "host-test" => run_host_tests(release),
         "miri" => run_miri_tests(),
         "verify" => run_kani_verify(),
-        "rpi5-image" => build_rpi5_image(release).map(|_| ()),
+        "rpi5-image" => resolve_profile(&root, &args[1..], "rpi5")
+            .and_then(|p| build_rpi5_image(&p, release).map(|_| ())),
         "bench" => run_bench(&args[1..]),
         "help" | "-h" | "--help" => {
             eprintln!(
-                "Usage: cargo xtask <rpi5-image|build|run|test|host-test|miri|verify|bench> [--release]\n\
-                 Target: Raspberry Pi 5 16 GB (BCM2712 Cortex-A76, aarch64-unknown-none)"
+                "Usage: cargo xtask <config|feature-matrix|rpi5-image|build|run|test|host-test|miri|verify|bench> [options]\n\
+                 Options:\n\
+                   --profile <profiles/*.toml>            Load declarative TOML system composition profile\n\
+                   --board <rpi5|qemu-virt>               Override target board\n\
+                   --sched <priority-rr|round-robin|fifo> Override kernel scheduler policy\n\
+                   --no-smp | --no-acpi | --no-userspace | --no-shell | --no-net | --no-ssh | --no-crypto\n\
+                   --ipv4-only | --ipv6-only              Select single-stack networking\n\
+                   --release                              Build in release mode"
             );
             Ok(())
         }
         other => Err(format!(
-            "unknown subcommand `{other}`\nUsage: cargo xtask <rpi5-image|build|run|test|host-test|miri|verify|bench> [--release]"
+            "unknown subcommand `{other}`\nRun `cargo xtask help` for usage."
         )),
     };
 
@@ -73,18 +122,23 @@ fn run_checked(cmd: &mut Command, label: &str) -> Result<(), String> {
     }
 }
 
-fn build_kernel(root: &Path, release: bool) -> Result<PathBuf, String> {
+fn build_kernel(root: &Path, profile: &BuildProfile, release: bool) -> Result<PathBuf, String> {
     let linker_script = root.join("crates/kernel/linker-aarch64.ld");
     let rustflags = format!(
-        "-C link-arg=-T{} -C relocation-model=pie -C link-arg=-pie -C link-arg=-z -C link-arg=relro -C link-arg=-z -C link-arg=now -C target-cpu={TARGET_CPU} -Z sanitizer=kcfi",
-        linker_script.display()
+        "-C link-arg=-T{} -C relocation-model=pie -C link-arg=-pie -C link-arg=-z -C link-arg=relro -C link-arg=-z -C link-arg=now -C target-cpu={} -Z sanitizer=kcfi",
+        linker_script.display(),
+        profile.cpu,
     );
 
+    let features = profile.kernel_features().join(",");
     let mut cmd = Command::new("cargo");
     cmd.current_dir(root).env("RUSTFLAGS", rustflags).args([
         "build",
         "--package",
         "newos-kernel",
+        "--no-default-features",
+        "--features",
+        &features,
         "--target",
         KERNEL_TARGET_TRIPLE,
         "-Z",
@@ -97,7 +151,7 @@ fn build_kernel(root: &Path, release: bool) -> Result<PathBuf, String> {
     }
     run_checked(
         &mut cmd,
-        "cargo build (newos-kernel aarch64-softfloat/cortex-a76)",
+        &format!("cargo build (newos-kernel {}/{features})", profile.cpu),
     )?;
 
     Ok(root
@@ -107,11 +161,18 @@ fn build_kernel(root: &Path, release: bool) -> Result<PathBuf, String> {
         .join("newos-kernel"))
 }
 
-fn build_user_elf(root: &Path, pkg: &str, dir: &str, release: bool) -> Result<PathBuf, String> {
+fn build_user_elf(
+    root: &Path,
+    pkg: &str,
+    dir: &str,
+    cpu: &str,
+    features: Option<&[String]>,
+    release: bool,
+) -> Result<PathBuf, String> {
     let linker_script = root.join(format!("crates/{dir}/linker-aarch64.ld"));
     let target_json = root.join("targets/aarch64-newos-user.json");
     let rustflags = format!(
-        "-C link-arg=-T{} -C relocation-model=pie -C link-arg=-pie -C link-arg=-z -C link-arg=relro -C link-arg=-z -C link-arg=now -C target-cpu={TARGET_CPU} -Z fixed-x18 -Z sanitizer=kcfi -Z sanitizer=shadow-call-stack",
+        "-C link-arg=-T{} -C relocation-model=pie -C link-arg=-pie -C link-arg=-z -C link-arg=relro -C link-arg=-z -C link-arg=now -C target-cpu={cpu} -Z fixed-x18 -Z sanitizer=kcfi -Z sanitizer=shadow-call-stack",
         linker_script.display()
     );
 
@@ -129,6 +190,12 @@ fn build_user_elf(root: &Path, pkg: &str, dir: &str, release: bool) -> Result<Pa
         "-Z",
         "build-std-features=compiler-builtins-mem",
     ]);
+    if let Some(feats) = features {
+        cmd.arg("--no-default-features");
+        if !feats.is_empty() {
+            cmd.args(["--features", &feats.join(",")]);
+        }
+    }
     if release {
         cmd.arg("--release");
     }
@@ -202,21 +269,71 @@ fn package_gpt_esp_image(
     Ok(())
 }
 
+/// Build enabled EL0 userspace modules for `profile` and return `(boot_filename, host_path)` pairs.
+fn build_profile_modules(
+    root: &Path,
+    profile: &BuildProfile,
+    include_daemons: bool,
+    release: bool,
+) -> Result<Vec<(&'static str, PathBuf)>, String> {
+    let mut modules = Vec::new();
+    if !profile.userspace {
+        return Ok(modules);
+    }
+    if profile.init {
+        let init_feats = profile.init_features();
+        let elf = build_user_elf(
+            root,
+            "newos-init",
+            "init",
+            &profile.cpu,
+            Some(&init_feats),
+            release,
+        )?;
+        modules.push(("newos-init", elf));
+    }
+    if profile.worker {
+        let elf = build_user_elf(root, "newos-worker", "worker", &profile.cpu, None, release)?;
+        modules.push(("newos-worker", elf));
+    }
+    if profile.netd {
+        let netd_feats = profile.netd_features();
+        let elf = build_user_elf(
+            root,
+            "newos-netd",
+            "netd",
+            &profile.cpu,
+            Some(&netd_feats),
+            release,
+        )?;
+        if include_daemons {
+            modules.push(("newos-netd", elf));
+        }
+    }
+    if profile.keyd {
+        let elf = build_user_elf(root, "newos-keyd", "keyd", &profile.cpu, None, release)?;
+        if include_daemons {
+            modules.push(("newos-keyd", elf));
+        }
+    }
+    if profile.sshd {
+        let elf = build_user_elf(root, "newos-sshd", "sshd", &profile.cpu, None, release)?;
+        if include_daemons {
+            modules.push(("newos-sshd", elf));
+        }
+    }
+    Ok(modules)
+}
+
 /// Build a pure 64-bit AArch64 UEFI GPT + FAT32 ESP disk image for the QEMU `virt` test harness.
-fn build_uefi_disk(interactive: bool, release: bool) -> Result<PathBuf, String> {
+fn build_uefi_disk(
+    profile: &BuildProfile,
+    interactive: bool,
+    release: bool,
+) -> Result<PathBuf, String> {
     let root = workspace_root();
-    let kernel_elf = build_kernel(&root, release)?;
-    let init_elf = build_user_elf(&root, "newos-init", "init", release)?;
-    let worker_elf = build_user_elf(&root, "newos-worker", "worker", release)?;
-    // Always compile the three SSH daemons so `cargo xtask test` verifies their target builds (`N20`).
-    let netd_elf = build_user_elf(&root, "newos-netd", "netd", release)?;
-    let keyd_elf = build_user_elf(&root, "newos-keyd", "keyd", release)?;
-    let sshd_elf = build_user_elf(&root, "newos-sshd", "sshd", release)?;
-    let ssh_daemons = if interactive {
-        Some((netd_elf, keyd_elf, sshd_elf))
-    } else {
-        None
-    };
+    let kernel_elf = build_kernel(&root, profile, release)?;
+    let modules = build_profile_modules(&root, profile, interactive, release)?;
     let limine_dir = ensure_limine(&root)?;
 
     let stage = root.join("target/esp_root_aarch64");
@@ -231,23 +348,12 @@ fn build_uefi_disk(interactive: bool, release: bool) -> Result<PathBuf, String> 
 
     fs::copy(&kernel_elf, stage.join("boot/newos-kernel"))
         .map_err(|e| format!("failed to copy kernel ELF: {e}"))?;
-    fs::copy(&init_elf, stage.join("boot/newos-init"))
-        .map_err(|e| format!("failed to copy init ELF: {e}"))?;
-    fs::copy(&worker_elf, stage.join("boot/newos-worker"))
-        .map_err(|e| format!("failed to copy worker ELF: {e}"))?;
-    let extra_modules = if let Some((netd, keyd, sshd)) = ssh_daemons {
-        fs::copy(&netd, stage.join("boot/newos-netd"))
-            .map_err(|e| format!("failed to copy netd ELF: {e}"))?;
-        fs::copy(&keyd, stage.join("boot/newos-keyd"))
-            .map_err(|e| format!("failed to copy keyd ELF: {e}"))?;
-        fs::copy(&sshd, stage.join("boot/newos-sshd"))
-            .map_err(|e| format!("failed to copy sshd ELF: {e}"))?;
-        "    module_path: boot():/boot/newos-netd\n\
-         \x20   module_path: boot():/boot/newos-keyd\n\
-         \x20   module_path: boot():/boot/newos-sshd\n"
-    } else {
-        ""
-    };
+    let mut module_lines = String::new();
+    for (name, path) in &modules {
+        fs::copy(path, stage.join("boot").join(name))
+            .map_err(|e| format!("failed to copy {name} ELF: {e}"))?;
+        module_lines.push_str(&format!("    module_path: boot():/boot/{name}\n"));
+    }
 
     let cmdline = if interactive {
         "interactive qemu"
@@ -262,9 +368,7 @@ fn build_uefi_disk(interactive: bool, release: bool) -> Result<PathBuf, String> 
          \x20   kaslr: yes\n\
          \x20   path: boot():/boot/newos-kernel\n\
          \x20   cmdline: {cmdline}\n\
-         \x20   module_path: boot():/boot/newos-init\n\
-         \x20   module_path: boot():/boot/newos-worker\n\
-         {extra_modules}"
+         {module_lines}"
     );
     fs::write(boot_limine.join("limine.conf"), limine_conf)
         .map_err(|e| format!("failed to write limine.conf: {e}"))?;
@@ -282,22 +386,21 @@ fn build_uefi_disk(interactive: bool, release: bool) -> Result<PathBuf, String> 
     )?;
 
     println!(
-        "[xtask] built pure AArch64 UEFI GPT+FAT32 ESP image {}",
-        disk_path.display()
+        "[xtask] built pure AArch64 UEFI GPT+FAT32 ESP image {} (board={}, sched={}, modules={})",
+        disk_path.display(),
+        profile.board,
+        profile.scheduler,
+        modules.len(),
     );
     Ok(disk_path)
 }
 
 /// Build a 64 MiB UEFI GPT + FAT32 ESP boot image (`target/newos-rpi5.img`) + staging folder
 /// (`target/rpi5_boot/`) for Raspberry Pi 5 (16 GB, BCM2712 Cortex-A76).
-fn build_rpi5_image(release: bool) -> Result<PathBuf, String> {
+fn build_rpi5_image(profile: &BuildProfile, release: bool) -> Result<PathBuf, String> {
     let root = workspace_root();
-    let kernel_elf = build_kernel(&root, release)?;
-    let init_elf = build_user_elf(&root, "newos-init", "init", release)?;
-    let worker_elf = build_user_elf(&root, "newos-worker", "worker", release)?;
-    let netd_elf = build_user_elf(&root, "newos-netd", "netd", release)?;
-    let keyd_elf = build_user_elf(&root, "newos-keyd", "keyd", release)?;
-    let sshd_elf = build_user_elf(&root, "newos-sshd", "sshd", release)?;
+    let kernel_elf = build_kernel(&root, profile, release)?;
+    let modules = build_profile_modules(&root, profile, true, release)?;
     let limine_dir = ensure_limine(&root)?;
 
     let stage = root.join("target/rpi5_boot");
@@ -322,35 +425,26 @@ armstub=RPI_EFI.fd
     fs::write(stage.join("config.txt"), config_txt)
         .map_err(|e| format!("failed to write config.txt: {e}"))?;
 
-    let limine_conf = "\
-timeout: 3
-serial: yes
-
-/NewOS (Raspberry Pi 5 - 16 GB)
-    protocol: limine
-    path: boot():/boot/newos-kernel
-    cmdline: interactive
-    module_path: boot():/boot/newos-init
-    module_path: boot():/boot/newos-worker
-    module_path: boot():/boot/newos-netd
-    module_path: boot():/boot/newos-keyd
-    module_path: boot():/boot/newos-sshd
-";
-    fs::write(boot_limine.join("limine.conf"), limine_conf)
-        .map_err(|e| format!("failed to write limine.conf: {e}"))?;
-
     fs::copy(&kernel_elf, stage.join("boot/newos-kernel"))
         .map_err(|e| format!("failed to copy kernel ELF: {e}"))?;
-    fs::copy(&init_elf, stage.join("boot/newos-init"))
-        .map_err(|e| format!("failed to copy init ELF: {e}"))?;
-    fs::copy(&worker_elf, stage.join("boot/newos-worker"))
-        .map_err(|e| format!("failed to copy worker ELF: {e}"))?;
-    fs::copy(&netd_elf, stage.join("boot/newos-netd"))
-        .map_err(|e| format!("failed to copy netd ELF: {e}"))?;
-    fs::copy(&keyd_elf, stage.join("boot/newos-keyd"))
-        .map_err(|e| format!("failed to copy keyd ELF: {e}"))?;
-    fs::copy(&sshd_elf, stage.join("boot/newos-sshd"))
-        .map_err(|e| format!("failed to copy sshd ELF: {e}"))?;
+    let mut module_lines = String::new();
+    for (name, path) in &modules {
+        fs::copy(path, stage.join("boot").join(name))
+            .map_err(|e| format!("failed to copy {name} ELF: {e}"))?;
+        module_lines.push_str(&format!("    module_path: boot():/boot/{name}\n"));
+    }
+
+    let limine_conf = format!(
+        "timeout: 3\n\
+         serial: yes\n\n\
+         /NewOS (Raspberry Pi 5 - 16 GB)\n\
+         \x20   protocol: limine\n\
+         \x20   path: boot():/boot/newos-kernel\n\
+         \x20   cmdline: interactive\n\
+         {module_lines}"
+    );
+    fs::write(boot_limine.join("limine.conf"), limine_conf)
+        .map_err(|e| format!("failed to write limine.conf: {e}"))?;
     fs::copy(
         limine_dir.join("BOOTAA64.EFI"),
         efi_boot.join("BOOTAA64.EFI"),
@@ -372,8 +466,10 @@ serial: yes
     )?;
 
     println!(
-        "[xtask] built Raspberry Pi 5 UEFI GPT+FAT32 ESP boot image: {}",
-        img_path.display()
+        "[xtask] built Raspberry Pi 5 UEFI GPT+FAT32 ESP boot image: {} (sched={}, modules={})",
+        img_path.display(),
+        profile.scheduler,
+        modules.len(),
     );
     println!("[xtask] staging directory: {}", stage.display());
     println!(
@@ -383,11 +479,157 @@ serial: yes
     Ok(img_path)
 }
 
+/// Verify modular system composition across crypto, ABI, kernel-core, networking, and driver crates.
+fn run_feature_matrix(root: &Path) -> Result<(), String> {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "newos-crypto (none)",
+            &["test", "-p", "newos-crypto", "--no-default-features"],
+        ),
+        (
+            "newos-crypto (sha3)",
+            &[
+                "test",
+                "-p",
+                "newos-crypto",
+                "--no-default-features",
+                "--features",
+                "sha3",
+            ],
+        ),
+        (
+            "newos-crypto (chacha20-poly1305)",
+            &[
+                "test",
+                "-p",
+                "newos-crypto",
+                "--no-default-features",
+                "--features",
+                "chacha20-poly1305",
+            ],
+        ),
+        (
+            "newos-crypto (all)",
+            &["test", "-p", "newos-crypto", "--all-features"],
+        ),
+        (
+            "newos-abi (zero crypto)",
+            &["test", "-p", "newos-abi", "--no-default-features"],
+        ),
+        (
+            "newos-kernel-core (tinykernel/fifo)",
+            &[
+                "test",
+                "-p",
+                "newos-kernel-core",
+                "--no-default-features",
+                "--features",
+                "sched-fifo",
+            ],
+        ),
+        (
+            "newos-kernel-core (round-robin+userspace)",
+            &[
+                "test",
+                "-p",
+                "newos-kernel-core",
+                "--no-default-features",
+                "--features",
+                "sched-round-robin,userspace",
+            ],
+        ),
+        (
+            "newos-kernel-core (full)",
+            &["test", "-p", "newos-kernel-core", "--all-features"],
+        ),
+        (
+            "newos-net (ipv4-only)",
+            &[
+                "test",
+                "-p",
+                "newos-net",
+                "--no-default-features",
+                "--features",
+                "ipv4,tcp,icmp,driver-virtio",
+            ],
+        ),
+        (
+            "newos-net (ipv6-only)",
+            &[
+                "test",
+                "-p",
+                "newos-net",
+                "--no-default-features",
+                "--features",
+                "ipv6,tcp,udp,driver-virtio",
+            ],
+        ),
+        (
+            "newos-net (dual-stack)",
+            &["test", "-p", "newos-net", "--all-features"],
+        ),
+        (
+            "newos-storage (zero crypto)",
+            &[
+                "test",
+                "-p",
+                "newos-storage",
+                "--no-default-features",
+                "--features",
+                "pcie,sdhci,nvme",
+            ],
+        ),
+        (
+            "newos-rng (zero crypto)",
+            &[
+                "test",
+                "-p",
+                "newos-rng",
+                "--no-default-features",
+                "--features",
+                "bcm2712,virtio",
+            ],
+        ),
+        (
+            "drivers (minimal)",
+            &[
+                "test",
+                "-p",
+                "newos-gpu",
+                "-p",
+                "newos-ai",
+                "-p",
+                "newos-board",
+                "-p",
+                "newos-usb",
+                "-p",
+                "newos-gpio",
+                "-p",
+                "newos-wdt",
+                "--no-default-features",
+            ],
+        ),
+        ("xtask (profiles)", &["test", "-p", "xtask"]),
+    ];
+    for (label, cargo_args) in cases {
+        let mut cmd = Command::new("cargo");
+        cmd.current_dir(root).args(*cargo_args);
+        run_checked(&mut cmd, &format!("feature-matrix: {label}"))?;
+    }
+    println!(
+        "[xtask] feature-matrix: all {} configurations passed!",
+        cases.len()
+    );
+    Ok(())
+}
+
 fn run_host_tests(release: bool) -> Result<(), String> {
     let root = workspace_root();
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&root).args([
         "test",
+        "--package",
+        "newos-crypto",
         "--package",
         "newos-abi",
         "--package",
@@ -604,7 +846,8 @@ fn run_bench(raw_args: &[String]) -> Result<(), String> {
 
 fn run_tests(release: bool) -> Result<(), String> {
     run_host_tests(release)?;
-    run_qemu(false, release)
+    let profile = BuildProfile::default_full("qemu-virt");
+    run_qemu(&profile, false, release)
 }
 
 fn find_firmware() -> Result<&'static str, String> {
@@ -624,8 +867,8 @@ fn find_firmware() -> Result<&'static str, String> {
         })
 }
 
-fn run_qemu(interactive: bool, release: bool) -> Result<(), String> {
-    let disk_path = build_uefi_disk(interactive, release)?;
+fn run_qemu(profile: &BuildProfile, interactive: bool, release: bool) -> Result<(), String> {
+    let disk_path = build_uefi_disk(profile, interactive, release)?;
     let firmware = find_firmware()?;
     let disk_str = disk_path.to_str().ok_or("invalid disk path")?;
 
@@ -644,7 +887,7 @@ fn run_qemu(interactive: bool, release: bool) -> Result<(), String> {
         "-M",
         "virt",
         "-cpu",
-        TARGET_CPU,
+        &profile.cpu,
         "-smp",
         "4",
         "-m",

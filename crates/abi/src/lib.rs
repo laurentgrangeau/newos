@@ -4,7 +4,8 @@
 //! Shared, 100% memory-safe ABI contract between the NewOS microkernel (EL1) and EL0 userspace.
 
 pub mod ring;
-pub mod sha3;
+#[cfg(feature = "sha3")]
+pub use newos_crypto::sha3;
 
 /// Unforgeable handle indexing a slot inside a process's capability space (`CSpace`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -9,6 +9,40 @@ pub const DEFAULT_TIME_SLICE: u32 = 4;
 /// Default priority assigned to normal userspace processes.
 pub const DEFAULT_PRIORITY: u8 = 16;
 
+/// Compile-time selectable EL1 microkernel scheduling policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedPolicyKind {
+    /// Preemptive strict-priority scheduler with round-robin within equal priorities.
+    PriorityRoundRobin,
+    /// Preemptive flat round-robin scheduler (ignores priority levels).
+    RoundRobin,
+    /// Cooperative FIFO scheduler (no timer preemption; minimal overhead for tinykernel).
+    Fifo,
+}
+
+impl SchedPolicyKind {
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PriorityRoundRobin => "priority-rr",
+            Self::RoundRobin => "round-robin",
+            Self::Fifo => "fifo",
+        }
+    }
+}
+
+/// Active compile-time scheduler policy selected by Cargo features.
+#[cfg(feature = "sched-priority-rr")]
+pub const ACTIVE_SCHED_POLICY: SchedPolicyKind = SchedPolicyKind::PriorityRoundRobin;
+
+/// Active compile-time scheduler policy selected by Cargo features.
+#[cfg(all(not(feature = "sched-priority-rr"), feature = "sched-round-robin"))]
+pub const ACTIVE_SCHED_POLICY: SchedPolicyKind = SchedPolicyKind::RoundRobin;
+
+/// Active compile-time scheduler policy selected by Cargo features.
+#[cfg(all(not(feature = "sched-priority-rr"), not(feature = "sched-round-robin")))]
+pub const ACTIVE_SCHED_POLICY: SchedPolicyKind = SchedPolicyKind::Fifo;
+
 /// Unique kernel thread identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -230,12 +264,83 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
         }
     }
 
+    /// SMP-safe lookup of the next `Ready` thread slot without mutating `self.current`
+    /// or demoting any thread currently `Running` on another CPU.
+    ///
+    /// Scans strictly `ThreadState::Ready` threads starting round-robin after `after_slot`,
+    /// respecting [`ACTIVE_SCHED_POLICY`]. The caller transitions the chosen slot to
+    /// `Running` via [`Self::mark_running`].
+    #[inline]
+    pub fn pick_next_ready(&self, after_slot: usize) -> Option<usize> {
+        if MAX_THREADS == 0 {
+            return None;
+        }
+        let start = if after_slot + 1 < MAX_THREADS {
+            after_slot + 1
+        } else {
+            0
+        };
+
+        if MAX_THREADS <= 64 {
+            let rm = self.ready_mask;
+            if rm == 0 {
+                return None;
+            }
+            if rm.is_power_of_two() {
+                return Some(rm.trailing_zeros() as usize);
+            }
+            let mut mask = rm.rotate_right(start as u32);
+            let first_off = mask.trailing_zeros() as usize;
+            let mut best_idx = (start + first_off) & 63;
+            if matches!(ACTIVE_SCHED_POLICY, SchedPolicyKind::PriorityRoundRobin) {
+                mask &= mask - 1;
+                let mut best_prio = self.priorities[best_idx];
+                while mask != 0 {
+                    let off = mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    let idx = (start + off) & 63;
+                    let prio = self.priorities[idx];
+                    if prio > best_prio {
+                        best_idx = idx;
+                        best_prio = prio;
+                    }
+                }
+            }
+            return Some(best_idx);
+        }
+
+        let mut best: Option<(usize, u8)> = None;
+        for offset in 0..MAX_THREADS {
+            let idx = (start + offset) % MAX_THREADS;
+            let Some(tcb) = &self.threads[idx] else {
+                continue;
+            };
+            if tcb.state != ThreadState::Ready {
+                continue;
+            }
+            let is_better = match best {
+                None => true,
+                Some((_, best_prio)) => {
+                    matches!(ACTIVE_SCHED_POLICY, SchedPolicyKind::PriorityRoundRobin)
+                        && tcb.priority > best_prio
+                }
+            };
+            if is_better {
+                best = Some((idx, tcb.priority));
+            }
+        }
+        best.map(|(idx, _)| idx)
+    }
+
     /// Account one hardware timer tick on the specific thread `slot` running on the calling CPU (`P7`).
     ///
-    /// Returns `true` when `slot`'s quantum expires and at least one other `Ready` thread
-    /// with equal or higher priority is waiting to preempt it.
+    /// Returns `true` when `slot`'s quantum expires and another `Ready` thread is eligible
+    /// to preempt it under [`ACTIVE_SCHED_POLICY`].
     #[inline]
     pub fn on_timer_tick_for(&mut self, slot: usize) -> bool {
+        if matches!(ACTIVE_SCHED_POLICY, SchedPolicyKind::Fifo) {
+            return false;
+        }
         let cur_prio = {
             let Some(Some(tcb)) = self.threads.get_mut(slot) else {
                 return false;
@@ -251,7 +356,11 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
             tcb.priority
         };
 
-        let has_preemptor = self.has_ready_with_min_priority(cur_prio);
+        let has_preemptor = match ACTIVE_SCHED_POLICY {
+            SchedPolicyKind::PriorityRoundRobin => self.has_ready_with_min_priority(cur_prio),
+            SchedPolicyKind::RoundRobin => self.ready_count() > 0,
+            SchedPolicyKind::Fifo => false,
+        };
         if has_preemptor && let Some(Some(tcb)) = self.threads.get_mut(slot) {
             tcb.preemptions = tcb.preemptions.saturating_add(1);
         }
@@ -286,10 +395,13 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
 
     /// Account one hardware timer tick on the currently running thread.
     ///
-    /// Returns `true` when the thread's quantum expires and at least one other `Ready` thread
-    /// with equal or higher priority is waiting to preempt it.
+    /// Returns `true` when the thread's quantum expires and another `Ready` thread is eligible
+    /// to preempt it under [`ACTIVE_SCHED_POLICY`].
     #[inline]
     pub fn on_timer_tick(&mut self) -> bool {
+        if matches!(ACTIVE_SCHED_POLICY, SchedPolicyKind::Fifo) {
+            return false;
+        }
         let Some(cur) = self.current else {
             return false;
         };
@@ -308,7 +420,11 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
             tcb.priority
         };
 
-        let has_preemptor = self.has_ready_with_min_priority(cur_prio);
+        let has_preemptor = match ACTIVE_SCHED_POLICY {
+            SchedPolicyKind::PriorityRoundRobin => self.has_ready_with_min_priority(cur_prio),
+            SchedPolicyKind::RoundRobin => self.ready_count() > 0,
+            SchedPolicyKind::Fifo => false,
+        };
         if has_preemptor && let Some(tcb) = &mut self.threads[cur] {
             tcb.preemptions = tcb.preemptions.saturating_add(1);
         }
@@ -415,17 +531,19 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
             } else {
                 let mut mask = rm.rotate_right(start as u32);
                 let first_off = mask.trailing_zeros() as usize;
-                mask &= mask - 1;
                 let mut best_idx = (start + first_off) & 63;
-                let mut best_prio = self.priorities[best_idx];
-                while mask != 0 {
-                    let off = mask.trailing_zeros() as usize;
+                if matches!(ACTIVE_SCHED_POLICY, SchedPolicyKind::PriorityRoundRobin) {
                     mask &= mask - 1;
-                    let idx = (start + off) & 63;
-                    let prio = self.priorities[idx];
-                    if prio > best_prio {
-                        best_idx = idx;
-                        best_prio = prio;
+                    let mut best_prio = self.priorities[best_idx];
+                    while mask != 0 {
+                        let off = mask.trailing_zeros() as usize;
+                        mask &= mask - 1;
+                        let idx = (start + off) & 63;
+                        let prio = self.priorities[idx];
+                        if prio > best_prio {
+                            best_idx = idx;
+                            best_prio = prio;
+                        }
                     }
                 }
                 best_idx
@@ -448,7 +566,10 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
             {
                 let is_better = match best {
                     None => true,
-                    Some((_, best_prio)) => tcb.priority > best_prio,
+                    Some((_, best_prio)) => {
+                        matches!(ACTIVE_SCHED_POLICY, SchedPolicyKind::PriorityRoundRobin)
+                            && tcb.priority > best_prio
+                    }
                 };
                 if is_better {
                     best = Some((idx, tcb.priority));
@@ -486,11 +607,13 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
 }
 
 /// Multi-core SMP scheduler managing per-CPU runqueues with least-loaded placement and work-stealing.
+#[cfg(feature = "smp")]
 pub struct SmpScheduler<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize> {
     per_cpu: [Scheduler<MAX_THREADS_PER_CPU>; MAX_CPUS],
     online_cpus: usize,
 }
 
+#[cfg(feature = "smp")]
 impl<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize>
     SmpScheduler<MAX_CPUS, MAX_THREADS_PER_CPU>
 {
@@ -593,6 +716,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "sched-priority-rr")]
     fn priority_and_round_robin_scheduling() {
         let mut sched = Scheduler::<8>::new();
         let low = sched.spawn(1).unwrap();
@@ -634,18 +758,22 @@ mod tests {
         assert_eq!(s64.schedule_next(), Some(ids64[0]));
 
         // Scheduler::<80> exercises fallback for slots >= 64.
-        let mut s80 = Scheduler::<80>::new();
-        for _ in 0..64 {
-            let _ = s80.spawn(1).unwrap();
+        #[cfg(feature = "sched-priority-rr")]
+        {
+            let mut s80 = Scheduler::<80>::new();
+            for _ in 0..64 {
+                let _ = s80.spawn(1).unwrap();
+            }
+            let high_64 = s80.spawn(10).unwrap();
+            let high_65 = s80.spawn(10).unwrap();
+            assert_eq!(s80.schedule_next(), Some(high_64));
+            assert_eq!(s80.schedule_next(), Some(high_65));
+            assert_eq!(s80.schedule_next(), Some(high_64));
         }
-        let high_64 = s80.spawn(10).unwrap();
-        let high_65 = s80.spawn(10).unwrap();
-        assert_eq!(s80.schedule_next(), Some(high_64));
-        assert_eq!(s80.schedule_next(), Some(high_65));
-        assert_eq!(s80.schedule_next(), Some(high_64));
     }
 
     #[test]
+    #[cfg(feature = "sched-priority-rr")]
     fn timer_tick_preemption_and_block_wake_lifecycle() {
         let mut sched = Scheduler::<8>::new();
         let a = sched.spawn(10).unwrap();
@@ -680,6 +808,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "smp")]
     fn smp_scheduler_balances_and_steals_work() {
         let mut smp = SmpScheduler::<4, 8>::new(2);
         let (cpu0, _t0) = smp.spawn_balanced(10).unwrap();
@@ -697,6 +826,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sched-priority-rr")]
     fn single_ready_fastpath_and_priority_sync() {
         let mut sched = Scheduler::<8>::new();
         let a = sched.spawn(5).unwrap();
@@ -733,6 +863,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "smp")]
     fn zero_cpu_and_out_of_bounds_smp_scheduler() {
         let mut smp0 = SmpScheduler::<0, 8>::new(0);
         assert_eq!(smp0.online_cpus(), 0);
@@ -760,6 +891,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sched-priority-rr")]
     fn steal_ready_and_enqueue_migrated_syncs_priorities() {
         let mut src = Scheduler::<8>::new();
         let high = src.spawn_on_cpu(200, 0).unwrap();
@@ -797,5 +929,76 @@ mod tests {
         assert_eq!(sched.current_slot(), Some(0));
         assert_eq!(sched.tcb(0).unwrap().state, ThreadState::Running);
         assert_eq!(sched.tcb(1).unwrap().state, ThreadState::Exited);
+    }
+
+    #[test]
+    fn active_scheduler_policy_behaves_as_configured() {
+        let mut sched = Scheduler::<8>::new();
+        let low = sched.spawn(1).unwrap();
+        let high = sched.spawn(50).unwrap();
+
+        match ACTIVE_SCHED_POLICY {
+            SchedPolicyKind::PriorityRoundRobin => {
+                assert_eq!(sched.schedule_next(), Some(high));
+                assert_eq!(ACTIVE_SCHED_POLICY.as_str(), "priority-rr");
+            }
+            SchedPolicyKind::RoundRobin => {
+                // Ignores priorities: visits `low` first, then `high`, and preempts on quantum expiry.
+                assert_eq!(sched.schedule_next(), Some(low));
+                for _ in 0..(DEFAULT_TIME_SLICE - 1) {
+                    assert!(!sched.on_timer_tick());
+                }
+                assert!(sched.on_timer_tick());
+                assert_eq!(sched.schedule_next(), Some(high));
+                assert_eq!(ACTIVE_SCHED_POLICY.as_str(), "round-robin");
+            }
+            SchedPolicyKind::Fifo => {
+                // Cooperative FIFO: never preempts on timer ticks.
+                assert_eq!(sched.schedule_next(), Some(low));
+                for _ in 0..(DEFAULT_TIME_SLICE * 2) {
+                    assert!(!sched.on_timer_tick());
+                }
+                assert_eq!(sched.schedule_next(), Some(high));
+                assert_eq!(ACTIVE_SCHED_POLICY.as_str(), "fifo");
+            }
+        }
+    }
+
+    #[test]
+    fn smp_pick_next_ready_preserves_other_running_threads_and_timer_ticks() {
+        let mut sched = Scheduler::<8>::new();
+        for _ in 0..5 {
+            let _ = sched.spawn(DEFAULT_PRIORITY).unwrap();
+        }
+        // Simulate 4 SMP CPUs running slots 1, 2, 3, 4 while slot 0 is Ready.
+        for slot in 1..=4 {
+            sched.mark_running(slot);
+        }
+        assert_eq!(sched.ready_count(), 1);
+        assert_eq!(sched.pick_next_ready(1), Some(0));
+        // None of the other CPUs' Running threads were demoted to Ready.
+        for slot in 1..=4 {
+            assert_eq!(sched.tcb(slot).unwrap().state, ThreadState::Running);
+        }
+        assert_eq!(sched.ready_count(), 1);
+
+        // Preemptive timer ticks still work on every running CPU (not just `self.current`).
+        if !matches!(ACTIVE_SCHED_POLICY, SchedPolicyKind::Fifo) {
+            for _ in 0..(DEFAULT_TIME_SLICE - 1) {
+                assert!(!sched.on_timer_tick_for(1));
+            }
+            assert!(sched.on_timer_tick_for(1));
+        }
+
+        // Context-switch CPU running slot 1 -> slot 0.
+        sched.mark_ready(1);
+        sched.mark_running(0);
+        assert_eq!(sched.tcb(0).unwrap().state, ThreadState::Running);
+        assert_eq!(sched.tcb(1).unwrap().state, ThreadState::Ready);
+        for slot in 2..=4 {
+            assert_eq!(sched.tcb(slot).unwrap().state, ThreadState::Running);
+        }
+        assert_eq!(sched.ready_count(), 1);
+        assert_eq!(sched.pick_next_ready(0), Some(1));
     }
 }

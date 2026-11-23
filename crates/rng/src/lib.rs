@@ -10,14 +10,20 @@
 //! Raw hardware entropy passes NIST SP 800-90B startup health tests (fail-closed),
 //! is conditioned with FIPS 202 `SHAKE256`, and drives a fast-key-erasure ChaCha20 CSPRNG.
 
+#[cfg(feature = "bcm2712")]
 pub mod bcm2712;
+#[cfg(feature = "csprng")]
 pub mod csprng;
+#[cfg(feature = "virtio")]
 pub mod virtio;
 
+#[cfg(feature = "bcm2712")]
 pub use bcm2712::Bcm2712Rng200;
+#[cfg(feature = "csprng")]
 pub use csprng::{
     ConditionedCsprng, RESEED_INTERVAL_BYTES, SEED_BLOCK_BYTES, verify_entropy_health,
 };
+#[cfg(feature = "virtio")]
 pub use virtio::{VIRTIO_DEVICE_RNG, VIRTIO_MMIO_MAGIC, VirtioRngDevice, VirtioRngDma};
 
 use newos_abi::SysError;
@@ -70,6 +76,7 @@ where
     F: FnMut(u64) -> Result<u32, SysError>,
 {
     let reg0 = read32(0x00).map_err(RngError::Sys)?;
+    #[cfg(feature = "virtio")]
     if reg0 == VIRTIO_MMIO_MAGIC {
         let version = read32(0x04).map_err(RngError::Sys)?;
         let device_id = read32(0x08).map_err(RngError::Sys)?;
@@ -78,12 +85,19 @@ where
         }
         return Err(RngError::DeviceNotFound);
     }
-    // Otherwise validate that `REG_FIFO_COUNT` (`0x24`) is readable within the scoped `0x28` window.
-    let _ = read32(bcm2712::REG_FIFO_COUNT).map_err(RngError::Sys)?;
-    Ok(RngKind::Bcm2712Rng200)
+    let _ = reg0;
+    #[cfg(feature = "bcm2712")]
+    {
+        // Otherwise validate that `REG_FIFO_COUNT` (`0x24`) is readable within the scoped `0x28` window.
+        let _ = read32(bcm2712::REG_FIFO_COUNT).map_err(RngError::Sys)?;
+        Ok(RngKind::Bcm2712Rng200)
+    }
+    #[cfg(not(feature = "bcm2712"))]
+    Err(RngError::DeviceNotFound)
 }
 
 #[cfg(test)]
+#[cfg(all(feature = "bcm2712", feature = "virtio", feature = "csprng"))]
 mod tests {
     use super::*;
     use core::sync::atomic::{AtomicU32, Ordering};

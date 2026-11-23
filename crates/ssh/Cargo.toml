@@ -4,10 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["suite-pq-level5"]
+suite-pq-level5 = ["newos-crypto/suite-pq-level5"]
+
 [dependencies]
 ml-dsa = { version = "0.1", default-features = false, features = ["zeroize"] }
 ml-kem = { version = "0.3", default-features = false, features = ["zeroize"] }
 newos-abi = { workspace = true }
+newos-crypto = { workspace = true, default-features = false, features = ["suite-pq-level5"] }
 subtle = { version = "2", default-features = false }
 zeroize = { version = "1", default-features = false, features = ["derive"] }
 

@@ -4,7 +4,6 @@
 //! Every DMA ring and packet buffer is page-aligned (`<= 4096B`) so it never crosses a page boundary.
 
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering, fence};
-use newos_abi::SysError;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
@@ -37,22 +36,8 @@ const STATUS_FEATURES_OK: u32 = 8;
 
 const DESC_F_WRITE: u16 = 2;
 
-/// Capability-scoped MMIO + DMA translation & cache-coherency transport injected by EL0 `user-rt`.
-pub trait MmioDmaTransport {
-    fn read32(&self, offset: u64) -> Result<u32, SysError>;
-    fn write32(&self, offset: u64, val: u32) -> Result<(), SysError>;
-    fn virt_to_phys<T>(&self, r: &T) -> Result<u64, SysError>;
-
-    /// Clean data cache lines (`dc cvac`) for `r` before outbound non-coherent DMA.
-    fn dma_clean<T>(&self, _r: &T) -> Result<(), SysError> {
-        Ok(())
-    }
-
-    /// Clean & invalidate data cache lines (`dc civac`) for `r` before/after inbound non-coherent DMA.
-    fn dma_invalidate<T>(&self, _r: &T) -> Result<(), SysError> {
-        Ok(())
-    }
-}
+/// Re-exported from crate root for backward compatibility.
+pub use crate::MmioDmaTransport;
 
 #[repr(C)]
 struct VirtqDesc {
