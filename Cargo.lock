@@ -53,11 +53,11 @@ checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
 name = "newos-abi"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "newos-bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "newos-abi",
  "newos-kernel-core",
@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "newos-hal"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "limine",
  "newos-abi",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "newos-init"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "newos-abi",
  "newos-net",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "newos-kernel"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "newos-hal",
  "newos-kernel-core",
@@ -93,14 +93,14 @@ dependencies = [
 
 [[package]]
 name = "newos-kernel-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "newos-abi",
 ]
 
 [[package]]
 name = "newos-net"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "newos-abi",
  "smoltcp",
@@ -108,21 +108,21 @@ dependencies = [
 
 [[package]]
 name = "newos-shell-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "newos-abi",
 ]
 
 [[package]]
 name = "newos-user-rt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "newos-abi",
 ]
 
 [[package]]
 name = "newos-worker"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "newos-abi",
  "newos-user-rt",
@@ -149,4 +149,4 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.3.0"

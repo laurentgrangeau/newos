@@ -1,6 +1,6 @@
 # NewOS
 
-> **Release:** [`v0.2.0`](https://github.com/laurentgrangeau/newos/releases/tag/v0.2.0) · Pure 64-bit AArch64 microkernel, UEFI GPT+FAT32 ESP, KASLR/ASLR/KCFI/ShadowCallStack, ACPI/GICv2/SMMUv3, and Miri/Kani verification.
+> **Release:** [`v0.2.0`](https://github.com/laurentgrangeau/newos/releases/tag/v0.2.0) · `main` is on `0.3.0` development.
 
 A pure **seL4-style 64-bit capability microkernel** and **post-UNIX EL0 environment** written in modern Rust — built solely for the **Raspberry Pi 5 16 GB** (`aarch64` / ARMv8.2-A quad-core BCM2712 Cortex-A76, with QEMU `aarch64` `virt` retained as a local test harness). Built with **zero kernel heap (`no_alloc` in EL1)**, **100% memory-safe Rust APIs (`#![forbid(unsafe_code)]` across core, networking, shell, userspace & benchmarks)**, **Kernel PIE + Limine KASLR**, **Userspace PIE + full ASLR + KCFI + LLVM ShadowCallStack (`x18`)**, **SMP multi-core bring-up with GICv2 SGI wakeups**, **isolated `TTBR0_EL1` address spaces (16-bit ASIDs + full NEON/FP save/restore)**, **EL0 crash isolation**, **live ACPI hardware discovery (`FADT`/`SPCR`/`MADT`/`GTDT`/`MCFG`/`IORT`) + ARM SMMUv3 `IoSpace`**, an **EL0 `smoltcp` IPv4/IPv6 TCP/IP stack + RP1 Cadence GEM Gigabit Ethernet driver** (plus VirtIO 1.0+ for QEMU testing), a **SHA-256 Content-Addressed Object Store (CAOS)**, and a **UTF-8 Typed Pipeline Shell (`newos-sh`)**.
 
@@ -144,7 +144,7 @@ sequenceDiagram
 ```text
 newos/
 ├── rust-toolchain.toml          # Nightly toolchain + rust-src, llvm-tools-preview, aarch64-unknown-none
-├── Cargo.toml                   # Workspace manifest (v0.2.0)
+├── Cargo.toml                   # Workspace manifest (v0.3.0-dev; v0.2.0 released)
 ├── BENCHMARK_RESULTS.md         # Reproducible 28-metric before/after kernel, shell & IPC benchmarks
 ├── targets/
 │   └── aarch64-newos-user.json  # Custom EL0 PIE target spec enabling KCFI + LLVM ShadowCallStack (x18)
