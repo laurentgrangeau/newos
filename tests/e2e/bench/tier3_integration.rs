@@ -44,6 +44,7 @@ fn is_bench_binary_fresh(bin: &Path) -> bool {
     let Ok(bin_mtime) = meta.modified() else {
         return false;
     };
+    let root = crate::workspace_root();
     let src_dirs = [
         "crates/abi/src",
         "crates/kernel-core/src",
@@ -51,7 +52,7 @@ fn is_bench_binary_fresh(bin: &Path) -> bool {
         "crates/bench/src",
     ];
     for dir in src_dirs {
-        if let Some(src_mtime) = newest_mtime_in_dir(Path::new(dir))
+        if let Some(src_mtime) = newest_mtime_in_dir(&root.join(dir))
             && src_mtime > bin_mtime
         {
             return false;
@@ -174,6 +175,7 @@ fn ensure_bench_binary() -> String {
 
             for (name, args) in &steps {
                 let out = Command::new("rustc")
+                    .current_dir(&root)
                     .args(args)
                     .output()
                     .expect("invoke rustc");
