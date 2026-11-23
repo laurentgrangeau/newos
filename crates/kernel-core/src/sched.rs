@@ -36,6 +36,7 @@ pub struct ThreadControlBlock {
 /// Fixed-capacity, `no_alloc` priority + round-robin scheduler.
 pub struct Scheduler<const MAX_THREADS: usize> {
     threads: [Option<ThreadControlBlock>; MAX_THREADS],
+    priorities: [u8; MAX_THREADS],
     ready_mask: u64,
     current: Option<usize>,
     next_id: u32,
@@ -51,6 +52,7 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
     pub const fn new() -> Self {
         Self {
             threads: [None; MAX_THREADS],
+            priorities: [0; MAX_THREADS],
             ready_mask: 0,
             current: None,
             next_id: 1,
@@ -77,6 +79,7 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
                     cpu_affinity,
                     preemptions: 0,
                 });
+                self.priorities[idx] = priority;
                 if idx < 64 {
                     self.ready_mask |= 1u64 << idx;
                 }
@@ -127,6 +130,7 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
             .and_then(Option::as_mut)
             .ok_or(SysError::InvalidArgument)?;
         tcb.priority = priority;
+        self.priorities[slot] = priority;
         Ok(())
     }
 
@@ -186,7 +190,7 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
     /// Directly mark `slot` as the `Running` thread (used by direct-switch IPC fastpaths).
     #[inline]
     pub fn select_slot(&mut self, slot: usize) {
-        if slot >= MAX_THREADS {
+        if !matches!(self.threads.get(slot), Some(Some(tcb)) if tcb.state != ThreadState::Exited) {
             return;
         }
         if let Some(prev) = self.current
@@ -234,9 +238,7 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
         };
 
         let has_preemptor = self.has_ready_with_min_priority(cur_prio);
-        if has_preemptor
-            && let Some(tcb) = &mut self.threads[cur]
-        {
+        if has_preemptor && let Some(tcb) = &mut self.threads[cur] {
             tcb.preemptions = tcb.preemptions.saturating_add(1);
         }
         has_preemptor
@@ -246,12 +248,16 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
     fn has_ready_with_min_priority(&self, min_priority: u8) -> bool {
         if MAX_THREADS <= 64 {
             let mut mask = self.ready_mask;
+            if mask == 0 {
+                return false;
+            }
+            if mask.is_power_of_two() {
+                return self.priorities[mask.trailing_zeros() as usize] >= min_priority;
+            }
             while mask != 0 {
                 let idx = mask.trailing_zeros() as usize;
                 mask &= mask - 1;
-                if let Some(tcb) = &self.threads[idx]
-                    && tcb.priority >= min_priority
-                {
+                if self.priorities[idx] >= min_priority {
                     return true;
                 }
             }
@@ -278,6 +284,7 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
         if victim_idx < 64 {
             self.ready_mask &= !(1u64 << victim_idx);
         }
+        self.priorities[victim_idx] = 0;
         self.threads[victim_idx].take()
     }
 
@@ -292,6 +299,7 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
                 tcb.state = ThreadState::Ready;
                 tcb.cpu_affinity = new_cpu;
                 tcb.quantum_remaining = DEFAULT_TIME_SLICE;
+                self.priorities[idx] = tcb.priority;
                 *slot = Some(tcb);
                 if idx < 64 {
                     self.ready_mask |= 1u64 << idx;
@@ -326,39 +334,53 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
             }
         }
 
-        let mut best: Option<(usize, u8)> = None;
         if MAX_THREADS <= 64 {
-            if self.ready_mask == 0 {
+            let rm = self.ready_mask;
+            if rm == 0 {
                 return None;
             }
-            let mut mask = self.ready_mask.rotate_right(start as u32);
-            while mask != 0 {
-                let off = mask.trailing_zeros() as usize;
+            let best_idx = if rm.is_power_of_two() {
+                rm.trailing_zeros() as usize
+            } else {
+                let mut mask = rm.rotate_right(start as u32);
+                let first_off = mask.trailing_zeros() as usize;
                 mask &= mask - 1;
-                let idx = (start + off) & 63;
-                if let Some(tcb) = &self.threads[idx] {
-                    let is_better = match best {
-                        None => true,
-                        Some((_, best_prio)) => tcb.priority > best_prio,
-                    };
-                    if is_better {
-                        best = Some((idx, tcb.priority));
+                let mut best_idx = (start + first_off) & 63;
+                let mut best_prio = self.priorities[best_idx];
+                while mask != 0 {
+                    let off = mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    let idx = (start + off) & 63;
+                    let prio = self.priorities[idx];
+                    if prio > best_prio {
+                        best_idx = idx;
+                        best_prio = prio;
                     }
                 }
+                best_idx
+            };
+            self.current = Some(best_idx);
+            self.ready_mask = rm & !(1u64 << best_idx);
+            if let Some(tcb) = &mut self.threads[best_idx] {
+                tcb.state = ThreadState::Running;
+                tcb.quantum_remaining = DEFAULT_TIME_SLICE;
+                return Some(tcb.id);
             }
-        } else {
-            for offset in 0..MAX_THREADS {
-                let idx = (start + offset) % MAX_THREADS;
-                if let Some(tcb) = &self.threads[idx]
-                    && tcb.state == ThreadState::Ready
-                {
-                    let is_better = match best {
-                        None => true,
-                        Some((_, best_prio)) => tcb.priority > best_prio,
-                    };
-                    if is_better {
-                        best = Some((idx, tcb.priority));
-                    }
+            return None;
+        }
+
+        let mut best: Option<(usize, u8)> = None;
+        for offset in 0..MAX_THREADS {
+            let idx = (start + offset) % MAX_THREADS;
+            if let Some(tcb) = &self.threads[idx]
+                && tcb.state == ThreadState::Ready
+            {
+                let is_better = match best {
+                    None => true,
+                    Some((_, best_prio)) => tcb.priority > best_prio,
+                };
+                if is_better {
+                    best = Some((idx, tcb.priority));
                 }
             }
         }
@@ -402,7 +424,9 @@ impl<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize>
     SmpScheduler<MAX_CPUS, MAX_THREADS_PER_CPU>
 {
     pub const fn new(online_cpus: usize) -> Self {
-        let clamped = if online_cpus == 0 {
+        let clamped = if MAX_CPUS == 0 {
+            0
+        } else if online_cpus == 0 {
             1
         } else if online_cpus > MAX_CPUS {
             MAX_CPUS
@@ -431,6 +455,9 @@ impl<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize>
 
     /// Spawn a thread on the least-loaded online CPU core, returning `(cpu_id, thread_id)`.
     pub fn spawn_balanced(&mut self, priority: u8) -> Result<(usize, ThreadId), SysError> {
+        if self.online_cpus == 0 {
+            return Err(SysError::OutOfMemory);
+        }
         let mut best_cpu = 0usize;
         let mut best_load = usize::MAX;
         for (cpu, rq) in self.per_cpu.iter().enumerate().take(self.online_cpus) {
@@ -473,6 +500,8 @@ impl<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize>
         {
             self.per_cpu[cpu_id].schedule_next()
         } else {
+            // Restore stolen thread back to victim CPU so it is never lost.
+            let _ = self.per_cpu[victim_cpu].enqueue_migrated(stolen, victim_cpu as u8);
             None
         }
     }
@@ -594,5 +623,108 @@ mod tests {
         // CPU 1 has no local threads -> steals `t_b` from CPU 0!
         assert_eq!(smp2.schedule_or_steal(1), Some(t_b));
         assert_eq!(smp2.cpu_mut(1).unwrap().tcb(0).unwrap().cpu_affinity, 1);
+    }
+
+    #[test]
+    fn single_ready_fastpath_and_priority_sync() {
+        let mut sched = Scheduler::<8>::new();
+        let a = sched.spawn(5).unwrap();
+        assert_eq!(sched.schedule_next(), Some(a));
+        assert_eq!(sched.ready_count(), 0);
+        // Single ready thread fastpath when rescheduling `a`.
+        assert_eq!(sched.schedule_next(), Some(a));
+
+        // Spawn `b`, block it, change its priority while blocked, then wake it.
+        let b = sched.spawn(1).unwrap();
+        sched.block_slot(1).unwrap();
+        sched.set_priority(1, 50).unwrap();
+        sched.wake_slot(1).unwrap();
+        for _ in 0..(DEFAULT_TIME_SLICE - 1) {
+            assert!(!sched.on_timer_tick());
+        }
+        assert!(sched.on_timer_tick());
+        assert_eq!(sched.schedule_next(), Some(b));
+    }
+
+    #[test]
+    fn boundary_invalid_slot_operations() {
+        let mut sched = Scheduler::<4>::new();
+        assert_eq!(sched.set_priority(0, 10), Err(SysError::InvalidArgument));
+        assert_eq!(sched.set_priority(99, 10), Err(SysError::InvalidArgument));
+        assert_eq!(sched.block_slot(0), Err(SysError::InvalidArgument));
+        assert_eq!(sched.wake_slot(0), Err(SysError::InvalidArgument));
+        assert_eq!(sched.exit_slot(0), Err(SysError::InvalidArgument));
+        assert_eq!(sched.tcb(99), None);
+        assert_eq!(sched.yield_current(), None);
+        assert!(!sched.on_timer_tick());
+        sched.select_slot(99);
+        assert_eq!(sched.current_slot(), None);
+    }
+
+    #[test]
+    fn zero_cpu_and_out_of_bounds_smp_scheduler() {
+        let mut smp0 = SmpScheduler::<0, 8>::new(0);
+        assert_eq!(smp0.online_cpus(), 0);
+        assert!(smp0.cpu_mut(0).is_none());
+        assert_eq!(smp0.spawn_balanced(10), Err(SysError::OutOfMemory));
+        assert_eq!(smp0.schedule_or_steal(0), None);
+        assert!(!smp0.on_timer_tick(0));
+
+        // Work-stealing when thief's runqueue is full of Blocked threads must restore victim thread.
+        let mut smp = SmpScheduler::<2, 2>::new(2);
+        let _ = smp.cpu_mut(0).unwrap().spawn_on_cpu(10, 0).unwrap();
+        let victim = smp.cpu_mut(0).unwrap().spawn_on_cpu(10, 0).unwrap();
+        let _ = smp.cpu_mut(0).unwrap().schedule_next(); // slot 0 Running, slot 1 (`victim`) Ready
+
+        // Fill CPU 1 with 2 Blocked threads so enqueue_migrated returns OutOfMemory.
+        let _ = smp.cpu_mut(1).unwrap().spawn_on_cpu(5, 1).unwrap();
+        let _ = smp.cpu_mut(1).unwrap().spawn_on_cpu(5, 1).unwrap();
+        smp.cpu_mut(1).unwrap().block_slot(0).unwrap();
+        smp.cpu_mut(1).unwrap().block_slot(1).unwrap();
+
+        assert_eq!(smp.schedule_or_steal(1), None);
+        // `victim` must still be Ready on CPU 0!
+        assert_eq!(smp.cpu_mut(0).unwrap().ready_count(), 1);
+        assert_eq!(smp.cpu_mut(0).unwrap().schedule_next(), Some(victim));
+    }
+
+    #[test]
+    fn steal_ready_and_enqueue_migrated_syncs_priorities() {
+        let mut src = Scheduler::<8>::new();
+        let high = src.spawn_on_cpu(200, 0).unwrap();
+        let stolen = src.steal_ready().unwrap();
+        assert_eq!(stolen.id, high);
+        assert_eq!(src.ready_count(), 0);
+
+        let mut dst = Scheduler::<8>::new();
+        let _low = dst.spawn_on_cpu(10, 1).unwrap();
+        dst.enqueue_migrated(stolen, 1).unwrap();
+        // Migrated high-priority thread must beat local low-priority thread.
+        assert_eq!(dst.schedule_next(), Some(high));
+    }
+
+    #[test]
+    fn select_slot_rejects_empty_and_exited_slots_without_corrupting_current() {
+        let mut sched = Scheduler::<8>::new();
+        let t0 = sched.spawn(10).unwrap();
+        let t1 = sched.spawn(10).unwrap();
+        assert_eq!(sched.schedule_next(), Some(t0));
+        assert_eq!(sched.current_slot(), Some(0));
+        assert_eq!(sched.tcb(0).unwrap().state, ThreadState::Running);
+
+        // Empty slot 5 must be a no-op and must not demote current slot 0.
+        sched.select_slot(5);
+        assert_eq!(sched.current_slot(), Some(0));
+        assert_eq!(sched.tcb(0).unwrap().state, ThreadState::Running);
+        assert_eq!(sched.ready_count(), 1);
+
+        // Exited slot 1 must not be resurrected to Running.
+        sched.exit_slot(1).unwrap();
+        assert_eq!(sched.tcb(1).unwrap().state, ThreadState::Exited);
+        assert_eq!(sched.tcb(1).unwrap().id, t1);
+        sched.select_slot(1);
+        assert_eq!(sched.current_slot(), Some(0));
+        assert_eq!(sched.tcb(0).unwrap().state, ThreadState::Running);
+        assert_eq!(sched.tcb(1).unwrap().state, ThreadState::Exited);
     }
 }

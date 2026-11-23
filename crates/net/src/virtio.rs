@@ -242,7 +242,9 @@ impl<'a, T: VirtioTransport> VirtioNetDevice<'a, T> {
             dma.rx_desc.0[i]
                 .len
                 .store(PKT_BUF_SIZE as u32, Ordering::Relaxed);
-            dma.rx_desc.0[i].flags.store(DESC_F_WRITE, Ordering::Relaxed);
+            dma.rx_desc.0[i]
+                .flags
+                .store(DESC_F_WRITE, Ordering::Relaxed);
             dma.rx_desc.0[i].next.store(0, Ordering::Relaxed);
             dma.rx_avail.ring[i].store(i as u16, Ordering::Relaxed);
         }
@@ -277,7 +279,9 @@ impl<'a, T: VirtioTransport> VirtioNetDevice<'a, T> {
         if let Ok(isr) = self.transport.read32(self.slot_base + REG_INTERRUPT_STATUS)
             && isr != 0
         {
-            let _ = self.transport.write32(self.slot_base + REG_INTERRUPT_ACK, isr);
+            let _ = self
+                .transport
+                .write32(self.slot_base + REG_INTERRUPT_ACK, isr);
         }
     }
 }

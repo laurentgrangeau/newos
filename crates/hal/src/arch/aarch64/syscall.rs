@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use newos_abi::{
     CAP_MINT_SET_BADGE, CapId, ObjectType, QemuExitCode, Rights, SysError, SyscallNumber,
 };
-use newos_kernel_core::ipc::{KernelIpcState, MAX_IPC_PROCS};
+use newos_kernel_core::ipc::{KernelIpcState, MAX_ENDPOINTS, MAX_IPC_PROCS};
 use newos_kernel_core::memory::{
     FrameMappingTracker, PAGE_MASK, PAGE_SIZE, PageFlags, PhysAddr, PhysFrame, UntypedInventory,
     VSpaceMapper, VirtAddr,
@@ -21,6 +21,7 @@ use super::serial;
 
 const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
 const MAX_PROCS: usize = MAX_IPC_PROCS;
+const _: () = assert!(MAX_PROCS <= 8);
 const TTBR0_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 const CNTV_CTL_ENABLE: u64 = 1 << 0;
 const CNTV_CTL_ISTATUS: u64 = 1 << 2;
@@ -28,7 +29,7 @@ const CNTV_CTL_ISTATUS: u64 = 1 << 2;
 /// IRQ-disabling spinlock protecting kernel globals across EL0 syscalls, EL0 IRQs, and SMP cores.
 ///
 /// Lock hierarchy (always acquire in this order when holding more than one):
-/// `PROCS` -> `IPC_STATE` -> `RUNTIME_UNTYPED`.
+/// `PROCS` -> `IPC_STATE` -> `RUNTIME_UNTYPED` -> `FRAME_MAPPINGS`.
 struct IrqSpinLock<T> {
     locked: AtomicBool,
     data: UnsafeCell<T>,
@@ -109,6 +110,26 @@ fn set_ipc_return(frame: &mut TrapFrame, payload: u64, badge: u64) {
     frame.x[2] = badge;
 }
 
+#[inline]
+fn parse_rights(raw: u64) -> Result<Rights, SysError> {
+    if raw > u64::from(u8::MAX) {
+        return Err(SysError::InvalidArgument);
+    }
+    Rights::from_bits(raw as u8).ok_or(SysError::InvalidArgument)
+}
+
+#[inline]
+fn parse_mint_rights_and_badge(a2: u64, a3: u64) -> Result<(Rights, Option<u64>), SysError> {
+    let raw_rights = a2 & !CAP_MINT_SET_BADGE;
+    let rights = parse_rights(raw_rights)?;
+    let badge = if (a2 & CAP_MINT_SET_BADGE) != 0 {
+        Some(a3)
+    } else {
+        None
+    };
+    Ok((rights, badge))
+}
+
 static YIELD_COUNTER: AtomicU64 = AtomicU64::new(0);
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 static NET_MMIO_PHYS: AtomicU64 = AtomicU64::new(0);
@@ -116,7 +137,7 @@ static NET_MMIO_VIRT: AtomicU64 = AtomicU64::new(0);
 static NET_MMIO_LEN: AtomicU64 = AtomicU64::new(0);
 static SYS_INFO_PACKED: AtomicU64 = AtomicU64::new(0);
 static TIMER_TICK_INTERVAL: AtomicU64 = AtomicU64::new(625_000);
-static LAST_TICK_CNT: AtomicU64 = AtomicU64::new(0);
+static SYSCALL_TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PREEMPT_PENDING: AtomicBool = AtomicBool::new(false);
 static IPC_STATE: IrqSpinLock<KernelIpcState> = IrqSpinLock::new(KernelIpcState::new());
 static RUNTIME_UNTYPED: IrqSpinLock<UntypedInventory> = IrqSpinLock::new(UntypedInventory::new());
@@ -183,6 +204,8 @@ impl ProcessSlot {
 struct ProcTable {
     procs: [ProcessSlot; MAX_PROCS],
     sched: Scheduler<MAX_PROCS>,
+    recv_waiters: [u8; MAX_ENDPOINTS],
+    reply_waiters: [u8; MAX_ENDPOINTS],
     count: usize,
     current: usize,
 }
@@ -192,8 +215,37 @@ impl ProcTable {
         Self {
             procs: [ProcessSlot::EMPTY; MAX_PROCS],
             sched: Scheduler::new(),
+            recv_waiters: [0; MAX_ENDPOINTS],
+            reply_waiters: [0; MAX_ENDPOINTS],
             count: 0,
             current: 0,
+        }
+    }
+
+    #[inline]
+    fn set_wait_state(&mut self, pid: usize, new_state: IpcWaitState, new_ep: u32) {
+        if pid >= MAX_PROCS {
+            return;
+        }
+        let bit = 1u8 << pid;
+        let old_state = self.procs[pid].wait;
+        let old_ep = self.procs[pid].wait_ep_id as usize;
+        if old_ep < MAX_ENDPOINTS {
+            match old_state {
+                IpcWaitState::WaitingRecv => self.recv_waiters[old_ep] &= !bit,
+                IpcWaitState::WaitingReply => self.reply_waiters[old_ep] &= !bit,
+                IpcWaitState::Runnable => {}
+            }
+        }
+        self.procs[pid].wait = new_state;
+        self.procs[pid].wait_ep_id = new_ep;
+        let new_ep_idx = new_ep as usize;
+        if new_ep_idx < MAX_ENDPOINTS {
+            match new_state {
+                IpcWaitState::WaitingRecv => self.recv_waiters[new_ep_idx] |= bit,
+                IpcWaitState::WaitingReply => self.reply_waiters[new_ep_idx] |= bit,
+                IpcWaitState::Runnable => {}
+            }
         }
     }
 
@@ -204,7 +256,9 @@ impl ProcTable {
         }
         let _ = self.sched.schedule_next()?;
         let next = self.sched.current_slot()?;
-        if next != from && self.procs[next].active && self.procs[next].wait == IpcWaitState::Runnable
+        if next != from
+            && self.procs[next].active
+            && self.procs[next].wait == IpcWaitState::Runnable
         {
             Some(next)
         } else {
@@ -214,16 +268,23 @@ impl ProcTable {
 
     #[inline]
     fn find_waiter(&self, state: IpcWaitState, ep_id: u32, exclude: usize) -> Option<usize> {
-        for idx in 0..self.count {
-            if idx != exclude
-                && self.procs[idx].active
-                && self.procs[idx].wait == state
-                && self.procs[idx].wait_ep_id == ep_id
-            {
-                return Some(idx);
-            }
+        let ep = ep_id as usize;
+        if ep >= MAX_ENDPOINTS {
+            return None;
         }
-        None
+        let mut mask = match state {
+            IpcWaitState::WaitingRecv => self.recv_waiters[ep],
+            IpcWaitState::WaitingReply => self.reply_waiters[ep],
+            IpcWaitState::Runnable => return None,
+        };
+        if exclude < MAX_PROCS {
+            mask &= !(1u8 << exclude);
+        }
+        if mask == 0 {
+            None
+        } else {
+            Some(mask.trailing_zeros() as usize)
+        }
     }
 }
 
@@ -309,13 +370,23 @@ fn switch_ttbr0(ttbr0_phys: u64, pid: usize) {
 }
 
 #[inline]
-fn read_cntvct() -> u64 {
+pub(crate) fn read_cntvct() -> u64 {
     let v: u64;
     // SAFETY: `CNTVCT_EL0` is always readable in EL1.
     unsafe {
         asm!("isb", "mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack));
     }
     v
+}
+
+#[inline]
+fn read_cntv_ctl() -> u64 {
+    let ctl: u64;
+    // SAFETY: Reading `CNTV_CTL_EL0` in EL1 checks the Virtual Timer status register.
+    unsafe {
+        asm!("mrs {}, cntv_ctl_el0", out(reg) ctl, options(nomem, nostack));
+    }
+    ctl
 }
 
 #[inline]
@@ -343,20 +414,13 @@ fn init_preempt_timer() {
     // 10 ms tick interval (fallback to 625_000 ticks if CNTFRQ_EL0 reports 0).
     let interval = if freq >= 100 { freq / 100 } else { 625_000 };
     TIMER_TICK_INTERVAL.store(interval, Ordering::Release);
-    LAST_TICK_CNT.store(read_cntvct(), Ordering::Release);
     arm_virtual_timer(interval);
 }
 
 /// Rust handler invoked by `__newos_irq_el0` on hardware IRQs (e.g. ARM Generic Timer preemption).
 pub extern "C" fn irq_el0_dispatch(frame: &mut TrapFrame) {
-    let ctl: u64;
-    // SAFETY: Reading `CNTV_CTL_EL0` in EL1 IRQ handler checks Virtual Timer status.
-    unsafe {
-        asm!("mrs {}, cntv_ctl_el0", out(reg) ctl, options(nomem, nostack));
-    }
-    if (ctl & CNTV_CTL_ISTATUS) != 0 {
+    if (read_cntv_ctl() & CNTV_CTL_ISTATUS) != 0 {
         let interval = TIMER_TICK_INTERVAL.load(Ordering::Acquire);
-        LAST_TICK_CNT.store(read_cntvct(), Ordering::Release);
         arm_virtual_timer(interval);
 
         let mut table = PROCS.lock();
@@ -377,12 +441,7 @@ pub extern "C" fn irq_el0_dispatch(frame: &mut TrapFrame) {
 ///
 /// Walks `ttbr0` for every 4 KiB page spanned by `user_ptr..user_ptr+count`, rejecting any
 /// unmapped or non-EL0 page with `Err(SysError::InvalidArgument)` without risking an EL1 abort.
-fn copy_from_user(
-    ttbr0: u64,
-    user_ptr: u64,
-    len: u64,
-    dst: &mut [u8],
-) -> Result<usize, SysError> {
+fn copy_from_user(ttbr0: u64, user_ptr: u64, len: u64, dst: &mut [u8]) -> Result<usize, SysError> {
     if len == 0 {
         return Ok(0);
     }
@@ -420,6 +479,27 @@ fn copy_from_user(
     Ok(count)
 }
 
+/// Out-of-line `DebugWrite` handler using a 1024-byte EL1 stack buffer with UTF-8
+/// char-boundary backup when `user_len > 1024` splits a multi-byte codepoint.
+#[inline(never)]
+fn handle_debug_write(cur_ttbr0: u64, user_ptr: u64, user_len: u64) -> Result<u64, SysError> {
+    let mut buf = [0u8; 1024];
+    let n = copy_from_user(cur_ttbr0, user_ptr, user_len, &mut buf)?;
+    let valid_len = match core::str::from_utf8(&buf[..n]) {
+        Ok(_) => n,
+        Err(e)
+            if user_len > (buf.len() as u64) && e.error_len().is_none() && e.valid_up_to() > 0 =>
+        {
+            e.valid_up_to()
+        }
+        Err(_) => return Err(SysError::InvalidArgument),
+    };
+    let text = core::str::from_utf8(&buf[..valid_len]).map_err(|_| SysError::InvalidArgument)?;
+    let mut s = serial::Pl011::new();
+    let _ = s.write_str(text);
+    Ok(valid_len as u64)
+}
+
 /// Rust handler invoked by `__newos_sync_el0` on any synchronous trap from EL0 (`svc #0` or fault).
 pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
     let esr: u64;
@@ -447,18 +527,17 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 "[newos-hal] caught EL0 fault (EC={:#x}, ELR={:#018x}) -> kernel healthy, redirecting to EL0 supervisor",
                 ec, frame.elr_el1
             );
-            // Signal fault notification in supervisor PID 0 (or self for PID 0)
-            let notif_pid = if cur_pid == 0 { 0 } else { 0 };
+            // Signal fault notification in supervisor PID 0
             let _ = IPC_STATE
                 .lock()
-                .notify_signal_for(notif_pid, CapId::BOOTSTRAP_FAULT_NOTIF, 1u64 << 6);
+                .notify_signal_for(0, CapId::BOOTSTRAP_FAULT_NOTIF, 1u64 << 6);
             frame.elr_el1 = rec_pc;
             frame.sp_el0 = rec_sp;
             frame.spsr_el1 = 0;
             return;
         }
-        // Non-root EL0 fault without self-handler: notify PID 0 supervisor, terminate ONLY the
-        // faulting process, and switch to the next runnable process instead of halting the kernel.
+        // Non-root EL0 fault without self-handler: notify PID 0 supervisor, wake any WaitingReply
+        // client, terminate ONLY the faulting process, and switch to the next runnable process.
         if cur_pid != 0 {
             let mut s = serial::Pl011::new();
             let _ = writeln!(
@@ -466,13 +545,43 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 "[newos-hal] isolated non-root EL0 fault (pid={cur_pid}, EC={:#x}, ELR={:#018x}) -> notifying supervisor",
                 ec, frame.elr_el1
             );
-            let _ = IPC_STATE
-                .lock()
-                .notify_signal_for(0, CapId::BOOTSTRAP_FAULT_NOTIF, 1u64 << (ec.min(63)));
+            let _ = IPC_STATE.lock().notify_signal_for(
+                0,
+                CapId::BOOTSTRAP_FAULT_NOTIF,
+                1u64 << (ec.min(63)),
+            );
             let mut table = PROCS.lock();
+            table.set_wait_state(cur_pid, IpcWaitState::Runnable, 0);
+            if let Some(client) = table.procs[cur_pid].reply_target.take()
+                && client < table.count
+                && table.procs[client].active
+                && table.procs[client].wait == IpcWaitState::WaitingReply
+            {
+                table.procs[client].frame.x[0] = SysError::InvalidCapability as u64;
+                table.procs[client].frame.x[1] = 0;
+                table.procs[client].frame.x[2] = 0;
+                table.set_wait_state(client, IpcWaitState::Runnable, 0);
+                let _ = table.sched.wake_slot(client);
+            }
             table.procs[cur_pid].active = false;
-            table.procs[cur_pid].reply_target = None;
             let _ = table.sched.exit_slot(cur_pid);
+            if table.sched.ready_count() == 0 {
+                // Lock order: `PROCS` -> `IPC_STATE`. No runnable thread remains to ever service
+                // a buffered `IpcCall`, so wake any active `WaitingReply` callers with an error.
+                let mut ipc = IPC_STATE.lock();
+                ipc.drain_buffered_call_senders(|client| {
+                    if client < table.count
+                        && table.procs[client].active
+                        && table.procs[client].wait == IpcWaitState::WaitingReply
+                    {
+                        table.procs[client].frame.x[0] = SysError::InvalidCapability as u64;
+                        table.procs[client].frame.x[1] = 0;
+                        table.procs[client].frame.x[2] = 0;
+                        table.set_wait_state(client, IpcWaitState::Runnable, 0);
+                        let _ = table.sched.wake_slot(client);
+                    }
+                });
+            }
             if let Some(next) = table.pick_next_runnable(cur_pid) {
                 table.current = next;
                 switch_ttbr0(table.procs[next].ttbr0, next);
@@ -508,19 +617,13 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
 
     let mut ipc_badge_out: u64 = 0;
     let result: Result<u64, SysError> = match syscall {
-        SyscallNumber::DebugWrite => IPC_STATE
-            .lock()
-            .validate_console_for(cur_pid, CapId::new(a0), Rights::WRITE)
-            .and_then(|()| {
-                let mut buf = [0u8; 256];
-                copy_from_user(cur_ttbr0, a1, a2, &mut buf).and_then(|n| {
-                    let text =
-                        core::str::from_utf8(&buf[..n]).map_err(|_| SysError::InvalidArgument)?;
-                    let mut s = serial::Pl011::new();
-                    let _ = s.write_str(text);
-                    Ok(n as u64)
-                })
-            }),
+        SyscallNumber::DebugWrite => {
+            let allowed =
+                IPC_STATE
+                    .lock()
+                    .validate_console_for(cur_pid, CapId::new(a0), Rights::WRITE);
+            allowed.and_then(|()| handle_debug_write(cur_ttbr0, a1, a2))
+        }
         SyscallNumber::Yield => {
             let next_count = YIELD_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
             frame.x[0] = 0;
@@ -559,67 +662,51 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             .map(|()| 0),
         SyscallNumber::NotifyPoll => IPC_STATE.lock().notify_poll_for(cur_pid, CapId::new(a0)),
         SyscallNumber::IpcSend => {
-            let lookup = IPC_STATE
-                .lock()
-                .lookup_endpoint_for(cur_pid, CapId::new(a0), Rights::WRITE);
-            if let Ok((ep_id, badge)) = lookup {
-                let woken = {
-                    let mut table = PROCS.lock();
+            let mut table = PROCS.lock();
+            let mut ipc = IPC_STATE.lock();
+            match ipc.lookup_endpoint_for(cur_pid, CapId::new(a0), Rights::WRITE) {
+                Err(e) => Err(e),
+                Ok((ep_id, badge)) => {
                     let cur = table.current;
                     // Strictly wake only `WaitingRecv` servers — NEVER hijack `WaitingReply` callers.
                     if let Some(peer) = table.find_waiter(IpcWaitState::WaitingRecv, ep_id, cur) {
                         set_ipc_return(&mut table.procs[peer].frame, a1, badge);
-                        table.procs[peer].wait = IpcWaitState::Runnable;
-                        table.procs[peer].wait_ep_id = 0;
+                        table.set_wait_state(peer, IpcWaitState::Runnable, 0);
                         let _ = table.sched.wake_slot(peer);
-                        true
+                        Ok(0)
                     } else {
-                        false
+                        ipc.ipc_send_resolved(ep_id, badge, a1, None).map(|()| 0)
                     }
-                };
-                if woken {
-                    Ok(0)
-                } else {
-                    IPC_STATE
-                        .lock()
-                        .ipc_send_for(cur_pid, CapId::new(a0), a1)
-                        .map(|()| 0)
                 }
-            } else {
-                IPC_STATE
-                    .lock()
-                    .ipc_send_for(cur_pid, CapId::new(a0), a1)
-                    .map(|()| 0)
             }
         }
-        SyscallNumber::IpcRecv => IPC_STATE
-            .lock()
-            .ipc_recv_for(cur_pid, CapId::new(a0))
-            .map(|msg| {
-                ipc_badge_out = msg.badge;
-                msg.payload
-            }),
+        SyscallNumber::IpcRecv => {
+            IPC_STATE
+                .lock()
+                .ipc_recv_for(cur_pid, CapId::new(a0))
+                .map(|msg| {
+                    ipc_badge_out = msg.badge;
+                    msg.payload
+                })
+        }
         SyscallNumber::IpcCall => {
-            let resolved = IPC_STATE.lock().lookup_endpoint_for(
+            let mut table = PROCS.lock();
+            let mut ipc = IPC_STATE.lock();
+            match ipc.lookup_endpoint_for(
                 cur_pid,
                 CapId::new(a0),
                 Rights::WRITE.union(Rights::READ),
-            );
-            match resolved {
+            ) {
                 Err(e) => Err(e),
                 Ok((ep_id, badge)) => {
-                    let mut table = PROCS.lock();
                     let cur = table.current;
-                    if let Some(server) =
-                        table.find_waiter(IpcWaitState::WaitingRecv, ep_id, cur)
-                    {
+                    if let Some(server) = table.find_waiter(IpcWaitState::WaitingRecv, ep_id, cur) {
+                        drop(ipc);
                         // Mint single-use Reply capability on `server` pointing exclusively to `cur`.
                         set_ipc_return(&mut table.procs[server].frame, a1, badge);
-                        table.procs[server].wait = IpcWaitState::Runnable;
-                        table.procs[server].wait_ep_id = 0;
+                        table.set_wait_state(server, IpcWaitState::Runnable, 0);
                         table.procs[server].reply_target = Some(cur);
-                        table.procs[cur].wait = IpcWaitState::WaitingReply;
-                        table.procs[cur].wait_ep_id = ep_id;
+                        table.set_wait_state(cur, IpcWaitState::WaitingReply, ep_id);
                         let _ = table.sched.block_slot(cur);
                         let _ = table.sched.wake_slot(server);
                         table.sched.select_slot(server);
@@ -630,20 +717,21 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                         return;
                     }
                     if table.sched.ready_count() > 0 {
-                        match IPC_STATE.lock().ipc_send_for(cur_pid, CapId::new(a0), a1) {
+                        match ipc.ipc_send_resolved(ep_id, badge, a1, Some(cur)) {
                             Ok(()) => {
-                                table.procs[cur].wait = IpcWaitState::WaitingReply;
-                                table.procs[cur].wait_ep_id = ep_id;
+                                table.set_wait_state(cur, IpcWaitState::WaitingReply, ep_id);
                                 let _ = table.sched.block_slot(cur);
                                 if let Some(next) = table.pick_next_runnable(cur) {
+                                    drop(ipc);
                                     table.procs[cur].frame = *frame;
                                     table.current = next;
                                     switch_ttbr0(table.procs[next].ttbr0, next);
                                     *frame = table.procs[next].frame;
                                     return;
                                 }
-                                table.procs[cur].wait = IpcWaitState::Runnable;
-                                table.procs[cur].wait_ep_id = 0;
+                                // Roll back buffered message so no orphan remains in the endpoint.
+                                let _ = ipc.ipc_recv_resolved(ep_id);
+                                table.set_wait_state(cur, IpcWaitState::Runnable, 0);
                                 let _ = table.sched.wake_slot(cur);
                                 table.sched.select_slot(cur);
                                 Err(SysError::WouldBlock)
@@ -657,17 +745,19 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             }
         }
         SyscallNumber::IpcReplyRecv => {
-            if a2 != 0 {
-                let resolved = IPC_STATE.lock().lookup_endpoint_for(
-                    cur_pid,
-                    CapId::new(a0),
-                    Rights::WRITE.union(Rights::READ),
-                );
-                match resolved {
-                    Err(e) => Err(e),
-                    Ok((ep_id, badge)) => {
-                        let mut table = PROCS.lock();
-                        let cur = table.current;
+            let mut table = PROCS.lock();
+            let mut ipc = IPC_STATE.lock();
+            let cur = table.current;
+            let required = if a2 != 0 {
+                Rights::WRITE.union(Rights::READ)
+            } else {
+                Rights::READ
+            };
+            match ipc.lookup_endpoint_for(cur_pid, CapId::new(a0), required) {
+                Err(e) => Err(e),
+                Ok((ep_id, badge)) => {
+                    let mut fastpath_client = None;
+                    if a2 != 0 {
                         // Consume single-use Reply capability minted during `IpcCall` rendezvous.
                         if let Some(client) = table.procs[cur].reply_target.take()
                             && client < table.count
@@ -675,96 +765,56 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                             && table.procs[client].wait == IpcWaitState::WaitingReply
                         {
                             set_ipc_return(&mut table.procs[client].frame, a1, badge);
-                            table.procs[client].wait = IpcWaitState::Runnable;
-                            table.procs[client].wait_ep_id = 0;
-                            table.procs[cur].wait = IpcWaitState::WaitingRecv;
-                            table.procs[cur].wait_ep_id = ep_id;
-                            let _ = table.sched.block_slot(cur);
+                            table.set_wait_state(client, IpcWaitState::Runnable, 0);
                             let _ = table.sched.wake_slot(client);
-                            table.sched.select_slot(client);
-                            table.procs[cur].frame = *frame;
-                            table.current = client;
-                            switch_ttbr0(table.procs[client].ttbr0, client);
-                            *frame = table.procs[client].frame;
-                            return;
+                            fastpath_client = Some(client);
                         }
-                        match IPC_STATE.lock().ipc_send_for(cur_pid, CapId::new(a0), a1) {
-                            Ok(()) => {
-                                if table.sched.ready_count() > 0 {
-                                    table.procs[cur].wait = IpcWaitState::WaitingRecv;
-                                    table.procs[cur].wait_ep_id = ep_id;
-                                    let _ = table.sched.block_slot(cur);
-                                    if let Some(next) = table.pick_next_runnable(cur) {
-                                        table.procs[cur].frame = *frame;
-                                        table.current = next;
-                                        switch_ttbr0(table.procs[next].ttbr0, next);
-                                        *frame = table.procs[next].frame;
-                                        return;
-                                    }
-                                    table.procs[cur].wait = IpcWaitState::Runnable;
-                                    table.procs[cur].wait_ep_id = 0;
-                                    let _ = table.sched.wake_slot(cur);
-                                    table.sched.select_slot(cur);
-                                }
-                                Err(SysError::WouldBlock)
-                            }
-                            Err(e) => Err(e),
-                        }
+                        // Stale or absent `reply_target`: do not inject reply into request endpoint;
+                        // fall through directly into the `recv` phase below.
                     }
-                }
-            } else {
-                let recv_res = IPC_STATE.lock().ipc_recv_for(cur_pid, CapId::new(a0));
-                match recv_res {
-                    Ok(msg) => {
-                        // If a caller parked in WaitingReply via buffered IpcCall, mint Reply cap now.
-                        if let Ok((ep_id, _)) =
-                            IPC_STATE
-                                .lock()
-                                .lookup_endpoint_for(cur_pid, CapId::new(a0), Rights::READ)
-                        {
-                            let mut table = PROCS.lock();
-                            let cur = table.current;
-                            if let Some(client) =
-                                table.find_waiter(IpcWaitState::WaitingReply, ep_id, cur)
+                    match ipc.ipc_recv_resolved(ep_id) {
+                        Ok((msg, sender_pid)) => {
+                            if let Some(caller) = sender_pid
+                                && caller < table.count
+                                && table.procs[caller].active
+                                && table.procs[caller].wait == IpcWaitState::WaitingReply
                             {
-                                table.procs[cur].reply_target = Some(client);
+                                table.procs[cur].reply_target = Some(caller);
                             }
+                            ipc_badge_out = msg.badge;
+                            Ok(msg.payload)
                         }
-                        ipc_badge_out = msg.badge;
-                        Ok(msg.payload)
-                    }
-                    Err(SysError::WouldBlock) => {
-                        let resolved = IPC_STATE.lock().lookup_endpoint_for(
-                            cur_pid,
-                            CapId::new(a0),
-                            Rights::READ,
-                        );
-                        match resolved {
-                            Err(e) => Err(e),
-                            Ok((ep_id, _)) => {
-                                let mut table = PROCS.lock();
-                                let cur = table.current;
-                                if table.sched.ready_count() > 0 {
-                                    table.procs[cur].wait = IpcWaitState::WaitingRecv;
-                                    table.procs[cur].wait_ep_id = ep_id;
-                                    let _ = table.sched.block_slot(cur);
-                                    if let Some(next) = table.pick_next_runnable(cur) {
-                                        table.procs[cur].frame = *frame;
-                                        table.current = next;
-                                        switch_ttbr0(table.procs[next].ttbr0, next);
-                                        *frame = table.procs[next].frame;
-                                        return;
-                                    }
-                                    table.procs[cur].wait = IpcWaitState::Runnable;
-                                    table.procs[cur].wait_ep_id = 0;
-                                    let _ = table.sched.wake_slot(cur);
-                                    table.sched.select_slot(cur);
+                        Err(SysError::WouldBlock) => {
+                            if let Some(client) = fastpath_client {
+                                drop(ipc);
+                                table.set_wait_state(cur, IpcWaitState::WaitingRecv, ep_id);
+                                let _ = table.sched.block_slot(cur);
+                                table.sched.select_slot(client);
+                                table.procs[cur].frame = *frame;
+                                table.current = client;
+                                switch_ttbr0(table.procs[client].ttbr0, client);
+                                *frame = table.procs[client].frame;
+                                return;
+                            }
+                            if table.sched.ready_count() > 0 {
+                                table.set_wait_state(cur, IpcWaitState::WaitingRecv, ep_id);
+                                let _ = table.sched.block_slot(cur);
+                                if let Some(next) = table.pick_next_runnable(cur) {
+                                    drop(ipc);
+                                    table.procs[cur].frame = *frame;
+                                    table.current = next;
+                                    switch_ttbr0(table.procs[next].ttbr0, next);
+                                    *frame = table.procs[next].frame;
+                                    return;
                                 }
-                                Err(SysError::WouldBlock)
+                                table.set_wait_state(cur, IpcWaitState::Runnable, 0);
+                                let _ = table.sched.wake_slot(cur);
+                                table.sched.select_slot(cur);
                             }
+                            Err(SysError::WouldBlock)
                         }
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
                 }
             }
         }
@@ -809,9 +859,10 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 None => Err(SysError::WouldBlock),
             }),
         SyscallNumber::SysInfo => {
-            let allowed = IPC_STATE
-                .lock()
-                .validate_power_for(cur_pid, CapId::new(a0), Rights::READ);
+            let allowed =
+                IPC_STATE
+                    .lock()
+                    .validate_power_for(cur_pid, CapId::new(a0), Rights::READ);
             allowed.map(|()| {
                 let proc_count = PROCS.lock().count as u64;
                 let base = SYS_INFO_PACKED.load(Ordering::Acquire);
@@ -844,16 +895,12 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             }
         }
         SyscallNumber::CapMint => {
-            let rights = Rights::from_bits_truncate(a2 as u8);
-            let badge = if (a2 & CAP_MINT_SET_BADGE) != 0 {
-                Some(a3)
-            } else {
-                None
-            };
-            IPC_STATE
-                .lock()
-                .cap_mint_for(cur_pid, CapId::new(a0), a1 as usize, rights, badge)
-                .map(CapId::raw)
+            parse_mint_rights_and_badge(a2, a3).and_then(|(rights, badge)| {
+                IPC_STATE
+                    .lock()
+                    .cap_mint_for(cur_pid, CapId::new(a0), a1 as usize, rights, badge)
+                    .map(CapId::raw)
+            })
         }
         SyscallNumber::CapCopy => IPC_STATE
             .lock()
@@ -868,68 +915,70 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             .cap_delete_for(cur_pid, CapId::new(a0))
             .map(|()| 0),
         SyscallNumber::CapRevoke => {
-            let mut revoked_frames = [None; 64];
-            let res = IPC_STATE.lock().cap_revoke_for_collecting_frames(
-                cur_pid,
-                CapId::new(a0),
-                &mut revoked_frames,
-            );
-            res.map(|(revoked_count, frame_count)| {
-                let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
-                for phys in revoked_frames[..frame_count].iter().flatten() {
-                    let mut mappings = [None; 8];
-                    let n = FRAME_MAPPINGS.lock().drain_for_phys(*phys, &mut mappings);
-                    let mut reclaimed_frame = None;
-                    for m in mappings[..n].iter().flatten() {
-                        let mut vs = super::paging::Aarch64VSpace::from_root_phys(
-                            m.vspace_root.raw(),
-                            hhdm,
-                        );
-                        if let Ok(f) = vs.unmap_4k(m.virt) {
-                            reclaimed_frame = Some(f);
+            let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
+            IPC_STATE
+                .lock()
+                .cap_revoke_for_with_frame_reclaim_cb(
+                    cur_pid,
+                    CapId::new(a0),
+                    |phys, can_reclaim| {
+                        let mut reclaimed_frame = None;
+                        let mut mappings = [None; 8];
+                        loop {
+                            let n = FRAME_MAPPINGS.lock().drain_for_phys(phys, &mut mappings);
+                            if n == 0 {
+                                break;
+                            }
+                            for m in mappings[..n].iter().flatten() {
+                                let mut vs = super::paging::Aarch64VSpace::from_root_phys(
+                                    m.vspace_root.raw(),
+                                    hhdm,
+                                );
+                                if let Ok(f) = vs.unmap_4k(m.virt) {
+                                    reclaimed_frame = Some(f);
+                                }
+                            }
                         }
-                    }
-                    if let Some(f) = reclaimed_frame {
-                        let _ = RUNTIME_UNTYPED.lock().reclaim_frame(f);
-                    } else if let Ok(f) = PhysFrame::from_aligned(*phys) {
-                        let _ = RUNTIME_UNTYPED.lock().reclaim_frame(f);
-                    }
-                }
-                revoked_count as u64
-            })
+                        if can_reclaim {
+                            // Lock order: IPC_STATE (held) -> RUNTIME_UNTYPED -> FRAME_MAPPINGS.
+                            let mut untyped = RUNTIME_UNTYPED.lock();
+                            let mappings_guard = FRAME_MAPPINGS.lock();
+                            if !mappings_guard.has_mapping_for_phys(phys) {
+                                if let Some(f) = reclaimed_frame {
+                                    let _ = untyped.reclaim_frame(f);
+                                } else if let Ok(f) = PhysFrame::from_aligned(phys) {
+                                    let _ = untyped.reclaim_frame(f);
+                                }
+                            }
+                        }
+                    },
+                )
+                .map(|revoked_count| revoked_count as u64)
         }
         SyscallNumber::CapGrant => {
-            let dst_cnode_cap = CapId::new(a0);
-            let active_count = PROCS.lock().count;
-            let dst_pid = IPC_STATE
-                .lock()
-                .validate_cnode_for(cur_pid, dst_cnode_cap, Rights::WRITE);
-            match dst_pid {
-                Err(e) => Err(e),
-                Ok(pid) if pid >= active_count => Err(SysError::InvalidArgument),
-                Ok(_) => {
-                    let rights = Rights::from_bits_truncate(a2 as u8);
-                    let badge = if (a2 & CAP_MINT_SET_BADGE) != 0 {
-                        Some(a3)
-                    } else {
-                        None
-                    };
-                    IPC_STATE
-                        .lock()
-                        .cap_grant_between(cur_pid, dst_cnode_cap, CapId::new(a1), rights, badge)
-                        .map(CapId::raw)
-                }
-            }
+            parse_mint_rights_and_badge(a2, a3).and_then(|(rights, badge)| {
+                let active_count = PROCS.lock().count;
+                IPC_STATE
+                    .lock()
+                    .cap_grant_between_checked(
+                        cur_pid,
+                        CapId::new(a0),
+                        CapId::new(a1),
+                        rights,
+                        badge,
+                        active_count,
+                    )
+                    .map(CapId::raw)
+            })
         }
         SyscallNumber::SetPriority => {
             if a1 > u64::from(u8::MAX) {
                 Err(SysError::InvalidArgument)
             } else {
-                let target = IPC_STATE.lock().validate_thread_for(
-                    cur_pid,
-                    CapId::new(a0),
-                    Rights::WRITE,
-                );
+                let target =
+                    IPC_STATE
+                        .lock()
+                        .validate_thread_for(cur_pid, CapId::new(a0), Rights::WRITE);
                 match target {
                     Err(e) => Err(e),
                     Ok(target_pid) => {
@@ -956,15 +1005,13 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             if a1 == 0 || a1 >= USER_ADDR_LIMIT {
                 Err(SysError::InvalidArgument)
             } else {
-                let vspace_root = IPC_STATE.lock().validate_vspace_for(
-                    cur_pid,
-                    CapId::new(a0),
-                    Rights::WRITE,
-                );
+                let vspace_root =
+                    IPC_STATE
+                        .lock()
+                        .validate_vspace_for(cur_pid, CapId::new(a0), Rights::WRITE);
                 match vspace_root {
                     Err(e) => Err(e),
-                    Ok(root) => {
-                        let rights = Rights::from_bits_truncate(a2 as u8);
+                    Ok(root) => parse_rights(a2).and_then(|rights| {
                         let flags = PageFlags::new_wx(
                             rights.contains(Rights::WRITE),
                             rights.contains(Rights::EXEC),
@@ -993,11 +1040,17 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                                             match vspace.map_4k(va, frame, page_flags, &mut untyped)
                                             {
                                                 Ok(()) => {
-                                                    let _ = FRAME_MAPPINGS.lock().record(
+                                                    if let Err(e) = FRAME_MAPPINGS.lock().record(
                                                         PhysAddr::new(root_phys),
                                                         va,
                                                         pa,
-                                                    );
+                                                    ) {
+                                                        if let Ok(reclaimed) = vspace.unmap_4k(va) {
+                                                            let _ =
+                                                                untyped.reclaim_frame(reclaimed);
+                                                        }
+                                                        return Err(e);
+                                                    }
                                                     Ok(0)
                                                 }
                                                 Err(e) => {
@@ -1017,7 +1070,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                             }
                             _ => Err(SysError::InvalidArgument),
                         }
-                    }
+                    }),
                 }
             }
         }
@@ -1025,11 +1078,10 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             if a1 == 0 || a1 >= USER_ADDR_LIMIT {
                 Err(SysError::InvalidArgument)
             } else {
-                let vspace_root = IPC_STATE.lock().validate_vspace_for(
-                    cur_pid,
-                    CapId::new(a0),
-                    Rights::WRITE,
-                );
+                let vspace_root =
+                    IPC_STATE
+                        .lock()
+                        .validate_vspace_for(cur_pid, CapId::new(a0), Rights::WRITE);
                 match vspace_root {
                     Err(e) => Err(e),
                     Ok(root) => match VirtAddr::new_page_aligned(a1) {
@@ -1044,10 +1096,17 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                                 super::paging::Aarch64VSpace::from_root_phys(root_phys, hhdm);
                             match vspace.unmap_4k(va) {
                                 Ok(frame) => {
-                                    let _ = FRAME_MAPPINGS
-                                        .lock()
-                                        .remove(PhysAddr::new(root_phys), va);
-                                    let _ = RUNTIME_UNTYPED.lock().reclaim_frame(frame);
+                                    let pa = frame.start_addr();
+                                    // Lock order: IPC_STATE -> RUNTIME_UNTYPED -> FRAME_MAPPINGS.
+                                    let ipc = IPC_STATE.lock();
+                                    let mut untyped = RUNTIME_UNTYPED.lock();
+                                    let mut mappings = FRAME_MAPPINGS.lock();
+                                    let _ = mappings.remove(PhysAddr::new(root_phys), va);
+                                    if !ipc.has_live_frame_cap(pa)
+                                        && !mappings.has_mapping_for_phys(pa)
+                                    {
+                                        let _ = untyped.reclaim_frame(frame);
+                                    }
                                     Ok(0)
                                 }
                                 Err(e) => Err(e),
@@ -1090,64 +1149,70 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             if a2 == 0 || a2 >= USER_ADDR_LIMIT {
                 Err(SysError::InvalidArgument)
             } else {
-                let req_rights = Rights::from_bits_truncate(a3 as u8);
-                let frame_req = if req_rights.contains(Rights::WRITE) {
-                    Rights::READ.union(Rights::WRITE)
-                } else {
-                    Rights::READ
-                };
-                let caps = {
-                    let ipc = IPC_STATE.lock();
-                    let vs_root = ipc.validate_vspace_for(cur_pid, CapId::new(a0), Rights::WRITE);
-                    let fr_phys = ipc.validate_frame_for(cur_pid, CapId::new(a1), frame_req);
-                    match (vs_root, fr_phys) {
-                        (Ok(r), Ok(p)) => Ok((r, p)),
-                        (Err(e), _) | (_, Err(e)) => Err(e),
-                    }
-                };
-                match caps {
-                    Err(e) => Err(e),
-                    Ok((root, phys)) => {
-                        let flags = PageFlags::new_wx(
-                            req_rights.contains(Rights::WRITE),
-                            req_rights.contains(Rights::EXEC),
-                            true,
-                            false,
-                        );
-                        match (
-                            VirtAddr::new_page_aligned(a2),
-                            flags,
-                            PhysFrame::from_aligned(phys),
-                        ) {
-                            (Ok(va), Ok(page_flags), Ok(frame_obj)) => {
-                                let root_phys = if root.raw() != 0 {
-                                    root.raw()
-                                } else {
-                                    cur_ttbr0
-                                };
-                                let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
-                                let mut vspace =
-                                    super::paging::Aarch64VSpace::from_root_phys(root_phys, hhdm);
-                                if vspace.translate(va).is_some() {
-                                    Err(SysError::SlotOccupied)
-                                } else {
-                                    let mut untyped = RUNTIME_UNTYPED.lock();
-                                    vspace
-                                        .map_4k(va, frame_obj, page_flags, &mut untyped)
-                                        .map(|()| {
-                                            let _ = FRAME_MAPPINGS.lock().record(
-                                                PhysAddr::new(root_phys),
-                                                va,
-                                                phys,
-                                            );
-                                            0
-                                        })
+                parse_rights(a3).and_then(|req_rights| {
+                    let frame_req = if req_rights.contains(Rights::WRITE) {
+                        Rights::READ.union(Rights::WRITE)
+                    } else {
+                        Rights::READ
+                    };
+                    let caps = {
+                        let ipc = IPC_STATE.lock();
+                        let vs_root =
+                            ipc.validate_vspace_for(cur_pid, CapId::new(a0), Rights::WRITE);
+                        let fr_phys = ipc.validate_frame_for(cur_pid, CapId::new(a1), frame_req);
+                        match (vs_root, fr_phys) {
+                            (Ok(r), Ok(p)) => Ok((r, p)),
+                            (Err(e), _) | (_, Err(e)) => Err(e),
+                        }
+                    };
+                    match caps {
+                        Err(e) => Err(e),
+                        Ok((root, phys)) => {
+                            let flags = PageFlags::new_wx(
+                                req_rights.contains(Rights::WRITE),
+                                req_rights.contains(Rights::EXEC),
+                                true,
+                                false,
+                            );
+                            match (
+                                VirtAddr::new_page_aligned(a2),
+                                flags,
+                                PhysFrame::from_aligned(phys),
+                            ) {
+                                (Ok(va), Ok(page_flags), Ok(frame_obj)) => {
+                                    let root_phys = if root.raw() != 0 {
+                                        root.raw()
+                                    } else {
+                                        cur_ttbr0
+                                    };
+                                    let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
+                                    let mut vspace = super::paging::Aarch64VSpace::from_root_phys(
+                                        root_phys, hhdm,
+                                    );
+                                    if vspace.translate(va).is_some() {
+                                        Err(SysError::SlotOccupied)
+                                    } else {
+                                        let mut untyped = RUNTIME_UNTYPED.lock();
+                                        vspace
+                                            .map_4k(va, frame_obj, page_flags, &mut untyped)
+                                            .and_then(|()| {
+                                                if let Err(e) = FRAME_MAPPINGS.lock().record(
+                                                    PhysAddr::new(root_phys),
+                                                    va,
+                                                    phys,
+                                                ) {
+                                                    let _ = vspace.unmap_4k(va);
+                                                    return Err(e);
+                                                }
+                                                Ok(0)
+                                            })
+                                    }
                                 }
+                                _ => Err(SysError::InvalidArgument),
                             }
-                            _ => Err(SysError::InvalidArgument),
                         }
                     }
-                }
+                })
             }
         }
     };
@@ -1165,14 +1230,15 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         }
     }
 
-    // Account elapsed ARM Generic Timer ticks on syscall exit and honor pending preemption.
-    let now = read_cntvct();
-    let last = LAST_TICK_CNT.load(Ordering::Acquire);
-    let interval = TIMER_TICK_INTERVAL.load(Ordering::Acquire);
-    let tick_elapsed = now.saturating_sub(last) >= interval;
-    if tick_elapsed || PREEMPT_PENDING.swap(false, Ordering::AcqRel) {
+    // Sample hardware-latched Virtual Timer status every 64 syscalls (avoiding unconditional
+    // `isb` + `mrs cntvct_el0` + `AcqRel swap` on every non-switching syscall exit).
+    let check_timer = (SYSCALL_TICK_COUNTER.fetch_add(1, Ordering::Relaxed) & 0x3F) == 0;
+    let tick_elapsed = check_timer && (read_cntv_ctl() & CNTV_CTL_ISTATUS) != 0;
+    let preempt_flag =
+        PREEMPT_PENDING.load(Ordering::Relaxed) && PREEMPT_PENDING.swap(false, Ordering::AcqRel);
+    if tick_elapsed || preempt_flag {
         if tick_elapsed {
-            LAST_TICK_CNT.store(now, Ordering::Release);
+            let interval = TIMER_TICK_INTERVAL.load(Ordering::Acquire);
             arm_virtual_timer(interval);
         }
         let mut table = PROCS.lock();

@@ -185,9 +185,13 @@ impl UntypedRegion {
         if self.remaining() < PAGE_SIZE {
             return Err(SysError::OutOfMemory);
         }
-        let addr = self.base + self.watermark;
+        let addr = self
+            .base
+            .checked_add(self.watermark)
+            .ok_or(SysError::OutOfMemory)?;
+        let frame = PhysFrame::from_aligned(PhysAddr::new(addr))?;
         self.watermark += PAGE_SIZE;
-        PhysFrame::from_aligned(PhysAddr::new(addr))
+        Ok(frame)
     }
 }
 
@@ -272,13 +276,22 @@ impl UntypedInventory {
 
     /// Return an unmapped, exclusively owned 4 KiB `PhysFrame` to the LIFO reuse cache.
     ///
-    /// Returns `true` if cached, or `false` if the bounded cache is full.
+    /// Deduplicates already-cached physical addresses to prevent double-reclaim aliasing.
+    /// Returns `true` if cached (or already present), or `false` if the bounded cache is full.
     #[inline]
     pub fn reclaim_frame(&mut self, frame: PhysFrame) -> bool {
+        let addr = frame.start_addr().raw();
+        let mut i = 0;
+        while i < self.reclaimed_len {
+            if self.reclaimed[i] == addr {
+                return true;
+            }
+            i += 1;
+        }
         if self.reclaimed_len >= MAX_RECLAIMED_FRAMES {
             return false;
         }
-        self.reclaimed[self.reclaimed_len] = frame.start_addr().raw();
+        self.reclaimed[self.reclaimed_len] = addr;
         self.reclaimed_len += 1;
         true
     }
@@ -302,9 +315,17 @@ impl UntypedInventory {
         if region_index >= self.count {
             return Err(SysError::InvalidArgument);
         }
-        let frame = self.regions[region_index].retype_frame()?;
+        let region = &mut self.regions[region_index];
+        if region.len - region.watermark < PAGE_SIZE {
+            return Err(SysError::OutOfMemory);
+        }
+        let addr = region.base + region.watermark;
+        region.watermark += PAGE_SIZE;
+        debug_assert!((addr & PAGE_MASK) == 0);
         self.retyped_frames = self.retyped_frames.saturating_add(1);
-        Ok(frame)
+        Ok(PhysFrame {
+            base: PhysAddr::new(addr),
+        })
     }
 
     /// Carve one 4 KiB `PhysFrame` — reusing a reclaimed frame first, otherwise advancing
@@ -314,13 +335,22 @@ impl UntypedInventory {
         if self.reclaimed_len > 0 {
             self.reclaimed_len -= 1;
             let addr = self.reclaimed[self.reclaimed_len];
+            debug_assert!((addr & PAGE_MASK) == 0);
             self.retyped_frames = self.retyped_frames.saturating_add(1);
-            return PhysFrame::from_aligned(PhysAddr::new(addr));
+            return Ok(PhysFrame {
+                base: PhysAddr::new(addr),
+            });
         }
         while self.active_region < self.count {
-            if let Ok(frame) = self.regions[self.active_region].retype_frame() {
+            let region = &mut self.regions[self.active_region];
+            if region.len - region.watermark >= PAGE_SIZE {
+                let addr = region.base + region.watermark;
+                region.watermark += PAGE_SIZE;
+                debug_assert!((addr & PAGE_MASK) == 0);
                 self.retyped_frames = self.retyped_frames.saturating_add(1);
-                return Ok(frame);
+                return Ok(PhysFrame {
+                    base: PhysAddr::new(addr),
+                });
             }
             self.active_region += 1;
         }
@@ -333,10 +363,17 @@ impl UntypedInventory {
     /// reclaimed-frame cache so it can be reused for 4 KiB allocations.
     pub fn retype_frame_2m(&mut self) -> Result<PhysFrame2M, SysError> {
         for i in self.active_region..self.count {
-            let cur = self.regions[i].base.saturating_add(self.regions[i].watermark);
-            let aligned = (cur.saturating_add(HUGE_PAGE_MASK_2M)) & !HUGE_PAGE_MASK_2M;
-            let pad = aligned.saturating_sub(cur);
-            let needed = pad.saturating_add(HUGE_PAGE_SIZE_2M);
+            let Some(cur) = self.regions[i].base.checked_add(self.regions[i].watermark) else {
+                continue;
+            };
+            let Some(rounded) = cur.checked_add(HUGE_PAGE_MASK_2M) else {
+                continue;
+            };
+            let aligned = rounded & !HUGE_PAGE_MASK_2M;
+            let pad = aligned - cur;
+            let Some(needed) = pad.checked_add(HUGE_PAGE_SIZE_2M) else {
+                continue;
+            };
             if self.regions[i].remaining() >= needed {
                 // Recycle any 4 KiB alignment padding frames into the LIFO cache.
                 let mut p = cur;
@@ -474,10 +511,19 @@ pub struct FrameMapping {
     pub phys: PhysAddr,
 }
 
+impl FrameMapping {
+    const EMPTY: Self = Self {
+        vspace_root: PhysAddr::new(0),
+        virt: VirtAddr(0),
+        phys: PhysAddr::new(0),
+    };
+}
+
 /// Fixed-capacity reverse-mapping table (`#![forbid(unsafe_code)]`, `no_alloc`) enabling
 /// hardware PTE unmap + TLB flush when a `Frame` or parent `Untyped` capability is revoked (`H-3`).
 pub struct FrameMappingTracker<const MAX_MAPPINGS: usize> {
-    entries: [Option<FrameMapping>; MAX_MAPPINGS],
+    entries: [FrameMapping; MAX_MAPPINGS],
+    len: usize,
 }
 
 impl<const MAX_MAPPINGS: usize> Default for FrameMappingTracker<MAX_MAPPINGS> {
@@ -489,60 +535,85 @@ impl<const MAX_MAPPINGS: usize> Default for FrameMappingTracker<MAX_MAPPINGS> {
 impl<const MAX_MAPPINGS: usize> FrameMappingTracker<MAX_MAPPINGS> {
     pub const fn new() -> Self {
         Self {
-            entries: [None; MAX_MAPPINGS],
+            entries: [FrameMapping::EMPTY; MAX_MAPPINGS],
+            len: 0,
         }
     }
 
-    /// Record a new `(vspace_root, virt) -> phys` mapping.
-    pub fn record(&mut self, vspace_root: PhysAddr, virt: VirtAddr, phys: PhysAddr) -> Result<(), SysError> {
-        for slot in &mut self.entries {
-            if slot.is_none() {
-                *slot = Some(FrameMapping {
-                    vspace_root,
-                    virt,
-                    phys,
-                });
-                return Ok(());
-            }
+    /// Record a new `(vspace_root, virt) -> phys` mapping in O(1).
+    #[inline]
+    pub fn record(
+        &mut self,
+        vspace_root: PhysAddr,
+        virt: VirtAddr,
+        phys: PhysAddr,
+    ) -> Result<(), SysError> {
+        if self.len >= MAX_MAPPINGS {
+            return Err(SysError::OutOfMemory);
         }
-        Err(SysError::OutOfMemory)
+        self.entries[self.len] = FrameMapping {
+            vspace_root,
+            virt,
+            phys,
+        };
+        self.len += 1;
+        Ok(())
     }
 
-    /// Remove a specific `(vspace_root, virt)` mapping entry (e.g., on `UnmapPage`).
+    /// Remove a specific `(vspace_root, virt)` mapping entry (e.g., on `UnmapPage`) via swap-remove.
+    #[inline]
     pub fn remove(&mut self, vspace_root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
-        for slot in &mut self.entries {
-            if let Some(m) = slot
-                && m.vspace_root == vspace_root
-                && m.virt == virt
-            {
-                let phys = m.phys;
-                *slot = None;
-                return Some(phys);
+        let mut i = 0;
+        while i < self.len {
+            let m = self.entries[i];
+            if m.vspace_root == vspace_root && m.virt == virt {
+                self.len -= 1;
+                self.entries[i] = self.entries[self.len];
+                return Some(m.phys);
             }
+            i += 1;
         }
         None
     }
 
-    /// Drain all mappings referencing `phys` into `out` (returns count written), used on `CapRevoke`.
+    /// Drain up to `out.len()` mappings referencing `phys` into `out` (returns count written), used on `CapRevoke`.
+    #[inline]
     pub fn drain_for_phys(&mut self, phys: PhysAddr, out: &mut [Option<FrameMapping>]) -> usize {
+        if self.len == 0 || out.is_empty() {
+            return 0;
+        }
         let mut n = 0usize;
-        for slot in &mut self.entries {
-            if n >= out.len() {
-                break;
-            }
-            if let Some(m) = slot
-                && m.phys == phys
-            {
-                out[n] = slot.take();
+        let mut i = 0usize;
+        while i < self.len && n < out.len() {
+            if self.entries[i].phys == phys {
+                out[n] = Some(self.entries[i]);
                 n += 1;
+                self.len -= 1;
+                self.entries[i] = self.entries[self.len];
+            } else {
+                i += 1;
             }
         }
         n
     }
 
-    /// Count active tracked mappings.
-    pub fn count(&self) -> usize {
-        self.entries.iter().filter(|e| e.is_some()).count()
+    /// Return `true` if any active tracked mapping references `phys`.
+    #[inline]
+    pub fn has_mapping_for_phys(&self, phys: PhysAddr) -> bool {
+        let mut i = 0;
+        while i < self.len {
+            if self.entries[i].phys == phys {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Count active tracked mappings in O(1).
+    #[inline]
+    pub const fn count(&self) -> usize {
+        self.len
     }
 }
 
@@ -632,14 +703,11 @@ mod tests {
         let reused = inv.retype_frame().unwrap();
         assert_eq!(reused.start_addr(), f0_addr);
         assert_eq!(inv.reclaimed_count(), 0);
-        drop(f1);
+        let _ = f1;
 
         // Carve a 2 MiB superpage from an unaligned region and verify padding frames are reclaimed.
         let mut inv2 = UntypedInventory::new();
-        assert!(inv2.push_raw_region(
-            0x20_0000 - PAGE_SIZE * 3,
-            HUGE_PAGE_SIZE_2M + PAGE_SIZE * 3
-        ));
+        assert!(inv2.push_raw_region(0x20_0000 - PAGE_SIZE * 3, HUGE_PAGE_SIZE_2M + PAGE_SIZE * 3));
         let huge = inv2.retype_frame_2m().unwrap();
         assert_eq!(huge.start_addr().raw(), 0x20_0000);
         assert_eq!(inv2.reclaimed_count(), 3);
@@ -668,5 +736,144 @@ mod tests {
         assert_eq!(tracker.count(), 1);
         assert_eq!(tracker.remove(vs0, va1), Some(p1));
         assert_eq!(tracker.count(), 0);
+    }
+
+    #[test]
+    fn untyped_region_overflow_and_unaligned_boundaries() {
+        assert_eq!(UntypedRegion::from_raw(0, 0), None);
+        assert_eq!(UntypedRegion::from_raw(0x100, PAGE_SIZE - 1), None);
+        assert_eq!(UntypedRegion::from_raw(u64::MAX - 10, 100), None);
+
+        // Manually constructed unaligned UntypedRegion must reject alignment without advancing watermark.
+        let mut bad_align = UntypedRegion {
+            base: 0x1001,
+            len: PAGE_SIZE * 2,
+            watermark: 0,
+        };
+        assert_eq!(bad_align.retype_frame(), Err(SysError::InvalidArgument));
+        assert_eq!(bad_align.watermark, 0);
+
+        // Manually constructed overflowing UntypedRegion must fail cleanly with OutOfMemory.
+        let mut overflow = UntypedRegion {
+            base: u64::MAX - PAGE_SIZE + 1,
+            len: PAGE_SIZE * 4,
+            watermark: PAGE_SIZE,
+        };
+        assert_eq!(overflow.retype_frame(), Err(SysError::OutOfMemory));
+    }
+
+    #[test]
+    fn untyped_inventory_dedup_reclaim_capacity_and_2m_overflow() {
+        let mut inv = UntypedInventory::new();
+        for i in 0..MAX_UNTYPED_REGIONS {
+            assert!(inv.push_raw_region((i as u64 + 1) * 0x10_0000, PAGE_SIZE));
+        }
+        assert!(!inv.push_raw_region(0x8000_0000, PAGE_SIZE));
+        assert_eq!(inv.region_remaining(MAX_UNTYPED_REGIONS), None);
+        assert_eq!(
+            inv.retype_frame_in(MAX_UNTYPED_REGIONS),
+            Err(SysError::InvalidArgument)
+        );
+
+        // Duplicate reclaim_frame must NOT push the same physical address twice.
+        let f_dup1 = PhysFrame::from_aligned(PhysAddr::new(0x9000_0000)).unwrap();
+        let f_dup2 = PhysFrame::from_aligned(PhysAddr::new(0x9000_0000)).unwrap();
+        assert!(inv.reclaim_frame(f_dup1));
+        assert_eq!(inv.reclaimed_count(), 1);
+        assert!(inv.reclaim_frame(f_dup2));
+        assert_eq!(inv.reclaimed_count(), 1);
+
+        // Fill remaining reclaimed cache up to MAX_RECLAIMED_FRAMES; 65th distinct frame returns false.
+        for i in 1..MAX_RECLAIMED_FRAMES {
+            let f = PhysFrame::from_aligned(PhysAddr::new(0x9000_0000 + (i as u64) * PAGE_SIZE))
+                .unwrap();
+            assert!(inv.reclaim_frame(f));
+        }
+        let overflow_f = PhysFrame::from_aligned(PhysAddr::new(0xA000_0000)).unwrap();
+        assert!(!inv.reclaim_frame(overflow_f));
+
+        // retype_frame_2m near u64::MAX must return OutOfMemory without wrapping.
+        let mut high = UntypedInventory::new();
+        assert!(high.push_raw_region(
+            u64::MAX - HUGE_PAGE_SIZE_2M + 1,
+            HUGE_PAGE_SIZE_2M - PAGE_SIZE
+        ));
+        assert_eq!(high.retype_frame_2m(), Err(SysError::OutOfMemory));
+    }
+
+    #[test]
+    fn frame_mapping_tracker_zero_cap_full_and_multi_batch_drain() {
+        let mut zero = FrameMappingTracker::<0>::new();
+        let vs = PhysAddr::new(0x10_0000);
+        let va = VirtAddr::new_page_aligned(0x40_0000).unwrap();
+        let phys = PhysAddr::new(0x8000_0000);
+        assert_eq!(zero.record(vs, va, phys), Err(SysError::OutOfMemory));
+        assert_eq!(zero.count(), 0);
+        assert_eq!(zero.remove(vs, va), None);
+
+        // Record 12 mappings to the same physical frame and drain in batches of 4 until n == 0.
+        let mut tracker = FrameMappingTracker::<16>::new();
+        for i in 0..12u64 {
+            let v = VirtAddr::new_page_aligned(0x40_0000 + i * PAGE_SIZE).unwrap();
+            tracker.record(vs, v, phys).unwrap();
+        }
+        assert_eq!(tracker.count(), 12);
+        // Empty output slice drains 0 without losing entries.
+        assert_eq!(tracker.drain_for_phys(phys, &mut []), 0);
+        assert_eq!(tracker.count(), 12);
+
+        let mut total_drained = 0usize;
+        let mut batch = [None; 4];
+        loop {
+            let n = tracker.drain_for_phys(phys, &mut batch);
+            if n == 0 {
+                break;
+            }
+            total_drained += n;
+        }
+        assert_eq!(total_drained, 12);
+        assert_eq!(tracker.count(), 0);
+    }
+
+    #[test]
+    fn virt_addr_and_phys_frame_canonical_boundaries() {
+        assert!(VirtAddr::new_canonical(0x0000_7FFF_FFFF_FFFF).is_ok());
+        assert_eq!(
+            VirtAddr::new_canonical(0x0000_8000_0000_0000),
+            Err(SysError::InvalidArgument)
+        );
+        assert_eq!(
+            VirtAddr::new_canonical(0xFFFF_7FFF_FFFF_FFFF),
+            Err(SysError::InvalidArgument)
+        );
+        assert!(VirtAddr::new_canonical(0xFFFF_8000_0000_0000).is_ok());
+        assert!(PhysFrame2M::from_aligned(PhysAddr::new(HUGE_PAGE_SIZE_2M)).is_ok());
+        assert_eq!(
+            PhysFrame2M::from_aligned(PhysAddr::new(PAGE_SIZE)),
+            Err(SysError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn frame_mapping_tracker_has_mapping_for_phys_tracks_shared_mappings() {
+        let mut tracker = FrameMappingTracker::<8>::new();
+        let vs0 = PhysAddr::new(0x10_0000);
+        let vs1 = PhysAddr::new(0x20_0000);
+        let va0 = VirtAddr::new_page_aligned(0x40_0000).unwrap();
+        let va1 = VirtAddr::new_page_aligned(0x40_1000).unwrap();
+        let phys_a = PhysAddr::new(0x8000_0000);
+        let phys_b = PhysAddr::new(0x8000_1000);
+
+        assert!(!tracker.has_mapping_for_phys(phys_a));
+        tracker.record(vs0, va0, phys_a).unwrap();
+        tracker.record(vs1, va1, phys_a).unwrap();
+        assert!(tracker.has_mapping_for_phys(phys_a));
+        assert!(!tracker.has_mapping_for_phys(phys_b));
+
+        assert_eq!(tracker.remove(vs0, va0), Some(phys_a));
+        assert!(tracker.has_mapping_for_phys(phys_a));
+
+        assert_eq!(tracker.remove(vs1, va1), Some(phys_a));
+        assert!(!tracker.has_mapping_for_phys(phys_a));
     }
 }

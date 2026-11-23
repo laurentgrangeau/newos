@@ -188,13 +188,15 @@ impl<const N: usize> SpscRing<N> {
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.consumer.head.load(Ordering::Acquire) == self.producer.tail.load(Ordering::Acquire)
+        let head = self.consumer.head.load(Ordering::Acquire) & (N - 1);
+        let tail = self.producer.tail.load(Ordering::Acquire) & (N - 1);
+        head == tail
     }
 
     #[inline]
     pub fn is_full(&self) -> bool {
-        let head = self.consumer.head.load(Ordering::Acquire);
-        let tail = self.producer.tail.load(Ordering::Acquire);
+        let head = self.consumer.head.load(Ordering::Acquire) & (N - 1);
+        let tail = self.producer.tail.load(Ordering::Acquire) & (N - 1);
         ((tail + 1) & (N - 1)) == head
     }
 }
@@ -345,13 +347,39 @@ mod tests {
     #[test]
     fn spsc_ring_survives_corrupted_peer_indices_without_panicking() {
         let ring = SpscRing::<8>::new();
-        // Simulate a malicious peer sharing the RW frame writing out-of-range indices >= N.
+        // Simulate a malicious peer sharing the RW frame writing out-of-range indices >= N
+        // and boundary values like usize::MAX (which would overflow `tail + 1` if unmasked).
+        ring.producer.tail.store(usize::MAX, Ordering::Relaxed);
+        ring.consumer.head.store(usize::MAX, Ordering::Relaxed);
+        assert!(ring.is_empty());
+        assert!(!ring.is_full());
+        assert_eq!(ring.len(), 0);
+
+        // Unmasked values congruent mod N: tail = N + 3, head = 3 => empty.
+        ring.producer.tail.store(8 + 3, Ordering::Relaxed);
+        ring.consumer.head.store(3, Ordering::Relaxed);
+        assert!(ring.is_empty());
+        assert!(!ring.is_full());
+        assert_eq!(ring.len(), 0);
+
+        // Unmasked values representing full ring: tail = usize::MAX (mod 8 == 7), head = 8 (mod 8 == 0).
+        ring.producer.tail.store(usize::MAX, Ordering::Relaxed);
+        ring.consumer.head.store(8, Ordering::Relaxed);
+        assert!(!ring.is_empty());
+        assert!(ring.is_full());
+        assert_eq!(ring.len(), 7);
+
         ring.producer.tail.store(usize::MAX - 3, Ordering::Relaxed);
         ring.consumer.head.store(12345, Ordering::Relaxed);
+        let _ = ring.is_empty();
+        let _ = ring.is_full();
+        let _ = ring.len();
         let _ = ring.try_push(0xAA);
+        let _ = ring.try_push_slice(&[]);
         let _ = ring.try_push_slice(&[1, 2, 3, 4]);
         let mut out = [0u64; 4];
         let _ = ring.try_pop();
+        let _ = ring.try_pop_slice(&mut []);
         let _ = ring.try_pop_slice(&mut out);
     }
 }

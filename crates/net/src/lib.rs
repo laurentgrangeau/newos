@@ -18,8 +18,8 @@ pub use virtio::{VirtioNetDevice, VirtioNetDma, VirtioTransport};
 use newos_abi::SysError;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
 use smoltcp::socket::udp::{self, PacketBuffer, PacketMetadata};
+use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     DnsQueryType, EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr,
@@ -334,7 +334,10 @@ pub fn run_dns_query_with_clock<D: Device, C: NetClock>(
             return Err("dns query timed out");
         }
         let _ = iface.poll(Instant::from_millis(now_ms), device, &mut sockets);
-        match sockets.get_mut::<dns::Socket>(handle).get_query_result(query) {
+        match sockets
+            .get_mut::<dns::Socket>(handle)
+            .get_query_result(query)
+        {
             Ok(addrs) => {
                 if let Some(IpAddress::Ipv4(v4)) = addrs.first() {
                     return Ok(v4.octets());
@@ -812,8 +815,7 @@ mod tests {
             ncr_writes: AtomicU32::new(0),
             dmacfg: AtomicU32::new(0),
         };
-        let nic =
-            probe_nic(|off| (&mock).read32(off)).expect("should detect Pi 5 RP1 Cadence GEM");
+        let nic = probe_nic(|off| (&mock).read32(off)).expect("should detect Pi 5 RP1 Cadence GEM");
         let NicKind::CadenceGem(info) = nic else {
             panic!("expected CadenceGem");
         };

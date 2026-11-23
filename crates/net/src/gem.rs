@@ -157,16 +157,28 @@ pub struct GemNetDevice<'a, T: VirtioTransport> {
 impl<'a, T: VirtioTransport> GemNetDevice<'a, T> {
     pub fn init(transport: T, info: GemInfo, dma: &'a GemDma) -> Result<Self, &'static str> {
         // 1. Disable RX/TX & mask interrupts while configuring DMA rings
-        transport.write32(REG_NCR, NCR_MPE).map_err(|_| "gem ncr disable failed")?;
-        transport.write32(REG_IDR, 0xFFFF_FFFF).map_err(|_| "gem idr failed")?;
-        transport.write32(REG_TSR, 0xFFFF_FFFF).map_err(|_| "gem tsr clear failed")?;
-        transport.write32(REG_RSR, 0xFFFF_FFFF).map_err(|_| "gem rsr clear failed")?;
+        transport
+            .write32(REG_NCR, NCR_MPE)
+            .map_err(|_| "gem ncr disable failed")?;
+        transport
+            .write32(REG_IDR, 0xFFFF_FFFF)
+            .map_err(|_| "gem idr failed")?;
+        transport
+            .write32(REG_TSR, 0xFFFF_FFFF)
+            .map_err(|_| "gem tsr clear failed")?;
+        transport
+            .write32(REG_RSR, 0xFFFF_FFFF)
+            .map_err(|_| "gem rsr clear failed")?;
 
         // 2. Program MAC address into SA1B/SA1T
         let sa1b = u32::from_le_bytes([info.mac[0], info.mac[1], info.mac[2], info.mac[3]]);
         let sa1t = u32::from_le_bytes([info.mac[4], info.mac[5], 0, 0]);
-        transport.write32(REG_SA1B, sa1b).map_err(|_| "gem sa1b failed")?;
-        transport.write32(REG_SA1T, sa1t).map_err(|_| "gem sa1t failed")?;
+        transport
+            .write32(REG_SA1B, sa1b)
+            .map_err(|_| "gem sa1b failed")?;
+        transport
+            .write32(REG_SA1T, sa1t)
+            .map_err(|_| "gem sa1t failed")?;
 
         // 3. Configure 64-bit DMA mode with 2 KiB RX buffers
         transport
@@ -231,7 +243,9 @@ impl<'a, T: VirtioTransport> GemNetDevice<'a, T> {
         // 7. Preserve firmware PHY/RGMII config in NCFGR while enabling Full-Duplex + Gigabit + FCS strip
         let prev_ncfgr = transport.read32(REG_NCFGR).unwrap_or(0);
         let ncfgr = prev_ncfgr | NCFGR_SPD | NCFGR_FD | NCFGR_GIGE | NCFGR_RFCS;
-        transport.write32(REG_NCFGR, ncfgr).map_err(|_| "gem ncfgr failed")?;
+        transport
+            .write32(REG_NCFGR, ncfgr)
+            .map_err(|_| "gem ncfgr failed")?;
 
         // 8. Enable RX + TX + MDIO
         transport

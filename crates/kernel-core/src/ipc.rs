@@ -9,16 +9,27 @@ use crate::memory::{PhysAddr, UntypedInventory};
 use newos_abi::{CapId, ObjectType, Rights, SysError};
 
 const MAX_NOTIFICATIONS: usize = 16;
-const MAX_ENDPOINTS: usize = 16;
+/// Maximum number of kernel IPC `Endpoint` objects (`0..MAX_ENDPOINTS`).
+pub const MAX_ENDPOINTS: usize = 16;
 const ROOT_CSPACE_SLOTS: usize = 64;
 /// Maximum number of isolated process capability spaces (`PID 0..MAX_IPC_PROCS`).
 pub const MAX_IPC_PROCS: usize = 8;
+
+const _: () = assert!(MAX_ENDPOINTS <= 16);
+const _: () = assert!(MAX_IPC_PROCS + 2 <= u8::MAX as usize);
 
 /// Register-only fastpath IPC message delivered through an `Endpoint`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IpcMessage {
     pub badge: u64,
     pub payload: u64,
+}
+
+impl IpcMessage {
+    const EMPTY: Self = Self {
+        badge: 0,
+        payload: 0,
+    };
 }
 
 /// Live kernel-core IPC and notification operation counters.
@@ -53,12 +64,17 @@ impl IpcStats {
 pub struct KernelIpcState {
     pub root_cspace: CNode<ROOT_CSPACE_SLOTS>,
     proc_cspaces: [CNode<ROOT_CSPACE_SLOTS>; MAX_IPC_PROCS - 1],
-    notifications: [u64; MAX_NOTIFICATIONS],
-    endpoints: [Option<IpcMessage>; MAX_ENDPOINTS],
-    next_endpoint_id: u32,
-    next_notif_id: u32,
+    /// Per-endpoint occupancy + buffered `IpcCall` sender PID:
+    /// `0` = empty, `1` = occupied (`sender_pid == None`), `2 + pid` = occupied (`Some(pid)`).
+    endpoint_state: [u8; MAX_ENDPOINTS],
+    endpoints: [IpcMessage; MAX_ENDPOINTS],
     stats: IpcStats,
+    notifications: [u64; MAX_NOTIFICATIONS],
+    next_endpoint_id: u16,
+    next_notif_id: u16,
 }
+
+const _: () = assert!(core::mem::size_of::<KernelIpcState>() <= 25_224);
 
 impl Default for KernelIpcState {
     fn default() -> Self {
@@ -71,11 +87,12 @@ impl KernelIpcState {
         Self {
             root_cspace: CNode::new(),
             proc_cspaces: [const { CNode::new() }; MAX_IPC_PROCS - 1],
-            notifications: [0; MAX_NOTIFICATIONS],
-            endpoints: [None; MAX_ENDPOINTS],
-            next_endpoint_id: 1,
-            next_notif_id: 2,
+            endpoint_state: [0; MAX_ENDPOINTS],
+            endpoints: [IpcMessage::EMPTY; MAX_ENDPOINTS],
             stats: IpcStats::new(),
+            notifications: [0; MAX_NOTIFICATIONS],
+            next_endpoint_id: 2,
+            next_notif_id: 2,
         }
     }
 
@@ -100,7 +117,7 @@ impl KernelIpcState {
     }
 
     /// Borrow the isolated `CNode` for process `pid` (`0..MAX_IPC_PROCS`).
-    #[inline]
+    #[inline(always)]
     pub fn cspace(&self, pid: usize) -> Result<&CNode<ROOT_CSPACE_SLOTS>, SysError> {
         if pid == 0 {
             Ok(&self.root_cspace)
@@ -112,7 +129,7 @@ impl KernelIpcState {
     }
 
     /// Mutably borrow the isolated `CNode` for process `pid` (`0..MAX_IPC_PROCS`).
-    #[inline]
+    #[inline(always)]
     pub fn cspace_mut(&mut self, pid: usize) -> Result<&mut CNode<ROOT_CSPACE_SLOTS>, SysError> {
         if pid == 0 {
             Ok(&mut self.root_cspace)
@@ -175,17 +192,19 @@ impl KernelIpcState {
                 Rights::ALL,
             ),
         )?;
-        let _ = self.root_cspace.insert_root_at(
-            8,
-            Capability::new(CapObject::Thread { id: 0 }, Rights::ALL),
-        )?;
-        let _ = self.root_cspace.insert_root_at(
-            9,
-            Capability::new(CapObject::CNode { id: 0 }, Rights::ALL),
-        )?;
+        let _ = self
+            .root_cspace
+            .insert_root_at(8, Capability::new(CapObject::Thread { id: 0 }, Rights::ALL))?;
+        let _ = self
+            .root_cspace
+            .insert_root_at(9, Capability::new(CapObject::CNode { id: 0 }, Rights::ALL))?;
         let _ = self.root_cspace.insert_root_at(
             10,
             Capability::new(CapObject::Untyped { region_index: 0 }, Rights::ALL),
+        )?;
+        let _ = self.root_cspace.insert_root_at(
+            11,
+            Capability::new(CapObject::Endpoint { id: 1 }, Rights::ALL),
         )?;
         Ok((notif, ep, fault_notif))
     }
@@ -193,19 +212,18 @@ impl KernelIpcState {
     /// Install least-privilege bootstrap capabilities for a non-root process (`pid >= 1`).
     ///
     /// Grants `BOOTSTRAP_NOTIF` (`READ | WRITE`), `BOOTSTRAP_EP` (`READ | WRITE`, badge `0x5E14`),
-    /// write-only `BOOTSTRAP_CONSOLE` (`WRITE`), and `BOOTSTRAP_SELF_THREAD` (`READ | WRITE`).
-    /// Hardware MMIO, supervisor fault notifications, `PowerControl`, `VSpace`, and peer `CNode`
-    /// capabilities are intentionally withheld.
+    /// `BOOTSTRAP_SELF_THREAD` (`READ | WRITE`), and write-only `BOOTSTRAP_LOG_EP` (`WRITE`,
+    /// immutable kernel-stamped `badge = pid as u64`) for routing console output through `init`.
+    /// Direct `Console` UART access, hardware MMIO, supervisor fault notifications, `PowerControl`,
+    /// `VSpace`, and peer `CNode` capabilities are intentionally withheld.
     pub fn init_worker_bootstrap_caps(&mut self, pid: usize) -> Result<(CapId, CapId), SysError> {
         if pid == 0 || pid >= MAX_IPC_PROCS {
             return Err(SysError::InvalidArgument);
         }
         let cnode = &mut self.proc_cspaces[pid - 1];
         let rw = Rights::READ.union(Rights::WRITE);
-        let notif = cnode.insert_root_at(
-            1,
-            Capability::new(CapObject::Notification { id: 0 }, rw),
-        )?;
+        let notif =
+            cnode.insert_root_at(1, Capability::new(CapObject::Notification { id: 0 }, rw))?;
         let ep = cnode.insert_root_at(
             2,
             Capability {
@@ -214,10 +232,15 @@ impl KernelIpcState {
                 badge: 0x5E14,
             },
         )?;
-        let _ = cnode.insert_root_at(5, Capability::new(CapObject::Console, Rights::WRITE))?;
+        let _ =
+            cnode.insert_root_at(8, Capability::new(CapObject::Thread { id: pid as u32 }, rw))?;
         let _ = cnode.insert_root_at(
-            8,
-            Capability::new(CapObject::Thread { id: pid as u32 }, rw),
+            11,
+            Capability {
+                object: CapObject::Endpoint { id: 1 },
+                rights: Rights::WRITE,
+                badge: pid as u64,
+            },
         )?;
         Ok((notif, ep))
     }
@@ -354,10 +377,10 @@ impl KernelIpcState {
         required: Rights,
     ) -> Result<(u32, u64), SysError> {
         let cap = self.cspace(pid)?.lookup(cap_id, required)?;
-        match cap.object {
-            CapObject::Endpoint { id } => Ok((id, cap.badge)),
-            _ => Err(SysError::InvalidArgument),
-        }
+        let CapObject::Endpoint { id } = cap.object else {
+            return Err(SysError::InvalidArgument);
+        };
+        Ok((id, cap.badge))
     }
 
     /// Bitwise-OR `badge` (or the capability's immutable badge if non-zero) into a `Notification`
@@ -418,8 +441,75 @@ impl KernelIpcState {
         self.notify_poll_for(0, cap_id)
     }
 
+    /// Buffer a fastpath IPC message into an already-validated `Endpoint` (`ep_id`),
+    /// optionally recording `sender_pid` for buffered `IpcCall` reply tracking.
+    #[inline(always)]
+    pub fn ipc_send_resolved(
+        &mut self,
+        ep_id: u32,
+        badge: u64,
+        payload: u64,
+        sender_pid: Option<usize>,
+    ) -> Result<(), SysError> {
+        let idx = ep_id as usize;
+        if idx >= MAX_ENDPOINTS {
+            return Err(SysError::InvalidArgument);
+        }
+        if self.endpoint_state[idx] != 0 {
+            self.stats.would_blocks = self.stats.would_blocks.wrapping_add(1);
+            return Err(SysError::WouldBlock);
+        }
+        self.endpoints[idx] = IpcMessage { badge, payload };
+        self.endpoint_state[idx] = match sender_pid {
+            None => 1,
+            Some(p) if p < MAX_IPC_PROCS => 2 + p as u8,
+            Some(_) => 1,
+        };
+        self.stats.ipc_sends = self.stats.ipc_sends.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Receive a buffered fastpath IPC message from an already-validated `Endpoint` (`ep_id`),
+    /// returning `(message, optional_sender_pid)`.
+    #[inline(always)]
+    pub fn ipc_recv_resolved(
+        &mut self,
+        ep_id: u32,
+    ) -> Result<(IpcMessage, Option<usize>), SysError> {
+        let idx = ep_id as usize;
+        if idx >= MAX_ENDPOINTS {
+            return Err(SysError::InvalidArgument);
+        }
+        let state = self.endpoint_state[idx];
+        if state == 0 {
+            self.stats.would_blocks = self.stats.would_blocks.wrapping_add(1);
+            return Err(SysError::WouldBlock);
+        }
+        self.endpoint_state[idx] = 0;
+        let msg = self.endpoints[idx];
+        let sender = if state >= 2 {
+            Some((state - 2) as usize)
+        } else {
+            None
+        };
+        self.stats.ipc_recvs = self.stats.ipc_recvs.wrapping_add(1);
+        Ok((msg, sender))
+    }
+
+    /// Drain all occupied endpoints holding a buffered `IpcCall` (`sender_pid.is_some()`),
+    /// clearing each endpoint's occupancy and invoking `on_sender(pid)` for every caller.
+    pub fn drain_buffered_call_senders(&mut self, mut on_sender: impl FnMut(usize)) {
+        for slot in &mut self.endpoint_state {
+            let state = *slot;
+            if state >= 2 {
+                *slot = 0;
+                on_sender((state - 2) as usize);
+            }
+        }
+    }
+
     /// Send a register-only fastpath IPC payload to an `Endpoint` in `pid`'s `CSpace`.
-    #[inline]
+    #[inline(always)]
     pub fn ipc_send_for(
         &mut self,
         pid: usize,
@@ -427,47 +517,24 @@ impl KernelIpcState {
         payload: u64,
     ) -> Result<(), SysError> {
         let (id, badge) = self.lookup_endpoint_for(pid, cap_id, Rights::WRITE)?;
-        let slot = self
-            .endpoints
-            .get_mut(id as usize)
-            .ok_or(SysError::InvalidArgument)?;
-        if slot.is_some() {
-            self.stats.would_blocks = self.stats.would_blocks.wrapping_add(1);
-            return Err(SysError::WouldBlock);
-        }
-        *slot = Some(IpcMessage { badge, payload });
-        self.stats.ipc_sends = self.stats.ipc_sends.wrapping_add(1);
-        Ok(())
+        self.ipc_send_resolved(id, badge, payload, None)
     }
 
     /// Send a register-only fastpath IPC payload to an `Endpoint` in PID 0's `CSpace`.
-    #[inline]
+    #[inline(always)]
     pub fn ipc_send(&mut self, cap_id: CapId, payload: u64) -> Result<(), SysError> {
         self.ipc_send_for(0, cap_id, payload)
     }
 
     /// Receive a pending register-only fastpath IPC message from an `Endpoint` in `pid`'s `CSpace`.
-    #[inline]
+    #[inline(always)]
     pub fn ipc_recv_for(&mut self, pid: usize, cap_id: CapId) -> Result<IpcMessage, SysError> {
         let (id, _) = self.lookup_endpoint_for(pid, cap_id, Rights::READ)?;
-        let slot = self
-            .endpoints
-            .get_mut(id as usize)
-            .ok_or(SysError::InvalidArgument)?;
-        match slot.take() {
-            Some(msg) => {
-                self.stats.ipc_recvs = self.stats.ipc_recvs.wrapping_add(1);
-                Ok(msg)
-            }
-            None => {
-                self.stats.would_blocks = self.stats.would_blocks.wrapping_add(1);
-                Err(SysError::WouldBlock)
-            }
-        }
+        self.ipc_recv_resolved(id).map(|(msg, _)| msg)
     }
 
     /// Receive a pending register-only fastpath IPC message from an `Endpoint` in PID 0's `CSpace`.
-    #[inline]
+    #[inline(always)]
     pub fn ipc_recv(&mut self, cap_id: CapId) -> Result<IpcMessage, SysError> {
         self.ipc_recv_for(0, cap_id)
     }
@@ -483,11 +550,11 @@ impl KernelIpcState {
     ) -> Result<IpcMessage, SysError> {
         let (id, badge) =
             self.lookup_endpoint_for(pid, cap_id, Rights::READ.union(Rights::WRITE))?;
-        let slot = self
-            .endpoints
-            .get(id as usize)
-            .ok_or(SysError::InvalidArgument)?;
-        if slot.is_some() {
+        let idx = id as usize;
+        if idx >= MAX_ENDPOINTS {
+            return Err(SysError::InvalidArgument);
+        }
+        if self.endpoint_state[idx] != 0 {
             self.stats.would_blocks = self.stats.would_blocks.wrapping_add(1);
             return Err(SysError::WouldBlock);
         }
@@ -560,9 +627,7 @@ impl KernelIpcState {
             slot: slot as u16,
         };
         for other in 0..MAX_IPC_PROCS {
-            if other != pid
-                && let Ok(other_cn) = self.cspace_mut(other)
-            {
+            if let Ok(other_cn) = self.cspace_mut(other) {
                 other_cn.reparent_external_children(old_ext, Some(new_ext));
             }
         }
@@ -585,13 +650,21 @@ impl KernelIpcState {
             })
             .or(ext_parent);
         for other in 0..MAX_IPC_PROCS {
-            if other != pid
-                && let Ok(other_cn) = self.cspace_mut(other)
-            {
+            if let Ok(other_cn) = self.cspace_mut(other) {
                 other_cn.reparent_external_children(old_ext, replacement);
             }
         }
         Ok(())
+    }
+
+    /// Return `true` if any active `CSpace` holds a live `CapObject::Frame { phys }` capability.
+    #[inline]
+    pub fn has_live_frame_cap(&self, phys: PhysAddr) -> bool {
+        self.root_cspace.has_live_frame_cap(phys)
+            || self
+                .proc_cspaces
+                .iter()
+                .any(|cn| cn.has_live_frame_cap(phys))
     }
 
     /// Validate a `Frame` capability in `pid`'s `CSpace`, returning its physical base address.
@@ -633,7 +706,7 @@ impl KernelIpcState {
                 if (self.next_endpoint_id as usize) >= MAX_ENDPOINTS {
                     return Err(SysError::OutOfMemory);
                 }
-                let ep_id = self.next_endpoint_id;
+                let ep_id = u32::from(self.next_endpoint_id);
                 let cap_id = self.cspace_mut(pid)?.insert_retyped_child(
                     untyped_cap,
                     slot,
@@ -646,7 +719,7 @@ impl KernelIpcState {
                 if (self.next_notif_id as usize) >= MAX_NOTIFICATIONS {
                     return Err(SysError::OutOfMemory);
                 }
-                let notif_id = self.next_notif_id;
+                let notif_id = u32::from(self.next_notif_id);
                 let cap_id = self.cspace_mut(pid)?.insert_retyped_child(
                     untyped_cap,
                     slot,
@@ -659,6 +732,108 @@ impl KernelIpcState {
         }
     }
 
+    /// Transitively revoke all CDT descendants of `cap_id` across all `CSpace`s, invoking
+    /// `on_revoked_frame(phys, can_reclaim)` for each unique revoked `CapObject::Frame { phys }`
+    /// per revoked `CSpace`, where `can_reclaim` is `true` ONLY when NO live `CapObject::Frame`
+    /// capability for `phys` remains in any `CSpace` (preventing physical-frame aliasing / UAF).
+    pub fn cap_revoke_for_with_frame_reclaim_cb(
+        &mut self,
+        pid: usize,
+        cap_id: CapId,
+        mut on_revoked_frame: impl FnMut(PhysAddr, bool),
+    ) -> Result<usize, SysError> {
+        let mut batch = [PhysAddr::new(0); ROOT_CSPACE_SLOTS];
+        let mut batch_len = 0usize;
+        let (mut total, root_slot, local_mask) = {
+            let mut collect = |cap: Capability| {
+                if let CapObject::Frame { phys } = cap.object
+                    && !batch[..batch_len].contains(&phys)
+                    && batch_len < batch.len()
+                {
+                    batch[batch_len] = phys;
+                    batch_len += 1;
+                }
+            };
+            self.cspace_mut(pid)?
+                .revoke_with_mask_cb(cap_id, &mut collect)?
+        };
+        for &phys in &batch[..batch_len] {
+            let can_reclaim = !self.has_live_frame_cap(phys);
+            on_revoked_frame(phys, can_reclaim);
+        }
+
+        let mut parent_masks = [0u64; MAX_IPC_PROCS];
+        parent_masks[pid] = local_mask | (1u64 << root_slot);
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for target_pid in 0..MAX_IPC_PROCS {
+                batch_len = 0;
+                let (cnt, new_mask) = {
+                    let mut collect = |cap: Capability| {
+                        if let CapObject::Frame { phys } = cap.object
+                            && !batch[..batch_len].contains(&phys)
+                            && batch_len < batch.len()
+                        {
+                            batch[batch_len] = phys;
+                            batch_len += 1;
+                        }
+                    };
+                    self.cspace_mut(target_pid)?
+                        .revoke_matching_external_parents_cb(&parent_masks, &mut collect)
+                };
+                for &phys in &batch[..batch_len] {
+                    let can_reclaim = !self.has_live_frame_cap(phys);
+                    on_revoked_frame(phys, can_reclaim);
+                }
+                if new_mask != 0 {
+                    parent_masks[target_pid] |= new_mask;
+                    total += cnt;
+                    changed = true;
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Transitively revoke all CDT descendants of `cap_id` across all `CSpace`s, invoking
+    /// `on_revoked_frame` for EVERY revoked `CapObject::Frame { phys }` (no fixed buffer cap).
+    pub fn cap_revoke_for_with_frame_cb(
+        &mut self,
+        pid: usize,
+        cap_id: CapId,
+        mut on_revoked_frame: impl FnMut(PhysAddr),
+    ) -> Result<usize, SysError> {
+        let mut handle_cap = |cap: Capability| {
+            if let CapObject::Frame { phys } = cap.object {
+                on_revoked_frame(phys);
+            }
+        };
+
+        let (mut total, root_slot, local_mask) = self
+            .cspace_mut(pid)?
+            .revoke_with_mask_cb(cap_id, &mut handle_cap)?;
+        let mut parent_masks = [0u64; MAX_IPC_PROCS];
+        parent_masks[pid] = local_mask | (1u64 << root_slot);
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for target_pid in 0..MAX_IPC_PROCS {
+                let (cnt, new_mask) = self
+                    .cspace_mut(target_pid)?
+                    .revoke_matching_external_parents_cb(&parent_masks, &mut handle_cap);
+                if new_mask != 0 {
+                    parent_masks[target_pid] |= new_mask;
+                    total += cnt;
+                    changed = true;
+                }
+            }
+        }
+        Ok(total)
+    }
+
     /// Transitively revoke all CDT descendants of `cap_id` across all `CSpace`s, collecting any
     /// revoked `CapObject::Frame { phys }` addresses into `revoked_frames` so hardware PTEs can
     /// be unmapped and flushed (`H-3`). Returns `(revoked_cap_count, collected_frame_count)`.
@@ -669,60 +844,37 @@ impl KernelIpcState {
         revoked_frames: &mut [Option<PhysAddr>],
     ) -> Result<(usize, usize), SysError> {
         let mut frame_count = 0usize;
-        let mut record_frame = |cap: Capability| {
-            if let CapObject::Frame { phys } = cap.object
-                && frame_count < revoked_frames.len()
-            {
+        let total = self.cap_revoke_for_with_frame_cb(pid, cap_id, |phys| {
+            if frame_count < revoked_frames.len() {
                 revoked_frames[frame_count] = Some(phys);
                 frame_count += 1;
             }
-        };
-
-        let (mut total, root_slot, local_mask) =
-            self.cspace_mut(pid)?
-                .revoke_with_mask_cb(cap_id, &mut record_frame)?;
-        let mut parent_masks = [0u64; MAX_IPC_PROCS];
-        parent_masks[pid] = local_mask | (1u64 << root_slot);
-
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for target_pid in 0..MAX_IPC_PROCS {
-                let (cnt, new_mask) = self
-                    .cspace_mut(target_pid)?
-                    .revoke_matching_external_parents_cb(&parent_masks, &mut record_frame);
-                if new_mask != 0 {
-                    parent_masks[target_pid] |= new_mask;
-                    total += cnt;
-                    changed = true;
-                }
-            }
-        }
+        })?;
         Ok((total, frame_count))
     }
 
     /// Transitively revoke all CDT descendants of `cap_id` across `pid`'s `CSpace` AND any
     /// capabilities granted into other processes' `CSpace`s (multi-hop cross-process CDT).
     pub fn cap_revoke_for(&mut self, pid: usize, cap_id: CapId) -> Result<usize, SysError> {
-        let mut ignored = [None; 0];
-        self.cap_revoke_for_collecting_frames(pid, cap_id, &mut ignored)
-            .map(|(n, _)| n)
+        self.cap_revoke_for_with_frame_cb(pid, cap_id, |_| {})
     }
 
     /// Grant an attenuated capability from `src_pid`'s `CSpace` into the `CNode` designated by
-    /// `dst_cnode_cap` (`CapObject::CNode`, requiring `Rights::WRITE`).
-    ///
-    /// Enforces `Rights::GRANT` on `src_cap`, non-escalating rights attenuation, immutable non-zero
-    /// badging, and preserves cross-process CDT ancestry for transitive `CapRevoke`.
-    pub fn cap_grant_between(
+    /// `dst_cnode_cap` (`CapObject::CNode`, requiring `Rights::WRITE`), validating that the
+    /// target PID is `< active_procs`.
+    pub fn cap_grant_between_checked(
         &mut self,
         src_pid: usize,
         dst_cnode_cap: CapId,
         src_cap: CapId,
         rights_mask: Rights,
         new_badge: Option<u64>,
+        active_procs: usize,
     ) -> Result<CapId, SysError> {
         let dst_pid = self.validate_cnode_for(src_pid, dst_cnode_cap, Rights::WRITE)?;
+        if dst_pid >= active_procs {
+            return Err(SysError::InvalidArgument);
+        }
         if src_pid == dst_pid {
             return self.cap_mint_for(src_pid, src_cap, 0, rights_mask, new_badge);
         }
@@ -750,6 +902,29 @@ impl KernelIpcState {
         };
         self.cspace_mut(dst_pid)?
             .insert_external_derived(derived, ext_parent)
+    }
+
+    /// Grant an attenuated capability from `src_pid`'s `CSpace` into the `CNode` designated by
+    /// `dst_cnode_cap` (`CapObject::CNode`, requiring `Rights::WRITE`).
+    ///
+    /// Enforces `Rights::GRANT` on `src_cap`, non-escalating rights attenuation, immutable non-zero
+    /// badging, and preserves cross-process CDT ancestry for transitive `CapRevoke`.
+    pub fn cap_grant_between(
+        &mut self,
+        src_pid: usize,
+        dst_cnode_cap: CapId,
+        src_cap: CapId,
+        rights_mask: Rights,
+        new_badge: Option<u64>,
+    ) -> Result<CapId, SysError> {
+        self.cap_grant_between_checked(
+            src_pid,
+            dst_cnode_cap,
+            src_cap,
+            rights_mask,
+            new_badge,
+            MAX_IPC_PROCS,
+        )
     }
 
     /// Validate an EL0 driver's 32-bit MMIO read against `pid`'s `MmioRegion` capability.
@@ -806,7 +981,9 @@ impl KernelIpcState {
             return Err(SysError::InvalidArgument);
         }
         Ok(PhysAddr::new(
-            phys.raw().checked_add(offset).ok_or(SysError::InvalidArgument)?,
+            phys.raw()
+                .checked_add(offset)
+                .ok_or(SysError::InvalidArgument)?,
         ))
     }
 }
@@ -998,7 +1175,10 @@ mod tests {
             ipc.validate_mmio_read32_for(0, CapId::BOOTSTRAP_NET_MMIO, 0),
             Ok(PhysAddr::new(0x0A00_0000))
         );
-        assert!(ipc.notify_signal_for(0, CapId::BOOTSTRAP_FAULT_NOTIF, 1).is_ok());
+        assert!(
+            ipc.notify_signal_for(0, CapId::BOOTSTRAP_FAULT_NOTIF, 1)
+                .is_ok()
+        );
 
         // PID 1 (`worker`) is completely isolated from init's MMIO and fault caps!
         assert_eq!(
@@ -1045,12 +1225,18 @@ mod tests {
         // Copy and move within PID 0.
         let copied = ipc.cap_copy_for(0, minted, 0).unwrap();
         let moved = ipc.cap_move_for(0, copied, 0).unwrap();
-        assert_eq!(ipc.notify_poll_for(0, copied), Err(SysError::InvalidCapability));
+        assert_eq!(
+            ipc.notify_poll_for(0, copied),
+            Err(SysError::InvalidCapability)
+        );
         assert_eq!(ipc.notify_poll_for(0, moved), Ok(0));
 
         // Revoke from `notif` transitively destroys both `minted` and `moved`.
         assert_eq!(ipc.cap_revoke_for(0, notif), Ok(2));
-        assert_eq!(ipc.notify_poll_for(0, moved), Err(SysError::InvalidCapability));
+        assert_eq!(
+            ipc.notify_poll_for(0, moved),
+            Err(SysError::InvalidCapability)
+        );
 
         // Cross-process CapGrant via designated CNode capability: PID 0 -> PID 1.
         let granted = ipc
@@ -1064,12 +1250,21 @@ mod tests {
         );
         // Unprivileged PID 1 holds no CNode cap for PID 0, so granting into PID 0 fails.
         assert_eq!(
-            ipc.cap_grant_between(1, CapId::BOOTSTRAP_SELF_CNODE, CapId::BOOTSTRAP_EP, Rights::READ, None),
+            ipc.cap_grant_between(
+                1,
+                CapId::BOOTSTRAP_SELF_CNODE,
+                CapId::BOOTSTRAP_EP,
+                Rights::READ,
+                None
+            ),
             Err(SysError::InvalidCapability)
         );
         // Deleting in PID 1 does not affect PID 0's `notif` or `ep`.
         ipc.cap_delete_for(1, granted).unwrap();
-        assert_eq!(ipc.notify_poll_for(1, granted), Err(SysError::InvalidCapability));
+        assert_eq!(
+            ipc.notify_poll_for(1, granted),
+            Err(SysError::InvalidCapability)
+        );
         assert_eq!(ipc.notify_poll_for(0, notif), Ok(0));
         assert!(ipc.ipc_send_for(0, ep, 7).is_ok());
     }
@@ -1090,13 +1285,25 @@ mod tests {
 
         // Multi-hop grant chain: PID 0 (`notif`) -> PID 1 (`g1`) -> local mint (`g1_child`) -> PID 2 (`g2`) -> local mint (`g2_child`).
         let g1 = ipc
-            .cap_grant_between(0, w1_cnode, notif, Rights::READ.union(Rights::GRANT), Some(0x1111_2222_3333_4444))
+            .cap_grant_between(
+                0,
+                w1_cnode,
+                notif,
+                Rights::READ.union(Rights::GRANT),
+                Some(0x1111_2222_3333_4444),
+            )
             .unwrap();
         let g1_child = ipc
             .cap_mint_for(1, g1, 0, Rights::READ.union(Rights::GRANT), None)
             .unwrap();
         let g2 = ipc
-            .cap_grant_between(1, w2_cnode_in_1, g1_child, Rights::READ.union(Rights::GRANT), None)
+            .cap_grant_between(
+                1,
+                w2_cnode_in_1,
+                g1_child,
+                Rights::READ.union(Rights::GRANT),
+                None,
+            )
             .unwrap();
         let g2_child = ipc.cap_mint_for(2, g2, 0, Rights::READ, None).unwrap();
 
@@ -1107,9 +1314,15 @@ mod tests {
         // Revoking `notif` in PID 0 transitively destroys all 4 descendants across PID 1 & PID 2!
         assert_eq!(ipc.cap_revoke_for(0, notif), Ok(4));
         assert_eq!(ipc.notify_poll_for(1, g1), Err(SysError::InvalidCapability));
-        assert_eq!(ipc.notify_poll_for(1, g1_moved), Err(SysError::InvalidCapability));
+        assert_eq!(
+            ipc.notify_poll_for(1, g1_moved),
+            Err(SysError::InvalidCapability)
+        );
         assert_eq!(ipc.notify_poll_for(2, g2), Err(SysError::InvalidCapability));
-        assert_eq!(ipc.notify_poll_for(2, g2_child), Err(SysError::InvalidCapability));
+        assert_eq!(
+            ipc.notify_poll_for(2, g2_child),
+            Err(SysError::InvalidCapability)
+        );
 
         // Deleting intermediate cap `g1_b` in PID 1 reparents `g2_b` in PID 2 back to PID 0's `notif`.
         let g1_b = ipc
@@ -1120,7 +1333,10 @@ mod tests {
             .unwrap();
         ipc.cap_delete_for(1, g1_b).unwrap();
         assert_eq!(ipc.cap_revoke_for(0, notif), Ok(1));
-        assert_eq!(ipc.notify_poll_for(2, g2_b), Err(SysError::InvalidCapability));
+        assert_eq!(
+            ipc.notify_poll_for(2, g2_b),
+            Err(SysError::InvalidCapability)
+        );
 
         // Explicit Some(0) badge is rejected in CapGrant.
         assert_eq!(
@@ -1140,7 +1356,13 @@ mod tests {
             .untyped_retype_for(0, CapId::BOOTSTRAP_UNTYPED, ObjectType::Frame, 0, &mut inv)
             .unwrap();
         let ep_cap = ipc
-            .untyped_retype_for(0, CapId::BOOTSTRAP_UNTYPED, ObjectType::Endpoint, 0, &mut inv)
+            .untyped_retype_for(
+                0,
+                CapId::BOOTSTRAP_UNTYPED,
+                ObjectType::Endpoint,
+                0,
+                &mut inv,
+            )
             .unwrap();
         let n_cap = ipc
             .untyped_retype_for(
@@ -1183,7 +1405,11 @@ mod tests {
 
         // PID 0 (`init`) holds full Console, PowerControl, and bound VSpace capabilities.
         assert_eq!(
-            ipc.validate_console_for(0, CapId::BOOTSTRAP_CONSOLE, Rights::READ.union(Rights::WRITE)),
+            ipc.validate_console_for(
+                0,
+                CapId::BOOTSTRAP_CONSOLE,
+                Rights::READ.union(Rights::WRITE)
+            ),
             Ok(())
         );
         assert_eq!(
@@ -1191,18 +1417,39 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            ipc.validate_vspace_for(0, CapId::BOOTSTRAP_VSPACE, Rights::READ.union(Rights::WRITE)),
+            ipc.validate_vspace_for(
+                0,
+                CapId::BOOTSTRAP_VSPACE,
+                Rights::READ.union(Rights::WRITE)
+            ),
             Ok(PhysAddr::new(0x4000_0000))
         );
 
-        // PID 1 (`worker`) has write-only Console (cannot steal UART input via DebugRead).
+        // PID 1 (`worker`) has NO direct Console capability (single-owner console in `init`),
+        // and instead logs through write-only, PID-badged `BOOTSTRAP_LOG_EP`.
         assert_eq!(
             ipc.validate_console_for(1, CapId::BOOTSTRAP_CONSOLE, Rights::WRITE),
-            Ok(())
+            Err(SysError::InvalidCapability)
         );
         assert_eq!(
             ipc.validate_console_for(1, CapId::BOOTSTRAP_CONSOLE, Rights::READ),
+            Err(SysError::InvalidCapability)
+        );
+        let log_chunk = newos_abi::log_ipc::encode_chunk(b"hello\n");
+        assert_eq!(
+            ipc.ipc_send_for(1, CapId::BOOTSTRAP_LOG_EP, log_chunk),
+            Ok(())
+        );
+        assert_eq!(
+            ipc.ipc_recv_for(1, CapId::BOOTSTRAP_LOG_EP),
             Err(SysError::InsufficientRights)
+        );
+        assert_eq!(
+            ipc.ipc_recv_for(0, CapId::BOOTSTRAP_LOG_EP),
+            Ok(IpcMessage {
+                badge: 1,
+                payload: log_chunk,
+            })
         );
 
         // PID 1 has NO PowerControl (Exit/SysInfo) and NO VSpace (MapPage/UnmapPage/VirtToPhys).
@@ -1232,5 +1479,272 @@ mod tests {
             ipc.validate_vspace_for(0, CapId::NULL, Rights::READ),
             Err(SysError::InvalidCapability)
         );
+    }
+
+    #[test]
+    fn kernel_ipc_state_footprint_resolved_sender_and_over_64_frame_revoke() {
+        assert!(core::mem::size_of::<KernelIpcState>() <= 25_224);
+
+        let mut ipc = KernelIpcState::new();
+        let _ = ipc.init_bootstrap_caps(None).unwrap();
+
+        // Resolved send/recv tracks sender_pid and rejects out-of-range endpoint IDs.
+        assert_eq!(
+            ipc.ipc_send_resolved(MAX_ENDPOINTS as u32, 0, 1, None),
+            Err(SysError::InvalidArgument)
+        );
+        assert_eq!(
+            ipc.ipc_recv_resolved(MAX_ENDPOINTS as u32),
+            Err(SysError::InvalidArgument)
+        );
+        ipc.ipc_send_resolved(0, 0x5E14, 0xDEAD, Some(3)).unwrap();
+        assert_eq!(
+            ipc.ipc_send_resolved(0, 0x5E14, 0xBEEF, Some(4)),
+            Err(SysError::WouldBlock)
+        );
+        assert_eq!(
+            ipc.ipc_recv_resolved(0),
+            Ok((
+                IpcMessage {
+                    badge: 0x5E14,
+                    payload: 0xDEAD
+                },
+                Some(3)
+            ))
+        );
+        assert_eq!(ipc.ipc_recv_resolved(0), Err(SysError::WouldBlock));
+
+        // Out-of-range PIDs rejected cleanly.
+        assert_eq!(
+            ipc.cspace(MAX_IPC_PROCS).err(),
+            Some(SysError::InvalidArgument)
+        );
+        assert_eq!(
+            ipc.ipc_send_for(MAX_IPC_PROCS, CapId::BOOTSTRAP_EP, 1),
+            Err(SysError::InvalidArgument)
+        );
+
+        // Revoking >64 Frame capabilities across multiple processes invokes callback for EVERY frame.
+        let mut inv = UntypedInventory::new();
+        assert!(inv.push_raw_region(0x8000_0000, crate::memory::PAGE_SIZE * 80));
+        let (_, c1) = ipc.register_child_caps_in_root(1).unwrap();
+        let (_, c2) = ipc.register_child_caps_in_root(2).unwrap();
+
+        // Retype 40 frames in PID 0, grant each into PID 1 and PID 2 (40 + 40 + 40 = 120 Frame caps > 64!).
+        let mut expected_frames = 0usize;
+        for _ in 0..40 {
+            let f0 = ipc
+                .untyped_retype_for(0, CapId::BOOTSTRAP_UNTYPED, ObjectType::Frame, 0, &mut inv)
+                .unwrap();
+            let _ = ipc
+                .cap_grant_between(0, c1, f0, Rights::READ.union(Rights::WRITE), None)
+                .unwrap();
+            let _ = ipc
+                .cap_grant_between(0, c2, f0, Rights::READ.union(Rights::WRITE), None)
+                .unwrap();
+            expected_frames += 3;
+        }
+        assert!(expected_frames > 64);
+
+        let mut seen_frames = 0usize;
+        let revoked = ipc
+            .cap_revoke_for_with_frame_cb(0, CapId::BOOTSTRAP_UNTYPED, |_phys| {
+                seen_frames += 1;
+            })
+            .unwrap();
+        assert_eq!(revoked, expected_frames);
+        assert_eq!(seen_frames, expected_frames);
+    }
+
+    #[test]
+    fn drain_buffered_call_senders_wakes_only_callers_and_preserves_plain_sends() {
+        let mut ipc = KernelIpcState::new();
+
+        // Buffer two IpcCall senders (PID 0 on ep 0, PID 5 on ep 4), one plain IpcSend
+        // (sender=None on ep 2), and one out-of-range sender PID (treated as plain send on ep 6).
+        ipc.ipc_send_resolved(0, 0x10, 0xAAAA, Some(0)).unwrap();
+        ipc.ipc_send_resolved(2, 0x20, 0xBBBB, None).unwrap();
+        ipc.ipc_send_resolved(4, 0x30, 0xCCCC, Some(5)).unwrap();
+        ipc.ipc_send_resolved(6, 0x40, 0xDDDD, Some(MAX_IPC_PROCS))
+            .unwrap();
+
+        let mut drained = [usize::MAX; 4];
+        let mut drained_len = 0usize;
+        ipc.drain_buffered_call_senders(|pid| {
+            drained[drained_len] = pid;
+            drained_len += 1;
+        });
+
+        assert_eq!(drained_len, 2);
+        assert_eq!(&drained[..drained_len], &[0, 5]);
+
+        // Drained IpcCall endpoints are now empty.
+        assert_eq!(ipc.ipc_recv_resolved(0), Err(SysError::WouldBlock));
+        assert_eq!(ipc.ipc_recv_resolved(4), Err(SysError::WouldBlock));
+
+        // Plain sends (sender_pid == None or out-of-range) remain intact.
+        assert_eq!(
+            ipc.ipc_recv_resolved(2),
+            Ok((
+                IpcMessage {
+                    badge: 0x20,
+                    payload: 0xBBBB
+                },
+                None
+            ))
+        );
+        assert_eq!(
+            ipc.ipc_recv_resolved(6),
+            Ok((
+                IpcMessage {
+                    badge: 0x40,
+                    payload: 0xDDDD
+                },
+                None
+            ))
+        );
+    }
+
+    #[test]
+    fn frame_reclaim_cb_guards_live_frame_caps_across_processes() {
+        let mut ipc = KernelIpcState::new();
+        let _ = ipc.init_bootstrap_caps(None).unwrap();
+        let _ = ipc.init_worker_bootstrap_caps(1).unwrap();
+        let (_, w1_cnode) = ipc.register_child_caps_in_root(1).unwrap();
+        let mut inv = UntypedInventory::new();
+        assert!(inv.push_raw_region(0x4000_0000, crate::memory::PAGE_SIZE * 4));
+
+        // Retype a frame from BOOTSTRAP_UNTYPED, copy locally, and grant a child to PID 1.
+        let frame_root = ipc
+            .untyped_retype_for(0, CapId::BOOTSTRAP_UNTYPED, ObjectType::Frame, 0, &mut inv)
+            .unwrap();
+        let phys = ipc.validate_frame_for(0, frame_root, Rights::READ).unwrap();
+        assert!(ipc.has_live_frame_cap(phys));
+
+        let frame_child_0 = ipc.cap_copy_for(0, frame_root, 0).unwrap();
+        let _frame_child_1 = ipc
+            .cap_grant_between_checked(
+                0,
+                w1_cnode,
+                frame_child_0,
+                Rights::READ.union(Rights::WRITE),
+                None,
+                2,
+            )
+            .unwrap();
+
+        // CapRevoke(frame_root) revokes descendants while frame_root survives -> can_reclaim MUST be false.
+        let mut events = [(PhysAddr::new(0), false); 8];
+        let mut n_events = 0usize;
+        let revoked = ipc
+            .cap_revoke_for_with_frame_reclaim_cb(0, frame_root, |p, can_reclaim| {
+                events[n_events] = (p, can_reclaim);
+                n_events += 1;
+            })
+            .unwrap();
+        assert_eq!(revoked, 2);
+        assert_eq!(n_events, 2);
+        assert!(events[..n_events].iter().all(|&(p, can)| p == phys && !can));
+        assert!(ipc.has_live_frame_cap(phys));
+
+        // Re-grant to PID 1, then CapRevoke(BOOTSTRAP_UNTYPED) -> can_reclaim is true ONLY once last cap is gone.
+        let _frame_child_1b = ipc
+            .cap_grant_between_checked(
+                0,
+                w1_cnode,
+                frame_root,
+                Rights::READ.union(Rights::WRITE),
+                None,
+                2,
+            )
+            .unwrap();
+        n_events = 0;
+        let revoked_all = ipc
+            .cap_revoke_for_with_frame_reclaim_cb(0, CapId::BOOTSTRAP_UNTYPED, |p, can_reclaim| {
+                events[n_events] = (p, can_reclaim);
+                n_events += 1;
+            })
+            .unwrap();
+        assert_eq!(revoked_all, 2);
+        assert_eq!(n_events, 2);
+        assert_eq!(events[0], (phys, false));
+        assert_eq!(events[1], (phys, true));
+        assert!(!ipc.has_live_frame_cap(phys));
+
+        // Direct CapDelete on sole Frame cap also drops has_live_frame_cap to false.
+        let frame2 = ipc
+            .untyped_retype_for(0, CapId::BOOTSTRAP_UNTYPED, ObjectType::Frame, 0, &mut inv)
+            .unwrap();
+        let phys2 = ipc.validate_frame_for(0, frame2, Rights::READ).unwrap();
+        assert!(ipc.has_live_frame_cap(phys2));
+        ipc.cap_delete_for(0, frame2).unwrap();
+        assert!(!ipc.has_live_frame_cap(phys2));
+    }
+
+    #[test]
+    fn cross_process_cdt_return_to_origin_move_delete_and_revoke() {
+        let mut ipc = KernelIpcState::new();
+        let _ = ipc.init_bootstrap_caps(None).unwrap();
+        let _ = ipc.init_worker_bootstrap_caps(1).unwrap();
+        let (_, w1_cnode) = ipc.register_child_caps_in_root(1).unwrap();
+
+        // Give PID 1 a CNode cap to PID 0 so PID 1 can grant back to PID 0.
+        let cnode0_in_pid1 = ipc
+            .cspace_mut(1)
+            .unwrap()
+            .insert_root_at(20, Capability::new(CapObject::CNode { id: 0 }, Rights::ALL))
+            .unwrap();
+
+        // Part A: PID 0 -> PID 1 -> PID 0, delete intermediate g1, move root in PID 0, revoke moved root.
+        let root_a = ipc
+            .cspace_mut(0)
+            .unwrap()
+            .insert_root_at(
+                30,
+                Capability::new(CapObject::Notification { id: 7 }, Rights::ALL),
+            )
+            .unwrap();
+        let g1 = ipc
+            .cap_grant_between_checked(0, w1_cnode, root_a, Rights::ALL, None, 2)
+            .unwrap();
+        let g2 = ipc
+            .cap_grant_between_checked(1, cnode0_in_pid1, g1, Rights::READ, None, 2)
+            .unwrap();
+        ipc.cap_delete_for(1, g1).unwrap();
+        let moved_a = ipc.cap_move_for(0, root_a, 40).unwrap();
+        assert_eq!(ipc.cap_revoke_for(0, moved_a), Ok(1));
+        assert_eq!(
+            ipc.cspace(0).unwrap().lookup(g2, Rights::READ),
+            Err(SysError::InvalidCapability)
+        );
+
+        // Part B: Return-to-origin + delete root + reuse original slot 30 for unrelated cap + revoke.
+        let root_b = ipc
+            .cspace_mut(0)
+            .unwrap()
+            .insert_root_at(
+                30,
+                Capability::new(CapObject::Notification { id: 8 }, Rights::ALL),
+            )
+            .unwrap();
+        let g1_b = ipc
+            .cap_grant_between_checked(0, w1_cnode, root_b, Rights::ALL, None, 2)
+            .unwrap();
+        let g2_b = ipc
+            .cap_grant_between_checked(1, cnode0_in_pid1, g1_b, Rights::READ, None, 2)
+            .unwrap();
+        ipc.cap_delete_for(1, g1_b).unwrap();
+        ipc.cap_delete_for(0, root_b).unwrap();
+
+        let unrelated = ipc
+            .cspace_mut(0)
+            .unwrap()
+            .insert_root_at(
+                30,
+                Capability::new(CapObject::Endpoint { id: 9 }, Rights::ALL),
+            )
+            .unwrap();
+        assert_eq!(ipc.cap_revoke_for(0, unrelated), Ok(0));
+        assert!(ipc.cspace(0).unwrap().lookup(g2_b, Rights::READ).is_ok());
     }
 }

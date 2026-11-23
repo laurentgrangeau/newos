@@ -51,8 +51,9 @@ impl ParsedElf64 {
 
 #[inline]
 fn read_u16_le(bytes: &[u8], off: usize) -> Result<u16, SysError> {
+    let end = off.checked_add(2).ok_or(SysError::InvalidArgument)?;
     let slice: [u8; 2] = bytes
-        .get(off..off + 2)
+        .get(off..end)
         .ok_or(SysError::InvalidArgument)?
         .try_into()
         .map_err(|_| SysError::InvalidArgument)?;
@@ -61,8 +62,9 @@ fn read_u16_le(bytes: &[u8], off: usize) -> Result<u16, SysError> {
 
 #[inline]
 fn read_u32_le(bytes: &[u8], off: usize) -> Result<u32, SysError> {
+    let end = off.checked_add(4).ok_or(SysError::InvalidArgument)?;
     let slice: [u8; 4] = bytes
-        .get(off..off + 4)
+        .get(off..end)
         .ok_or(SysError::InvalidArgument)?
         .try_into()
         .map_err(|_| SysError::InvalidArgument)?;
@@ -71,8 +73,9 @@ fn read_u32_le(bytes: &[u8], off: usize) -> Result<u32, SysError> {
 
 #[inline]
 fn read_u64_le(bytes: &[u8], off: usize) -> Result<u64, SysError> {
+    let end = off.checked_add(8).ok_or(SysError::InvalidArgument)?;
     let slice: [u8; 8] = bytes
-        .get(off..off + 8)
+        .get(off..end)
         .ok_or(SysError::InvalidArgument)?
         .try_into()
         .map_err(|_| SysError::InvalidArgument)?;
@@ -101,7 +104,7 @@ pub fn parse_elf64(bytes: &[u8]) -> Result<ParsedElf64, SysError> {
     }
     let entry = VirtAddr::new_canonical(entry_raw)?;
 
-    let phoff = read_u64_le(bytes, 32)? as usize;
+    let phoff = usize::try_from(read_u64_le(bytes, 32)?).map_err(|_| SysError::InvalidArgument)?;
     let phentsize = read_u16_le(bytes, 54)? as usize;
     let phnum = read_u16_le(bytes, 56)? as usize;
     if phentsize < 56 {
@@ -115,6 +118,12 @@ pub fn parse_elf64(bytes: &[u8]) -> Result<ParsedElf64, SysError> {
         let off = phoff
             .checked_add(i.checked_mul(phentsize).ok_or(SysError::InvalidArgument)?)
             .ok_or(SysError::InvalidArgument)?;
+        let ph_end = off
+            .checked_add(phentsize)
+            .ok_or(SysError::InvalidArgument)?;
+        if ph_end > bytes.len() {
+            return Err(SysError::InvalidArgument);
+        }
         let p_type = read_u32_le(bytes, off)?;
         if p_type != PT_LOAD {
             continue;
@@ -124,9 +133,11 @@ pub fn parse_elf64(bytes: &[u8]) -> Result<ParsedElf64, SysError> {
         }
 
         let p_flags = read_u32_le(bytes, off + 4)?;
-        let p_offset = read_u64_le(bytes, off + 8)? as usize;
+        let p_offset =
+            usize::try_from(read_u64_le(bytes, off + 8)?).map_err(|_| SysError::InvalidArgument)?;
         let p_vaddr = read_u64_le(bytes, off + 16)?;
-        let p_filesz = read_u64_le(bytes, off + 32)? as usize;
+        let p_filesz = usize::try_from(read_u64_le(bytes, off + 32)?)
+            .map_err(|_| SysError::InvalidArgument)?;
         let p_memsz = read_u64_le(bytes, off + 40)?;
 
         if p_memsz < p_filesz as u64 {
@@ -177,6 +188,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_magic_and_32bit_elf() {
+        assert_eq!(parse_elf64(&[]), Err(SysError::InvalidArgument));
         assert_eq!(parse_elf64(&[0u8; 64]), Err(SysError::InvalidArgument));
 
         let mut elf32 = [0u8; 64];
@@ -184,5 +196,93 @@ mod tests {
         elf32[4] = 1; // ELFCLASS32 — must be rejected!
         elf32[5] = ELFDATA2LSB;
         assert_eq!(parse_elf64(&elf32), Err(SysError::Unsupported));
+    }
+
+    fn make_valid_header(entry: u64, phoff: u64, phentsize: u16, phnum: u16) -> [u8; 64] {
+        let mut hdr = [0u8; 64];
+        hdr[0..4].copy_from_slice(&ELF_MAGIC);
+        hdr[4] = ELFCLASS64;
+        hdr[5] = ELFDATA2LSB;
+        hdr[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        hdr[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        hdr[24..32].copy_from_slice(&entry.to_le_bytes());
+        hdr[32..40].copy_from_slice(&phoff.to_le_bytes());
+        hdr[54..56].copy_from_slice(&phentsize.to_le_bytes());
+        hdr[56..58].copy_from_slice(&phnum.to_le_bytes());
+        hdr
+    }
+
+    fn write_load_phdr(
+        buf: &mut [u8],
+        off: usize,
+        p_flags: u32,
+        p_offset: u64,
+        p_vaddr: u64,
+        p_filesz: u64,
+        p_memsz: u64,
+    ) {
+        buf[off..off + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        buf[off + 4..off + 8].copy_from_slice(&p_flags.to_le_bytes());
+        buf[off + 8..off + 16].copy_from_slice(&p_offset.to_le_bytes());
+        buf[off + 16..off + 24].copy_from_slice(&p_vaddr.to_le_bytes());
+        buf[off + 32..off + 40].copy_from_slice(&p_filesz.to_le_bytes());
+        buf[off + 40..off + 48].copy_from_slice(&p_memsz.to_le_bytes());
+    }
+
+    #[test]
+    fn rejects_overflowing_phoff_and_phentsize() {
+        // phoff near u64::MAX must not panic on checked_add.
+        let hdr = make_valid_header(0x40_0000, u64::MAX - 1, 56, 1);
+        assert_eq!(parse_elf64(&hdr), Err(SysError::InvalidArgument));
+
+        // phentsize < 56 rejected.
+        let hdr_small = make_valid_header(0x40_0000, 64, 55, 1);
+        assert_eq!(parse_elf64(&hdr_small), Err(SysError::InvalidArgument));
+
+        // phentsize large enough to overflow phoff + i * phentsize.
+        let hdr_mul = make_valid_header(0x40_0000, 64, u16::MAX, u16::MAX);
+        assert_eq!(parse_elf64(&hdr_mul), Err(SysError::InvalidArgument));
+    }
+
+    #[test]
+    fn rejects_wx_non_canonical_memsz_and_too_many_segments() {
+        // Non-canonical / upper-half entry point.
+        let hdr_hi = make_valid_header(0x0000_8000_0000_0000, 64, 56, 1);
+        assert_eq!(parse_elf64(&hdr_hi), Err(SysError::InvalidArgument));
+
+        // Valid 1-segment RX ELF passes.
+        let mut img = [0u8; 64 + 56 * 9];
+        img[..64].copy_from_slice(&make_valid_header(0x40_0000, 64, 56, 1));
+        write_load_phdr(&mut img, 64, PF_X, 0, 0x40_0000, 64, 64);
+        let parsed = parse_elf64(&img).unwrap();
+        assert_eq!(parsed.segment_count(), 1);
+        assert_eq!(parsed.entry.raw(), 0x40_0000);
+
+        // W^X violation (PF_W | PF_X) rejected.
+        write_load_phdr(&mut img, 64, PF_W | PF_X, 0, 0x40_0000, 64, 64);
+        assert_eq!(parse_elf64(&img), Err(SysError::InvalidArgument));
+
+        // p_memsz < p_filesz rejected.
+        write_load_phdr(&mut img, 64, PF_W, 0, 0x40_0000, 64, 32);
+        assert_eq!(parse_elf64(&img), Err(SysError::InvalidArgument));
+
+        // More than MAX_LOAD_SEGMENTS (9) rejected with OutOfMemory.
+        img[..64].copy_from_slice(&make_valid_header(0x40_0000, 64, 56, 9));
+        for i in 0..9 {
+            write_load_phdr(
+                &mut img,
+                64 + i * 56,
+                PF_W,
+                0,
+                0x40_0000 + (i as u64) * 0x1000,
+                16,
+                16,
+            );
+        }
+        assert_eq!(parse_elf64(&img), Err(SysError::OutOfMemory));
+
+        // Zero PT_LOAD segments rejected.
+        img[..64].copy_from_slice(&make_valid_header(0x40_0000, 64, 56, 0));
+        assert_eq!(parse_elf64(&img), Err(SysError::InvalidArgument));
     }
 }

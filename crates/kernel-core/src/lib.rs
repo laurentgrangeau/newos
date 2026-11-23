@@ -111,7 +111,10 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
     );
 
     if platform.online_cpus() != info.cpu_count {
-        let _ = writeln!(platform, "[newos] FAIL: SMP secondary cores did not come online");
+        let _ = writeln!(
+            platform,
+            "[newos] FAIL: SMP secondary cores did not come online"
+        );
         platform.exit(QemuExitCode::Failed);
     }
 
@@ -166,11 +169,17 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
 
     // Phase 4+: Load `init` (PID 0) and `worker` (PID 1) into SEPARATE isolated EL0 VSpaces!
     let Some(init_bytes) = info.init_module else {
-        let _ = writeln!(platform, "[newos] FAIL: missing Limine boot module `newos-init`");
+        let _ = writeln!(
+            platform,
+            "[newos] FAIL: missing Limine boot module `newos-init`"
+        );
         platform.exit(QemuExitCode::Failed);
     };
     let Some(worker_bytes) = info.worker_module else {
-        let _ = writeln!(platform, "[newos] FAIL: missing Limine boot module `newos-worker`");
+        let _ = writeln!(
+            platform,
+            "[newos] FAIL: missing Limine boot module `newos-worker`"
+        );
         platform.exit(QemuExitCode::Failed);
     };
 
@@ -182,7 +191,10 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
             platform.start_userspace()
         }
         Err(err) => {
-            let _ = writeln!(platform, "[newos] FAIL: failed to spawn EL0 processes: {err:?}");
+            let _ = writeln!(
+                platform,
+                "[newos] FAIL: failed to spawn EL0 processes: {err:?}"
+            );
             platform.exit(QemuExitCode::Failed);
         }
     }
@@ -216,6 +228,9 @@ fn load_elf64_into_vspace<V: VSpaceMapper>(
     let parsed = elf::parse_elf64(elf_bytes)?;
 
     for seg in parsed.segments() {
+        if seg.mem_size == 0 {
+            continue;
+        }
         let seg_start = seg.vaddr;
         let seg_end = seg_start
             .checked_add(seg.mem_size)
@@ -228,8 +243,8 @@ fn load_elf64_into_vspace<V: VSpaceMapper>(
             let frame = untyped.retype_frame()?;
             vspace.zero_frame(&frame);
 
-            let page_end = page_vaddr + PAGE_SIZE;
-            let file_vaddr_end = seg_start + seg.file_size as u64;
+            let page_end = page_vaddr.saturating_add(PAGE_SIZE);
+            let file_vaddr_end = seg_start.saturating_add(seg.file_size as u64);
             let copy_start = page_vaddr.max(seg_start);
             let copy_end = page_end.min(file_vaddr_end);
 
@@ -245,7 +260,10 @@ fn load_elf64_into_vspace<V: VSpaceMapper>(
 
             let virt = VirtAddr::new_page_aligned(page_vaddr)?;
             vspace.map_4k(virt, frame, seg.flags, untyped)?;
-            page_vaddr += PAGE_SIZE;
+            match page_vaddr.checked_add(PAGE_SIZE) {
+                Some(next) => page_vaddr = next,
+                None => break,
+            }
         }
     }
 
@@ -290,7 +308,8 @@ fn verify_phase2_memory<P: HalPlatform>(
     }
 
     let reclaimed = platform.vspace_mut().unmap_4k(test_virt)?;
-    if reclaimed.start_addr() != expected_phys || platform.vspace_mut().translate(test_virt).is_some()
+    if reclaimed.start_addr() != expected_phys
+        || platform.vspace_mut().translate(test_virt).is_some()
     {
         return Err(SysError::InvalidArgument);
     }

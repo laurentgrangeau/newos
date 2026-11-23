@@ -1,5 +1,4 @@
 #![no_std]
-#![feature(sync_unsafe_cell)]
 
 //! Safe EL0 userspace runtime & `svc #0` syscall SDK for NewOS (Raspberry Pi 5 16 GB, `aarch64`).
 //!
@@ -7,24 +6,31 @@
 //! all userspace services (`init`, drivers, apps) can enforce `#![forbid(unsafe_code)]`.
 
 use core::arch::asm;
-use core::cell::SyncUnsafeCell;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU64, Ordering};
 use newos_abi::{
     CAP_MINT_SET_BADGE, CapId, ObjectType, QemuExitCode, Rights, SysError, SyscallNumber,
 };
 
-const DEBUG_WRITE_MAX: usize = 256;
+pub const DEBUG_WRITE_MAX: usize = 1024;
 const SYS_INFO_UNCACHED: u64 = u64::MAX;
 static SYS_INFO_CACHE: AtomicU64 = AtomicU64::new(SYS_INFO_UNCACHED);
 
 const RECOVERY_STACK_SIZE: usize = 64 * 1024;
+const RECOVERY_STACK_WORDS: usize = RECOVERY_STACK_SIZE / core::mem::size_of::<AtomicU64>();
 
 #[repr(C, align(16))]
-struct RecoveryStack([u8; RECOVERY_STACK_SIZE]);
+struct RecoveryStack([AtomicU64; RECOVERY_STACK_WORDS]);
 
-static SUPERVISOR_RECOVERY_STACK: SyncUnsafeCell<RecoveryStack> =
-    SyncUnsafeCell::new(RecoveryStack([0; RECOVERY_STACK_SIZE]));
+const _: () = assert!(
+    core::mem::size_of::<RecoveryStack>() == RECOVERY_STACK_SIZE
+        && core::mem::align_of::<RecoveryStack>() == 16
+);
+
+/// 64 KiB 16-byte-aligned EL0 recovery stack placed in writable `.bss` (`PF_R | PF_W`) via
+/// interior-mutable `AtomicU64` elements (avoiding `.rodata` placement and `SyncUnsafeCell`).
+static SUPERVISOR_RECOVERY_STACK: RecoveryStack =
+    RecoveryStack([const { AtomicU64::new(0) }; RECOVERY_STACK_WORDS]);
 
 #[inline]
 fn raw_syscall_full(
@@ -37,7 +43,10 @@ fn raw_syscall_full(
     let err: u64;
     let val: u64;
     let badge: u64;
-    // SAFETY: Executing `svc #0` in EL0 traps to `VBAR_EL1`, returning `(err, val, badge)` in `(x0, x1, x2)`.
+    // SAFETY: Executing `svc #0` in EL0 traps synchronously to `VBAR_EL1`. The kernel saves and
+    // restores `SP_EL0` and all non-return registers in `TrapFrame`, returning `(err, val, badge)`
+    // in `(x0, x1, x2)`. `options(nostack)` holds because neither `svc #0` nor the trap return
+    // modifies the EL0 stack pointer.
     unsafe {
         asm!(
             "svc #0",
@@ -78,7 +87,7 @@ pub fn debug_log(msg: &str) -> Result<usize, SysError> {
     debug_log_with_cap(CapId::BOOTSTRAP_CONSOLE, msg)
 }
 
-/// Write an entire UTF-8 string to the debug console, chunking at `<= 256`B UTF-8 char boundaries.
+/// Write an entire UTF-8 string to the debug console, chunking at `<= 1024`B (`DEBUG_WRITE_MAX`) UTF-8 char boundaries.
 pub fn debug_write_all(mut s: &str) -> Result<(), SysError> {
     while !s.is_empty() {
         let mut end = s.len().min(DEBUG_WRITE_MAX);
@@ -110,7 +119,7 @@ impl Write for DebugConsole {
 ///
 /// Coalesces `write!`/`writeln!` fragments into `<= N`-byte `DebugWrite` syscalls and
 /// flushes automatically on `Drop` (call `flush()` explicitly before diverging calls).
-pub struct BufferedConsole<const N: usize = 256> {
+pub struct BufferedConsole<const N: usize = DEBUG_WRITE_MAX> {
     buf: [u8; N],
     pos: usize,
 }
@@ -170,6 +179,197 @@ impl<const N: usize> Drop for BufferedConsole<N> {
     }
 }
 
+/// Send a UTF-8 log message to the console owner over an `Endpoint` capability
+/// (`CapId::BOOTSTRAP_LOG_EP`) using 7-byte register-only fastpath IPC chunks.
+///
+/// Yields and retries if the endpoint slot is temporarily full (`SysError::WouldBlock`).
+pub fn ipc_log_write(ep: CapId, msg: &str) -> Result<usize, SysError> {
+    let bytes = msg.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = (offset + newos_abi::log_ipc::MAX_CHUNK_BYTES).min(bytes.len());
+        let word = newos_abi::log_ipc::encode_chunk(&bytes[offset..end]);
+        loop {
+            match ipc_send(ep, word) {
+                Ok(()) => break,
+                Err(SysError::WouldBlock) => {
+                    let _ = yield_now();
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        offset = end;
+    }
+    Ok(bytes.len())
+}
+
+/// Zero-allocation buffered `core::fmt::Write` sink for non-root processes without a direct
+/// `Console` capability, routing output over `CapId::BOOTSTRAP_LOG_EP` to `init`.
+pub struct IpcLogConsole<const N: usize = 256> {
+    ep: CapId,
+    buf: [u8; N],
+    pos: usize,
+}
+
+impl<const N: usize> IpcLogConsole<N> {
+    pub const fn new(ep: CapId) -> Self {
+        Self {
+            ep,
+            buf: [0u8; N],
+            pos: 0,
+        }
+    }
+
+    pub fn flush(&mut self) {
+        if self.pos > 0 {
+            if let Ok(s) = core::str::from_utf8(&self.buf[..self.pos]) {
+                let _ = ipc_log_write(self.ep, s);
+            }
+            self.pos = 0;
+        }
+    }
+}
+
+impl<const N: usize> Write for IpcLogConsole<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if s.is_empty() {
+            return Ok(());
+        }
+        if N == 0 {
+            return ipc_log_write(self.ep, s)
+                .map(|_| ())
+                .map_err(|_| fmt::Error);
+        }
+        let bytes = s.as_bytes();
+        if bytes.len() <= N - self.pos {
+            self.buf[self.pos..self.pos + bytes.len()].copy_from_slice(bytes);
+            self.pos += bytes.len();
+            return Ok(());
+        }
+        self.flush();
+        if bytes.len() >= N {
+            ipc_log_write(self.ep, s)
+                .map(|_| ())
+                .map_err(|_| fmt::Error)
+        } else {
+            self.buf[..bytes.len()].copy_from_slice(bytes);
+            self.pos = bytes.len();
+            Ok(())
+        }
+    }
+}
+
+impl<const N: usize> Drop for IpcLogConsole<N> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+/// Zero-allocation line reassembler used by the console owner (`init`) to drain
+/// 7-byte fastpath IPC log chunks from `CapId::BOOTSTRAP_LOG_EP` into complete lines.
+pub struct IpcLogAssembler<const N: usize = 256> {
+    buf: [u8; N],
+    len: usize,
+    active_badge: Option<u64>,
+    pending_chunk: [u8; newos_abi::log_ipc::MAX_CHUNK_BYTES],
+    pending_off: usize,
+    pending_len: usize,
+    pending_badge: u64,
+    stashed_msg: Option<(u64, u64)>,
+}
+
+impl<const N: usize> IpcLogAssembler<N> {
+    pub const fn new() -> Self {
+        Self {
+            buf: [0u8; N],
+            len: 0,
+            active_badge: None,
+            pending_chunk: [0u8; newos_abi::log_ipc::MAX_CHUNK_BYTES],
+            pending_off: 0,
+            pending_len: 0,
+            pending_badge: 0,
+            stashed_msg: None,
+        }
+    }
+
+    fn emit_line(&mut self, out: &mut [u8]) -> Option<(u64, usize)> {
+        let badge = self.active_badge.unwrap_or(0);
+        let n = self.len.min(out.len());
+        out[..n].copy_from_slice(&self.buf[..n]);
+        self.len = 0;
+        self.active_badge = None;
+        Some((badge, n))
+    }
+
+    fn feed_pending_chunk(&mut self, out: &mut [u8]) -> Option<(u64, usize)> {
+        while self.pending_off < self.pending_len {
+            let b = self.pending_chunk[self.pending_off];
+            self.pending_off += 1;
+            if self.active_badge.is_none() {
+                self.active_badge = Some(self.pending_badge);
+            }
+            if b == b'\n' {
+                return self.emit_line(out);
+            }
+            if b == b'\r' {
+                continue;
+            }
+            if self.len < N {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+            if self.len == N {
+                return self.emit_line(out);
+            }
+        }
+        None
+    }
+
+    /// Non-blocking poll of `ep` for the next complete log line (excluding `\n`).
+    ///
+    /// Copies the line into `out` and returns `Some((sender_badge, len))`, or `None`
+    /// if no complete line is ready yet.
+    pub fn poll_line(&mut self, ep: CapId, out: &mut [u8]) -> Option<(u64, usize)> {
+        if let Some(res) = self.feed_pending_chunk(out) {
+            return Some(res);
+        }
+
+        loop {
+            let (badge, payload) = match self.stashed_msg.take() {
+                Some(msg) => msg,
+                None => match ipc_recv(ep) {
+                    Ok(msg) => msg,
+                    Err(_) => return None,
+                },
+            };
+
+            if let Some(cur) = self.active_badge
+                && cur != badge
+                && self.len > 0
+            {
+                self.stashed_msg = Some((badge, payload));
+                return self.emit_line(out);
+            }
+
+            let (chunk, chunk_len) = newos_abi::log_ipc::decode_chunk(payload);
+            self.pending_chunk = chunk;
+            self.pending_off = 0;
+            self.pending_len = chunk_len;
+            self.pending_badge = badge;
+
+            if let Some(res) = self.feed_pending_chunk(out) {
+                return Some(res);
+            }
+        }
+    }
+}
+
+impl<const N: usize> Default for IpcLogAssembler<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Yield the current thread's remaining time slice.
 pub fn yield_now() -> Result<u64, SysError> {
     raw_syscall(SyscallNumber::Yield, 0, 0, 0, 0)
@@ -224,14 +424,13 @@ pub fn read_cycles() -> Result<u64, SysError> {
 }
 
 /// Register an EL0 supervisor recovery entry point invoked if an EL0 hardware fault occurs.
+///
+/// The kernel resets `SP_EL0` to the 16-byte-aligned top of `SUPERVISOR_RECOVERY_STACK`
+/// before entering `handler`. Safe for single-threaded EL0 processes because any prior frame
+/// on the recovery stack is abandoned by the kernel on fault re-entry.
 pub fn set_fault_handler(handler: extern "C" fn() -> !) -> Result<(), SysError> {
-    // SAFETY: Computes the 16-byte-aligned top address of the static EL0 recovery stack.
-    let stack_top = unsafe {
-        SUPERVISOR_RECOVERY_STACK
-            .get()
-            .cast::<u8>()
-            .add(RECOVERY_STACK_SIZE) as u64
-    };
+    let stack_top =
+        (&raw const SUPERVISOR_RECOVERY_STACK as usize).wrapping_add(RECOVERY_STACK_SIZE) as u64;
     raw_syscall(
         SyscallNumber::SetFaultHandler,
         handler as *const () as u64,
@@ -423,7 +622,9 @@ pub fn cap_grant(
 
 /// Deliberately trigger an EL0 hardware invalid-instruction exception (`udf #0`) for crash-isolation testing.
 pub fn trigger_user_fault() -> ! {
-    // SAFETY: Intentionally executes `udf #0` in EL0 for crash-isolation verification.
+    // SAFETY: `udf #0` is a permanently undefined AArch64 instruction that deterministically raises
+    // a synchronous EL0 exception trapped by `VBAR_EL1`, which either redirects execution to the
+    // registered fault handler or terminates the process; control never returns (`noreturn`).
     unsafe {
         asm!("udf #0", options(noreturn));
     }
@@ -464,7 +665,13 @@ pub fn sys_info() -> SysInfo {
     if cached != SYS_INFO_UNCACHED {
         return decode_sys_info(cached);
     }
-    match raw_syscall(SyscallNumber::SysInfo, CapId::BOOTSTRAP_POWER.raw(), 0, 0, 0) {
+    match raw_syscall(
+        SyscallNumber::SysInfo,
+        CapId::BOOTSTRAP_POWER.raw(),
+        0,
+        0,
+        0,
+    ) {
         Ok(raw) => {
             SYS_INFO_CACHE.store(raw, Ordering::Relaxed);
             decode_sys_info(raw)
@@ -490,6 +697,8 @@ pub fn exit(code: QemuExitCode) -> ! {
 #[macro_export]
 macro_rules! entry {
     ($path:path) => {
+        // SAFETY: `_start` is the unique ELF entry point required by `linker-aarch64.ld`
+        // (`ENTRY(_start)`); each userspace binary invokes `entry!` exactly once.
         #[unsafe(no_mangle)]
         pub extern "C" fn _start() -> ! {
             let main_fn: fn() -> ! = $path;

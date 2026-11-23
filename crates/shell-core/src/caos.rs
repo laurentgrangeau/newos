@@ -7,12 +7,21 @@
 //!   atomic rollback (`prev_hash`) and irreversible capability attenuation (`seal` -> read-only).
 //! - No global `/` namespace, no `cd`, no `../../` path traversal, no ambient authority.
 
+use core::num::{NonZeroU8, NonZeroU64};
 use newos_abi::Rights;
 
 pub const MAX_OBJECTS: usize = 24;
 pub const MAX_REFS: usize = 16;
 pub const MAX_BLOB_SIZE: usize = 128;
 pub const MAX_REF_NAME: usize = 24;
+
+const _: () = {
+    assert!(MAX_OBJECTS <= u8::MAX as usize);
+    assert!(MAX_OBJECTS <= 32);
+    assert!(MAX_REFS <= u8::MAX as usize);
+    assert!(MAX_BLOB_SIZE <= u8::MAX as usize);
+    assert!(MAX_REF_NAME <= u8::MAX as usize);
+};
 
 /// Deterministic 64-bit content address (FNV-1a 64-bit + avalanche finalizer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -72,53 +81,29 @@ const GUIDE_BYTES: &[u8] =
 const MOTD_HASH: ObjHash = ObjHash::hash_bytes(MOTD_BYTES);
 const GUIDE_HASH: ObjHash = ObjHash::hash_bytes(GUIDE_BYTES);
 
-#[derive(Clone, Copy)]
-struct BlobSlot {
-    hash: ObjHash,
-    data: [u8; MAX_BLOB_SIZE],
-    size: usize,
-}
-
-impl BlobSlot {
-    const EMPTY: Self = Self {
-        hash: ObjHash::ZERO,
-        data: [0; MAX_BLOB_SIZE],
-        size: 0,
-    };
-
-    const fn from_static(hash: ObjHash, bytes: &[u8]) -> Self {
-        let mut data = [0u8; MAX_BLOB_SIZE];
-        let mut i = 0;
-        while i < bytes.len() {
-            data[i] = bytes[i];
-            i += 1;
-        }
-        Self {
-            hash,
-            data,
-            size: bytes.len(),
-        }
+const fn pad_blob(bytes: &[u8]) -> [u8; MAX_BLOB_SIZE] {
+    let mut data = [0u8; MAX_BLOB_SIZE];
+    let mut i = 0;
+    while i < bytes.len() {
+        data[i] = bytes[i];
+        i += 1;
     }
+    data
 }
 
 #[derive(Clone, Copy)]
 struct RefSlot {
-    name: [u8; MAX_REF_NAME],
-    name_len: usize,
     target: ObjHash,
-    prev: Option<ObjHash>,
+    prev: Option<NonZeroU64>,
+    name: [u8; MAX_REF_NAME],
+    name_len: NonZeroU8,
     rights: Rights,
 }
 
-impl RefSlot {
-    const EMPTY: Self = Self {
-        name: [0; MAX_REF_NAME],
-        name_len: 0,
-        target: ObjHash::ZERO,
-        prev: None,
-        rights: Rights::NONE,
-    };
+const _: () =
+    assert!(core::mem::size_of::<RefSlot>() == 48 && core::mem::size_of::<Option<RefSlot>>() == 48);
 
+impl RefSlot {
     const fn sealed_static(raw_name: &[u8], target: ObjHash) -> Self {
         let mut name = [0u8; MAX_REF_NAME];
         let mut i = 0;
@@ -126,25 +111,43 @@ impl RefSlot {
             name[i] = raw_name[i];
             i += 1;
         }
+        let name_len = match NonZeroU8::new(raw_name.len() as u8) {
+            Some(n) => n,
+            None => NonZeroU8::MIN,
+        };
         Self {
-            name,
-            name_len: raw_name.len(),
             target,
             prev: None,
+            name,
+            name_len,
             rights: Rights::READ,
         }
     }
 
     #[inline]
     fn name_bytes(&self) -> &[u8] {
-        &self.name[..self.name_len]
+        &self.name[..self.name_len.get() as usize]
+    }
+
+    #[inline]
+    fn prev_hash(&self) -> Option<ObjHash> {
+        self.prev.map(|nz| ObjHash(nz.get()))
     }
 }
 
-const BOOT_MOTD_BLOB: BlobSlot = BlobSlot::from_static(MOTD_HASH, MOTD_BYTES);
-const BOOT_GUIDE_BLOB: BlobSlot = BlobSlot::from_static(GUIDE_HASH, GUIDE_BYTES);
+const BOOT_MOTD_DATA: [u8; MAX_BLOB_SIZE] = pad_blob(MOTD_BYTES);
+const BOOT_GUIDE_DATA: [u8; MAX_BLOB_SIZE] = pad_blob(GUIDE_BYTES);
 const BOOT_MOTD_REF: RefSlot = RefSlot::sealed_static(b"motd", MOTD_HASH);
 const BOOT_GUIDE_REF: RefSlot = RefSlot::sealed_static(b"guide", GUIDE_HASH);
+
+#[inline]
+fn is_valid_ref_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_REF_NAME
+        && !name
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || c == '@')
+}
 
 /// Snapshot metadata for an immutable object (emitted directly as a typed shell `Record`).
 #[derive(Clone, Copy)]
@@ -156,25 +159,43 @@ pub struct ObjectMeta {
 /// Snapshot metadata for a capability-gated named Ref (emitted as a typed shell `Record`).
 #[derive(Clone, Copy)]
 pub struct RefMeta {
-    pub name: [u8; MAX_REF_NAME],
-    pub name_len: usize,
     pub target: ObjHash,
-    pub prev: Option<ObjHash>,
+    pub prev_hash: Option<NonZeroU64>,
+    pub name: [u8; MAX_REF_NAME],
+    pub name_len: u8,
     pub writable: bool,
 }
 
+const _: () = assert!(core::mem::size_of::<RefMeta>() == 48);
+
 impl RefMeta {
+    #[inline]
     pub fn name_str(&self) -> &str {
-        core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("?")
+        core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("?")
+    }
+
+    #[inline]
+    pub const fn prev(&self) -> Option<ObjHash> {
+        match self.prev_hash {
+            Some(nz) => Some(ObjHash(nz.get())),
+            None => None,
+        }
     }
 }
 
 /// EL0 Content-Addressed Object Store (`no_alloc`, `#![forbid(unsafe_code)]`).
+///
+/// Structure-of-Arrays (SoA) layout concentrates all live `ObjHash` entries into 3 cache lines
+/// (`hashes: [ObjHash; 24]`) and uses `Option`-backed lazy initialization to avoid zeroing
+/// unused 128-byte blob payloads in `ObjectStore::new()`.
 pub struct ObjectStore {
-    blobs: [BlobSlot; MAX_OBJECTS],
-    refs: [RefSlot; MAX_REFS],
-    object_count: usize,
-    ref_count: usize,
+    hashes: [ObjHash; MAX_OBJECTS],
+    refs: [Option<RefSlot>; MAX_REFS],
+    used_mask: u32,
+    object_count: u8,
+    ref_count: u8,
+    sizes: [u8; MAX_OBJECTS],
+    data: [Option<[u8; MAX_BLOB_SIZE]>; MAX_OBJECTS],
 }
 
 impl Default for ObjectStore {
@@ -184,21 +205,45 @@ impl Default for ObjectStore {
 }
 
 impl ObjectStore {
-    pub fn new() -> Self {
-        let mut blobs = [BlobSlot::EMPTY; MAX_OBJECTS];
-        blobs[0] = BOOT_MOTD_BLOB;
-        blobs[1] = BOOT_GUIDE_BLOB;
+    pub const fn new() -> Self {
+        let mut hashes = [ObjHash::ZERO; MAX_OBJECTS];
+        hashes[0] = MOTD_HASH;
+        hashes[1] = GUIDE_HASH;
 
-        let mut refs = [RefSlot::EMPTY; MAX_REFS];
-        refs[0] = BOOT_MOTD_REF; // `@motd` is sealed read-only at boot!
-        refs[1] = BOOT_GUIDE_REF;
+        let mut sizes = [0u8; MAX_OBJECTS];
+        sizes[0] = MOTD_BYTES.len() as u8;
+        sizes[1] = GUIDE_BYTES.len() as u8;
+
+        let mut data = [None; MAX_OBJECTS];
+        data[0] = Some(BOOT_MOTD_DATA);
+        data[1] = Some(BOOT_GUIDE_DATA);
+
+        let mut refs = [None; MAX_REFS];
+        refs[0] = Some(BOOT_MOTD_REF); // `@motd` is sealed read-only at boot!
+        refs[1] = Some(BOOT_GUIDE_REF);
 
         Self {
-            blobs,
+            hashes,
             refs,
+            used_mask: 0b11,
             object_count: 2,
             ref_count: 2,
+            sizes,
+            data,
         }
+    }
+
+    #[inline]
+    fn find_blob_idx(&self, hash: ObjHash) -> Option<usize> {
+        let mut mask = self.used_mask;
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if self.hashes[idx] == hash {
+                return Some(idx);
+            }
+        }
+        None
     }
 
     /// Store an immutable byte slice; automatically deduplicates identical content.
@@ -208,42 +253,44 @@ impl ObjectStore {
         }
         let hash = ObjHash::hash_bytes(bytes);
 
-        // Content deduplication & collision rejection: single-pass bounded scan over live packed blobs.
-        for slot in &self.blobs[..self.object_count] {
-            if slot.hash == hash {
-                if &slot.data[..slot.size] == bytes {
-                    return Ok(hash);
-                }
-                return Err(StoreError::HashCollision);
+        // Content deduplication & collision rejection: L1-dense scan over `hashes`.
+        if let Some(idx) = self.find_blob_idx(hash) {
+            if let Some(buf) = &self.data[idx]
+                && &buf[..self.sizes[idx] as usize] == bytes
+            {
+                return Ok(hash);
             }
+            return Err(StoreError::HashCollision);
         }
 
-        if self.object_count >= MAX_OBJECTS {
+        if self.object_count as usize >= MAX_OBJECTS {
             return Err(StoreError::NoSpace);
         }
-        let slot = &mut self.blobs[self.object_count];
-        slot.hash = hash;
-        slot.data[..bytes.len()].copy_from_slice(bytes);
-        slot.size = bytes.len();
+        let idx = (!self.used_mask).trailing_zeros() as usize;
+        if idx >= MAX_OBJECTS {
+            return Err(StoreError::NoSpace);
+        }
+        self.hashes[idx] = hash;
+        self.sizes[idx] = bytes.len() as u8;
+        let buf = self.data[idx].insert([0u8; MAX_BLOB_SIZE]);
+        buf[..bytes.len()].copy_from_slice(bytes);
+        self.used_mask |= 1u32 << idx;
         self.object_count += 1;
         Ok(hash)
     }
 
     /// Lock-free immutable lookup by `ObjHash`.
     pub fn get_by_hash(&self, hash: ObjHash) -> Result<&[u8], StoreError> {
-        for slot in &self.blobs[..self.object_count] {
-            if slot.hash == hash {
-                return Ok(&slot.data[..slot.size]);
-            }
-        }
-        Err(StoreError::NotFound)
+        let idx = self.find_blob_idx(hash).ok_or(StoreError::NotFound)?;
+        let buf = self.data[idx].as_ref().ok_or(StoreError::NotFound)?;
+        Ok(&buf[..self.sizes[idx] as usize])
     }
 
     /// Resolve `@ref_name` or `obj:<hex>` to `(ObjHash, &[u8])`.
     pub fn get_any(&self, spec: &str) -> Result<(ObjHash, &[u8]), StoreError> {
         if let Some(name) = spec.strip_prefix('@') {
             let name_bytes = name.as_bytes();
-            for r in &self.refs[..self.ref_count] {
+            for r in self.refs[..self.ref_count as usize].iter().flatten() {
                 if r.name_bytes() == name_bytes {
                     if !r.rights.contains(Rights::READ) {
                         return Err(StoreError::ReadOnly);
@@ -261,20 +308,21 @@ impl ObjectStore {
     /// Atomically bind or update `@name -> target` (recording `prev` for instant rollback).
     pub fn set_ref(&mut self, raw_name: &str, target: ObjHash) -> Result<(), StoreError> {
         let name = raw_name.strip_prefix('@').unwrap_or(raw_name);
-        if name.is_empty() || name.len() > MAX_REF_NAME {
+        if !is_valid_ref_name(name) {
             return Err(StoreError::InvalidName);
         }
         let _ = self.get_by_hash(target)?;
 
         // Update existing ref if writable (single-pass bounded scan over live packed refs)
         let name_bytes = name.as_bytes();
-        for r in &mut self.refs[..self.ref_count] {
+        let ref_count = self.ref_count as usize;
+        for r in self.refs[..ref_count].iter_mut().flatten() {
             if r.name_bytes() == name_bytes {
                 if !r.rights.contains(Rights::WRITE) {
                     return Err(StoreError::ReadOnly);
                 }
                 if r.target != target {
-                    r.prev = Some(r.target);
+                    r.prev = NonZeroU64::new(r.target.0);
                     r.target = target;
                 }
                 return Ok(());
@@ -282,15 +330,19 @@ impl ObjectStore {
         }
 
         // Create new ref with READ | WRITE in O(1)
-        if self.ref_count >= MAX_REFS {
+        if ref_count >= MAX_REFS {
             return Err(StoreError::NoSpace);
         }
-        let r = &mut self.refs[self.ref_count];
-        r.name[..name_bytes.len()].copy_from_slice(name_bytes);
-        r.name_len = name_bytes.len();
-        r.target = target;
-        r.prev = None;
-        r.rights = Rights::READ.union(Rights::WRITE);
+        let name_len = NonZeroU8::new(name_bytes.len() as u8).ok_or(StoreError::InvalidName)?;
+        let mut slot_name = [0u8; MAX_REF_NAME];
+        slot_name[..name_bytes.len()].copy_from_slice(name_bytes);
+        self.refs[ref_count] = Some(RefSlot {
+            target,
+            prev: None,
+            name: slot_name,
+            name_len,
+            rights: Rights::READ.union(Rights::WRITE),
+        });
         self.ref_count += 1;
         Ok(())
     }
@@ -299,7 +351,7 @@ impl ObjectStore {
     pub fn seal_ref(&mut self, raw_name: &str) -> Result<(), StoreError> {
         let name = raw_name.strip_prefix('@').unwrap_or(raw_name);
         let name_bytes = name.as_bytes();
-        for r in &mut self.refs[..self.ref_count] {
+        for r in self.refs[..self.ref_count as usize].iter_mut().flatten() {
             if r.name_bytes() == name_bytes {
                 r.rights = r.rights.attenuate(Rights::READ);
                 return Ok(());
@@ -312,12 +364,12 @@ impl ObjectStore {
     pub fn rollback_ref(&mut self, raw_name: &str) -> Result<ObjHash, StoreError> {
         let name = raw_name.strip_prefix('@').unwrap_or(raw_name);
         let name_bytes = name.as_bytes();
-        for r in &mut self.refs[..self.ref_count] {
+        for r in self.refs[..self.ref_count as usize].iter_mut().flatten() {
             if r.name_bytes() == name_bytes {
                 if !r.rights.contains(Rights::WRITE) {
                     return Err(StoreError::ReadOnly);
                 }
-                let prev = r.prev.take().ok_or(StoreError::NoPreviousVersion)?;
+                let prev = ObjHash(r.prev.take().ok_or(StoreError::NoPreviousVersion)?.get());
                 r.target = prev;
                 return Ok(prev);
             }
@@ -327,53 +379,66 @@ impl ObjectStore {
 
     #[inline]
     pub fn object_count(&self) -> usize {
-        self.object_count
+        self.object_count as usize
     }
 
+    #[inline]
     pub fn for_each_object(&self, mut f: impl FnMut(ObjectMeta)) {
-        for b in &self.blobs[..self.object_count] {
-            f(ObjectMeta {
-                hash: b.hash,
-                size: b.size,
-            });
+        let mut mask = self.used_mask & ((1u32 << MAX_OBJECTS) - 1);
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if idx < MAX_OBJECTS {
+                f(ObjectMeta {
+                    hash: self.hashes[idx],
+                    size: self.sizes[idx] as usize,
+                });
+            }
         }
     }
 
+    #[inline]
     pub fn for_each_ref(&self, mut f: impl FnMut(RefMeta)) {
-        for r in &self.refs[..self.ref_count] {
+        for r in self.refs[..self.ref_count as usize].iter().flatten() {
             f(RefMeta {
-                name: r.name,
-                name_len: r.name_len,
                 target: r.target,
-                prev: r.prev,
+                prev_hash: r.prev,
+                name: r.name,
+                name_len: r.name_len.get(),
                 writable: r.rights.contains(Rights::WRITE),
             });
         }
     }
 
     pub fn collect_objects(&self, out: &mut [Option<ObjectMeta>]) -> usize {
-        let n = self.object_count.min(out.len());
-        for (dst, b) in out[..n].iter_mut().zip(&self.blobs[..n]) {
-            *dst = Some(ObjectMeta {
-                hash: b.hash,
-                size: b.size,
+        let mut n = 0usize;
+        let mut mask = self.used_mask;
+        while mask != 0 && n < out.len() {
+            let idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            out[n] = Some(ObjectMeta {
+                hash: self.hashes[idx],
+                size: self.sizes[idx] as usize,
             });
+            n += 1;
         }
         n
     }
 
     pub fn collect_refs(&self, out: &mut [Option<RefMeta>]) -> usize {
-        let n = self.ref_count.min(out.len());
-        for (dst, r) in out[..n].iter_mut().zip(&self.refs[..n]) {
-            *dst = Some(RefMeta {
-                name: r.name,
-                name_len: r.name_len,
+        let n = (self.ref_count as usize).min(out.len());
+        let mut count = 0usize;
+        for r in self.refs[..n].iter().flatten() {
+            out[count] = Some(RefMeta {
                 target: r.target,
-                prev: r.prev,
+                prev_hash: r.prev,
+                name: r.name,
+                name_len: r.name_len.get(),
                 writable: r.rights.contains(Rights::WRITE),
             });
+            count += 1;
         }
-        n
+        count
     }
 
     /// Mark-and-sweep garbage collection: reclaim all immutable blobs not reachable
@@ -381,25 +446,27 @@ impl ObjectStore {
     ///
     /// Returns the number of reclaimed object slots.
     pub fn gc(&mut self) -> usize {
-        let mut write_idx = 0usize;
-        let orig_count = self.object_count;
-        for read_idx in 0..orig_count {
-            let hash = self.blobs[read_idx].hash;
-            let reachable = self.refs[..self.ref_count]
+        let mut reclaimed = 0usize;
+        let mut mask = self.used_mask;
+        let ref_count = self.ref_count as usize;
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let hash = self.hashes[idx];
+            let reachable = self.refs[..ref_count]
                 .iter()
-                .any(|r| r.target == hash || r.prev == Some(hash));
-            if reachable {
-                if write_idx != read_idx {
-                    self.blobs[write_idx] = self.blobs[read_idx];
-                }
-                write_idx += 1;
+                .flatten()
+                .any(|r| r.target == hash || r.prev_hash() == Some(hash));
+            if !reachable {
+                self.used_mask &= !(1u32 << idx);
+                self.hashes[idx] = ObjHash::ZERO;
+                self.sizes[idx] = 0;
+                self.data[idx] = None;
+                reclaimed += 1;
             }
         }
-        for slot in &mut self.blobs[write_idx..orig_count] {
-            *slot = BlobSlot::EMPTY;
-        }
-        self.object_count = write_idx;
-        orig_count - write_idx
+        self.object_count -= reclaimed as u8;
+        reclaimed
     }
 
     /// Serialize the entire CAOS store into a crash-safe, checksummed binary snapshot
@@ -418,19 +485,24 @@ impl ObjectStore {
 
         // Header: magic "CAOS" (4B) + version u8 (1B) + object_count u8 (1B) + ref_count u8 (1B) + pad (1B)
         push(b"CAOS")?;
-        push(&[1u8, self.object_count as u8, self.ref_count as u8, 0u8])?;
+        push(&[1u8, self.object_count, self.ref_count, 0u8])?;
 
-        for b in &self.blobs[..self.object_count] {
-            push(&b.hash.0.to_le_bytes())?;
-            push(&(b.size as u16).to_le_bytes())?;
-            push(&b.data[..b.size])?;
+        let mut mask = self.used_mask;
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let size = self.sizes[idx] as usize;
+            let data = self.data[idx].as_ref().ok_or(StoreError::CorruptSnapshot)?;
+            push(&self.hashes[idx].0.to_le_bytes())?;
+            push(&(size as u16).to_le_bytes())?;
+            push(&data[..size])?;
         }
 
-        for r in &self.refs[..self.ref_count] {
-            push(&[r.name_len as u8, r.rights.bits()])?;
-            push(&r.name[..r.name_len])?;
+        for r in self.refs[..self.ref_count as usize].iter().flatten() {
+            push(&[r.name_len.get(), r.rights.bits()])?;
+            push(r.name_bytes())?;
             push(&r.target.0.to_le_bytes())?;
-            push(&r.prev.map_or(0u64, |p| p.0).to_le_bytes())?;
+            push(&r.prev.map_or(0u64, NonZeroU64::get).to_le_bytes())?;
         }
 
         drop(push);
@@ -445,7 +517,7 @@ impl ObjectStore {
 
     /// Verify checksum and restore an `ObjectStore` from a serialized binary snapshot.
     pub fn decode_snapshot(bytes: &[u8]) -> Result<Self, StoreError> {
-        if bytes.len() < 16 || &bytes[0..4] != b"CAOS" || bytes[4] != 1 {
+        if bytes.len() < 16 || &bytes[0..4] != b"CAOS" || bytes[4] != 1 || bytes[7] != 0 {
             return Err(StoreError::CorruptSnapshot);
         }
         let body_len = bytes.len() - 8;
@@ -466,9 +538,7 @@ impl ObjectStore {
 
         let mut pos = 8usize;
         let mut take = |len: usize| -> Result<&[u8], StoreError> {
-            let end = pos
-                .checked_add(len)
-                .ok_or(StoreError::CorruptSnapshot)?;
+            let end = pos.checked_add(len).ok_or(StoreError::CorruptSnapshot)?;
             if end > body_len {
                 return Err(StoreError::CorruptSnapshot);
             }
@@ -477,11 +547,19 @@ impl ObjectStore {
             Ok(slice)
         };
 
+        let used_mask = if obj_count == 0 {
+            0
+        } else {
+            (1u32 << obj_count) - 1
+        };
         let mut store = Self {
-            blobs: [BlobSlot::EMPTY; MAX_OBJECTS],
-            object_count: obj_count,
-            refs: [RefSlot::EMPTY; MAX_REFS],
-            ref_count,
+            hashes: [ObjHash::ZERO; MAX_OBJECTS],
+            refs: [None; MAX_REFS],
+            used_mask,
+            object_count: obj_count as u8,
+            ref_count: ref_count as u8,
+            sizes: [0u8; MAX_OBJECTS],
+            data: [None; MAX_OBJECTS],
         };
 
         for i in 0..obj_count {
@@ -503,28 +581,37 @@ impl ObjectStore {
                 return Err(StoreError::CorruptSnapshot);
             }
             // Reject duplicate blob hashes in snapshot (`M-4`).
-            if store.blobs[..i].iter().any(|prev| prev.hash == hash) {
+            if store.hashes[..i].contains(&hash) {
                 return Err(StoreError::CorruptSnapshot);
             }
-            let b = &mut store.blobs[i];
-            b.hash = hash;
-            b.size = size;
-            b.data[..size].copy_from_slice(data);
+            store.hashes[i] = hash;
+            store.sizes[i] = size as u8;
+            let buf = store.data[i].insert([0u8; MAX_BLOB_SIZE]);
+            buf[..size].copy_from_slice(data);
         }
 
         for i in 0..ref_count {
             let hdr = take(2)?;
             let name_len = hdr[0] as usize;
+            if (hdr[1] & !Rights::ALL.bits()) != 0 {
+                return Err(StoreError::CorruptSnapshot);
+            }
             let rights = Rights::from_bits_truncate(hdr[1]);
-            if name_len == 0 || name_len > MAX_REF_NAME {
+            let name_len_nz = NonZeroU8::new(hdr[0]).ok_or(StoreError::CorruptSnapshot)?;
+            if name_len > MAX_REF_NAME {
                 return Err(StoreError::CorruptSnapshot);
             }
             let name = take(name_len)?;
-            if core::str::from_utf8(name).is_err() {
+            let name_str = core::str::from_utf8(name).map_err(|_| StoreError::CorruptSnapshot)?;
+            if !is_valid_ref_name(name_str) {
                 return Err(StoreError::CorruptSnapshot);
             }
             // Reject duplicate ref names (`M-4`).
-            if store.refs[..i].iter().any(|prev| prev.name_bytes() == name) {
+            if store.refs[..i]
+                .iter()
+                .flatten()
+                .any(|prev| prev.name_bytes() == name)
+            {
                 return Err(StoreError::CorruptSnapshot);
             }
             // Reject tampered snapshots that unseal immutable boot refs (`@motd`, `@guide`).
@@ -541,26 +628,25 @@ impl ObjectStore {
                     .try_into()
                     .map_err(|_| StoreError::CorruptSnapshot)?,
             );
-            let prev = if prev_raw == 0 {
-                None
-            } else {
-                Some(ObjHash(prev_raw))
-            };
-            // Verify referential integrity: `target` and `prev` must exist in `store.blobs` (`M-4`).
-            if !store.blobs[..obj_count].iter().any(|b| b.hash == target) {
+            let prev = NonZeroU64::new(prev_raw);
+            // Verify referential integrity: `target` and `prev` must exist in `store.hashes` (`M-4`).
+            if !store.hashes[..obj_count].contains(&target) {
                 return Err(StoreError::CorruptSnapshot);
             }
             if let Some(p) = prev
-                && !store.blobs[..obj_count].iter().any(|b| b.hash == p)
+                && !store.hashes[..obj_count].contains(&ObjHash(p.get()))
             {
                 return Err(StoreError::CorruptSnapshot);
             }
-            let r = &mut store.refs[i];
-            r.name[..name_len].copy_from_slice(name);
-            r.name_len = name_len;
-            r.rights = rights;
-            r.target = target;
-            r.prev = prev;
+            let mut slot_name = [0u8; MAX_REF_NAME];
+            slot_name[..name_len].copy_from_slice(name);
+            store.refs[i] = Some(RefSlot {
+                target,
+                prev,
+                name: slot_name,
+                name_len: name_len_nz,
+                rights,
+            });
         }
 
         if pos != body_len {
@@ -628,7 +714,10 @@ mod tests {
         );
 
         store.set_ref("@cfg", h1).unwrap();
-        assert_eq!(store.rollback_ref("@cfg"), Err(StoreError::NoPreviousVersion));
+        assert_eq!(
+            store.rollback_ref("@cfg"),
+            Err(StoreError::NoPreviousVersion)
+        );
 
         store.set_ref("@cfg", h2).unwrap();
         assert_eq!(store.get_any("@cfg").unwrap(), (h2, b"v2".as_slice()));
@@ -636,7 +725,10 @@ mod tests {
         let rolled = store.rollback_ref("@cfg").unwrap();
         assert_eq!(rolled, h1);
         assert_eq!(store.get_any("@cfg").unwrap(), (h1, b"v1".as_slice()));
-        assert_eq!(store.rollback_ref("@cfg"), Err(StoreError::NoPreviousVersion));
+        assert_eq!(
+            store.rollback_ref("@cfg"),
+            Err(StoreError::NoPreviousVersion)
+        );
 
         store.seal_ref("@cfg").unwrap();
         assert_eq!(store.set_ref("@cfg", h2), Err(StoreError::ReadOnly));
@@ -763,12 +855,292 @@ mod tests {
 
         // Craft a checksummed snapshot that tries to unseal `@motd` to WRITE.
         let mut store = ObjectStore::new();
-        store.refs[0].rights = Rights::READ.union(Rights::WRITE);
+        store.refs[0].as_mut().unwrap().rights = Rights::READ.union(Rights::WRITE);
         let mut buf = [0u8; 4096];
         let written = store.encode_snapshot(&mut buf).unwrap();
         assert!(matches!(
             ObjectStore::decode_snapshot(&buf[..written]),
             Err(StoreError::CorruptSnapshot)
         ));
+    }
+
+    fn finalize_snapshot(raw: &mut [u8], body_len: usize) -> usize {
+        let crc = ObjHash::hash_bytes(&raw[..body_len]);
+        raw[body_len..body_len + 8].copy_from_slice(&crc.0.to_le_bytes());
+        body_len + 8
+    }
+
+    #[test]
+    fn set_ref_rejects_invalid_characters_whitespace_and_embedded_at() {
+        let mut store = ObjectStore::new();
+        let h = store.put(b"payload").unwrap();
+
+        let invalid_names = [
+            "",
+            "@",
+            "@@foo",
+            "foo@bar",
+            "foo bar",
+            "foo\tbar",
+            "foo\nbar",
+            "foo\rbar",
+            "foo\0bar",
+            "foo\x1bbar",
+            "foo\x7fbar",
+            "abcdefghijklmnopqrstuvwxy", // 25 bytes = MAX_REF_NAME + 1
+        ];
+        for bad in invalid_names {
+            assert_eq!(
+                store.set_ref(bad, h),
+                Err(StoreError::InvalidName),
+                "expected InvalidName for {bad:?}"
+            );
+        }
+
+        // Exact boundary length (MAX_REF_NAME = 24 bytes) succeeds.
+        let max_name = "abcdefghijklmnopqrstuvwx";
+        assert_eq!(max_name.len(), MAX_REF_NAME);
+        assert_eq!(store.set_ref(max_name, h), Ok(()));
+        assert_eq!(
+            store.get_any("@abcdefghijklmnopqrstuvwx"),
+            Ok((h, &b"payload"[..]))
+        );
+    }
+
+    #[test]
+    fn decode_snapshot_rejects_nonzero_pad_byte_and_unknown_rights() {
+        let store = ObjectStore::new();
+        let mut buf = [0u8; 4096];
+        let written = store.encode_snapshot(&mut buf).unwrap();
+        let body_len = written - 8;
+
+        // Non-zero header pad byte at index 7 must be rejected even with valid checksum.
+        let mut bad_pad = buf;
+        bad_pad[7] = 1;
+        let len = finalize_snapshot(&mut bad_pad, body_len);
+        assert!(matches!(
+            ObjectStore::decode_snapshot(&bad_pad[..len]),
+            Err(StoreError::CorruptSnapshot)
+        ));
+
+        // Unknown rights bits in ref header must be rejected even with valid checksum.
+        for bad_bits in [Rights::READ.bits() | 0x80, 0x20, 0xFF] {
+            let mut raw = [0u8; 256];
+            let mut pos = 0usize;
+            let mut push = |b: &[u8]| {
+                raw[pos..pos + b.len()].copy_from_slice(b);
+                pos += b.len();
+            };
+            let blob = b"ok";
+            let hash = ObjHash::hash_bytes(blob);
+            push(b"CAOS");
+            push(&[1u8, 1u8, 1u8, 0u8]);
+            push(&hash.0.to_le_bytes());
+            push(&(blob.len() as u16).to_le_bytes());
+            push(blob);
+            push(&[4u8, bad_bits]);
+            push(b"note");
+            push(&hash.0.to_le_bytes());
+            push(&0u64.to_le_bytes());
+            drop(push);
+            let total = finalize_snapshot(&mut raw, pos);
+            assert!(
+                matches!(
+                    ObjectStore::decode_snapshot(&raw[..total]),
+                    Err(StoreError::CorruptSnapshot)
+                ),
+                "expected CorruptSnapshot for rights bits {bad_bits:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_snapshot_rejects_malformed_ref_names_and_boundary_counts() {
+        let blob = b"data";
+        let hash = ObjHash::hash_bytes(blob);
+
+        // Malformed ref names (control char, whitespace, embedded '@')
+        for bad_name in [b"a\x1bb".as_slice(), b"a b".as_slice(), b"a@b".as_slice()] {
+            let mut raw = [0u8; 256];
+            let mut pos = 0usize;
+            let mut push = |b: &[u8]| {
+                raw[pos..pos + b.len()].copy_from_slice(b);
+                pos += b.len();
+            };
+            push(b"CAOS");
+            push(&[1u8, 1u8, 1u8, 0u8]);
+            push(&hash.0.to_le_bytes());
+            push(&(blob.len() as u16).to_le_bytes());
+            push(blob);
+            push(&[bad_name.len() as u8, Rights::READ.bits()]);
+            push(bad_name);
+            push(&hash.0.to_le_bytes());
+            push(&0u64.to_le_bytes());
+            drop(push);
+            let total = finalize_snapshot(&mut raw, pos);
+            assert!(matches!(
+                ObjectStore::decode_snapshot(&raw[..total]),
+                Err(StoreError::CorruptSnapshot)
+            ));
+        }
+
+        // Truncated snapshot (< 16 bytes)
+        assert!(matches!(
+            ObjectStore::decode_snapshot(b"CAOS\x01\x00\x00\x00"),
+            Err(StoreError::CorruptSnapshot)
+        ));
+
+        // obj_count > MAX_OBJECTS and ref_count > MAX_REFS
+        for (oc, rc) in [(MAX_OBJECTS as u8 + 1, 0), (0, MAX_REFS as u8 + 1)] {
+            let mut raw = [0u8; 32];
+            raw[0..4].copy_from_slice(b"CAOS");
+            raw[4..8].copy_from_slice(&[1, oc, rc, 0]);
+            let total = finalize_snapshot(&mut raw, 8);
+            assert!(matches!(
+                ObjectStore::decode_snapshot(&raw[..total]),
+                Err(StoreError::CorruptSnapshot)
+            ));
+        }
+
+        // blob size > MAX_BLOB_SIZE
+        {
+            let mut raw = [0u8; 64];
+            raw[0..4].copy_from_slice(b"CAOS");
+            raw[4..8].copy_from_slice(&[1, 1, 0, 0]);
+            raw[8..16].copy_from_slice(&hash.0.to_le_bytes());
+            raw[16..18].copy_from_slice(&((MAX_BLOB_SIZE + 1) as u16).to_le_bytes());
+            let total = finalize_snapshot(&mut raw, 18);
+            assert!(matches!(
+                ObjectStore::decode_snapshot(&raw[..total]),
+                Err(StoreError::CorruptSnapshot)
+            ));
+        }
+
+        // Trailing extra bytes after valid body
+        {
+            let mut raw = [0u8; 64];
+            raw[0..4].copy_from_slice(b"CAOS");
+            raw[4..8].copy_from_slice(&[1, 0, 0, 0]);
+            raw[8] = 0x99;
+            let total = finalize_snapshot(&mut raw, 9);
+            assert!(matches!(
+                ObjectStore::decode_snapshot(&raw[..total]),
+                Err(StoreError::CorruptSnapshot)
+            ));
+        }
+
+        // Duplicate blob hash
+        {
+            let mut raw = [0u8; 128];
+            let mut pos = 0usize;
+            let mut push = |b: &[u8]| {
+                raw[pos..pos + b.len()].copy_from_slice(b);
+                pos += b.len();
+            };
+            push(b"CAOS");
+            push(&[1u8, 2u8, 0u8, 0u8]);
+            for _ in 0..2 {
+                push(&hash.0.to_le_bytes());
+                push(&(blob.len() as u16).to_le_bytes());
+                push(blob);
+            }
+            drop(push);
+            let total = finalize_snapshot(&mut raw, pos);
+            assert!(matches!(
+                ObjectStore::decode_snapshot(&raw[..total]),
+                Err(StoreError::CorruptSnapshot)
+            ));
+        }
+
+        // Duplicate ref name
+        {
+            let mut raw = [0u8; 128];
+            let mut pos = 0usize;
+            let mut push = |b: &[u8]| {
+                raw[pos..pos + b.len()].copy_from_slice(b);
+                pos += b.len();
+            };
+            push(b"CAOS");
+            push(&[1u8, 1u8, 2u8, 0u8]);
+            push(&hash.0.to_le_bytes());
+            push(&(blob.len() as u16).to_le_bytes());
+            push(blob);
+            for _ in 0..2 {
+                push(&[3u8, Rights::READ.bits()]);
+                push(b"dup");
+                push(&hash.0.to_le_bytes());
+                push(&0u64.to_le_bytes());
+            }
+            drop(push);
+            let total = finalize_snapshot(&mut raw, pos);
+            assert!(matches!(
+                ObjectStore::decode_snapshot(&raw[..total]),
+                Err(StoreError::CorruptSnapshot)
+            ));
+        }
+
+        // Dangling prev hash
+        {
+            let mut raw = [0u8; 128];
+            let mut pos = 0usize;
+            let mut push = |b: &[u8]| {
+                raw[pos..pos + b.len()].copy_from_slice(b);
+                pos += b.len();
+            };
+            push(b"CAOS");
+            push(&[1u8, 1u8, 1u8, 0u8]);
+            push(&hash.0.to_le_bytes());
+            push(&(blob.len() as u16).to_le_bytes());
+            push(blob);
+            push(&[4u8, Rights::READ.bits()]);
+            push(b"prev");
+            push(&hash.0.to_le_bytes());
+            push(&0xBAD0_C0DEu64.to_le_bytes());
+            drop(push);
+            let total = finalize_snapshot(&mut raw, pos);
+            assert!(matches!(
+                ObjectStore::decode_snapshot(&raw[..total]),
+                Err(StoreError::CorruptSnapshot)
+            ));
+        }
+    }
+
+    #[test]
+    fn blob_size_exact_boundary_and_gc_reuse_slots() {
+        let mut store = ObjectStore::new();
+        let exact = [0x55u8; MAX_BLOB_SIZE];
+        let h_exact = store.put(&exact).unwrap();
+        assert_eq!(store.get_by_hash(h_exact), Ok(&exact[..]));
+        assert_eq!(
+            store.put(&[0x55u8; MAX_BLOB_SIZE + 1]),
+            Err(StoreError::TooLarge)
+        );
+        store.set_ref("@exact", h_exact).unwrap();
+
+        // Fill all remaining slots up to MAX_OBJECTS.
+        let remaining = MAX_OBJECTS - store.object_count();
+        for i in 0..remaining {
+            let payload = [0xA0u8, i as u8, (i * 3) as u8];
+            store.put(&payload).unwrap();
+        }
+        assert_eq!(store.object_count(), MAX_OBJECTS);
+        assert_eq!(store.put(b"full"), Err(StoreError::NoSpace));
+
+        // GC reclaims all unreferenced blobs; freed `used_mask` slots can be reused up to MAX_OBJECTS.
+        assert_eq!(store.gc(), remaining);
+        assert_eq!(store.object_count(), 3); // motd, guide, exact
+        for i in 0..remaining {
+            let payload = [0xB0u8, i as u8, (i * 5) as u8];
+            let h = store.put(&payload).unwrap();
+            assert_eq!(store.get_by_hash(h), Ok(&payload[..]));
+        }
+        assert_eq!(store.object_count(), MAX_OBJECTS);
+
+        // Snapshot encode/decode roundtrip preserves full store accurately.
+        let mut snap = [0u8; 4096];
+        let n = store.encode_snapshot(&mut snap).unwrap();
+        let restored = ObjectStore::decode_snapshot(&snap[..n]).unwrap();
+        assert_eq!(restored.object_count(), MAX_OBJECTS);
+        assert_eq!(restored.get_any("@exact"), Ok((h_exact, &exact[..])));
     }
 }

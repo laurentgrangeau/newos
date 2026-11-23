@@ -13,7 +13,7 @@ use newos_abi::ring::SpscRing;
 use newos_abi::{CapId, QemuExitCode, SysError};
 use newos_net::{GemDma, NetConfig, NicKind, VirtioNetDma, VirtioTransport};
 use newos_shell_core::shell::{NullWriter, Record, RecordStream, Shell, ShellHost, SysInfo};
-use newos_user_rt::BufferedConsole;
+use newos_user_rt::{BufferedConsole, IpcLogAssembler};
 
 /// Static EL0 DMA rings & packet buffers (`Sync` via atomics, 100% `#![forbid(unsafe_code)]`).
 pub static VIRTIO_DMA: VirtioNetDma = VirtioNetDma::new();
@@ -41,13 +41,19 @@ impl VirtioTransport for CapVirtioTransport {
 struct InitShellHost {
     net_cfg: Option<NetConfig>,
     cached_nic: Option<Option<NicKind>>,
+    log_rx: IpcLogAssembler<256>,
 }
 
 impl InitShellHost {
     const fn new() -> Self {
+        Self::with_log_rx(IpcLogAssembler::new())
+    }
+
+    const fn with_log_rx(log_rx: IpcLogAssembler<256>) -> Self {
         Self {
             net_cfg: None,
             cached_nic: None,
+            log_rx,
         }
     }
 
@@ -55,9 +61,8 @@ impl InitShellHost {
         if let Some(cached) = self.cached_nic {
             return cached;
         }
-        let nic = newos_net::probe_nic(|off| {
-            newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, off)
-        });
+        let nic =
+            newos_net::probe_nic(|off| newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, off));
         self.cached_nic = Some(nic);
         nic
     }
@@ -75,44 +80,41 @@ impl InitShellHost {
             .unwrap_or([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
         if let Some(n) = nic {
             match subcmd {
-                "dhcp" => match newos_net::live_dhcp_v4(
-                    CapVirtioTransport,
-                    n,
-                    &VIRTIO_DMA,
-                    &GEM_DMA,
-                ) {
-                    Ok(cfg) => {
-                        self.net_cfg = Some(cfg);
-                        let gw = cfg.gateway.unwrap_or([0; 4]);
-                        let dns = cfg.dns.unwrap_or([0; 4]);
-                        let _ = writeln!(
-                            out,
-                            "net dhcp ({}): ip={}.{}.{}.{}/{}, gw={}.{}.{}.{}, dns={}.{}.{}.{}",
-                            n.driver_name(),
-                            cfg.ip[0],
-                            cfg.ip[1],
-                            cfg.ip[2],
-                            cfg.ip[3],
-                            cfg.prefix_len,
-                            gw[0],
-                            gw[1],
-                            gw[2],
-                            gw[3],
-                            dns[0],
-                            dns[1],
-                            dns[2],
-                            dns[3],
-                        );
-                        stream.push(Record::Metric {
-                            label: "dhcp.prefix",
-                            value: u64::from(cfg.prefix_len),
-                            unit: "bits (IPv4 leased)",
-                        });
+                "dhcp" => {
+                    match newos_net::live_dhcp_v4(CapVirtioTransport, n, &VIRTIO_DMA, &GEM_DMA) {
+                        Ok(cfg) => {
+                            self.net_cfg = Some(cfg);
+                            let gw = cfg.gateway.unwrap_or([0; 4]);
+                            let dns = cfg.dns.unwrap_or([0; 4]);
+                            let _ = writeln!(
+                                out,
+                                "net dhcp ({}): ip={}.{}.{}.{}/{}, gw={}.{}.{}.{}, dns={}.{}.{}.{}",
+                                n.driver_name(),
+                                cfg.ip[0],
+                                cfg.ip[1],
+                                cfg.ip[2],
+                                cfg.ip[3],
+                                cfg.prefix_len,
+                                gw[0],
+                                gw[1],
+                                gw[2],
+                                gw[3],
+                                dns[0],
+                                dns[1],
+                                dns[2],
+                                dns[3],
+                            );
+                            stream.push(Record::Metric {
+                                label: "dhcp.prefix",
+                                value: u64::from(cfg.prefix_len),
+                                unit: "bits (IPv4 leased)",
+                            });
+                        }
+                        Err(e) => {
+                            let _ = writeln!(out, "net dhcp: {e}");
+                        }
                     }
-                    Err(e) => {
-                        let _ = writeln!(out, "net dhcp: {e}");
-                    }
-                },
+                }
                 "ping" => {
                     let cfg = self.net_cfg.unwrap_or(NetConfig::QEMU_DEFAULT);
                     let target = match arg {
@@ -201,11 +203,8 @@ impl InitShellHost {
                         &GEM_DMA,
                     ) {
                         Ok(ip) => {
-                            let _ = writeln!(
-                                out,
-                                "{host} -> {}.{}.{}.{}",
-                                ip[0], ip[1], ip[2], ip[3]
-                            );
+                            let _ =
+                                writeln!(out, "{host} -> {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
                             stream.push(Record::Metric {
                                 label: "dns.resolved",
                                 value: u64::from(u32::from_be_bytes(ip)),
@@ -340,17 +339,28 @@ impl ShellHost for InitShellHost {
             let mut sink = NullWriter;
             self.handle_net_with(subcmd, arg, stream, &mut sink);
         } else {
-            let mut out = BufferedConsole::<256>::new();
+            let mut out = BufferedConsole::<1024>::new();
             self.handle_net_with(subcmd, arg, stream, &mut out);
             out.flush();
         }
+    }
+
+    fn poll_background_log(&mut self, out: &mut [u8]) -> Option<(u64, usize)> {
+        self.log_rx.poll_line(CapId::BOOTSTRAP_LOG_EP, out)
     }
 }
 
 newos_user_rt::entry!(main);
 
+/// EL0 supervisor fault-recovery entry point.
+///
+/// Re-entrancy invariant: `init` is single-threaded. On any EL0 hardware fault (including a
+/// subsequent fault inside a recovered interactive shell), the kernel discards the faulted
+/// context and resets `SP_EL0` to the 16-byte-aligned top of the 64 KiB
+/// `SUPERVISOR_RECOVERY_STACK` before entering `supervisor_recover`. No stack growth occurs
+/// across repeated faults, and `SUPERVISOR_RECOVERY_STACK` is never aliased by Rust references.
 extern "C" fn supervisor_recover() -> ! {
-    let mut out = BufferedConsole::<256>::new();
+    let mut out = BufferedConsole::<1024>::new();
     let info = newos_user_rt::sys_info();
 
     match newos_user_rt::notify_poll(CapId::BOOTSTRAP_FAULT_NOTIF) {
@@ -390,13 +400,43 @@ extern "C" fn supervisor_recover() -> ! {
     }
 }
 
+/// Drain `worker`'s startup log line over `CapId::BOOTSTRAP_LOG_EP` as the sole console owner.
+///
+/// Bounded by `MAX_BOOT_LOG_YIELDS` so `init` cannot hang forever if `worker` fails to start
+/// or `BOOTSTRAP_LOG_EP` is revoked.
+fn drain_worker_boot_log<const N: usize>(
+    log_rx: &mut IpcLogAssembler<256>,
+    out: &mut BufferedConsole<N>,
+) {
+    const MAX_BOOT_LOG_YIELDS: usize = 10_000;
+    let mut line_buf = [0u8; 256];
+    for _ in 0..MAX_BOOT_LOG_YIELDS {
+        if let Some((_badge, n)) = log_rx.poll_line(CapId::BOOTSTRAP_LOG_EP, &mut line_buf) {
+            if let Ok(line) = core::str::from_utf8(&line_buf[..n]) {
+                let _ = writeln!(out, "{line}");
+                out.flush();
+            }
+            return;
+        }
+        if newos_user_rt::yield_now().is_err() {
+            return;
+        }
+    }
+}
+
 fn main() -> ! {
-    let mut out = BufferedConsole::<256>::new();
+    let mut out = BufferedConsole::<1024>::new();
+    let mut log_rx = IpcLogAssembler::<256>::new();
     let info = newos_user_rt::sys_info();
     let _ = newos_user_rt::set_fault_handler(supervisor_recover);
 
     if info.interactive_shell {
-        let mut sh = Shell::new(InitShellHost::new());
+        if info.proc_count > 1 {
+            drain_worker_boot_log(&mut log_rx, &mut out);
+            // Deterministic readiness handshake so `worker` is in its IPC loop before prompt.
+            let _ = newos_user_rt::ipc_call(CapId::BOOTSTRAP_EP, 0x5245_4144);
+        }
+        let mut sh = Shell::new(InitShellHost::with_log_rx(log_rx));
         sh.run_interactive()
     }
 
@@ -407,9 +447,14 @@ fn main() -> ! {
     );
     out.flush();
 
+    if info.proc_count > 1 {
+        drain_worker_boot_log(&mut log_rx, &mut out);
+    }
+
     // Multi-process TTBR0_EL1 IPC ping-pong with isolated EL0 `worker` process (1-syscall `IpcCall`)
     const PING_PAYLOAD: u64 = 0xA110_C0DE;
-    if newos_user_rt::ipc_call(CapId::BOOTSTRAP_EP, PING_PAYLOAD) != Ok((0x5E14, PING_PAYLOAD + 1)) {
+    if newos_user_rt::ipc_call(CapId::BOOTSTRAP_EP, PING_PAYLOAD) != Ok((0x5E14, PING_PAYLOAD + 1))
+    {
         let _ = writeln!(out, "[init] FAIL: missing IPC reply from worker");
         out.flush();
         newos_user_rt::exit(QemuExitCode::Failed);
@@ -468,7 +513,10 @@ fn main() -> ! {
     // EL0 Post-UNIX CAOS + Typed Pipeline Shell (`newos-sh`) self-check
     let mut sh = Shell::new(InitShellHost::new());
     if let Err(msg) = sh.run_self_test() {
-        let _ = writeln!(out, "[init] FAIL: EL0 CAOS & typed pipeline self-check: {msg}");
+        let _ = writeln!(
+            out,
+            "[init] FAIL: EL0 CAOS & typed pipeline self-check: {msg}"
+        );
         out.flush();
         newos_user_rt::exit(QemuExitCode::Failed);
     }
@@ -521,8 +569,17 @@ fn main() -> ! {
             }
         };
 
-        let target = cfg.gateway.unwrap_or(NetConfig::QEMU_DEFAULT.gateway.unwrap_or([10, 0, 2, 2]));
-        match newos_net::live_icmp_ping(CapVirtioTransport, nic, &cfg, target, &VIRTIO_DMA, &GEM_DMA) {
+        let target = cfg
+            .gateway
+            .unwrap_or(NetConfig::QEMU_DEFAULT.gateway.unwrap_or([10, 0, 2, 2]));
+        match newos_net::live_icmp_ping(
+            CapVirtioTransport,
+            nic,
+            &cfg,
+            target,
+            &VIRTIO_DMA,
+            &GEM_DMA,
+        ) {
             Ok(res) => {
                 let _ = writeln!(
                     out,

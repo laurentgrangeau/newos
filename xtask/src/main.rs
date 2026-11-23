@@ -75,19 +75,17 @@ fn build_kernel(root: &Path, release: bool) -> Result<PathBuf, String> {
     );
 
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(root)
-        .env("RUSTFLAGS", rustflags)
-        .args([
-            "build",
-            "--package",
-            "newos-kernel",
-            "--target",
-            TARGET_TRIPLE,
-            "-Z",
-            "build-std=core,compiler_builtins",
-            "-Z",
-            "build-std-features=compiler-builtins-mem",
-        ]);
+    cmd.current_dir(root).env("RUSTFLAGS", rustflags).args([
+        "build",
+        "--package",
+        "newos-kernel",
+        "--target",
+        TARGET_TRIPLE,
+        "-Z",
+        "build-std=core,compiler_builtins",
+        "-Z",
+        "build-std-features=compiler-builtins-mem",
+    ]);
     if release {
         cmd.arg("--release");
     }
@@ -108,19 +106,17 @@ fn build_user_elf(root: &Path, pkg: &str, dir: &str, release: bool) -> Result<Pa
     );
 
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(root)
-        .env("RUSTFLAGS", rustflags)
-        .args([
-            "build",
-            "--package",
-            pkg,
-            "--target",
-            TARGET_TRIPLE,
-            "-Z",
-            "build-std=core,compiler_builtins",
-            "-Z",
-            "build-std-features=compiler-builtins-mem",
-        ]);
+    cmd.current_dir(root).env("RUSTFLAGS", rustflags).args([
+        "build",
+        "--package",
+        pkg,
+        "--target",
+        TARGET_TRIPLE,
+        "-Z",
+        "build-std=core,compiler_builtins",
+        "-Z",
+        "build-std-features=compiler-builtins-mem",
+    ]);
     if release {
         cmd.arg("--release");
     }
@@ -164,8 +160,7 @@ fn build_iso(interactive: bool, release: bool) -> Result<PathBuf, String> {
 
     let iso_root = root.join("target/iso_root_aarch64");
     if iso_root.exists() {
-        fs::remove_dir_all(&iso_root)
-            .map_err(|e| format!("failed to clean iso_root: {e}"))?;
+        fs::remove_dir_all(&iso_root).map_err(|e| format!("failed to clean iso_root: {e}"))?;
     }
 
     let boot_limine = iso_root.join("boot/limine");
@@ -315,9 +310,14 @@ serial: yes
     ]);
     run_checked(&mut mcopy, "mcopy")?;
 
-    println!("[xtask] built Raspberry Pi 5 FAT32 boot image: {}", img_path.display());
+    println!(
+        "[xtask] built Raspberry Pi 5 FAT32 boot image: {}",
+        img_path.display()
+    );
     println!("[xtask] staging directory: {}", stage.display());
-    println!("[xtask] note: copy RPI_EFI.fd (from worproject/rpi5-uefi) onto the FAT32 SD card root,");
+    println!(
+        "[xtask] note: copy RPI_EFI.fd (from worproject/rpi5-uefi) onto the FAT32 SD card root,"
+    );
     println!("[xtask]       connect 3-pin JST UART debug probe at 115200 8N1, and power on!");
     Ok(img_path)
 }
@@ -359,7 +359,13 @@ fn run_bench(raw_args: &[String]) -> Result<(), String> {
 
     let cargo_status = Command::new("cargo")
         .current_dir(&root)
-        .args(["build", "--release", "--offline", "--package", "newos-bench"])
+        .args([
+            "build",
+            "--release",
+            "--offline",
+            "--package",
+            "newos-bench",
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();

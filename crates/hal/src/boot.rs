@@ -11,42 +11,49 @@ use newos_kernel_core::memory::UntypedInventory;
 
 const MP_FLAGS: u64 = 0;
 
-// SAFETY: Limine scans the `.requests_start_marker`, `.requests`, and
-// `.requests_end_marker` ELF sections defined in the kernel linker script.
+// SAFETY: Limine scans `.requests_start_marker` in the bare-metal ELF image.
 #[used]
-#[unsafe(link_section = ".requests_start_marker")]
+#[cfg_attr(target_os = "none", unsafe(link_section = ".requests_start_marker"))]
 static _START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
 
+// SAFETY: Limine scans `.requests` in the bare-metal ELF image for `BaseRevision`.
 #[used]
-#[unsafe(link_section = ".requests")]
+#[cfg_attr(target_os = "none", unsafe(link_section = ".requests"))]
 static BASE_REVISION: BaseRevision = BaseRevision::with_revision(3);
 
+// SAFETY: Limine scans `.requests` in the bare-metal ELF image for `HhdmRequest`.
 #[used]
-#[unsafe(link_section = ".requests")]
+#[cfg_attr(target_os = "none", unsafe(link_section = ".requests"))]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
+// SAFETY: Limine scans `.requests` in the bare-metal ELF image for `MemmapRequest`.
 #[used]
-#[unsafe(link_section = ".requests")]
+#[cfg_attr(target_os = "none", unsafe(link_section = ".requests"))]
 static MEMORY_MAP_REQUEST: MemmapRequest = MemmapRequest::new();
 
+// SAFETY: Limine scans `.requests` in the bare-metal ELF image for `MpRequest`.
 #[used]
-#[unsafe(link_section = ".requests")]
+#[cfg_attr(target_os = "none", unsafe(link_section = ".requests"))]
 static MP_REQUEST: MpRequest = MpRequest::new(MP_FLAGS);
 
+// SAFETY: Limine scans `.requests` in the bare-metal ELF image for `RsdpRequest`.
 #[used]
-#[unsafe(link_section = ".requests")]
+#[cfg_attr(target_os = "none", unsafe(link_section = ".requests"))]
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
+// SAFETY: Limine scans `.requests` in the bare-metal ELF image for `ModulesRequest`.
 #[used]
-#[unsafe(link_section = ".requests")]
+#[cfg_attr(target_os = "none", unsafe(link_section = ".requests"))]
 static MODULES_REQUEST: ModulesRequest = ModulesRequest::new();
 
+// SAFETY: Limine scans `.requests` in the bare-metal ELF image for `ExecutableFileRequest`.
 #[used]
-#[unsafe(link_section = ".requests")]
+#[cfg_attr(target_os = "none", unsafe(link_section = ".requests"))]
 static EXEC_FILE_REQUEST: ExecutableFileRequest = ExecutableFileRequest::new();
 
+// SAFETY: Limine scans `.requests_end_marker` in the bare-metal ELF image.
 #[used]
-#[unsafe(link_section = ".requests_end_marker")]
+#[cfg_attr(target_os = "none", unsafe(link_section = ".requests_end_marker"))]
 static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
 /// Returns `true` if the bootloader supports our requested Limine base revision.
@@ -61,10 +68,7 @@ pub fn mp_response() -> Option<&'static MpResponse> {
 
 /// Extract a safe, `no_alloc` boot descriptor and bootstrap `UntypedInventory` from Limine.
 pub fn boot_info() -> BootInfo {
-    let hhdm_offset = HHDM_REQUEST
-        .response()
-        .map(|resp| resp.offset)
-        .unwrap_or(0);
+    let hhdm_offset = HHDM_REQUEST.response().map(|resp| resp.offset).unwrap_or(0);
 
     let mut untyped = UntypedInventory::new();
     if let Some(mmap) = MEMORY_MAP_REQUEST.response() {
@@ -75,10 +79,7 @@ pub fn boot_info() -> BootInfo {
         }
     }
 
-    let cpu_count = MP_REQUEST
-        .response()
-        .map(|mp| mp.cpus().len())
-        .unwrap_or(1);
+    let cpu_count = MP_REQUEST.response().map(|mp| mp.cpus().len()).unwrap_or(1);
 
     let rsdp_addr = RSDP_REQUEST
         .response()

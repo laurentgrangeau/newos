@@ -44,6 +44,12 @@ impl CapId {
     /// Well-known bootstrap `Untyped` physical memory capability (slot 10, gen 1) for `UntypedRetype`.
     pub const BOOTSTRAP_UNTYPED: Self = Self((1u64 << 32) | 10);
 
+    /// Well-known bootstrap Console Log `Endpoint` capability (slot 11, gen 1).
+    ///
+    /// PID 0 (`init`, console owner) holds `Rights::ALL`; non-root processes (`pid >= 1`)
+    /// hold write-only (`Rights::WRITE`) with an immutable kernel-stamped `badge = pid as u64`.
+    pub const BOOTSTRAP_LOG_EP: Self = Self((1u64 << 32) | 11);
+
     #[inline]
     pub const fn new(raw: u64) -> Self {
         Self(raw)
@@ -79,6 +85,16 @@ impl Rights {
     #[inline]
     pub const fn bits(self) -> u8 {
         self.0
+    }
+
+    /// Construct a `Rights` bitmask from raw bits, returning `None` if any unknown bit is set.
+    #[inline]
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if (bits & !Self::ALL.0) == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
     }
 
     /// Construct a `Rights` bitmask from raw bits, truncating any unknown bits.
@@ -285,6 +301,51 @@ pub enum QemuExitCode {
     Failed = 0x11,
 }
 
+/// Register-only IPC log chunk framing for `CapId::BOOTSTRAP_LOG_EP`.
+///
+/// Packs up to 7 UTF-8 bytes into a single 64-bit `Endpoint` payload register:
+/// - bits `56..64`: chunk byte length (`0..=7`)
+/// - bits `0..56`: little-endian payload bytes `0..len`
+pub mod log_ipc {
+    /// Maximum UTF-8 bytes carried in a single 64-bit fastpath IPC log message.
+    pub const MAX_CHUNK_BYTES: usize = 7;
+
+    /// Pack up to [`MAX_CHUNK_BYTES`] bytes into a single 64-bit IPC register payload.
+    #[inline]
+    pub const fn encode_chunk(bytes: &[u8]) -> u64 {
+        let len = if bytes.len() > MAX_CHUNK_BYTES {
+            MAX_CHUNK_BYTES
+        } else {
+            bytes.len()
+        };
+        let mut word = (len as u64) << 56;
+        let mut i = 0;
+        while i < len {
+            word |= (bytes[i] as u64) << (i * 8);
+            i += 1;
+        }
+        word
+    }
+
+    /// Unpack a 64-bit IPC log payload into `([u8; 7], len)`.
+    #[inline]
+    pub const fn decode_chunk(word: u64) -> ([u8; MAX_CHUNK_BYTES], usize) {
+        let raw_len = (word >> 56) as usize;
+        let len = if raw_len > MAX_CHUNK_BYTES {
+            MAX_CHUNK_BYTES
+        } else {
+            raw_len
+        };
+        let mut buf = [0u8; MAX_CHUNK_BYTES];
+        let mut i = 0;
+        while i < len {
+            buf[i] = ((word >> (i * 8)) & 0xFF) as u8;
+            i += 1;
+        }
+        (buf, len)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +420,63 @@ mod tests {
             assert_eq!(SysError::from_u64(raw), Some(err));
         }
         assert_eq!(SysError::from_u64(8), None);
+    }
+
+    #[test]
+    fn log_ipc_chunk_roundtrip_and_bounds() {
+        let (buf, len) = log_ipc::decode_chunk(log_ipc::encode_chunk(b""));
+        assert_eq!(len, 0);
+        assert_eq!(&buf[..len], b"");
+
+        let (buf, len) = log_ipc::decode_chunk(log_ipc::encode_chunk(b"hi\n"));
+        assert_eq!(len, 3);
+        assert_eq!(&buf[..len], b"hi\n");
+
+        let (buf, len) = log_ipc::decode_chunk(log_ipc::encode_chunk(b"1234567"));
+        assert_eq!(len, 7);
+        assert_eq!(&buf[..len], b"1234567");
+
+        // Oversized slices clamp cleanly to 7 bytes; corrupted lengths clamp to 7.
+        let (buf, len) = log_ipc::decode_chunk(log_ipc::encode_chunk(b"123456789"));
+        assert_eq!(len, 7);
+        assert_eq!(&buf[..len], b"1234567");
+
+        let (_, clamped) = log_ipc::decode_chunk(0xFFu64 << 56);
+        assert_eq!(clamped, 7);
+    }
+
+    #[test]
+    fn rights_from_bits_rejects_unknown_bits_and_accepts_valid_mask() {
+        for raw in 0..=Rights::ALL.bits() {
+            assert_eq!(
+                Rights::from_bits(raw),
+                Some(Rights::from_bits_truncate(raw))
+            );
+        }
+        for raw in (Rights::ALL.bits() + 1)..=u8::MAX {
+            assert_eq!(Rights::from_bits(raw), None);
+        }
+        assert_eq!(Rights::from_bits(0), Some(Rights::NONE));
+        assert_eq!(Rights::from_bits(0xFF), None);
+        assert_eq!(Rights::from_bits(1 << 5), None);
+        assert_eq!(Rights::from_bits_truncate(0xFF), Rights::ALL);
+    }
+
+    #[test]
+    fn object_type_cap_id_and_extreme_boundary_values() {
+        for raw in 0..=12u64 {
+            let obj = ObjectType::from_u64(raw);
+            assert!(obj.is_some());
+            assert_eq!(obj.unwrap() as u64, raw);
+        }
+        assert_eq!(ObjectType::from_u64(13), None);
+        assert_eq!(ObjectType::from_u64(u64::MAX), None);
+
+        assert_eq!(SyscallNumber::from_u64(u64::MAX), None);
+        assert_eq!(SysError::from_u64(u64::MAX), None);
+
+        assert!(CapId::new(0).is_null());
+        assert_eq!(CapId::new(u64::MAX).raw(), u64::MAX);
+        assert!(!CapId::new(u64::MAX).is_null());
     }
 }

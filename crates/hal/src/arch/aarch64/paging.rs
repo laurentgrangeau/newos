@@ -2,6 +2,7 @@
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_bytes, write_volatile};
+use core::sync::atomic::{AtomicU8, Ordering};
 use newos_abi::SysError;
 use newos_kernel_core::memory::{
     HUGE_PAGE_MASK_2M, PAGE_SIZE, PageFlags, PhysAddr, PhysFrame, PhysFrame2M, UntypedInventory,
@@ -19,21 +20,31 @@ const DESC_AP_EL0_RO: u64 = 0b11 << 6;
 const DESC_PXN: u64 = 1 << 53; // Privileged Execute Never (SMEP equivalent)
 const DESC_UXN: u64 = 1 << 54; // Unprivileged Execute Never (NX for EL0)
 const DESC_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+const DESC_2M_ADDR_MASK: u64 = 0x0000_FFFF_FFE0_0000;
+
+static CACHED_DEVICE_MAIR_IDX: AtomicU8 = AtomicU8::new(u8::MAX);
 
 #[inline]
 fn device_mair_index() -> u64 {
+    let cached = CACHED_DEVICE_MAIR_IDX.load(Ordering::Relaxed);
+    if cached != u8::MAX {
+        return u64::from(cached);
+    }
     let mair: u64;
-    // SAFETY: Reading `MAIR_EL1` in EL1 inspects Limine's configured memory attributes.
+    // SAFETY: Reading `MAIR_EL1` in EL1 inspects Limine's immutable boot memory attributes.
     unsafe {
         asm!("mrs {}, mair_el1", out(reg) mair, options(nomem, nostack, preserves_flags));
     }
-    for idx in 0..8u64 {
-        let attr = ((mair >> (idx * 8)) & 0xFF) as u8;
+    let mut found = 0u8;
+    for idx in 0..8u8 {
+        let attr = ((mair >> (u64::from(idx) * 8)) & 0xFF) as u8;
         if attr == 0x00 || attr == 0x04 {
-            return idx;
+            found = idx;
+            break;
         }
     }
-    0
+    CACHED_DEVICE_MAIR_IDX.store(found, Ordering::Relaxed);
+    u64::from(found)
 }
 
 #[inline]
@@ -121,6 +132,27 @@ impl Aarch64VSpace {
         self.hhdm_offset.wrapping_add(phys) as *mut u64
     }
 
+    #[inline]
+    fn read_desc(&self, table_phys: u64, index: usize) -> Result<u64, SysError> {
+        if index >= 512 || (table_phys & 0xFFF) != 0 {
+            return Err(SysError::InvalidArgument);
+        }
+        // SAFETY: `table_phys` is 4 KiB-aligned, mapped via HHDM, and `index < 512` keeps
+        // the 8-byte descriptor within the 4 KiB translation table page.
+        Ok(unsafe { read_volatile(self.table_ptr(table_phys).add(index)) })
+    }
+
+    #[inline]
+    fn write_desc(&self, table_phys: u64, index: usize, value: u64) -> Result<(), SysError> {
+        if index >= 512 || (table_phys & 0xFFF) != 0 {
+            return Err(SysError::InvalidArgument);
+        }
+        // SAFETY: `table_phys` is 4 KiB-aligned, mapped via HHDM, and `index < 512` keeps
+        // the 8-byte descriptor within the 4 KiB translation table page.
+        unsafe { write_volatile(self.table_ptr(table_phys).add(index), value) };
+        Ok(())
+    }
+
     fn indices(virt: VirtAddr) -> [usize; 4] {
         let v = virt.raw();
         [
@@ -137,10 +169,7 @@ impl Aarch64VSpace {
         index: usize,
         untyped: &mut UntypedInventory,
     ) -> Result<u64, SysError> {
-        // SAFETY: `table_phys` is a valid 4 KiB-aligned translation table mapped via HHDM and `index < 512`.
-        let entry_ptr = unsafe { self.table_ptr(table_phys).add(index) };
-        // SAFETY: `entry_ptr` points to a valid 8-byte descriptor inside the HHDM-mapped page table.
-        let entry = unsafe { read_volatile(entry_ptr) };
+        let entry = self.read_desc(table_phys, index)?;
 
         if (entry & DESC_VALID) != 0 {
             if (entry & DESC_TABLE_OR_PAGE) == 0 {
@@ -151,19 +180,17 @@ impl Aarch64VSpace {
 
         let frame = untyped.retype_frame()?;
         self.zero_frame(&frame);
-        let next_phys = frame.start_addr().raw();
-        // SAFETY: Installing a valid table descriptor pointing to a freshly zeroed 4 KiB frame.
-        unsafe {
-            write_volatile(entry_ptr, next_phys | DESC_VALID | DESC_TABLE_OR_PAGE);
-        }
+        let next_phys = frame.start_addr().raw() & DESC_ADDR_MASK;
+        self.write_desc(
+            table_phys,
+            index,
+            next_phys | DESC_VALID | DESC_TABLE_OR_PAGE,
+        )?;
         Ok(next_phys)
     }
 
     fn next_table_existing(&self, table_phys: u64, index: usize) -> Option<u64> {
-        // SAFETY: `table_phys` is a valid 4 KiB-aligned translation table mapped via HHDM and `index < 512`.
-        let entry_ptr = unsafe { self.table_ptr(table_phys).add(index) };
-        // SAFETY: `entry_ptr` points to a valid 8-byte descriptor inside the HHDM-mapped page table.
-        let entry = unsafe { read_volatile(entry_ptr) };
+        let entry = self.read_desc(table_phys, index).ok()?;
         if (entry & (DESC_VALID | DESC_TABLE_OR_PAGE)) != (DESC_VALID | DESC_TABLE_OR_PAGE) {
             None
         } else {
@@ -196,14 +223,15 @@ impl VSpaceMapper for Aarch64VSpace {
         let l2 = self.next_table_or_create(l1, i1, untyped)?;
         let l3 = self.next_table_or_create(l2, i2, untyped)?;
 
-        // SAFETY: `l3` is a valid 4 KiB L3 page table mapped via HHDM and `i3 < 512`.
-        let pte_ptr = unsafe { self.table_ptr(l3).add(i3) };
-        // SAFETY: `pte_ptr` points to a valid 8-byte L3 descriptor inside `l3`.
-        if (unsafe { read_volatile(pte_ptr) } & DESC_VALID) != 0 {
+        if (self.read_desc(l3, i3)? & DESC_VALID) != 0 {
             return Err(SysError::SlotOccupied);
         }
 
-        let mut pte = frame.start_addr().raw() | DESC_VALID | DESC_TABLE_OR_PAGE | DESC_AF | DESC_SH_INNER;
+        let mut pte = (frame.start_addr().raw() & DESC_ADDR_MASK)
+            | DESC_VALID
+            | DESC_TABLE_OR_PAGE
+            | DESC_AF
+            | DESC_SH_INNER;
         if flags.no_cache {
             pte |= device_mair_index() << 2;
         }
@@ -222,8 +250,7 @@ impl VSpaceMapper for Aarch64VSpace {
             pte |= DESC_UXN;
         }
 
-        // SAFETY: Installing leaf L3 page descriptor and invalidating TLB for `virt`.
-        unsafe { write_volatile(pte_ptr, pte) };
+        self.write_desc(l3, i3, pte)?;
         tlbi_va(virt);
         Ok(())
     }
@@ -233,17 +260,13 @@ impl VSpaceMapper for Aarch64VSpace {
         let l1 = self.next_table_existing(self.l0_phys, i0)?;
         let l2 = self.next_table_existing(l1, i1)?;
 
-        // SAFETY: `l2` is a valid 4 KiB L2 table mapped via HHDM and `i2 < 512`.
-        let l2_ptr = unsafe { self.table_ptr(l2).add(i2) };
-        // SAFETY: `l2_ptr` points to a valid 8-byte L2 descriptor inside `l2`.
-        let l2_desc = unsafe { read_volatile(l2_ptr) };
+        let l2_desc = self.read_desc(l2, i2).ok()?;
         if (l2_desc & DESC_VALID) == 0 {
             return None;
         }
         let dev_idx = device_mair_index();
         if (l2_desc & DESC_TABLE_OR_PAGE) == 0 {
             // Level-2 2 MiB Block descriptor
-            const DESC_2M_ADDR_MASK: u64 = 0x0000_FFFF_FFE0_0000;
             let ap = (l2_desc >> 6) & 0b11;
             let user = (ap & 0b01) != 0;
             let writable = (ap & 0b10) == 0;
@@ -268,10 +291,7 @@ impl VSpaceMapper for Aarch64VSpace {
         }
 
         let l3 = l2_desc & DESC_ADDR_MASK;
-        // SAFETY: `l3` is a valid 4 KiB L3 page table mapped via HHDM and `i3 < 512`.
-        let pte_ptr = unsafe { self.table_ptr(l3).add(i3) };
-        // SAFETY: `pte_ptr` points to a valid 8-byte L3 descriptor inside `l3`.
-        let pte = unsafe { read_volatile(pte_ptr) };
+        let pte = self.read_desc(l3, i3).ok()?;
         if (pte & DESC_VALID) == 0 {
             return None;
         }
@@ -301,20 +321,22 @@ impl VSpaceMapper for Aarch64VSpace {
 
     fn unmap_4k(&mut self, virt: VirtAddr) -> Result<PhysFrame, SysError> {
         let [i0, i1, i2, i3] = Self::indices(virt);
-        let l1 = self.next_table_existing(self.l0_phys, i0).ok_or(SysError::InvalidArgument)?;
-        let l2 = self.next_table_existing(l1, i1).ok_or(SysError::InvalidArgument)?;
-        let l3 = self.next_table_existing(l2, i2).ok_or(SysError::InvalidArgument)?;
+        let l1 = self
+            .next_table_existing(self.l0_phys, i0)
+            .ok_or(SysError::InvalidArgument)?;
+        let l2 = self
+            .next_table_existing(l1, i1)
+            .ok_or(SysError::InvalidArgument)?;
+        let l3 = self
+            .next_table_existing(l2, i2)
+            .ok_or(SysError::InvalidArgument)?;
 
-        // SAFETY: `l3` is a valid 4 KiB L3 page table mapped via HHDM and `i3 < 512`.
-        let pte_ptr = unsafe { self.table_ptr(l3).add(i3) };
-        // SAFETY: `pte_ptr` points to a valid 8-byte L3 descriptor inside `l3`.
-        let pte = unsafe { read_volatile(pte_ptr) };
+        let pte = self.read_desc(l3, i3)?;
         if (pte & DESC_VALID) == 0 {
             return Err(SysError::InvalidArgument);
         }
 
-        // SAFETY: Clearing L3 descriptor and flushing TLB reclaims frame ownership.
-        unsafe { write_volatile(pte_ptr, 0) };
+        self.write_desc(l3, i3, 0)?;
         tlbi_va(virt);
         PhysFrame::from_aligned(PhysAddr::new(pte & DESC_ADDR_MASK))
     }
@@ -337,15 +359,13 @@ impl VSpaceMapper for Aarch64VSpace {
         let l1 = self.next_table_or_create(self.l0_phys, i0, untyped)?;
         let l2 = self.next_table_or_create(l1, i1, untyped)?;
 
-        // SAFETY: `l2` is a valid 4 KiB L2 table mapped via HHDM and `i2 < 512`.
-        let desc_ptr = unsafe { self.table_ptr(l2).add(i2) };
-        // SAFETY: `desc_ptr` points to a valid 8-byte L2 descriptor inside `l2`.
-        if (unsafe { read_volatile(desc_ptr) } & DESC_VALID) != 0 {
+        if (self.read_desc(l2, i2)? & DESC_VALID) != 0 {
             return Err(SysError::SlotOccupied);
         }
 
         // L2 Block descriptor: bit 0 = 1 (Valid), bit 1 = 0 (Block, not Table).
-        let mut desc = frame.start_addr().raw() | DESC_VALID | DESC_AF | DESC_SH_INNER;
+        let mut desc =
+            (frame.start_addr().raw() & DESC_2M_ADDR_MASK) | DESC_VALID | DESC_AF | DESC_SH_INNER;
         if flags.no_cache {
             desc |= device_mair_index() << 2;
         }
@@ -363,8 +383,7 @@ impl VSpaceMapper for Aarch64VSpace {
             desc |= DESC_UXN;
         }
 
-        // SAFETY: Installing L2 2 MiB Block descriptor and invalidating TLB for `virt`.
-        unsafe { write_volatile(desc_ptr, desc) };
+        self.write_desc(l2, i2, desc)?;
         tlbi_va(virt);
         Ok(())
     }
@@ -381,18 +400,13 @@ impl VSpaceMapper for Aarch64VSpace {
             .next_table_existing(l1, i1)
             .ok_or(SysError::InvalidArgument)?;
 
-        // SAFETY: `l2` is a valid 4 KiB L2 table mapped via HHDM and `i2 < 512`.
-        let desc_ptr = unsafe { self.table_ptr(l2).add(i2) };
-        // SAFETY: `desc_ptr` points to a valid 8-byte L2 descriptor inside `l2`.
-        let desc = unsafe { read_volatile(desc_ptr) };
+        let desc = self.read_desc(l2, i2)?;
         if (desc & (DESC_VALID | DESC_TABLE_OR_PAGE)) != DESC_VALID {
             return Err(SysError::InvalidArgument);
         }
 
-        // SAFETY: Clearing L2 2 MiB Block descriptor and flushing TLB reclaims superpage ownership.
-        unsafe { write_volatile(desc_ptr, 0) };
+        self.write_desc(l2, i2, 0)?;
         tlbi_va(virt);
-        const DESC_2M_ADDR_MASK: u64 = 0x0000_FFFF_FFE0_0000;
         PhysFrame2M::from_aligned(PhysAddr::new(desc & DESC_2M_ADDR_MASK))
     }
 
@@ -410,7 +424,9 @@ impl VSpaceMapper for Aarch64VSpace {
         offset: usize,
         src: &[u8],
     ) -> Result<(), SysError> {
-        let end = offset.checked_add(src.len()).ok_or(SysError::InvalidArgument)?;
+        let end = offset
+            .checked_add(src.len())
+            .ok_or(SysError::InvalidArgument)?;
         if end > PAGE_SIZE as usize {
             return Err(SysError::InvalidArgument);
         }
@@ -423,13 +439,21 @@ impl VSpaceMapper for Aarch64VSpace {
     }
 }
 
-pub fn probe_mapped_u64(vspace: &Aarch64VSpace, virt: VirtAddr, pattern: u64) -> Result<u64, SysError> {
+pub fn probe_mapped_u64(
+    vspace: &Aarch64VSpace,
+    virt: VirtAddr,
+    pattern: u64,
+) -> Result<u64, SysError> {
+    if !virt.is_page_aligned() {
+        return Err(SysError::InvalidArgument);
+    }
     let (_, flags) = vspace.translate(virt).ok_or(SysError::InvalidArgument)?;
     if !flags.writable || flags.user {
         return Err(SysError::InsufficientRights);
     }
     let ptr = virt.raw() as *mut u64;
-    // SAFETY: `translate` verified `virt` is mapped Valid, EL1 Writable, and 4 KiB-aligned.
+    // SAFETY: `virt` was verified 4 KiB-aligned (thus 8-byte aligned) and `translate`
+    // verified it is mapped Valid and EL1 Writable.
     unsafe {
         write_volatile(ptr, pattern);
         Ok(read_volatile(ptr))

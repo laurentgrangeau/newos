@@ -9,13 +9,13 @@
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
-use newos_abi::{CapId, QemuExitCode, SysError};
-use newos_user_rt::BufferedConsole;
+use newos_abi::{CapId, SysError};
+use newos_user_rt::IpcLogConsole;
 
 newos_user_rt::entry!(main);
 
 fn main() -> ! {
-    let mut out = BufferedConsole::<256>::new();
+    let mut out = IpcLogConsole::<256>::new(CapId::BOOTSTRAP_LOG_EP);
     let _ = writeln!(
         out,
         "[worker] alive in isolated EL0 VSpace (vaddr=0x400000, separate TTBR0_EL1)!"
@@ -31,16 +31,34 @@ fn main() -> ! {
                 reply_payload = payload.wrapping_add(1);
                 has_reply = true;
             }
-            Err(SysError::WouldBlock) | Err(_) => {
+            Err(SysError::WouldBlock) => {
                 has_reply = false;
                 let _ = newos_user_rt::yield_now();
             }
+            Err(err) => {
+                let _ = writeln!(
+                    out,
+                    "[worker] fatal IPC error (code={}); exiting IPC loop",
+                    err as u64
+                );
+                out.flush();
+                break;
+            }
+        }
+    }
+
+    // Non-root process has no `PowerControl` cap or `ThreadExit` syscall; park cleanly.
+    loop {
+        if newos_user_rt::yield_now().is_err() {
+            core::hint::spin_loop();
         }
     }
 }
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    let _ = newos_user_rt::debug_log("[worker] PANIC in EL0\n");
-    newos_user_rt::exit(QemuExitCode::Failed)
+    let _ = newos_user_rt::ipc_log_write(CapId::BOOTSTRAP_LOG_EP, "[worker] PANIC in EL0\n");
+    loop {
+        let _ = newos_user_rt::yield_now();
+    }
 }

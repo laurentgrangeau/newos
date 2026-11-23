@@ -2,10 +2,11 @@
 
 //! Pure-Rust, zero-external-dependency benchmark harness for `newos`.
 //!
-//! Measures:
-//! - Kernel speed (7 metrics, ns/op) against production `newos-abi` and `newos-kernel-core`
+//! Measures 28 metrics across 4 categories:
+//! - Kernel speed (9 metrics, ns/op) against production `newos-abi` and `newos-kernel-core`
 //! - Shell speed (3 metrics, ns/op) against production `newos-shell-core`
-//! - IPC consumption (6 metrics, exact syscall counts) exercising production kernel + shell paths
+//! - IPC consumption (10 metrics, exact syscall counts & payload/chunk bytes)
+//! - IPC footprint (6 metrics, exact `size_of` bytes for IPC & shell data structures)
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -17,7 +18,9 @@ use newos_kernel_core::ipc::{IpcMessage, KernelIpcState};
 use newos_kernel_core::memory::{PAGE_SIZE, UntypedInventory};
 use newos_kernel_core::sched::Scheduler;
 use newos_shell_core::caos::ObjectStore;
-use newos_shell_core::shell::{ExecOutcome, Record, Shell, ShellHost, SysInfo};
+use newos_shell_core::shell::{
+    ExecOutcome, LINE_BUF_SIZE, Record, RecordStream, Shell, ShellHost, SysInfo,
+};
 
 const SAMPLES: usize = 5;
 
@@ -81,7 +84,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Kernel Speed Benchmarks (7 metrics)
+// Kernel Speed Benchmarks (9 metrics)
 // ---------------------------------------------------------------------------
 
 fn bench_kernel_cnode_lookup() -> f64 {
@@ -247,6 +250,48 @@ fn bench_kernel_ring_spsc_transfer() -> f64 {
     ns
 }
 
+fn bench_kernel_ipc_call_reply() -> f64 {
+    let mut ipc = KernelIpcState::new();
+    let (_notif, ep, _fault) = ipc.init_bootstrap_caps(None).unwrap();
+    let ns = bench_median_ns_per_op(10_000, 500_000, 1, |iters| {
+        let mut acc = 0u64;
+        for i in 0..iters {
+            let reply = ipc
+                .ipc_call(black_box(ep), black_box(i as u64), |req| IpcMessage {
+                    badge: req.badge,
+                    payload: req.payload.wrapping_add(1),
+                })
+                .unwrap();
+            acc = acc.wrapping_add(reply.payload ^ reply.badge);
+        }
+        acc
+    });
+    assert_eq!(ipc.stats().would_blocks, 0);
+    ns
+}
+
+fn bench_kernel_ring_spsc_slice_transfer() -> f64 {
+    const BURST: usize = 32;
+    let ring = SpscRing::<64>::new();
+    let mut src = [0u64; BURST];
+    for (j, slot) in src.iter_mut().enumerate() {
+        *slot = (j as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    let mut dst = [0u64; BURST];
+    let ns = bench_median_ns_per_op(5_000, 100_000, BURST, |batches| {
+        let mut acc = 0u64;
+        for b in 0..batches {
+            src[0] = b as u64;
+            assert_eq!(ring.try_push_slice(black_box(&src)), BURST);
+            assert_eq!(ring.try_pop_slice(black_box(&mut dst)), BURST);
+            acc = acc.wrapping_add(dst[b & (BURST - 1)]);
+        }
+        acc
+    });
+    assert!(ring.is_empty());
+    ns
+}
+
 // ---------------------------------------------------------------------------
 // ShellHost Implementations for Shell & IPC Benchmarks
 // ---------------------------------------------------------------------------
@@ -254,6 +299,7 @@ fn bench_kernel_ring_spsc_transfer() -> f64 {
 struct BenchmarkHost {
     debug_write_syscalls: u64,
     debug_write_bytes: u64,
+    debug_write_max_chunk: u64,
     sys_info_syscalls: u64,
 }
 
@@ -262,12 +308,59 @@ impl BenchmarkHost {
         Self {
             debug_write_syscalls: 0,
             debug_write_bytes: 0,
+            debug_write_max_chunk: 0,
             sys_info_syscalls: 0,
         }
     }
 }
 
 impl ShellHost for BenchmarkHost {
+    fn write_debug(&mut self, s: &str) {
+        let len = s.len() as u64;
+        self.debug_write_syscalls += 1;
+        self.debug_write_bytes += len;
+        self.debug_write_max_chunk = self.debug_write_max_chunk.max(len);
+        black_box(s.as_bytes());
+    }
+
+    fn sys_info(&mut self) -> SysInfo {
+        self.sys_info_syscalls += 1;
+        SysInfo {
+            online_cpus: 2,
+            proc_count: 2,
+            interactive_shell: false,
+        }
+    }
+}
+
+/// Host for interactive REPL line-editing & command-execution IPC measurement.
+struct ReplBenchHost {
+    input: &'static [u8],
+    pos: usize,
+    debug_read_syscalls: u64,
+    debug_read_bytes: u64,
+    debug_write_syscalls: u64,
+    debug_write_bytes: u64,
+    sys_info_syscalls: u64,
+    yield_syscalls: u64,
+}
+
+impl ReplBenchHost {
+    const fn new(input: &'static [u8]) -> Self {
+        Self {
+            input,
+            pos: 0,
+            debug_read_syscalls: 0,
+            debug_read_bytes: 0,
+            debug_write_syscalls: 0,
+            debug_write_bytes: 0,
+            sys_info_syscalls: 0,
+            yield_syscalls: 0,
+        }
+    }
+}
+
+impl ShellHost for ReplBenchHost {
     fn write_debug(&mut self, s: &str) {
         self.debug_write_syscalls += 1;
         self.debug_write_bytes += s.len() as u64;
@@ -276,6 +369,40 @@ impl ShellHost for BenchmarkHost {
 
     fn sys_info(&mut self) -> SysInfo {
         self.sys_info_syscalls += 1;
+        SysInfo {
+            online_cpus: 2,
+            proc_count: 2,
+            interactive_shell: true,
+        }
+    }
+
+    fn read_debug_byte(&mut self) -> Result<u8, SysError> {
+        self.debug_read_syscalls += 1;
+        if self.pos < self.input.len() {
+            let b = self.input[self.pos];
+            self.pos += 1;
+            self.debug_read_bytes += 1;
+            Ok(b)
+        } else {
+            Err(SysError::WouldBlock)
+        }
+    }
+
+    fn yield_now(&mut self) -> Result<u64, SysError> {
+        self.yield_syscalls += 1;
+        Ok(0)
+    }
+}
+
+/// Zero-sized `ShellHost` used to measure pure `Shell<ZeroSizedHost>` struct footprint.
+struct ZeroSizedHost;
+
+impl ShellHost for ZeroSizedHost {
+    fn write_debug(&mut self, s: &str) {
+        black_box(s.as_bytes());
+    }
+
+    fn sys_info(&mut self) -> SysInfo {
         SysInfo {
             online_cpus: 2,
             proc_count: 2,
@@ -450,13 +577,50 @@ fn bench_shell_session_full() -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// IPC Consumption Benchmarks (6 metrics, exact production syscall counts)
+// IPC Consumption Benchmarks (10 metrics, exact production syscall & byte counts)
 // ---------------------------------------------------------------------------
 
-fn measure_shell_session_ipc() -> (u64, u64) {
+struct ShellSessionIpcStats {
+    debug_write_syscalls: u64,
+    sys_info_syscalls: u64,
+    debug_write_bytes: u64,
+    max_chunk_bytes: u64,
+}
+
+fn measure_shell_session_ipc() -> ShellSessionIpcStats {
     let mut sh = Shell::new(BenchmarkHost::new());
     black_box(run_canonical_session(&mut sh));
-    (sh.host().debug_write_syscalls, sh.host().sys_info_syscalls)
+    let host = sh.host();
+    ShellSessionIpcStats {
+        debug_write_syscalls: host.debug_write_syscalls,
+        sys_info_syscalls: host.sys_info_syscalls,
+        debug_write_bytes: host.debug_write_bytes,
+        max_chunk_bytes: host.debug_write_max_chunk,
+    }
+}
+
+fn measure_repl_line_ipc() -> (u64, u64) {
+    // Types "helx", backspace deletes 'x', types 'p', Ctrl-L redraws, Enter submits "help".
+    const REPL_INPUT: &[u8] = b"helx\x7fp\x0c\r";
+
+    let mut sh = Shell::new(ReplBenchHost::new(REPL_INPUT));
+    let mut buf = [0u8; LINE_BUF_SIZE];
+
+    sh.host_mut().write_debug("newos λ ");
+    let len = sh.read_line(&mut buf);
+
+    let line = core::str::from_utf8(&buf[..len]).unwrap_or("").trim();
+    assert_eq!(line, "help");
+    sh.record_history(line);
+    assert_eq!(sh.exec_line(line), ExecOutcome::Continue);
+
+    let host = sh.host();
+    let syscalls = host.debug_read_syscalls
+        + host.debug_write_syscalls
+        + host.sys_info_syscalls
+        + host.yield_syscalls;
+    let payload_bytes = host.debug_read_bytes + host.debug_write_bytes;
+    (syscalls, payload_bytes)
 }
 
 fn measure_ping_roundtrip_syscalls_per_op() -> u64 {
@@ -553,6 +717,38 @@ fn measure_idle_poll_100_wasted_worker_ipc() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// IPC Footprint Benchmarks (6 metrics, exact struct sizes in bytes)
+// ---------------------------------------------------------------------------
+
+struct IpcFootprintStats {
+    cap_slot_bytes: u64,
+    cnode64_bytes: u64,
+    kernel_ipc_state_bytes: u64,
+    spsc_ring64_bytes: u64,
+    record_stream_bytes: u64,
+    shell_bytes: u64,
+}
+
+fn measure_ipc_footprint() -> IpcFootprintStats {
+    let cnode64 = core::mem::size_of::<CNode<64>>();
+    let cnode32 = core::mem::size_of::<CNode<32>>();
+    let cnode_diff = cnode64 - cnode32;
+    assert_eq!(cnode_diff % 32, 0);
+    let cap_slot_bytes = (cnode_diff / 32) as u64;
+
+    assert_eq!(core::mem::size_of::<ZeroSizedHost>(), 0);
+
+    IpcFootprintStats {
+        cap_slot_bytes,
+        cnode64_bytes: cnode64 as u64,
+        kernel_ipc_state_bytes: core::mem::size_of::<KernelIpcState>() as u64,
+        spsc_ring64_bytes: core::mem::size_of::<SpscRing<64>>() as u64,
+        record_stream_bytes: core::mem::size_of::<RecordStream>() as u64,
+        shell_bytes: core::mem::size_of::<Shell<ZeroSizedHost>>() as u64,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CLI & Reporting
 // ---------------------------------------------------------------------------
 
@@ -562,7 +758,7 @@ fn print_usage() {
     println!("Options:");
     println!("  (default)   Print machine-parseable `METRIC <name> <value> <unit>` lines");
     println!("  --markdown  Print GitHub-flavored Markdown table");
-    println!("  --json      Print JSON object with all 16 benchmark metrics");
+    println!("  --json      Print JSON object with all 28 benchmark metrics");
     println!("  -h, --help  Show this help message and exit");
 }
 
@@ -605,7 +801,7 @@ fn main() {
         .expect("newos-shell-core run_self_test failed");
     assert_eq!(self_test_shell.host().debug_write_syscalls, 0);
 
-    // 1. Kernel Speed (7 metrics)
+    // 1. Kernel Speed (9 metrics)
     let k_cnode_lookup = bench_kernel_cnode_lookup();
     let k_cnode_mint_revoke = bench_kernel_cnode_mint_revoke();
     let k_ipc_send_recv = bench_kernel_ipc_send_recv();
@@ -613,19 +809,27 @@ fn main() {
     let k_sched_next = bench_kernel_sched_schedule_next();
     let k_mem_retype = bench_kernel_memory_retype_frame();
     let k_ring_spsc = bench_kernel_ring_spsc_transfer();
+    let k_ipc_call_reply = bench_kernel_ipc_call_reply();
+    let k_ring_spsc_slice = bench_kernel_ring_spsc_slice_transfer();
 
     // 2. Shell Speed (3 metrics)
     let s_caos = bench_shell_caos_put_get_ref();
     let s_pipeline = bench_shell_pipeline_eval();
     let s_session = bench_shell_session_full();
 
-    // 3. IPC Consumption (6 metrics)
-    let (ipc_debug_writes, ipc_sys_info) = measure_shell_session_ipc();
+    // 3. IPC Consumption (10 metrics)
+    let session_ipc = measure_shell_session_ipc();
+    let ipc_debug_writes = session_ipc.debug_write_syscalls;
+    let ipc_sys_info = session_ipc.sys_info_syscalls;
     let ipc_ping_per_op = measure_ping_roundtrip_syscalls_per_op();
     let ipc_ring_notify = measure_ring_burst_32w_notify_syscalls();
     let ipc_idle_wasted = measure_idle_poll_100_wasted_worker_ipc();
     let ipc_total =
         ipc_debug_writes + ipc_sys_info + ipc_ping_per_op + ipc_ring_notify + ipc_idle_wasted;
+    let (ipc_repl_syscalls, ipc_repl_payload_bytes) = measure_repl_line_ipc();
+
+    // 4. IPC Footprint (6 metrics)
+    let footprint = measure_ipc_footprint();
 
     let metrics = [
         Metric {
@@ -668,6 +872,18 @@ fn main() {
             category: "Kernel Speed",
             name: "kernel.ring.spsc_transfer",
             value: MetricValue::Float(k_ring_spsc),
+            unit: "ns/op",
+        },
+        Metric {
+            category: "Kernel Speed",
+            name: "kernel.ipc.call_reply",
+            value: MetricValue::Float(k_ipc_call_reply),
+            unit: "ns/op",
+        },
+        Metric {
+            category: "Kernel Speed",
+            name: "kernel.ring.spsc_slice_transfer",
+            value: MetricValue::Float(k_ring_spsc_slice),
             unit: "ns/op",
         },
         Metric {
@@ -723,6 +939,66 @@ fn main() {
             name: "ipc.total_consumption",
             value: MetricValue::Int(ipc_total),
             unit: "syscalls",
+        },
+        Metric {
+            category: "IPC Consumption",
+            name: "ipc.shell_session.debug_write_bytes",
+            value: MetricValue::Int(session_ipc.debug_write_bytes),
+            unit: "bytes",
+        },
+        Metric {
+            category: "IPC Consumption",
+            name: "ipc.shell_session.max_chunk_bytes",
+            value: MetricValue::Int(session_ipc.max_chunk_bytes),
+            unit: "bytes",
+        },
+        Metric {
+            category: "IPC Consumption",
+            name: "ipc.repl_line.syscalls",
+            value: MetricValue::Int(ipc_repl_syscalls),
+            unit: "syscalls",
+        },
+        Metric {
+            category: "IPC Consumption",
+            name: "ipc.repl_line.payload_bytes",
+            value: MetricValue::Int(ipc_repl_payload_bytes),
+            unit: "bytes",
+        },
+        Metric {
+            category: "IPC Footprint",
+            name: "ipc.footprint.cap_slot_bytes",
+            value: MetricValue::Int(footprint.cap_slot_bytes),
+            unit: "bytes",
+        },
+        Metric {
+            category: "IPC Footprint",
+            name: "ipc.footprint.cnode64_bytes",
+            value: MetricValue::Int(footprint.cnode64_bytes),
+            unit: "bytes",
+        },
+        Metric {
+            category: "IPC Footprint",
+            name: "ipc.footprint.kernel_ipc_state_bytes",
+            value: MetricValue::Int(footprint.kernel_ipc_state_bytes),
+            unit: "bytes",
+        },
+        Metric {
+            category: "IPC Footprint",
+            name: "ipc.footprint.spsc_ring64_bytes",
+            value: MetricValue::Int(footprint.spsc_ring64_bytes),
+            unit: "bytes",
+        },
+        Metric {
+            category: "IPC Footprint",
+            name: "ipc.footprint.record_stream_bytes",
+            value: MetricValue::Int(footprint.record_stream_bytes),
+            unit: "bytes",
+        },
+        Metric {
+            category: "IPC Footprint",
+            name: "ipc.footprint.shell_bytes",
+            value: MetricValue::Int(footprint.shell_bytes),
+            unit: "bytes",
         },
     ];
 

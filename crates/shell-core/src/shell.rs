@@ -10,13 +10,20 @@
 use core::fmt::{self, Write};
 use newos_abi::{CapId, QemuExitCode, SysError};
 
-use crate::caos::{ObjHash, ObjectMeta, ObjectStore, RefMeta, StoreError};
+use crate::caos::{MAX_BLOB_SIZE, ObjHash, ObjectMeta, ObjectStore, RefMeta, StoreError};
 
-const LINE_BUF_SIZE: usize = 128;
+pub const LINE_BUF_SIZE: usize = 128;
+const SHELL_OUT_BUF: usize = 1024;
 const HISTORY_LEN: usize = 8;
 const MAX_STAGES: usize = 6;
 const MAX_ARGS: usize = 12;
-const MAX_STREAM_RECORDS: usize = 32;
+const MAX_STREAM_RECORDS: usize = 24;
+
+const _: () = {
+    assert!(MAX_STREAM_RECORDS >= crate::caos::MAX_OBJECTS);
+    assert!(MAX_STREAM_RECORDS >= crate::caos::MAX_REFS);
+    assert!(LINE_BUF_SIZE <= u8::MAX as usize);
+};
 
 /// Read-only system summary returned by `ShellHost::sys_info()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +97,14 @@ pub trait ShellHost {
         _stream: &mut RecordStream,
         _silent: bool,
     ) {
+    }
+
+    /// Non-blocking poll for a complete background log line routed over `BOOTSTRAP_LOG_EP`.
+    ///
+    /// Copies a complete UTF-8 line (excluding trailing `\n`) into `out` and returns
+    /// `Some((sender_badge, len))` when a full line is ready, or `None` otherwise.
+    fn poll_background_log(&mut self, _out: &mut [u8]) -> Option<(u64, usize)> {
+        None
     }
 }
 
@@ -213,6 +228,7 @@ pub enum ExecOutcome {
 /// Typed structured record flowing between `|` pipeline stages (zero text re-parsing).
 #[derive(Clone, Copy)]
 pub enum Record {
+    Count(usize),
     Proc {
         pid: u64,
         el: u64,
@@ -225,12 +241,11 @@ pub enum Record {
         value: u64,
         unit: &'static str,
     },
-    Count(usize),
 }
 
 /// Fixed-capacity, `no_alloc` typed stream passed between pipeline stages.
 pub struct RecordStream {
-    items: [Option<Record>; MAX_STREAM_RECORDS],
+    items: [Record; MAX_STREAM_RECORDS],
     len: usize,
 }
 
@@ -241,50 +256,61 @@ impl Default for RecordStream {
 }
 
 impl RecordStream {
+    #[inline]
     pub const fn new() -> Self {
         Self {
-            items: [None; MAX_STREAM_RECORDS],
+            items: [Record::Count(0); MAX_STREAM_RECORDS],
             len: 0,
         }
     }
 
+    #[inline]
     pub fn push(&mut self, rec: Record) {
         if self.len < MAX_STREAM_RECORDS {
-            self.items[self.len] = Some(rec);
+            self.items[self.len] = rec;
             self.len += 1;
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    #[inline]
     pub fn first(&self) -> Option<Record> {
-        if self.len > 0 { self.items[0] } else { None }
+        if self.len > 0 {
+            Some(self.items[0])
+        } else {
+            None
+        }
     }
 
+    #[inline]
     pub fn clear(&mut self) {
         self.len = 0;
     }
 
+    #[inline]
     pub(crate) fn truncate(&mut self, limit: usize) {
         if limit < self.len {
             self.len = limit;
         }
     }
 
+    #[inline]
     pub(crate) fn retain<F: FnMut(Record) -> bool>(&mut self, mut pred: F) {
         let mut write_idx = 0usize;
         for read_idx in 0..self.len {
-            if let Some(rec) = self.items[read_idx]
-                && pred(rec)
-            {
+            let rec = self.items[read_idx];
+            if pred(rec) {
                 if write_idx != read_idx {
-                    self.items[write_idx] = Some(rec);
+                    self.items[write_idx] = rec;
                 }
                 write_idx += 1;
             }
@@ -298,75 +324,75 @@ impl RecordStream {
             return;
         }
         match self.items[0] {
-            Some(Record::Proc { .. }) => {
-                let _ = out.write_str("PID  EL    ISOLATION        NAME\n");
+            Record::Proc { .. } => {
+                let _ = out.write_str("PID EL VSPACE NAME\n");
                 let mut line = AsciiLine::<96>::new();
-                for rec in self.items[..self.len].iter().flatten() {
+                for rec in &self.items[..self.len] {
                     if let Record::Proc { pid, el, name } = rec {
                         line.clear();
-                        line.push_u64_left(*pid, 4);
-                        line.push_str(" EL");
-                        line.push_u64_left(*el, 3);
-                        line.push_str(" TTBR0 VSpace #");
                         line.push_u64(*pid);
-                        line.push_str("  ");
+                        line.push_str(" EL");
+                        line.push_u64(*el);
+                        line.push_str(" #");
+                        line.push_u64(*pid);
+                        line.push_byte(b' ');
                         line.push_str(name);
                         line.push_byte(b'\n');
                         let _ = out.write_str(line.as_str());
                     }
                 }
             }
-            Some(Record::Object(_)) => {
-                let _ = out.write_str("OBJECT HASH           SIZE\n");
-                let mut line = AsciiLine::<64>::new();
-                for rec in self.items[..self.len].iter().flatten() {
+            Record::Object(_) => {
+                let _ = out.write_str("OBJECT HASH SIZE\n");
+                let mut line = AsciiLine::<48>::new();
+                for rec in &self.items[..self.len] {
                     if let Record::Object(meta) = rec {
                         line.clear();
                         line.push_str("obj:");
                         line.push_hex16(meta.hash.0);
-                        line.push_str("  ");
+                        line.push_byte(b' ');
                         line.push_u64(meta.size as u64);
-                        line.push_str(" B\n");
+                        line.push_str("B\n");
                         let _ = out.write_str(line.as_str());
                     }
                 }
             }
-            Some(Record::Ref(_)) => {
-                let _ = out.write_str("REF              MODE  TARGET                PREV\n");
+            Record::Ref(_) => {
+                let _ = out.write_str("REF MODE TARGET PREV\n");
                 let mut line = AsciiLine::<96>::new();
-                for rec in self.items[..self.len].iter().flatten() {
+                for rec in &self.items[..self.len] {
                     if let Record::Ref(meta) = rec {
                         line.clear();
                         line.push_byte(b'@');
-                        line.push_str_left(meta.name_str(), 15);
+                        line.push_str(meta.name_str());
                         line.push_str(if meta.writable {
-                            " rw    obj:"
+                            " rw obj:"
                         } else {
-                            " ro    obj:"
+                            " ro obj:"
                         });
                         line.push_hex16(meta.target.0);
-                        match meta.prev {
+                        match meta.prev() {
                             Some(p) => {
-                                line.push_str("  obj:");
+                                line.push_str(" obj:");
                                 line.push_hex16(p.0);
                                 line.push_byte(b'\n');
                             }
                             None => {
-                                line.push_str("  -\n");
+                                line.push_str(" -\n");
                             }
                         }
                         let _ = out.write_str(line.as_str());
                     }
                 }
             }
-            Some(Record::Metric { .. }) => {
-                let _ = out.write_str("METRIC                VALUE\n");
+            Record::Metric { .. } => {
+                let _ = out.write_str("METRIC VALUE\n");
                 let mut line = AsciiLine::<96>::new();
-                for rec in self.items[..self.len].iter().flatten() {
+                for rec in &self.items[..self.len] {
                     if let Record::Metric { label, value, unit } = rec {
                         line.clear();
-                        line.push_str_left(label, 20);
-                        line.push_str("  ");
+                        line.push_str(label);
+                        line.push_byte(b' ');
                         line.push_u64(*value);
                         line.push_byte(b' ');
                         line.push_str(unit);
@@ -375,13 +401,12 @@ impl RecordStream {
                     }
                 }
             }
-            Some(Record::Count(c)) => {
+            Record::Count(c) => {
                 let mut line = AsciiLine::<24>::new();
                 line.push_u64(c as u64);
                 line.push_byte(b'\n');
                 let _ = out.write_str(line.as_str());
             }
-            None => {}
         }
     }
 }
@@ -417,17 +442,11 @@ impl<const N: usize> AsciiLine<N> {
     #[inline]
     fn push_str(&mut self, s: &str) {
         let bytes = s.as_bytes();
-        let n = bytes.len().min(N - self.len);
+        let mut n = bytes.len().min(N - self.len);
+        while n > 0 && !s.is_char_boundary(n) {
+            n -= 1;
+        }
         self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
-        self.len += n;
-    }
-
-    #[inline]
-    fn push_str_left(&mut self, s: &str, width: usize) {
-        self.push_str(s);
-        let pad = width.saturating_sub(s.len());
-        let n = pad.min(N - self.len);
-        self.buf[self.len..self.len + n].fill(b' ');
         self.len += n;
     }
 
@@ -450,17 +469,6 @@ impl<const N: usize> AsciiLine<N> {
     }
 
     #[inline]
-    fn push_u64_left(&mut self, v: u64, width: usize) {
-        let start = self.len;
-        self.push_u64(v);
-        let written = self.len - start;
-        let pad = width.saturating_sub(written);
-        let n = pad.min(N - self.len);
-        self.buf[self.len..self.len + n].fill(b' ');
-        self.len += n;
-    }
-
-    #[inline]
     fn push_hex16(&mut self, v: u64) {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         if N - self.len >= 16 {
@@ -479,14 +487,85 @@ impl<const N: usize> AsciiLine<N> {
     }
 }
 
+const BANNER_TEXT: &str = concat!(
+    "\n================================================================\n",
+    "  newos-sh: Post-UNIX Typed Pipeline Shell + EL0 CAOS\n",
+    "  100% #![forbid(unsafe_code)] · zero POSIX paths · zero heap\n",
+    "  Try: `get @guide`, `objects | where size > 20`, `help`\n",
+    "================================================================\n\n",
+);
+
+const _: () = assert!(BANNER_TEXT.len() <= SHELL_OUT_BUF);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParseError {
+    UnclosedQuote,
+    TooManyStages,
+    EmptyStage,
+    TooManyArgs,
+}
+
+#[inline]
+const fn parse_error_msg(err: ParseError) -> &'static str {
+    match err {
+        ParseError::UnclosedQuote => "newos-sh: unclosed quote\n",
+        ParseError::TooManyStages => "newos-sh: too many pipeline stages (max 6)\n",
+        ParseError::EmptyStage => "newos-sh: empty pipeline stage\n",
+        ParseError::TooManyArgs => "newos-sh: too many arguments (max 12)\n",
+    }
+}
+
+#[inline]
+const fn store_error_str(e: StoreError) -> &'static str {
+    match e {
+        StoreError::NotFound => "NotFound",
+        StoreError::NoSpace => "NoSpace",
+        StoreError::TooLarge => "TooLarge",
+        StoreError::InvalidName => "InvalidName",
+        StoreError::ReadOnly => "ReadOnly",
+        StoreError::NoPreviousVersion => "NoPreviousVersion",
+        StoreError::CorruptSnapshot => "CorruptSnapshot",
+        StoreError::HashCollision => "HashCollision",
+    }
+}
+
+#[inline]
+const fn sys_error_str(e: SysError) -> &'static str {
+    match e {
+        SysError::InvalidCapability => "InvalidCapability",
+        SysError::InsufficientRights => "InsufficientRights",
+        SysError::OutOfMemory => "OutOfMemory",
+        SysError::InvalidArgument => "InvalidArgument",
+        SysError::SlotOccupied => "SlotOccupied",
+        SysError::WouldBlock => "WouldBlock",
+        SysError::Unsupported => "Unsupported",
+    }
+}
+
+fn write_store_err<H: ShellHost>(host: &mut H, prefix: &str, e: StoreError) {
+    let mut line = AsciiLine::<128>::new();
+    line.push_str(prefix);
+    line.push_str(store_error_str(e));
+    line.push_byte(b'\n');
+    host.write_debug(line.as_str());
+}
+
+fn write_quoted_err<H: ShellHost>(host: &mut H, prefix: &str, item: &str, suffix: &str) {
+    let mut line = AsciiLine::<128>::new();
+    line.push_str(prefix);
+    line.push_str(item);
+    line.push_str(suffix);
+    host.write_debug(line.as_str());
+}
+
 pub struct Shell<H: ShellHost> {
     store: ObjectStore,
     host: H,
     cached_sys_info: Option<SysInfo>,
     scratch_stream: RecordStream,
     history: [[u8; LINE_BUF_SIZE]; HISTORY_LEN],
-    history_lens: [usize; HISTORY_LEN],
-    history_count: usize,
+    history_lens: [u8; HISTORY_LEN],
+    history_count: u32,
 }
 
 impl<H: ShellHost> Shell<H> {
@@ -505,11 +584,6 @@ impl<H: ShellHost> Shell<H> {
     #[inline]
     fn sys_info_cached(&mut self) -> SysInfo {
         sys_info_cached_with(&mut self.host, &mut self.cached_sys_info)
-    }
-
-    #[inline]
-    fn buffered_out(&mut self) -> BufferedWriter<256, HostWriter<'_, H>> {
-        BufferedWriter::new(HostWriter(&mut self.host))
     }
 
     pub fn store(&self) -> &ObjectStore {
@@ -534,14 +608,17 @@ impl<H: ShellHost> Shell<H> {
 
     pub fn record_history(&mut self, line: &str) {
         let bytes = line.as_bytes();
-        let len = bytes.len().min(LINE_BUF_SIZE);
+        let mut len = bytes.len().min(LINE_BUF_SIZE);
+        while len > 0 && !line.is_char_boundary(len) {
+            len -= 1;
+        }
         if len == 0 {
             return;
         }
-        let slot = self.history_count % HISTORY_LEN;
+        let slot = (self.history_count as usize) % HISTORY_LEN;
         self.history[slot][..len].copy_from_slice(&bytes[..len]);
-        self.history_lens[slot] = len;
-        self.history_count += 1;
+        self.history_lens[slot] = len as u8;
+        self.history_count = self.history_count.wrapping_add(1);
     }
 
     /// Automated post-UNIX CAOS + typed-pipeline self-check (run by `cargo xtask test`).
@@ -586,7 +663,7 @@ impl<H: ShellHost> Shell<H> {
 
         // 5. Typed pipeline filter & reduction: `procs | where pid == 1 | count` -> 1
         self.scratch_stream.clear();
-        eval_pipeline_with(
+        let _ = eval_pipeline_with(
             &mut self.store,
             &mut self.host,
             &mut self.cached_sys_info,
@@ -604,19 +681,15 @@ impl<H: ShellHost> Shell<H> {
 
     /// Run the interactive EL0 REPL (`cargo xtask run`).
     pub fn run_interactive(&mut self) -> ! {
-        {
-            let mut out = self.buffered_out();
-            let _ = writeln!(out, "\n================================================================");
-            let _ = writeln!(out, "  newos-sh: Post-UNIX Typed Pipeline Shell + EL0 CAOS");
-            let _ = writeln!(out, "  100% #![forbid(unsafe_code)] · zero POSIX paths · zero heap");
-            let _ = writeln!(out, "  Try: `get @guide`, `objects | where size > 20`, `help`");
-            let _ = writeln!(out, "================================================================\n");
-        }
+        self.host.write_debug(BANNER_TEXT);
 
         let mut line_buf = [0u8; LINE_BUF_SIZE];
         loop {
             self.host.write_debug("newos λ ");
-            let len = self.read_line(&mut line_buf);
+            let len = match self.read_line_checked(&mut line_buf) {
+                Ok(n) => n,
+                Err(_) => self.host.exit(QemuExitCode::Failed),
+            };
             let line = core::str::from_utf8(&line_buf[..len]).unwrap_or("").trim();
             if line.is_empty() {
                 continue;
@@ -628,20 +701,45 @@ impl<H: ShellHost> Shell<H> {
         }
     }
 
-    fn read_line(&mut self, buf: &mut [u8; LINE_BUF_SIZE]) -> usize {
+    fn drain_background_logs(&mut self, current_input: &[u8]) {
+        let mut log_buf = [0u8; 256];
+        while let Some((_badge, raw_n)) = self.host.poll_background_log(&mut log_buf) {
+            let n = raw_n.min(log_buf.len());
+            let mut out = AsciiLine::<512>::new();
+            out.push_str("\r\x1b[K");
+            if let Ok(line) = core::str::from_utf8(&log_buf[..n]) {
+                out.push_str(line);
+            }
+            out.push_str("\nnewos λ ");
+            if let Ok(typed) = core::str::from_utf8(current_input) {
+                out.push_str(typed);
+            }
+            self.host.write_debug(out.as_str());
+        }
+    }
+
+    /// Read a single interactive line into `buf`, returning the number of bytes read
+    /// (or `0` on `^C` or fatal host read/yield error).
+    pub fn read_line(&mut self, buf: &mut [u8; LINE_BUF_SIZE]) -> usize {
+        self.read_line_checked(buf).unwrap_or(0)
+    }
+
+    fn read_line_checked(&mut self, buf: &mut [u8; LINE_BUF_SIZE]) -> Result<usize, SysError> {
         let mut len = 0usize;
         loop {
+            self.drain_background_logs(&buf[..len]);
             let byte = match self.host.read_debug_byte() {
                 Ok(b) => b,
-                Err(SysError::WouldBlock) | Err(_) => {
-                    let _ = self.host.yield_now();
+                Err(SysError::WouldBlock) => {
+                    self.host.yield_now()?;
                     continue;
                 }
+                Err(e) => return Err(e),
             };
             match byte {
                 b'\r' | b'\n' => {
                     self.host.write_debug("\n");
-                    return len;
+                    return Ok(len);
                 }
                 0x08 | 0x7F => {
                     if len > 0 {
@@ -651,13 +749,15 @@ impl<H: ShellHost> Shell<H> {
                 }
                 0x03 => {
                     self.host.write_debug("^C\n");
-                    return 0;
+                    return Ok(0);
                 }
                 0x0C => {
-                    self.host.write_debug("\x1b[2J\x1b[Hnewos λ ");
+                    let mut out = AsciiLine::<160>::new();
+                    out.push_str("\x1b[2J\x1b[Hnewos λ ");
                     if let Ok(s) = core::str::from_utf8(&buf[..len]) {
-                        self.host.write_debug(s);
+                        out.push_str(s);
                     }
+                    self.host.write_debug(out.as_str());
                 }
                 0x20..=0x7E if len < LINE_BUF_SIZE => {
                     buf[len] = byte;
@@ -680,7 +780,7 @@ impl<H: ShellHost> Shell<H> {
     /// Evaluate a typed pipeline silently (no `write_debug` output) and return its `RecordStream`.
     pub fn eval_pipeline(&mut self, line: &str) -> RecordStream {
         let mut stream = RecordStream::new();
-        eval_pipeline_with(
+        let _ = eval_pipeline_with(
             &mut self.store,
             &mut self.host,
             &mut self.cached_sys_info,
@@ -691,8 +791,25 @@ impl<H: ShellHost> Shell<H> {
         stream
     }
 
+    /// Evaluate a typed pipeline silently reusing `self.scratch_stream` (zero stack `RecordStream` init).
+    pub fn eval_pipeline_ref(&mut self, line: &str) -> &RecordStream {
+        self.scratch_stream.clear();
+        let _ = eval_pipeline_with(
+            &mut self.store,
+            &mut self.host,
+            &mut self.cached_sys_info,
+            line,
+            true,
+            &mut self.scratch_stream,
+        );
+        &self.scratch_stream
+    }
+
     fn exec_line_inner(&mut self, line: &str, silent: bool) -> ExecOutcome {
         let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return ExecOutcome::Continue;
+        }
         match trimmed {
             "exit" | "shutdown" => {
                 if !silent {
@@ -717,14 +834,22 @@ impl<H: ShellHost> Shell<H> {
             }
             "history" => {
                 if !silent {
-                    let total = self.history_count.min(HISTORY_LEN);
-                    let start = self.history_count.saturating_sub(total);
-                    let mut out = BufferedWriter::<256, _>::new(HostWriter(&mut self.host));
+                    let count = self.history_count as usize;
+                    let total = count.min(HISTORY_LEN);
+                    let start = count.saturating_sub(total);
+                    let mut out =
+                        BufferedWriter::<SHELL_OUT_BUF, _>::new(HostWriter(&mut self.host));
+                    let mut row = AsciiLine::<160>::new();
                     for i in 0..total {
                         let idx = (start + i) % HISTORY_LEN;
-                        let len = self.history_lens[idx];
+                        let len = self.history_lens[idx] as usize;
                         if let Ok(s) = core::str::from_utf8(&self.history[idx][..len]) {
-                            let _ = writeln!(out, "{:>3}  {s}", start + i + 1);
+                            row.clear();
+                            row.push_u64((start + i + 1) as u64);
+                            row.push_str("  ");
+                            row.push_str(s);
+                            row.push_byte(b'\n');
+                            let _ = out.write_str(row.as_str());
                         }
                     }
                 }
@@ -732,8 +857,7 @@ impl<H: ShellHost> Shell<H> {
             }
             "help" => {
                 if !silent {
-                    let mut out = self.buffered_out();
-                    write_help(&mut out);
+                    self.host.write_debug(HELP_TEXT);
                 }
                 return ExecOutcome::Continue;
             }
@@ -741,11 +865,13 @@ impl<H: ShellHost> Shell<H> {
                 let reclaimed = self.store.gc();
                 let remaining = self.store.object_count();
                 if !silent {
-                    let mut out = self.buffered_out();
-                    let _ = writeln!(
-                        out,
-                        "gc: reclaimed {reclaimed} unreachable object(s), {remaining} live"
-                    );
+                    let mut row = AsciiLine::<96>::new();
+                    row.push_str("gc: reclaimed ");
+                    row.push_u64(reclaimed as u64);
+                    row.push_str(", ");
+                    row.push_u64(remaining as u64);
+                    row.push_str(" live\n");
+                    self.host.write_debug(row.as_str());
                 }
                 return ExecOutcome::Continue;
             }
@@ -753,24 +879,34 @@ impl<H: ShellHost> Shell<H> {
                 let info = self.sys_info_cached();
                 let obj_count = self.store.object_count();
                 if !silent {
-                    let mut out = self.buffered_out();
-                    let _ = writeln!(
-                        out,
-                        "NewOS 0.1.0 aarch64 (Raspberry Pi 5 16 GB) pure-seL4-microkernel (SMP={} CPUs, {} EL0 procs, {} CAOS objects)",
-                        info.online_cpus,
-                        info.proc_count,
-                        obj_count
-                    );
+                    let mut row = AsciiLine::<96>::new();
+                    row.push_str("NewOS 0.1.0 aarch64 seL4 (SMP=");
+                    row.push_u64(u64::from(info.online_cpus));
+                    row.push_str(" CPUs, ");
+                    row.push_u64(u64::from(info.proc_count));
+                    row.push_str(" procs, ");
+                    row.push_u64(obj_count as u64);
+                    row.push_str(" objs)\n");
+                    self.host.write_debug(row.as_str());
                 }
                 return ExecOutcome::Continue;
             }
             _ => {}
         }
 
-        // Single-stage commands: tokenize once for `get`, `ref`, and single-producer pipelines.
-        if !trimmed.contains('|') {
-            let mut toks = [""; MAX_ARGS];
-            let argc = split_tokens(trimmed, &mut toks);
+        // Single-pass stage tokenizer: parses stage 0 directly without a separate `split_pipeline` pass.
+        let mut toks = [""; MAX_ARGS];
+        let (argc, next_rest) = match next_pipeline_stage(trimmed, &mut toks) {
+            Ok(v) => v,
+            Err(pe) => {
+                if !silent {
+                    self.host.write_debug(parse_error_msg(pe));
+                }
+                return ExecOutcome::Continue;
+            }
+        };
+
+        if next_rest.is_none() {
             if argc > 0 && toks[0] == "get" {
                 let Some(spec) = toks.get(1).copied().filter(|s| !s.is_empty()) else {
                     if !silent {
@@ -782,14 +918,26 @@ impl<H: ShellHost> Shell<H> {
                     Ok((hash, bytes)) => {
                         if !silent {
                             let text = core::str::from_utf8(bytes).unwrap_or("<binary>");
-                            let mut out = BufferedWriter::<256, _>::new(HostWriter(&mut self.host));
-                            let _ = writeln!(out, "[obj:{:016x}, {} B]\n{text}", hash.0, bytes.len());
+                            let mut row = AsciiLine::<192>::new();
+                            row.push_str("[obj:");
+                            row.push_hex16(hash.0);
+                            row.push_str(", ");
+                            row.push_u64(bytes.len() as u64);
+                            row.push_str("B]\n");
+                            row.push_str(text);
+                            row.push_byte(b'\n');
+                            self.host.write_debug(row.as_str());
                         }
                     }
                     Err(e) => {
                         if !silent {
-                            let mut out = self.buffered_out();
-                            let _ = writeln!(out, "get: {spec}: {e:?}");
+                            let mut row = AsciiLine::<128>::new();
+                            row.push_str("get: ");
+                            row.push_str(spec);
+                            row.push_str(": ");
+                            row.push_str(store_error_str(e));
+                            row.push_byte(b'\n');
+                            self.host.write_debug(row.as_str());
                         }
                     }
                 }
@@ -801,7 +949,7 @@ impl<H: ShellHost> Shell<H> {
             }
 
             self.scratch_stream.clear();
-            eval_producer_tokens_with(
+            let ok = eval_producer_tokens_with(
                 &mut self.store,
                 &mut self.host,
                 &mut self.cached_sys_info,
@@ -809,8 +957,8 @@ impl<H: ShellHost> Shell<H> {
                 silent,
                 &mut self.scratch_stream,
             );
-            if !silent {
-                let mut out = BufferedWriter::<256, _>::new(HostWriter(&mut self.host));
+            if ok && !silent {
+                let mut out = BufferedWriter::<SHELL_OUT_BUF, _>::new(HostWriter(&mut self.host));
                 self.scratch_stream.render(&mut out);
             }
             return ExecOutcome::Continue;
@@ -818,16 +966,17 @@ impl<H: ShellHost> Shell<H> {
 
         // Multi-stage typed pipeline evaluation (`producer | filter | transform ...`)
         self.scratch_stream.clear();
-        eval_pipeline_with(
+        let ok = eval_pipeline_tail_with(
             &mut self.store,
             &mut self.host,
             &mut self.cached_sys_info,
-            trimmed,
+            &toks[..argc],
+            next_rest,
             silent,
             &mut self.scratch_stream,
         );
-        if !silent {
-            let mut out = BufferedWriter::<256, _>::new(HostWriter(&mut self.host));
+        if ok && !silent {
+            let mut out = BufferedWriter::<SHELL_OUT_BUF, _>::new(HostWriter(&mut self.host));
             self.scratch_stream.render(&mut out);
         }
         ExecOutcome::Continue
@@ -838,22 +987,30 @@ impl<H: ShellHost> Shell<H> {
             ["set", name, hash_str] => {
                 let Some(hash) = ObjHash::parse_hex(hash_str) else {
                     if !silent {
-                        let mut out = self.buffered_out();
-                        let _ = writeln!(out, "ref set: invalid hash `{hash_str}`");
+                        write_quoted_err(
+                            &mut self.host,
+                            "ref set: invalid hash `",
+                            hash_str,
+                            "`\n",
+                        );
                     }
                     return;
                 };
                 match self.store.set_ref(name, hash) {
                     Ok(()) => {
                         if !silent {
-                            let mut out = self.buffered_out();
-                            let _ = writeln!(out, "bound @{name} -> obj:{:016x}", hash.0);
+                            let mut row = AsciiLine::<96>::new();
+                            row.push_str("bound @");
+                            row.push_str(name.strip_prefix('@').unwrap_or(name));
+                            row.push_str(" -> obj:");
+                            row.push_hex16(hash.0);
+                            row.push_byte(b'\n');
+                            self.host.write_debug(row.as_str());
                         }
                     }
                     Err(e) => {
                         if !silent {
-                            let mut out = self.buffered_out();
-                            let _ = writeln!(out, "ref set: {e:?}");
+                            write_store_err(&mut self.host, "ref set: ", e);
                         }
                     }
                 }
@@ -861,43 +1018,46 @@ impl<H: ShellHost> Shell<H> {
             ["seal", name] => match self.store.seal_ref(name) {
                 Ok(()) => {
                     if !silent {
-                        let mut out = self.buffered_out();
-                        let _ = writeln!(out, "sealed @{name} (irreversibly read-only)");
+                        let mut row = AsciiLine::<64>::new();
+                        row.push_str("sealed @");
+                        row.push_str(name.strip_prefix('@').unwrap_or(name));
+                        row.push_str(" (ro)\n");
+                        self.host.write_debug(row.as_str());
                     }
                 }
                 Err(e) => {
                     if !silent {
-                        let mut out = self.buffered_out();
-                        let _ = writeln!(out, "ref seal: {e:?}");
+                        write_store_err(&mut self.host, "ref seal: ", e);
                     }
                 }
             },
             ["rollback", name] => match self.store.rollback_ref(name) {
                 Ok(h) => {
                     if !silent {
-                        let mut out = self.buffered_out();
-                        let _ = writeln!(out, "rolled back @{name} -> obj:{:016x}", h.0);
+                        let mut row = AsciiLine::<96>::new();
+                        row.push_str("rollback @");
+                        row.push_str(name.strip_prefix('@').unwrap_or(name));
+                        row.push_str(" -> obj:");
+                        row.push_hex16(h.0);
+                        row.push_byte(b'\n');
+                        self.host.write_debug(row.as_str());
                     }
                 }
                 Err(e) => {
                     if !silent {
-                        let mut out = self.buffered_out();
-                        let _ = writeln!(out, "ref rollback: {e:?}");
+                        write_store_err(&mut self.host, "ref rollback: ", e);
                     }
                 }
             },
             _ => {
                 if !silent {
-                    let mut out = self.buffered_out();
-                    let _ = writeln!(
-                        out,
-                        "usage: ref <set <name> <hash> | seal <name> | rollback <name>>"
+                    self.host.write_debug(
+                        "usage: ref <set <name> <hash> | seal <name> | rollback <name>>\n",
                     );
                 }
             }
         }
     }
-
 }
 
 #[inline]
@@ -918,25 +1078,96 @@ fn eval_pipeline_with<H: ShellHost>(
     line: &str,
     silent: bool,
     stream: &mut RecordStream,
-) {
-    let mut stages = [""; MAX_STAGES];
-    let mut stage_count = 0usize;
-    for part in line.split('|') {
-        if stage_count < MAX_STAGES {
-            stages[stage_count] = part.trim();
-            stage_count += 1;
+) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let mut toks = [""; MAX_ARGS];
+    let (argc, next_rest) = match next_pipeline_stage(trimmed, &mut toks) {
+        Ok(v) => v,
+        Err(pe) => {
+            if !silent {
+                host.write_debug(parse_error_msg(pe));
+            }
+            return false;
+        }
+    };
+    eval_pipeline_tail_with(
+        store,
+        host,
+        cached_sys_info,
+        &toks[..argc],
+        next_rest,
+        silent,
+        stream,
+    )
+}
+
+fn eval_pipeline_tail_with<H: ShellHost>(
+    store: &mut ObjectStore,
+    host: &mut H,
+    cached_sys_info: &mut Option<SysInfo>,
+    producer_toks: &[&str],
+    rest: Option<&str>,
+    silent: bool,
+    stream: &mut RecordStream,
+) -> bool {
+    let Some(mut rem) = rest else {
+        return eval_producer_tokens_with(
+            store,
+            host,
+            cached_sys_info,
+            producer_toks,
+            silent,
+            stream,
+        );
+    };
+
+    // Parse and validate all downstream pipeline stages ONCE on the stack before executing
+    // stage 0 so syntax errors in stage >= 1 never mutate CAOS state or dispatch IPC calls.
+    let mut stage_toks = [[""; MAX_ARGS]; MAX_STAGES - 1];
+    let mut stage_argcs = [0usize; MAX_STAGES - 1];
+    let mut n_transforms = 0usize;
+    loop {
+        if n_transforms >= MAX_STAGES - 1 {
+            stream.clear();
+            if !silent {
+                host.write_debug(parse_error_msg(ParseError::TooManyStages));
+            }
+            return false;
+        }
+        match next_pipeline_stage(rem, &mut stage_toks[n_transforms]) {
+            Ok((argc, next)) => {
+                stage_argcs[n_transforms] = argc;
+                n_transforms += 1;
+                match next {
+                    Some(n) => rem = n,
+                    None => break,
+                }
+            }
+            Err(pe) => {
+                stream.clear();
+                if !silent {
+                    host.write_debug(parse_error_msg(pe));
+                }
+                return false;
+            }
         }
     }
-    if stage_count == 0 {
-        return;
+
+    if !eval_producer_tokens_with(store, host, cached_sys_info, producer_toks, silent, stream) {
+        return false;
     }
 
-    let mut toks = [""; MAX_ARGS];
-    let argc = split_tokens(stages[0], &mut toks);
-    eval_producer_tokens_with(store, host, cached_sys_info, &toks[..argc], silent, stream);
-    for stage in &stages[1..stage_count] {
-        eval_transform_with(store, host, stage, stream, silent);
+    for i in 0..n_transforms {
+        let argc = stage_argcs[i];
+        if !eval_transform_tokens_with(store, host, &stage_toks[i][..argc], stream, silent) {
+            stream.clear();
+            return false;
+        }
     }
+    true
 }
 
 fn eval_producer_tokens_with<H: ShellHost>(
@@ -946,9 +1177,9 @@ fn eval_producer_tokens_with<H: ShellHost>(
     toks: &[&str],
     silent: bool,
     stream: &mut RecordStream,
-) {
+) -> bool {
     if toks.is_empty() {
-        return;
+        return true;
     }
 
     match toks[0] {
@@ -966,63 +1197,119 @@ fn eval_producer_tokens_with<H: ShellHost>(
                     name: "worker (IPC responder)",
                 });
             }
+            true
         }
         "objects" => {
             store.for_each_object(|meta| {
                 stream.push(Record::Object(meta));
             });
+            true
         }
         "refs" => {
             store.for_each_ref(|meta| {
                 stream.push(Record::Ref(meta));
             });
+            true
         }
         "put" => {
-            let mut buf = [0u8; 128];
-            let mut pos = 0usize;
-            for (i, arg) in toks[1..].iter().enumerate() {
-                if i > 0 && pos < buf.len() {
-                    buf[pos] = b' ';
-                    pos += 1;
+            let res = match &toks[1..] {
+                [] => store.put(&[]).map(|h| (h, 0)),
+                [single] => {
+                    let b = single.as_bytes();
+                    store.put(b).map(|h| (h, b.len()))
                 }
-                let b = arg.as_bytes();
-                let n = b.len().min(buf.len().saturating_sub(pos));
-                buf[pos..pos + n].copy_from_slice(&b[..n]);
-                pos += n;
-            }
-            match store.put(&buf[..pos]) {
-                Ok(hash) => stream.push(Record::Object(ObjectMeta { hash, size: pos })),
+                args => {
+                    let mut buf = [0u8; MAX_BLOB_SIZE];
+                    let mut pos = 0usize;
+                    let mut overflow = false;
+                    for (i, arg) in args.iter().enumerate() {
+                        let sep = usize::from(i > 0);
+                        let b = arg.as_bytes();
+                        match pos.checked_add(sep).and_then(|p| p.checked_add(b.len())) {
+                            Some(end) if end <= MAX_BLOB_SIZE => {
+                                if sep == 1 {
+                                    buf[pos] = b' ';
+                                    pos += 1;
+                                }
+                                buf[pos..pos + b.len()].copy_from_slice(b);
+                                pos += b.len();
+                            }
+                            _ => {
+                                overflow = true;
+                                break;
+                            }
+                        }
+                    }
+                    if overflow {
+                        Err(StoreError::TooLarge)
+                    } else {
+                        store.put(&buf[..pos]).map(|h| (h, pos))
+                    }
+                }
+            };
+            match res {
+                Ok((hash, size)) => {
+                    stream.push(Record::Object(ObjectMeta { hash, size }));
+                    true
+                }
                 Err(e) => {
                     if !silent {
-                        let mut out = BufferedWriter::<256, _>::new(HostWriter(host));
-                        let _ = writeln!(out, "put: {e:?}");
+                        write_store_err(host, "put: ", e);
                     }
+                    false
                 }
             }
         }
         "ping" => {
-            let val = toks
-                .get(1)
-                .filter(|s| !s.is_empty())
-                .and_then(|s| parse_hex_u64(s))
-                .unwrap_or(0xA110_C0DE);
-            if let Ok((badge, reply)) = host.ipc_call(CapId::BOOTSTRAP_EP, val) {
-                stream.push(Record::Metric {
-                    label: "ipc.badge",
-                    value: badge,
-                    unit: "(cap)",
-                });
-                stream.push(Record::Metric {
-                    label: "ipc.reply",
-                    value: reply,
-                    unit: "(from worker)",
-                });
+            if toks.len() > 2 {
+                if !silent {
+                    host.write_debug("usage: ping [hex]\n");
+                }
+                return false;
+            }
+            let val = match toks.get(1).copied() {
+                None | Some("") => 0xA110_C0DE,
+                Some(raw) => match parse_hex_u64(raw) {
+                    Some(v) => v,
+                    None => {
+                        if !silent {
+                            write_quoted_err(host, "ping: invalid hex `", raw, "`\n");
+                        }
+                        return false;
+                    }
+                },
+            };
+            match host.ipc_call(CapId::BOOTSTRAP_EP, val) {
+                Ok((badge, reply)) => {
+                    stream.push(Record::Metric {
+                        label: "ipc.badge",
+                        value: badge,
+                        unit: "(cap)",
+                    });
+                    stream.push(Record::Metric {
+                        label: "ipc.reply",
+                        value: reply,
+                        unit: "(from worker)",
+                    });
+                    true
+                }
+                Err(e) => {
+                    if !silent {
+                        let mut row = AsciiLine::<96>::new();
+                        row.push_str("ping: ipc_call failed: ");
+                        row.push_str(sys_error_str(e));
+                        row.push_byte(b'\n');
+                        host.write_debug(row.as_str());
+                    }
+                    false
+                }
             }
         }
         "net" => {
             let sub = toks.get(1).copied().unwrap_or("");
             let arg = toks.get(2).copied().filter(|s| !s.is_empty());
             host.handle_net(sub, arg, stream, silent);
+            true
         }
         "bench" => {
             const ROUNDTRIPS: u64 = 100;
@@ -1037,27 +1324,32 @@ fn eval_producer_tokens_with<H: ShellHost>(
                 value: avg,
                 unit: "cycles",
             });
+            true
         }
         other => {
             if !silent {
-                let mut out = BufferedWriter::<256, _>::new(HostWriter(host));
-                let _ = writeln!(out, "newos-sh: unknown producer `{other}` (try `help`)");
+                write_quoted_err(
+                    host,
+                    "newos-sh: unknown producer `",
+                    other,
+                    "` (try `help`)\n",
+                );
             }
+            false
         }
     }
 }
 
-fn eval_transform_with<H: ShellHost>(
+fn eval_transform_tokens_with<H: ShellHost>(
     store: &mut ObjectStore,
     host: &mut H,
-    stage: &str,
+    toks: &[&str],
     stream: &mut RecordStream,
     silent: bool,
-) {
-    let mut toks = [""; MAX_ARGS];
-    let argc = split_tokens(stage, &mut toks);
+) -> bool {
+    let argc = toks.len();
     if argc == 0 {
-        return;
+        return true;
     }
 
     match toks[0] {
@@ -1065,67 +1357,117 @@ fn eval_transform_with<H: ShellHost>(
             let n = stream.len();
             stream.clear();
             stream.push(Record::Count(n));
+            true
         }
         "first" => {
-            let limit = toks
-                .get(1)
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(1);
+            if argc > 2 {
+                stream.clear();
+                if !silent {
+                    host.write_debug("usage: ... | first <n>\n");
+                }
+                return false;
+            }
+            let limit = if argc == 1 {
+                1
+            } else {
+                let raw = toks[1];
+                if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) {
+                    match raw.parse::<usize>() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            stream.clear();
+                            if !silent {
+                                write_quoted_err(host, "first: invalid count `", raw, "`\n");
+                            }
+                            return false;
+                        }
+                    }
+                } else {
+                    stream.clear();
+                    if !silent {
+                        write_quoted_err(host, "first: invalid count `", raw, "`\n");
+                    }
+                    return false;
+                }
+            };
             stream.truncate(limit);
+            true
         }
         "save" => {
             let Some(ref_name) = toks.get(1).copied().filter(|s| !s.is_empty()) else {
+                stream.clear();
                 if !silent {
-                    let mut out = BufferedWriter::<256, _>::new(HostWriter(host));
-                    let _ = writeln!(out, "usage: ... | save @<name>");
+                    host.write_debug("usage: ... | save @<name>\n");
                 }
-                return;
+                return false;
             };
             if let Some(Record::Object(meta)) = stream.first() {
-                if let Err(e) = store.set_ref(ref_name, meta.hash)
-                    && !silent
-                {
-                    let mut out = BufferedWriter::<256, _>::new(HostWriter(host));
-                    let _ = writeln!(out, "save {ref_name}: {e:?}");
+                if let Err(e) = store.set_ref(ref_name, meta.hash) {
+                    stream.clear();
+                    if !silent {
+                        let mut row = AsciiLine::<128>::new();
+                        row.push_str("save ");
+                        row.push_str(ref_name);
+                        row.push_str(": ");
+                        row.push_str(store_error_str(e));
+                        row.push_byte(b'\n');
+                        host.write_debug(row.as_str());
+                    }
+                    return false;
                 }
-            } else if !silent {
-                let mut out = BufferedWriter::<256, _>::new(HostWriter(host));
-                let _ = writeln!(out, "save: expected an Object record from upstream");
-            }
-        }
-        "where" if argc >= 4 => {
-            if let Some(pred) = WherePredicate::parse(toks[1], toks[2], toks[3]) {
-                stream.retain(|rec| pred.matches(rec));
+                true
             } else {
                 stream.clear();
+                if !silent {
+                    host.write_debug("save: expected an Object record from upstream\n");
+                }
+                false
+            }
+        }
+        "where" => {
+            if argc != 4 {
+                stream.clear();
+                if !silent {
+                    host.write_debug("usage: ... | where <field> <op> <value>\n");
+                }
+                return false;
+            }
+            if let Some(pred) = WherePredicate::parse(toks[1], toks[2], toks[3]) {
+                stream.retain(|rec| pred.matches(rec));
+                true
+            } else {
+                stream.clear();
+                if !silent {
+                    host.write_debug("where: invalid predicate\n");
+                }
+                false
             }
         }
         other => {
+            stream.clear();
             if !silent {
-                let mut out = BufferedWriter::<256, _>::new(HostWriter(host));
-                let _ = writeln!(out, "newos-sh: unknown stage `{other}` (try `help`)");
+                write_quoted_err(host, "newos-sh: unknown stage `", other, "` (try `help`)\n");
             }
+            false
         }
     }
 }
 
 const HELP_TEXT: &str = concat!(
-    "Post-UNIX Typed Pipelines & Capability Object Store (CAOS):\n",
-    "  put <text>                  Store immutable deduplicated object -> Object\n",
-    "  get <@ref | obj:hash>       Read immutable object content\n",
-    "  objects / refs / procs      Emit typed Object / Ref / Proc records\n",
-    "  ref set|seal|rollback       Manage capability-gated Refs (atomic rollback)\n",
-    "  ping [hex] / bench          TTBR0 IPC round-trip & cycle benchmark\n",
-    "  net [dhcp|ping|resolve]     EL0 smoltcp + Pi 5 RP1 GEM / QEMU VirtIO\n",
-    "  | where <f> ==|!=|> <v>     Filter typed records (e.g. `objects | where size > 20`)\n",
-    "  | save @<name>              Bind upstream Object hash to a named Ref\n",
-    "  | first <n> / | count       Slice or count typed streams\n",
-    "  sys / crash / clear / exit  System info, EL0 fault test, power off\n",
+    "Post-UNIX Typed Pipelines & CAOS:\n",
+    "  put <text>               Store immutable object -> Object\n",
+    "  get <@ref | obj:hash>    Read object content\n",
+    "  objects / refs / procs   Emit Object / Ref / Proc records\n",
+    "  ref set|seal|rollback    Manage capability-gated Refs\n",
+    "  ping [hex] / bench       IPC round-trip & cycle bench\n",
+    "  net [dhcp|ping|resolve]  EL0 smoltcp + GEM / VirtIO\n",
+    "  | where <f> <op> <v>     Filter records\n",
+    "  | save @<name>           Bind Object to Ref\n",
+    "  | first <n> / | count    Slice or count stream\n",
+    "  sys / gc / history / crash / clear / exit\n",
 );
 
-fn write_help<W: Write>(out: &mut W) {
-    let _ = out.write_str(HELP_TEXT);
-}
+const _: () = assert!(HELP_TEXT.len() <= SHELL_OUT_BUF);
 
 #[derive(Clone, Copy)]
 enum CmpOp {
@@ -1228,7 +1570,7 @@ impl<'a> WherePredicate<'a> {
             (Self::Name(op, r), Record::Proc { name, .. }) => op.eval_eq(name == *r),
             (Self::Size(op, r), Record::Object(meta)) => op.eval(meta.size as u64, *r),
             (Self::Name(op, r), Record::Ref(meta)) => {
-                op.eval_eq(&meta.name[..meta.name_len] == r.as_bytes())
+                op.eval_eq(&meta.name[..meta.name_len as usize] == r.as_bytes())
             }
             (Self::Writable(op, r), Record::Ref(meta)) => op.eval_eq(meta.writable == *r),
             (Self::Value(op, r), Record::Metric { value, .. }) => op.eval(value, *r),
@@ -1241,20 +1583,42 @@ impl<'a> WherePredicate<'a> {
 
 #[inline]
 fn parse_u64(rhs: &str) -> Option<u64> {
-    rhs.parse::<u64>().ok().or_else(|| parse_hex_u64(rhs))
+    let b = rhs.as_bytes();
+    if b.len() > 2 && b[0] == b'0' && (b[1] == b'x' || b[1] == b'X') {
+        u64::from_str_radix(&rhs[2..], 16).ok()
+    } else {
+        rhs.parse::<u64>().ok()
+    }
 }
 
-fn split_tokens<'a>(line: &'a str, out: &mut [&'a str; MAX_ARGS]) -> usize {
+/// Single-pass, quote-aware stage tokenizer.
+///
+/// Parses tokens up to the next unquoted `|` (or end-of-line) into `out`, returning
+/// `(argc, remaining_after_pipe)`. Rejects empty stages, unclosed quotes, and `> MAX_ARGS`.
+#[inline]
+fn next_pipeline_stage<'a>(
+    line: &'a str,
+    out: &mut [&'a str; MAX_ARGS],
+) -> Result<(usize, Option<&'a str>), ParseError> {
     let bytes = line.as_bytes();
     let mut i = 0usize;
     let mut count = 0usize;
 
-    while i < bytes.len() && count < MAX_ARGS {
+    while i < bytes.len() {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
         if i >= bytes.len() {
             break;
+        }
+        if bytes[i] == b'|' {
+            if count == 0 {
+                return Err(ParseError::EmptyStage);
+            }
+            return Ok((count, Some(&line[i + 1..])));
+        }
+        if count >= MAX_ARGS {
+            return Err(ParseError::TooManyArgs);
         }
         if bytes[i] == b'"' {
             i += 1;
@@ -1262,25 +1626,36 @@ fn split_tokens<'a>(line: &'a str, out: &mut [&'a str; MAX_ARGS]) -> usize {
             while i < bytes.len() && bytes[i] != b'"' {
                 i += 1;
             }
+            if i >= bytes.len() {
+                return Err(ParseError::UnclosedQuote);
+            }
             out[count] = &line[start..i];
             count += 1;
-            if i < bytes.len() {
-                i += 1;
-            }
+            i += 1;
         } else {
             let start = i;
-            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'|' {
+                if bytes[i] == b'"' {
+                    return Err(ParseError::UnclosedQuote);
+                }
                 i += 1;
             }
             out[count] = &line[start..i];
             count += 1;
         }
     }
-    count
+
+    if count == 0 {
+        return Err(ParseError::EmptyStage);
+    }
+    Ok((count, None))
 }
 
 fn parse_hex_u64(s: &str) -> Option<u64> {
-    let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let stripped = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     u64::from_str_radix(stripped, 16).ok()
 }
 
@@ -1449,7 +1824,10 @@ mod tests {
         assert_eq!(sh.exec_line("crash"), ExecOutcome::Continue);
         assert!(sh.host().fault_triggered);
 
-        assert_eq!(sh.exec_line("exit"), ExecOutcome::Exit(QemuExitCode::Success));
+        assert_eq!(
+            sh.exec_line("exit"),
+            ExecOutcome::Exit(QemuExitCode::Success)
+        );
         assert_eq!(
             sh.exec_line("shutdown"),
             ExecOutcome::Exit(QemuExitCode::Success)
@@ -1527,9 +1905,390 @@ mod tests {
         let bad_rhs = sh.eval_pipeline("objects | where size > not_a_number");
         assert!(bad_rhs.is_empty());
 
-        // Malformed `where` (< 4 args) falls through to unknown stage with unchanged stream
+        // Malformed `where` (< 4 args) emits usage diagnostic and clears stream
         assert_eq!(sh.exec_line("objects | where size"), ExecOutcome::Continue);
-        assert!(sh.host().output_str().contains("unknown stage `where`"));
-        assert!(sh.host().output_str().contains("OBJECT HASH"));
+        assert!(sh.host().output_str().contains("usage: ... | where"));
+        assert!(!sh.host().output_str().contains("OBJECT HASH"));
+    }
+
+    #[test]
+    fn read_line_redraws_prompt_cleanly_on_async_background_log() {
+        struct AsyncLogHost {
+            out: [u8; 512],
+            out_len: usize,
+            step: usize,
+            log_delivered: bool,
+        }
+        impl AsyncLogHost {
+            fn output(&self) -> &str {
+                core::str::from_utf8(&self.out[..self.out_len]).unwrap_or("")
+            }
+        }
+        impl ShellHost for AsyncLogHost {
+            fn write_debug(&mut self, s: &str) {
+                let bytes = s.as_bytes();
+                let n = bytes.len().min(self.out.len() - self.out_len);
+                self.out[self.out_len..self.out_len + n].copy_from_slice(&bytes[..n]);
+                self.out_len += n;
+            }
+            fn sys_info(&mut self) -> SysInfo {
+                SysInfo {
+                    online_cpus: 4,
+                    proc_count: 2,
+                    interactive_shell: true,
+                }
+            }
+            fn read_debug_byte(&mut self) -> Result<u8, SysError> {
+                let b = match self.step {
+                    0 => Ok(b'h'),
+                    1 => Ok(b'e'),
+                    2 => Err(SysError::WouldBlock),
+                    3 => Ok(b'l'),
+                    4 => Ok(b'p'),
+                    _ => Ok(b'\n'),
+                };
+                self.step += 1;
+                b
+            }
+            fn poll_background_log(&mut self, out: &mut [u8]) -> Option<(u64, usize)> {
+                if self.step == 3 && !self.log_delivered {
+                    self.log_delivered = true;
+                    let msg = b"[worker] async log";
+                    out[..msg.len()].copy_from_slice(msg);
+                    Some((1, msg.len()))
+                } else {
+                    None
+                }
+            }
+        }
+
+        let mut sh = Shell::new(AsyncLogHost {
+            out: [0u8; 512],
+            out_len: 0,
+            step: 0,
+            log_delivered: false,
+        });
+        let mut line_buf = [0u8; LINE_BUF_SIZE];
+        let len = sh.read_line(&mut line_buf);
+        assert_eq!(&line_buf[..len], b"help");
+        assert_eq!(
+            sh.host().output(),
+            "he\r\x1b[K[worker] async log\nnewos λ help\n"
+        );
+    }
+
+    #[test]
+    fn quoted_pipe_preserved_in_put_and_save() {
+        let mut sh = Shell::new(MockHost::new());
+        let s = sh.eval_pipeline("put \"a | b\" | save @x");
+        assert_eq!(s.len(), 1);
+        assert_eq!(sh.store().get_any("@x").unwrap().1, b"a | b");
+
+        // Single-stage quoted pipe also works without splitting.
+        let s2 = sh.eval_pipeline("put \"left | right\"");
+        assert_eq!(s2.len(), 1);
+        if let Some(Record::Object(meta)) = s2.first() {
+            assert_eq!(sh.store().get_by_hash(meta.hash).unwrap(), b"left | right");
+        } else {
+            panic!("expected Object record");
+        }
+
+        // Verify eval_pipeline_ref reuses scratch_stream cleanly.
+        let r = sh.eval_pipeline_ref("procs | where pid == 1 | count");
+        assert!(matches!(r.first(), Some(Record::Count(1))));
+    }
+
+    #[test]
+    fn utf8_boundary_truncation_in_ascii_line_and_record_history() {
+        // Multi-byte UTF-8 ("λ" = 2B, "🦀" = 4B) straddling AsciiLine capacity
+        let mut line = AsciiLine::<5>::new();
+        line.push_str("ab🦀"); // 2 + 4 = 6 > 5 -> must truncate before '🦀', keeping "ab"
+        assert_eq!(line.as_str(), "ab");
+
+        let mut line2 = AsciiLine::<4>::new();
+        line2.push_str("aλz"); // 1 + 2 + 1 = 4 -> fits completely
+        assert_eq!(line2.as_str(), "aλz");
+
+        let mut line3 = AsciiLine::<2>::new();
+        line3.push_str("aλ"); // 1 + 2 = 3 > 2 -> keeps "a", never returns ""
+        assert_eq!(line3.as_str(), "a");
+
+        // Multi-byte UTF-8 straddling LINE_BUF_SIZE (128B) in record_history
+        let mut raw = [b'a'; 132];
+        // Put 4-byte '🦀' at bytes 126..130 (straddling 128)
+        raw[126..130].copy_from_slice("🦀".as_bytes());
+        let s = core::str::from_utf8(&raw[..130]).unwrap();
+        let mut sh = Shell::new(MockHost::new());
+        sh.record_history(s);
+        assert_eq!(sh.exec_line("history"), ExecOutcome::Continue);
+        assert!(sh.host().output_str().contains("1  aaaaaaaa"));
+        assert!(!sh.host().output_str().is_empty());
+    }
+
+    #[test]
+    fn put_oversized_single_and_multi_token_returns_too_large() {
+        let mut sh = Shell::new(MockHost::new());
+        let before = sh.store().object_count();
+
+        // Single-token > 128B (129 'x' bytes)
+        let mut cmd = [b'x'; 133];
+        cmd[..4].copy_from_slice(b"put ");
+        let cmd_str = core::str::from_utf8(&cmd).unwrap();
+        assert_eq!(sh.exec_line(cmd_str), ExecOutcome::Continue);
+        assert!(sh.host().output_str().contains("put: TooLarge"));
+        assert_eq!(sh.store().object_count(), before);
+
+        // Multi-token > 128B (65 + ' ' + 65 = 131B)
+        let mut sh2 = Shell::new(MockHost::new());
+        let mut cmd2 = [b'y'; 4 + 65 + 1 + 65];
+        cmd2[..4].copy_from_slice(b"put ");
+        cmd2[4 + 65] = b' ';
+        let cmd2_str = core::str::from_utf8(&cmd2).unwrap();
+        assert_eq!(sh2.exec_line(cmd2_str), ExecOutcome::Continue);
+        assert!(sh2.host().output_str().contains("put: TooLarge"));
+        assert_eq!(sh2.store().object_count(), before);
+    }
+
+    #[test]
+    fn parse_errors_diagnosed_cleanly() {
+        let cases = [
+            ("put \"abc", "unclosed quote"),
+            ("objects | | count", "empty pipeline stage"),
+            ("| count", "empty pipeline stage"),
+            ("objects |", "empty pipeline stage"),
+            (
+                "objects | first 1 | first 1 | first 1 | first 1 | first 1 | count",
+                "too many pipeline stages",
+            ),
+            ("put 1 2 3 4 5 6 7 8 9 10 11 12", "too many arguments"),
+        ];
+        for (cmd, expected) in cases {
+            let mut sh = Shell::new(MockHost::new());
+            assert_eq!(sh.exec_line(cmd), ExecOutcome::Continue);
+            assert!(
+                sh.host().output_str().contains(expected),
+                "cmd `{cmd}` output `{}` did not contain `{expected}`",
+                sh.host().output_str()
+            );
+        }
+    }
+
+    #[test]
+    fn where_first_ping_invalid_args_and_ipc_error_diagnosed() {
+        // Invalid `where` field/op/rhs/argc (including unprefixed hex "dead")
+        for cmd in [
+            "objects | where badfield == 1",
+            "objects | where size ~~ 1",
+            "objects | where size == dead",
+            "objects | where size == 1 extra",
+        ] {
+            let mut sh = Shell::new(MockHost::new());
+            assert_eq!(sh.exec_line(cmd), ExecOutcome::Continue);
+            let out = sh.host().output_str();
+            assert!(
+                out.contains("where: invalid predicate") || out.contains("usage: ... | where"),
+                "unexpected output for `{cmd}`: `{out}`"
+            );
+        }
+
+        // Invalid `first` count & extra args
+        {
+            let mut sh = Shell::new(MockHost::new());
+            assert_eq!(sh.exec_line("objects | first abc"), ExecOutcome::Continue);
+            assert!(sh.host().output_str().contains("first: invalid count"));
+        }
+        {
+            let mut sh = Shell::new(MockHost::new());
+            assert_eq!(sh.exec_line("objects | first 1 2"), ExecOutcome::Continue);
+            assert!(sh.host().output_str().contains("usage: ... | first"));
+        }
+
+        // Invalid `ping` hex
+        {
+            let mut sh = Shell::new(MockHost::new());
+            assert_eq!(sh.exec_line("ping zzz"), ExecOutcome::Continue);
+            assert!(sh.host().output_str().contains("ping: invalid hex"));
+        }
+
+        // `ping` with IPC error from host
+        struct FailIpcHost {
+            out: [u8; 256],
+            len: usize,
+        }
+        impl ShellHost for FailIpcHost {
+            fn write_debug(&mut self, s: &str) {
+                let b = s.as_bytes();
+                let n = b.len().min(self.out.len() - self.len);
+                self.out[self.len..self.len + n].copy_from_slice(&b[..n]);
+                self.len += n;
+            }
+            fn sys_info(&mut self) -> SysInfo {
+                SysInfo {
+                    online_cpus: 1,
+                    proc_count: 1,
+                    interactive_shell: false,
+                }
+            }
+            fn ipc_call(&mut self, _cap: CapId, _payload: u64) -> Result<(u64, u64), SysError> {
+                Err(SysError::InvalidCapability)
+            }
+        }
+        let mut sh = Shell::new(FailIpcHost {
+            out: [0u8; 256],
+            len: 0,
+        });
+        assert_eq!(sh.exec_line("ping 0x42"), ExecOutcome::Continue);
+        let out = core::str::from_utf8(&sh.host().out[..sh.host().len]).unwrap();
+        assert!(out.contains("ping: ipc_call failed: InvalidCapability"));
+    }
+
+    #[test]
+    fn read_line_breaks_on_fatal_error_and_coalesces_ctrl_l() {
+        // 1. Fatal read_debug_byte error breaks immediately with 0 yield_now calls.
+        struct FatalReadHost {
+            yields: usize,
+        }
+        impl ShellHost for FatalReadHost {
+            fn write_debug(&mut self, _s: &str) {}
+            fn sys_info(&mut self) -> SysInfo {
+                SysInfo {
+                    online_cpus: 1,
+                    proc_count: 1,
+                    interactive_shell: true,
+                }
+            }
+            fn read_debug_byte(&mut self) -> Result<u8, SysError> {
+                Err(SysError::InvalidCapability)
+            }
+            fn yield_now(&mut self) -> Result<u64, SysError> {
+                self.yields += 1;
+                Ok(0)
+            }
+        }
+        let mut sh = Shell::new(FatalReadHost { yields: 0 });
+        let mut buf = [0u8; LINE_BUF_SIZE];
+        assert_eq!(sh.read_line(&mut buf), 0);
+        assert_eq!(sh.host().yields, 0);
+
+        // 2. Ctrl-L coalesces screen clear + prompt + buffer into 1 write_debug syscall,
+        //    and drain_background_logs clamps n > 256 and emits 1 write_debug syscall.
+        struct CtrlLAndLogHost {
+            writes: usize,
+            step: usize,
+            log_sent: bool,
+            last_write_len: usize,
+        }
+        impl ShellHost for CtrlLAndLogHost {
+            fn write_debug(&mut self, s: &str) {
+                self.writes += 1;
+                self.last_write_len = s.len();
+            }
+            fn sys_info(&mut self) -> SysInfo {
+                SysInfo {
+                    online_cpus: 1,
+                    proc_count: 1,
+                    interactive_shell: true,
+                }
+            }
+            fn read_debug_byte(&mut self) -> Result<u8, SysError> {
+                let r = match self.step {
+                    0 => Ok(b'a'),
+                    1 => Ok(0x0C), // Ctrl-L
+                    _ => Ok(b'\n'),
+                };
+                self.step += 1;
+                r
+            }
+            fn poll_background_log(&mut self, out: &mut [u8]) -> Option<(u64, usize)> {
+                if self.step == 1 && !self.log_sent {
+                    self.log_sent = true;
+                    out.fill(b'z');
+                    // Deliberately return bogus length > out.len() to verify clamping!
+                    Some((1, 999))
+                } else {
+                    None
+                }
+            }
+        }
+        let mut sh2 = Shell::new(CtrlLAndLogHost {
+            writes: 0,
+            step: 0,
+            log_sent: false,
+            last_write_len: 0,
+        });
+        let n = sh2.read_line(&mut buf);
+        assert_eq!(&buf[..n], b"a");
+        // 1 write for 'a' + 1 coalesced write for log + 1 coalesced write for Ctrl-L + 1 write for '\n' = 4
+        assert_eq!(sh2.host().writes, 4);
+    }
+
+    #[test]
+    fn help_fits_in_single_debug_write_syscall() {
+        let mut sh = Shell::new(MockHost::new());
+        assert_eq!(sh.exec_line("help"), ExecOutcome::Continue);
+        assert_eq!(sh.host().debug_write_syscalls, 1);
+        assert!(sh.host().output_str().len() <= 1024);
+        assert!(sh.host().output_str().contains("Post-UNIX Typed Pipelines"));
+    }
+
+    #[test]
+    fn syntax_error_in_later_pipeline_stage_causes_no_side_effects() {
+        let mut sh = Shell::new(MockHost::new());
+        let base_objs = sh.store().object_count();
+        let bad_cmds = [
+            r#"put "leak1" |"#,
+            r#"put "leak2" | | count"#,
+            r#"put "leak3" | where "unclosed"#,
+            r#"put "leak4" | first 1 | first 1 | first 1 | first 1 | first 1 | count"#,
+            r#"put "leak5" | where a b c d e f g h i j k l"#,
+            r#"put "leak6" | save @leakref |"#,
+            r#"ping 0x10 |"#,
+        ];
+        for cmd in bad_cmds {
+            sh.host_mut().out_len = 0;
+            assert_eq!(sh.exec_line(cmd), ExecOutcome::Continue);
+            assert!(
+                sh.host().output_str().contains("newos-sh:"),
+                "missing diagnostic for `{cmd}`"
+            );
+            assert_eq!(
+                sh.store().object_count(),
+                base_objs,
+                "CAOS mutated for `{cmd}`"
+            );
+            assert!(
+                sh.store().get_any("@leakref").is_err(),
+                "@leakref created for `{cmd}`"
+            );
+            assert_eq!(
+                sh.host().ipc_send_syscalls,
+                0,
+                "IPC send dispatched for `{cmd}`"
+            );
+            assert_eq!(
+                sh.host().ipc_recv_syscalls,
+                0,
+                "IPC recv dispatched for `{cmd}`"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_transform_clears_eval_pipeline_stream() {
+        let mut sh = Shell::new(MockHost::new());
+        for cmd in [
+            "objects | bogus_stage",
+            "procs | save @x",
+            r#"put "abc" | save @motd"#,
+        ] {
+            assert!(
+                sh.eval_pipeline(cmd).is_empty(),
+                "eval_pipeline(`{cmd}`) should be empty"
+            );
+            assert!(
+                sh.eval_pipeline_ref(cmd).is_empty(),
+                "eval_pipeline_ref(`{cmd}`) should be empty"
+            );
+        }
     }
 }

@@ -34,6 +34,8 @@ pub fn bring_up_aps() -> usize {
     target_online
 }
 
+// SAFETY: Limine invokes this `extern "C"` AP entry point once per secondary core
+// with a valid `&MpInfo` and a dedicated per-CPU stack.
 unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
     let cpu_id = info.extra_argument();
     super::set_cpu_id(cpu_id);

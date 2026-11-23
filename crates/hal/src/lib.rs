@@ -20,7 +20,10 @@ pub fn early_init() -> (Platform, BootInfo) {
 
     if !boot::is_base_revision_supported() {
         let mut serial = arch::early_serial();
-        let _ = writeln!(serial, "[newos-hal] ERROR: unsupported Limine base revision");
+        let _ = writeln!(
+            serial,
+            "[newos-hal] ERROR: unsupported Limine base revision"
+        );
         arch::exit_qemu(QemuExitCode::Failed);
     }
 
@@ -41,6 +44,7 @@ pub fn handle_panic(info: &core::panic::PanicInfo<'_>) -> ! {
 #[macro_export]
 macro_rules! entry {
     ($path:path) => {
+        // SAFETY: Exports the single bootloader entry symbol `_start` required by the kernel linker script.
         #[unsafe(no_mangle)]
         pub extern "C" fn _start() -> ! {
             let (platform, info) = $crate::early_init();

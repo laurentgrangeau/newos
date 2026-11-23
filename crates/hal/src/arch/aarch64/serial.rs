@@ -35,6 +35,13 @@ pub fn try_read_byte() -> Option<u8> {
 
 pub struct Pl011;
 
+impl Default for Pl011 {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Pl011 {
     #[inline]
     pub const fn new() -> Self {

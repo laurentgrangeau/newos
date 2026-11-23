@@ -183,6 +183,8 @@ global_asm!(
     irq_el0 = sym syscall::irq_el0_dispatch,
 );
 
+// SAFETY: `__newos_aarch64_vectors` is defined by the `global_asm!` block above as a
+// 2 KiB-aligned EL1 exception vector table.
 unsafe extern "C" {
     static __newos_aarch64_vectors: u8;
 }
@@ -206,7 +208,11 @@ extern "C" fn aarch64_sync_el1_handler() {
     }
 
     let mut s = serial::Pl011::new();
-    let _ = writeln!(s, "[newos-hal] AArch64 sync exception EC={:#x} ELR={:#018x}", ec, elr);
+    let _ = writeln!(
+        s,
+        "[newos-hal] AArch64 sync exception EC={:#x} ELR={:#018x}",
+        ec, elr
+    );
     exit_qemu(QemuExitCode::Failed)
 }
 
@@ -292,7 +298,9 @@ impl Aarch64Platform {
         if let Ok(uart_virt) = VirtAddr::new_page_aligned(UART_VIRT)
             && let Ok(frame) = PhysFrame::from_aligned(PhysAddr::new(uart_phys))
             && let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
-            && vspace.map_4k(uart_virt, frame, mmio_flags, &mut info.untyped).is_ok()
+            && vspace
+                .map_4k(uart_virt, frame, mmio_flags, &mut info.untyped)
+                .is_ok()
         {
             serial::init_virt(UART_VIRT);
         } else {
@@ -311,18 +319,27 @@ impl Aarch64Platform {
         } else {
             RPI5_RP1_GEM_PHYS
         };
+        let mut net_mmio_mapped = false;
         if let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true) {
+            net_mmio_mapped = true;
             for p in 0..NET_MMIO_PAGES {
                 let off = p * 4096;
-                if let Ok(va) = VirtAddr::new_page_aligned(NET_MMIO_VIRT + off)
-                    && let Ok(frame) =
-                        PhysFrame::from_aligned(PhysAddr::new(net_mmio_phys + off))
-                {
-                    let _ = vspace.map_4k(va, frame, mmio_flags, &mut info.untyped);
+                let mapped = VirtAddr::new_page_aligned(NET_MMIO_VIRT + off)
+                    .and_then(|va| {
+                        PhysFrame::from_aligned(PhysAddr::new(net_mmio_phys + off)).and_then(
+                            |frame| vspace.map_4k(va, frame, mmio_flags, &mut info.untyped),
+                        )
+                    })
+                    .is_ok();
+                if !mapped {
+                    net_mmio_mapped = false;
+                    break;
                 }
             }
         }
-        let net_mmio = if info.qemu_virt {
+        let net_mmio = if !net_mmio_mapped {
+            None
+        } else if info.qemu_virt {
             // Scope BOOTSTRAP_NET_MMIO strictly to the single 512-byte VirtIO-Net slot (`C-3`)
             // rather than exposing all 32 VirtIO-MMIO devices on the bus.
             const VIRTIO_MAGIC: u32 = 0x7472_6976;
@@ -332,7 +349,8 @@ impl Aarch64Platform {
             for slot in 0..32u64 {
                 let off = slot * SLOT_STRIDE;
                 let base_va = NET_MMIO_VIRT + off;
-                // SAFETY: `NET_MMIO_VIRT..NET_MMIO_VIRT + 16 KiB` was just mapped as Device-nGnRnE.
+                // SAFETY: All `NET_MMIO_PAGES` pages of `NET_MMIO_VIRT..NET_MMIO_VIRT + 16 KiB`
+                // were verified mapped above as Device-nGnRnE.
                 let (magic, dev_id) = unsafe {
                     (
                         core::ptr::read_volatile(base_va as *const u32),
@@ -340,11 +358,7 @@ impl Aarch64Platform {
                     )
                 };
                 if magic == VIRTIO_MAGIC && dev_id == VIRTIO_DEV_NET {
-                    found = Some((
-                        PhysAddr::new(net_mmio_phys + off),
-                        base_va,
-                        SLOT_STRIDE,
-                    ));
+                    found = Some((PhysAddr::new(net_mmio_phys + off), base_va, SLOT_STRIDE));
                     break;
                 }
             }
@@ -414,18 +428,9 @@ impl HalPlatform for Aarch64Platform {
     }
 
     fn arm_oneshot_timer(&mut self, _ticks: u32) {
-        let t0: u64;
-        // SAFETY: `CNTVCT_EL0` is always readable in EL1 on ARMv8.
-        unsafe {
-            asm!("isb", "mrs {}, cntvct_el0", out(reg) t0, options(nomem, nostack));
-        }
-        let mut t1 = t0;
+        let t0 = syscall::read_cntvct();
         for _ in 0..10_000_000u32 {
-            // SAFETY: `CNTVCT_EL0` is always readable in EL1 on ARMv8.
-            unsafe {
-                asm!("isb", "mrs {}, cntvct_el0", out(reg) t1, options(nomem, nostack));
-            }
-            if t1 != t0 {
+            if syscall::read_cntvct() != t0 {
                 break;
             }
             core::hint::spin_loop();
