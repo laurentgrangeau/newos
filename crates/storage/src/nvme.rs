@@ -153,13 +153,18 @@ impl<'a, T: StorageDmaTransport> NvmeController<'a, T> {
         let dstrd = cap_hi & 0xF;
         let dstrd_bytes = 4u64 << dstrd;
 
-        // 1. Disable controller and wait for CSTS.RDY == 0
+        // 1. Disable controller and wait for CSTS.RDY == 0 (fail on timeout, `P12`)
         transport.write32(REG_CC, 0)?;
+        let mut disabled = false;
         for _ in 0..MAX_POLL {
             if (transport.read32(REG_CSTS)? & CSTS_RDY) == 0 {
+                disabled = true;
                 break;
             }
             core::hint::spin_loop();
+        }
+        if !disabled {
+            return Err(SysError::WouldBlock);
         }
 
         // 2. Program Admin Queue Attributes & 64-bit ASQ/ACQ physical bases
@@ -304,11 +309,12 @@ impl<'a, T: StorageDmaTransport> NvmeController<'a, T> {
         self.transport
             .write32(self.sq_doorbell(1), self.io_sq_tail as u32)?;
 
-        let cqe = &self.dma.io_cq.0[self.io_cq_head];
         for _ in 0..MAX_POLL {
+            let cqe = &self.dma.io_cq.0[self.io_cq_head];
             self.transport.dma_invalidate(cqe)?;
             let status = cqe.status.load(Ordering::Acquire);
             if ((status & 1) != 0) == self.io_phase {
+                let got_cid = cqe.cid.load(Ordering::Acquire);
                 let err_code = status >> 1;
                 self.io_cq_head = (self.io_cq_head + 1) % QUEUE_DEPTH;
                 if self.io_cq_head == 0 {
@@ -316,6 +322,10 @@ impl<'a, T: StorageDmaTransport> NvmeController<'a, T> {
                 }
                 self.transport
                     .write32(self.cq_doorbell(1), self.io_cq_head as u32)?;
+                // Discard stale completions from previously timed-out commands (`P12`).
+                if got_cid != cid {
+                    continue;
+                }
                 return if err_code == 0 {
                     Ok(())
                 } else {
@@ -393,7 +403,9 @@ mod tests {
             } else if offset == REG_DOORBELL_BASE + 8 {
                 // I/O SQ #1 doorbell -> execute mock read/write & post I/O CQE
                 let mut idx = self.io_idx.borrow_mut();
-                let op = (self.dma.io_sq.0[*idx].cdw0.load(Ordering::Acquire) & 0xFF) as u8;
+                let cdw0 = self.dma.io_sq.0[*idx].cdw0.load(Ordering::Acquire);
+                let op = (cdw0 & 0xFF) as u8;
+                let cid = (cdw0 >> 16) as u16;
                 if op == NVM_OP_WRITE {
                     let mut buf = self.stored.borrow_mut();
                     for (i, b) in buf.iter_mut().enumerate() {
@@ -405,6 +417,7 @@ mod tests {
                         self.dma.data_page.0[i].store(b, Ordering::Release);
                     }
                 }
+                self.dma.io_cq.0[*idx].cid.store(cid, Ordering::Release);
                 self.dma.io_cq.0[*idx].status.store(1, Ordering::Release);
                 *idx = (*idx + 1) % QUEUE_DEPTH;
             }

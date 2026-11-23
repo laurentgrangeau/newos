@@ -380,13 +380,17 @@ fn tier1_ipc_bootstrap_caps_layout() {
 
     let ep_cap = ipc.root_cspace.lookup(ep, Rights::ALL).unwrap();
     assert_eq!(ep_cap.badge, 0x5E14);
-    assert_eq!(ipc.root_cspace.occupied_count(), 10);
+    assert_eq!(ipc.root_cspace.occupied_count(), 15);
     assert_eq!(
         ipc.validate_mmio_read32(CapId::BOOTSTRAP_NET_MMIO, 0),
         Ok(PhysAddr::new(0x1000_0000))
     );
     assert_eq!(
-        ipc.validate_console_for(0, CapId::BOOTSTRAP_CONSOLE, Rights::READ.union(Rights::WRITE)),
+        ipc.validate_console_for(
+            0,
+            CapId::BOOTSTRAP_CONSOLE,
+            Rights::READ.union(Rights::WRITE)
+        ),
         Ok(())
     );
     assert_eq!(
@@ -394,7 +398,11 @@ fn tier1_ipc_bootstrap_caps_layout() {
         Ok(())
     );
     assert_eq!(
-        ipc.validate_vspace_for(0, CapId::BOOTSTRAP_VSPACE, Rights::READ.union(Rights::WRITE)),
+        ipc.validate_vspace_for(
+            0,
+            CapId::BOOTSTRAP_VSPACE,
+            Rights::READ.union(Rights::WRITE)
+        ),
         Ok(PhysAddr::new(0))
     );
 }
@@ -609,11 +617,16 @@ fn tier1_mem_phys_frame_from_aligned_and_boot_info_usable_mib() {
     assert!(untyped.push_raw_region(0x100_0000, 3 * 1024 * 1024 + PAGE_SIZE));
     let info = BootInfo {
         hhdm_offset: 0xFFFF_8000_0000_0000,
+        kernel_virt_base: 0,
         untyped,
         cpu_count: 4,
         rsdp_addr: 0,
+        framebuffer: None,
         init_module: None,
         worker_module: None,
+        netd_module: None,
+        keyd_module: None,
+        sshd_module: None,
         interactive_shell: false,
         qemu_virt: false,
     };

@@ -646,7 +646,7 @@ pub fn strip_cfg_test(tokens: &[Tok]) -> Vec<Tok> {
             && tokens[i + 2].text == "cfg"
             && tokens[i + 3].text == "("
             && tokens[i + 4].kind == TokKind::Ident
-            && tokens[i + 4].text == "test"
+            && (tokens[i + 4].text == "test" || tokens[i + 4].text == "kani")
             && tokens[i + 5].text == ")"
             && tokens[i + 6].text == "]"
         {

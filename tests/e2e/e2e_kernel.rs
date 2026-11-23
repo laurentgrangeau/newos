@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::assertions_on_constants)]
 
 //! Opaque-box E2E test suite for `newos-abi` and `newos-kernel-core`.
 //!

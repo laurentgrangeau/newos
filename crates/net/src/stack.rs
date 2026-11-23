@@ -58,6 +58,7 @@ pub struct NetStack<'a, D: Device> {
     sockets: SocketSet<'a>,
     dhcp_handle: SocketHandle,
     tcp_handle: SocketHandle,
+    initial_cfg: NetConfig,
     cfg: NetConfig,
     listen_port: u16,
     was_connected: bool,
@@ -74,7 +75,15 @@ impl<'a, D: Device> NetStack<'a, D> {
         now_ms: i64,
         storage: &'a mut NetStackStorage<'a>,
     ) -> Self {
-        let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+        let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+        // Derive a non-zero per-boot random seed from timestamp + MAC via SplitMix64 (`M8`)
+        // so TCP ISNs, ephemeral ports, and DNS transaction IDs do not repeat with seed=0.
+        let mut seed = (now_ms as u64)
+            ^ u64::from_le_bytes([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0xA5, 0x5A])
+            ^ 0x9E37_79B9_7F4A_7C15;
+        seed = (seed ^ (seed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        seed = (seed ^ (seed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        config.random_seed = seed ^ (seed >> 31);
         let mut iface = Interface::new(config, &mut device, Instant::from_millis(now_ms));
         Self::apply_ip_config(&mut iface, &initial_cfg);
 
@@ -85,6 +94,9 @@ impl<'a, D: Device> NetStack<'a, D> {
             tcp::SocketBuffer::new(&mut storage.tcp_rx_buf[..]),
             tcp::SocketBuffer::new(&mut storage.tcp_tx_buf[..]),
         );
+        // Enforce TCP inactivity timeout and keep-alive so a stalled peer cannot lock out SSH (`N3`).
+        tcp_sock.set_timeout(Some(smoltcp::time::Duration::from_secs(60)));
+        tcp_sock.set_keep_alive(Some(smoltcp::time::Duration::from_secs(15)));
         let _ = tcp_sock.listen(listen_port);
         let tcp_handle = sockets.add(tcp_sock);
 
@@ -94,6 +106,7 @@ impl<'a, D: Device> NetStack<'a, D> {
             sockets,
             dhcp_handle,
             tcp_handle,
+            initial_cfg,
             cfg: initial_cfg,
             listen_port,
             was_connected: false,
@@ -141,8 +154,15 @@ impl<'a, D: Device> NetStack<'a, D> {
                     Self::apply_ip_config(&mut self.iface, &self.cfg);
                 }
                 dhcpv4::Event::Deconfigured => {
-                    self.cfg = NetConfig::QEMU_DEFAULT;
-                    Self::apply_ip_config(&mut self.iface, &self.cfg);
+                    // Revert to the caller-supplied initial configuration (never hardcode QEMU's
+                    // 10.0.2.15/24 on non-QEMU hardware, `N16`).
+                    self.cfg = self.initial_cfg;
+                    if self.cfg.ip == [0, 0, 0, 0] {
+                        self.iface.update_ip_addrs(|addrs| addrs.clear());
+                        self.iface.routes_mut().remove_default_ipv4_route();
+                    } else {
+                        Self::apply_ip_config(&mut self.iface, &self.cfg);
+                    }
                 }
             }
         }

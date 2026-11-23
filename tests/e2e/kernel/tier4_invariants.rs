@@ -138,7 +138,11 @@ fn tier4_kernel_multi_tenant_cdt_isolation_and_untyped_lifecycle() {
     // Retype 6 physical frames from untyped.
     let mut frame_caps = Vec::new();
     for _ in 0..6 {
-        frame_caps.push(ipc.root_cspace.retype_frame_from(untyped, &mut inv).unwrap());
+        frame_caps.push(
+            ipc.root_cspace
+                .retype_frame_from(untyped, &mut inv)
+                .unwrap(),
+        );
     }
     assert_eq!(inv.retyped_frames(), 6);
     assert_eq!(inv.remaining_bytes(), 10 * PAGE_SIZE);
@@ -217,8 +221,8 @@ fn tier4_kernel_elf64_load_wx_and_bss_zeroing_invariant() {
             let page_file_start = (page_idx as usize) * (PAGE_SIZE as usize);
             if page_file_start < seg.file_size {
                 let copy_len = (seg.file_size - page_file_start).min(PAGE_SIZE as usize);
-                let src = &elf_bytes
-                    [seg.file_offset + page_file_start..seg.file_offset + page_file_start + copy_len];
+                let src = &elf_bytes[seg.file_offset + page_file_start
+                    ..seg.file_offset + page_file_start + copy_len];
                 mapper.write_frame_bytes(&frame, 0, src).unwrap();
             }
             let va = VirtAddr::new_page_aligned(seg.vaddr + page_idx * PAGE_SIZE).unwrap();
@@ -298,7 +302,7 @@ fn tier4_kernel_designated_authority_negative_invariants() {
     );
     assert_eq!(
         ipc.validate_console_for(1, CapId::BOOTSTRAP_CONSOLE, Rights::READ),
-        Err(SysError::InsufficientRights)
+        Err(SysError::InvalidCapability)
     );
 
     // 2. Explicit Some(0) badge is rejected; cross-process CDT revocation cascades cleanly.
@@ -307,7 +311,13 @@ fn tier4_kernel_designated_authority_negative_invariants() {
         Err(SysError::InvalidArgument)
     );
     let granted = ipc
-        .cap_grant_between(0, w1_cnode, notif, Rights::READ, Some(0xFACE_B00C_1234_5678))
+        .cap_grant_between(
+            0,
+            w1_cnode,
+            notif,
+            Rights::READ,
+            Some(0xFACE_B00C_1234_5678),
+        )
         .unwrap();
     assert_eq!(ipc.cap_revoke_for(0, notif), Ok(1));
     assert_eq!(

@@ -13,7 +13,7 @@ use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use newos_abi::{ShutdownStatus, SysError, cpu_isa};
 use newos_kernel_core::memory::{CpuSecurityFeatures, PhysAddr, UntypedInventory, VirtAddr};
-use newos_kernel_core::{BootInfo, HalPlatform};
+use newos_kernel_core::{BootInfo, HalPlatform, ProcessRole};
 
 const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
@@ -68,8 +68,8 @@ fn probe_and_enable_cpu_hardening() {
 
     if has_pan || has_ssbs {
         // SAFETY: CPU advertises PAN and/or SSBS; clearing `SCTLR_EL1.SPAN` (bit 23) forces
-        // `PSTATE.PAN = 1` on EL1 entry, and setting `SCTLR_EL1.DSSBS` (bit 44) enables
-        // Speculative Store Bypass Safe on EL1 entry.
+        // `PSTATE.PAN = 1` on EL1 entry, and clearing `SCTLR_EL1.DSSBS` (bit 44 = 0) sets
+        // `PSTATE.SSBS = 0` on EL1 entry so Speculative Store Bypass is *prevented* (`M6`).
         unsafe {
             let mut sctlr: u64;
             asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nomem, nostack));
@@ -77,11 +77,15 @@ fn probe_and_enable_cpu_hardening() {
                 sctlr &= !(1u64 << 23);
             }
             if has_ssbs {
-                sctlr |= 1u64 << 44;
+                sctlr &= !(1u64 << 44);
             }
             asm!("msr sctlr_el1, {}", "isb", in(reg) sctlr, options(nomem, nostack));
             if has_pan {
                 asm!("msr pan, #1", "isb", options(nomem, nostack));
+            }
+            if has_ssbs {
+                // Set `PSTATE.SSBS = 0` immediately via architectural `SSBS` system register (`s3_3_c4_c2_6`).
+                asm!("msr s3_3_c4_c2_6, xzr", "isb", options(nomem, nostack));
             }
         }
     }
@@ -123,11 +127,12 @@ fn probe_and_enable_cpu_hardening() {
     if has_pmuv3 {
         isa |= cpu_isa::PMUV3;
         // SAFETY: CPU advertises PMUv3 (`ID_AA64DFR0_EL1.PMUVer`); enable the architectural
-        // 64-bit cycle counter (`PMCCNTR_EL0`) for EL1/EL0 performance measurement.
+        // 64-bit cycle counter (`PMCCNTR_EL0`) for EL1 only (`PMUSERENR_EL0 = 0` so unprivileged
+        // EL0 processes do not get a free high-resolution side-channel timer).
         unsafe {
             let pmcr: u64 = (1 << 0) | (1 << 2); // E (enable) | C (reset cycle counter)
             let cntenset: u64 = 1 << 31; // Enable PMCCNTR_EL0
-            let userenr: u64 = 1 << 2; // CR: allow EL0 read of PMCCNTR_EL0
+            let userenr: u64 = 0; // Disallow direct EL0 PMU counter reads
             asm!(
                 "msr pmuserenr_el0, {userenr}",
                 "msr pmcr_el0, {pmcr}",
@@ -328,6 +333,30 @@ global_asm!(
     "ldp x0,  x1,  [sp, #0]",
     "add sp, sp, #272",
     "eret",
+    // Enter EL0 from a `TrapFrame` pointer in `x0` (restores all x0..x30, sp_el0, elr_el1, spsr_el1)
+    ".global __newos_el0_enter_frame",
+    "__newos_el0_enter_frame:",
+    "ldp x10, x11, [x0, #256]",
+    "msr elr_el1, x10",
+    "msr spsr_el1, x11",
+    "ldp x30, x9,  [x0, #240]",
+    "msr sp_el0, x9",
+    "ldp x28, x29, [x0, #224]",
+    "ldp x26, x27, [x0, #208]",
+    "ldp x24, x25, [x0, #192]",
+    "ldp x22, x23, [x0, #176]",
+    "ldp x20, x21, [x0, #160]",
+    "ldp x18, x19, [x0, #144]",
+    "ldp x16, x17, [x0, #128]",
+    "ldp x14, x15, [x0, #112]",
+    "ldp x12, x13, [x0, #96]",
+    "ldp x10, x11, [x0, #80]",
+    "ldp x8,  x9,  [x0, #64]",
+    "ldp x6,  x7,  [x0, #48]",
+    "ldp x4,  x5,  [x0, #32]",
+    "ldp x2,  x3,  [x0, #16]",
+    "ldp x0,  x1,  [x0, #0]",
+    "eret",
     "__newos_unhandled_el1:",
     "b __newos_unhandled_el1",
     sync_el1 = sym aarch64_sync_el1_handler,
@@ -347,6 +376,14 @@ extern "C" fn aarch64_irq_el1_handler() {
         let irq_id = iar & 0x3FF;
         if irq_id == gic::SGI_RESCHEDULE && get_cpu_id() != 0 {
             smp::record_ap_sgi_ack();
+        } else if irq_id == gic::virt_timer_irq() {
+            // Mask and disable the virtual timer so an idle core in EL1 never enters a
+            // continuous timer-IRQ storm (`P9`), and record the tick for the boot self-check (`H5`).
+            // SAFETY: Disabling `CNTV_CTL_EL0` (`IMASK=1, ENABLE=0`) in EL1 IRQ context.
+            unsafe {
+                asm!("msr cntv_ctl_el0, {}", "isb", in(reg) 2u64, options(nomem, nostack));
+            }
+            TIMER_COUNT.fetch_add(1, Ordering::Release);
         }
         gic::end_of_interrupt(iar);
     }
@@ -361,9 +398,12 @@ extern "C" fn aarch64_sync_el1_handler() {
         asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack));
     }
     let ec = (esr >> 26) & 0x3F;
-    if ec == 0x3C {
+    let iss = esr & 0xFFFF;
+    // Only skip `brk #0` (the boot-time vector self-test). Every other `brk` immediate —
+    // including KCFI traps (`brk #0x822x`) and compiler traps (`brk #0x1`) — is fatal (`H1`).
+    if ec == 0x3C && iss == 0 {
         BREAKPOINT_COUNT.fetch_add(1, Ordering::Release);
-        // SAFETY: Advancing `ELR_EL1` by 4 skips the `brk #0` instruction cleanly.
+        // SAFETY: Advancing `ELR_EL1` by 4 skips the `brk #0` self-test instruction cleanly.
         unsafe {
             asm!("msr elr_el1, {}", in(reg) elr + 4, options(nomem, nostack));
         }
@@ -373,8 +413,8 @@ extern "C" fn aarch64_sync_el1_handler() {
     let mut s = serial::Pl011::new();
     let _ = writeln!(
         s,
-        "[newos-hal] AArch64 sync exception EC={:#x} ELR={:#018x}",
-        ec, elr
+        "[newos-hal] FATAL AArch64 EL1 sync exception EC={:#x} ISS={:#x} ELR={:#018x}",
+        ec, iss, elr
     );
     system_off(ShutdownStatus::Failed)
 }
@@ -413,9 +453,20 @@ pub fn get_cpu_id() -> u64 {
     id
 }
 
+static IN_SYSTEM_OFF: AtomicBool = AtomicBool::new(false);
+
 /// Power off or reboot cleanly via PSCI `SYSTEM_OFF` / `SYSTEM_RESET`
 /// (`smc #0` on Raspberry Pi 5 ATF/UEFI, `hvc #0` on QEMU `virt`).
 pub fn system_off(code: ShutdownStatus) -> ! {
+    // Prevent infinite recursion if a wrong PSCI conduit faults back into `aarch64_sync_el1_handler`.
+    if IN_SYSTEM_OFF.swap(true, Ordering::AcqRel) {
+        loop {
+            // SAFETY: Mask interrupts and halt forever on recursive shutdown fault.
+            unsafe {
+                asm!("msr daifset, #0xf", "wfi", options(nomem, nostack));
+            }
+        }
+    }
     let mut s = serial::Pl011::new();
     let psci_fn = match code {
         ShutdownStatus::Success => {
@@ -433,12 +484,27 @@ pub fn system_off(code: ShutdownStatus) -> ! {
     };
     let use_smc = PSCI_USE_SMC.load(Ordering::Acquire);
     // SAFETY: Invoking ARM PSCI `SYSTEM_OFF` (0x8400_0008) or `SYSTEM_RESET` (0x8400_0009)
-    // over the board's PSCI conduit (`smc #0` on RPi5 ATF/EL3, `hvc #0` on QEMU `virt`).
+    // over the board's PSCI conduit (`smc #0` on RPi5 ATF/EL3, `hvc #0` on QEMU `virt`),
+    // declaring SMCCC caller-saved register clobbers (`x0..x3`).
     unsafe {
         if use_smc {
-            asm!("smc #0", in("x0") psci_fn, options(nomem, nostack));
+            asm!(
+                "smc #0",
+                inout("x0") psci_fn => _,
+                out("x1") _,
+                out("x2") _,
+                out("x3") _,
+                options(nomem, nostack),
+            );
         } else {
-            asm!("hvc #0", in("x0") psci_fn, options(nomem, nostack));
+            asm!(
+                "hvc #0",
+                inout("x0") psci_fn => _,
+                out("x1") _,
+                out("x2") _,
+                out("x3") _,
+                options(nomem, nostack),
+            );
         }
     }
     loop {
@@ -961,31 +1027,20 @@ impl Aarch64Platform {
                 syscall::register_init_mmio_cap(21, PhysAddr::new(THERMAL_PHYS), 0x1000);
             }
 
-            const RP1_PERIPH_PHYS: u64 = 0x1F_0003_0000;
-            const RP1_PERIPH_LEN: u64 = 0x69000;
-            const RP1_PERIPH_VIRT: u64 = 0xffff_b00a_0000_0000;
-            let mut periph_any = false;
-            for off in [
-                0x0_0000u64,
-                0x2_0000u64,
-                0x4_0000u64,
-                0x4_4000u64,
-                0x6_8000u64,
-            ] {
-                if let Ok(va) = VirtAddr::new_page_aligned(RP1_PERIPH_VIRT + off)
-                    && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(RP1_PERIPH_PHYS + off))
-                    && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
-                {
-                    syscall::register_extra_mmio_mapping(
-                        PhysAddr::new(RP1_PERIPH_PHYS + off),
-                        RP1_PERIPH_VIRT + off,
-                        0x1000,
-                    );
-                    periph_any = true;
-                }
-            }
-            if periph_any {
-                syscall::register_init_mmio_cap(22, PhysAddr::new(RP1_PERIPH_PHYS), RP1_PERIPH_LEN);
+            // Narrow RP1 peripheral capability to the 4 KiB RP1 UART0 page (`P10`) instead of
+            // spanning UART0, SPI0, I2C0, I2C1, and PWM0 in a single 420 KiB capability.
+            const RP1_UART0_PHYS: u64 = 0x1F_0003_0000;
+            const RP1_UART0_VIRT: u64 = 0xffff_b00a_0000_0000;
+            if let Ok(va) = VirtAddr::new_page_aligned(RP1_UART0_VIRT)
+                && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(RP1_UART0_PHYS))
+                && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
+            {
+                syscall::register_extra_mmio_mapping(
+                    PhysAddr::new(RP1_UART0_PHYS),
+                    RP1_UART0_VIRT,
+                    0x1000,
+                );
+                syscall::register_init_mmio_cap(22, PhysAddr::new(RP1_UART0_PHYS), 0x1000);
             }
 
             // Phase 3: BCM2712 MIP MSI-X (`0x10_0013_0000`), microSD SDHCI (`0x10_00ff_f000`),
@@ -1041,38 +1096,9 @@ impl Aarch64Platform {
                 }
             }
 
-            // Map 64 KiB PCIe ECAM window (ACPI MCFG or BCM2712 RC1 FFC fallback `0x10_0011_0000`)
-            let ecam_phys = acpi.ecam_base.unwrap_or(0x10_0011_0000);
-            const PCIE_ECAM_VIRT: u64 = 0xffff_b00f_0000_0000;
-            const PCIE_ECAM_PAGES: u64 = 16;
-            if (ecam_phys & 0xFFF) == 0 {
-                let mut ecam_ok = true;
-                for p in 0..PCIE_ECAM_PAGES {
-                    let off = p * 4096;
-                    let ok = VirtAddr::new_page_aligned(PCIE_ECAM_VIRT + off)
-                        .and_then(|va| {
-                            PhysFrame::from_aligned(PhysAddr::new(ecam_phys + off))
-                                .and_then(|fr| vspace.map_4k(va, fr, mmio_flags, &mut info.untyped))
-                        })
-                        .is_ok();
-                    if !ok {
-                        ecam_ok = false;
-                        break;
-                    }
-                }
-                if ecam_ok {
-                    let ecam_len = PCIE_ECAM_PAGES * 4096;
-                    syscall::register_extra_mmio_mapping(
-                        PhysAddr::new(ecam_phys),
-                        PCIE_ECAM_VIRT,
-                        ecam_len,
-                    );
-                    syscall::register_init_mmio_cap(26, PhysAddr::new(ecam_phys), ecam_len);
-                }
-            }
-
-            // Phase 4: VideoCore VII V3D 7.1 (`0x10_0200_0000` Hub + `0x10_0200_8000` Core 0)
-            // and Broadcom BCM2712 IOMMU (`brcm,bcm2712-iommu` at `0x10_0000_5000`).
+            // PCIe ECAM and BCM2712 IOMMU are intentionally kept kernel-owned (`P4`):
+            // never hand raw PCIe configuration space or IOMMU registers to EL0 `init`.
+            // Phase 4: VideoCore VII V3D 7.1 (`0x10_0200_0000` Hub + `0x10_0200_8000` Core 0).
             const RPI5_V3D_PHYS: u64 = 0x10_0200_0000;
             const RPI5_V3D_LEN: u64 = 0x9000;
             const RPI5_V3D_VIRT: u64 = 0xffff_b010_0000_0000;
@@ -1096,20 +1122,6 @@ impl Aarch64Platform {
             }
             if v3d_ok {
                 syscall::register_init_mmio_cap(28, PhysAddr::new(RPI5_V3D_PHYS), RPI5_V3D_LEN);
-            }
-
-            const RPI5_IOMMU_PHYS: u64 = 0x10_0000_5000;
-            const RPI5_IOMMU_VIRT: u64 = 0xffff_b011_0000_0000;
-            if let Ok(va) = VirtAddr::new_page_aligned(RPI5_IOMMU_VIRT)
-                && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_IOMMU_PHYS))
-                && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
-            {
-                syscall::register_extra_mmio_mapping(
-                    PhysAddr::new(RPI5_IOMMU_PHYS),
-                    RPI5_IOMMU_VIRT,
-                    0x1000,
-                );
-                syscall::register_init_mmio_cap(29, PhysAddr::new(RPI5_IOMMU_PHYS), 0x1000);
             }
         }
 
@@ -1216,15 +1228,20 @@ impl HalPlatform for Aarch64Platform {
         BREAKPOINT_COUNT.load(Ordering::Acquire)
     }
 
-    fn arm_oneshot_timer(&mut self, _ticks: u32) {
-        let t0 = syscall::read_cntvct();
-        for _ in 0..10_000_000u32 {
-            if syscall::read_cntvct() != t0 {
-                break;
-            }
-            core::hint::spin_loop();
+    fn arm_oneshot_timer(&mut self, ticks: u32) {
+        let clamped = u64::from(ticks.max(1));
+        // SAFETY: Program the real ARM Generic Virtual Timer (`CNTV_TVAL_EL0` / `CNTV_CTL_EL0`)
+        // so the boot self-check verifies actual GICv2 PPI delivery (`H5`).
+        unsafe {
+            asm!(
+                "msr cntv_tval_el0, {tval}",
+                "msr cntv_ctl_el0, {ctl}",
+                "isb",
+                tval = in(reg) clamped,
+                ctl = in(reg) 1u64, // ENABLE=1, IMASK=0
+                options(nomem, nostack),
+            );
         }
-        TIMER_COUNT.fetch_add(1, Ordering::Release);
     }
 
     fn timer_count(&self) -> u64 {
@@ -1273,12 +1290,14 @@ impl HalPlatform for Aarch64Platform {
 
     fn register_user_process(
         &mut self,
+        role: ProcessRole,
         entry: VirtAddr,
         user_sp: VirtAddr,
         user_shadow_sp: VirtAddr,
         vspace_root: PhysAddr,
     ) -> Result<usize, SysError> {
         syscall::register_user_process(
+            role,
             entry.raw(),
             user_sp.raw(),
             user_shadow_sp.raw(),

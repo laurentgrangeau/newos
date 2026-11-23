@@ -9,3 +9,6 @@ newos-abi = { workspace = true }
 newos-key-vault = { workspace = true }
 newos-rng = { workspace = true }
 newos-user-rt = { workspace = true }
+
+[lints]
+workspace = true

@@ -83,17 +83,25 @@ fn serve_vault<E: EntropySource>(
             Ok((badge, req)) => {
                 let now_cycles = newos_user_rt::read_cycles().unwrap_or(start_cycles);
                 let now_ms = (now_cycles.saturating_sub(start_cycles) / cycles_per_ms) as i64;
-                let (reply, gate_signal) = server.handle_ipc_word(badge, req, now_ms);
+                let (mut reply, gate_signal) = server.handle_ipc_word(badge, req, now_ms);
                 if let Some(sig) = gate_signal {
-                    // Best-effort non-blocking signal to `newos-init` auth-gate
-                    for _ in 0..32 {
+                    // Fail-closed auth-gate delivery (`N7`): if `init` cannot be notified,
+                    // refuse to report `REPLY_OK` to `sshd` so auth state never diverges.
+                    let mut delivered = false;
+                    for _ in 0..256 {
                         match newos_user_rt::ipc_send(CapId::BOOTSTRAP_AUTH_GATE_EP, sig) {
-                            Ok(()) => break,
+                            Ok(()) => {
+                                delivered = true;
+                                break;
+                            }
                             Err(SysError::WouldBlock) => {
                                 let _ = newos_user_rt::yield_now();
                             }
                             Err(_) => break,
                         }
+                    }
+                    if !delivered && reply == newos_abi::key_ipc::REPLY_OK {
+                        reply = newos_abi::key_ipc::REPLY_DENIED;
                     }
                 }
                 reply_payload = reply;

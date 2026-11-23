@@ -3,5 +3,7 @@
 *.img
 .DS_Store
 
-# Local SSH authorized keys (never commit user keys)
+# Local SSH keys (never commit private or authorized keys)
 authorized_keys.mldsa87
+id_mldsa87
+id_mldsa87.pub

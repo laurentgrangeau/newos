@@ -927,7 +927,7 @@ impl<H: ShellHost> Shell<H> {
                     row.push_str(concat!(
                         "NewOS ",
                         env!("CARGO_PKG_VERSION"),
-                        " aarch64 seL4 (SMP="
+                        " aarch64 microkernel (SMP="
                     ));
                     row.push_u64(u64::from(info.online_cpus));
                     row.push_str(" CPUs, ");

@@ -138,10 +138,9 @@ impl CapSlot {
 
     #[inline(always)]
     fn bump_generation(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        if self.generation == 0 {
-            self.generation = 1;
-        }
+        // Saturate at `u32::MAX` (retired slot) so a generation counter can NEVER wrap around
+        // and re-validate a stale `CapId` even after 4 billion reuses.
+        self.generation = self.generation.saturating_add(1);
     }
 }
 
@@ -195,12 +194,18 @@ impl<const SLOTS: usize> CNode<SLOTS> {
     /// Return `true` if any live slot in this `CNode` holds a `CapObject::Frame { phys }` capability.
     #[inline]
     pub fn has_live_frame_cap(&self, phys: PhysAddr) -> bool {
+        self.has_live_object(CapObject::Frame { phys })
+    }
+
+    /// Return `true` if any live slot in this `CNode` holds a capability referencing `object`.
+    #[inline]
+    pub fn has_live_object(&self, object: CapObject) -> bool {
         let mut mask = self.occupied_mask;
         while mask != 0 {
             let idx = mask.trailing_zeros() as usize;
             mask &= mask - 1;
             if let Some(cap) = &self.slots[idx].cap
-                && cap.object == (CapObject::Frame { phys })
+                && cap.object == object
             {
                 return true;
             }
@@ -208,13 +213,30 @@ impl<const SLOTS: usize> CNode<SLOTS> {
         if SLOTS > 64 {
             for slot in self.slots.iter().skip(64) {
                 if let Some(cap) = &slot.cap
-                    && cap.object == (CapObject::Frame { phys })
+                    && cap.object == object
                 {
                     return true;
                 }
             }
         }
         false
+    }
+
+    /// Clear every occupied capability slot in this `CNode` (bumping generations so old handles stay invalid),
+    /// invoking `on_removed(cap)` for each cleared capability (`M4`).
+    pub fn clear_all(&mut self, mut on_removed: impl FnMut(Capability)) {
+        for slot in self.slots.iter_mut() {
+            if let Some(cap) = slot.cap.take() {
+                slot.parent = 0;
+                slot.ext_cnode = 0;
+                slot.ext_slot = 0;
+                slot.bump_generation();
+                on_removed(cap);
+            }
+        }
+        self.occupied_mask = 0;
+        self.derived_mask = 0;
+        self.has_children_mask = 0;
     }
 
     /// Find the first free slot index (`1..SLOTS`).
@@ -265,6 +287,9 @@ impl<const SLOTS: usize> CNode<SLOTS> {
         };
         if self.slots[dst_slot].cap.is_some() {
             return Err(SysError::SlotOccupied);
+        }
+        if self.slots[dst_slot].generation == u32::MAX {
+            return Err(SysError::OutOfMemory);
         }
         self.slots[dst_slot].cap = Some(cap);
         self.slots[dst_slot].parent = parent_u16;
@@ -904,6 +929,9 @@ impl<const SLOTS: usize> CNode<SLOTS> {
         if self.slots[dst_slot].cap.is_some() {
             return Err(SysError::SlotOccupied);
         }
+        if self.slots[dst_slot].generation == u32::MAX {
+            return Err(SysError::OutOfMemory);
+        }
 
         let frame = inv.retype_frame_in(region_index as usize)?;
         let frame_cap = Capability::new(
@@ -942,9 +970,10 @@ impl<const SLOTS: usize> CNode<SLOTS> {
         if !cap.rights.contains(Rights::WRITE) {
             return Err(SysError::InsufficientRights);
         }
+        // Retyped child inherits at most the parent Untyped capability's rights (no amplification).
         self.insert_at(
             dst_slot,
-            Capability::new(object, Rights::ALL),
+            Capability::new(object, cap.rights),
             Some(parent_idx),
         )
     }

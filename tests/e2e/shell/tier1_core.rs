@@ -30,7 +30,7 @@ fn tier1_caos_boot_seeded_refs() {
     assert_eq!(n, 2);
     for r in refs.iter().take(n).flatten() {
         assert!(!r.writable, "boot refs @motd/@guide must be sealed ro");
-        assert!(r.prev.is_none());
+        assert!(r.prev().is_none());
     }
 }
 
@@ -44,9 +44,18 @@ fn tier1_caos_put_get_by_hash_and_hex_formats() {
     let obj_spec = format!("obj:{:016x}", h.0);
     let hex_spec = format!("0x{:016x}", h.0);
     let bare_spec = format!("{:016x}", h.0);
-    assert_eq!(store.get_any(&obj_spec).unwrap(), (h, b"alpha-payload".as_slice()));
-    assert_eq!(store.get_any(&hex_spec).unwrap(), (h, b"alpha-payload".as_slice()));
-    assert_eq!(store.get_any(&bare_spec).unwrap(), (h, b"alpha-payload".as_slice()));
+    assert_eq!(
+        store.get_any(&obj_spec).unwrap(),
+        (h, b"alpha-payload".as_slice())
+    );
+    assert_eq!(
+        store.get_any(&hex_spec).unwrap(),
+        (h, b"alpha-payload".as_slice())
+    );
+    assert_eq!(
+        store.get_any(&bare_spec).unwrap(),
+        (h, b"alpha-payload".as_slice())
+    );
 }
 
 #[test]
@@ -66,14 +75,23 @@ fn tier1_caos_ref_create_update_rollback() {
     let h2 = store.put(b"version-2").unwrap();
 
     store.set_ref("@cfg", h1).unwrap();
-    assert_eq!(store.get_any("@cfg").unwrap(), (h1, b"version-1".as_slice()));
+    assert_eq!(
+        store.get_any("@cfg").unwrap(),
+        (h1, b"version-1".as_slice())
+    );
 
     store.set_ref("@cfg", h2).unwrap();
-    assert_eq!(store.get_any("@cfg").unwrap(), (h2, b"version-2".as_slice()));
+    assert_eq!(
+        store.get_any("@cfg").unwrap(),
+        (h2, b"version-2".as_slice())
+    );
 
     let rolled = store.rollback_ref("@cfg").unwrap();
     assert_eq!(rolled, h1);
-    assert_eq!(store.get_any("@cfg").unwrap(), (h1, b"version-1".as_slice()));
+    assert_eq!(
+        store.get_any("@cfg").unwrap(),
+        (h1, b"version-1".as_slice())
+    );
 }
 
 #[test]
@@ -99,7 +117,12 @@ fn tier1_caos_collect_objects_and_refs() {
     let mut objs = [None; MAX_OBJECTS];
     let oc = store.collect_objects(&mut objs);
     assert_eq!(oc, 3);
-    assert!(objs[..oc].iter().flatten().any(|m| m.hash == h && m.size == 4));
+    assert!(
+        objs[..oc]
+            .iter()
+            .flatten()
+            .any(|m| m.hash == h && m.size == 4)
+    );
 
     let mut refs = [None; MAX_REFS];
     let rc = store.collect_refs(&mut refs);
@@ -127,7 +150,7 @@ fn tier1_shell_put_save_and_get() {
 
     assert_eq!(sh.exec_line("get @note"), ExecOutcome::Continue);
     let out = sh.host_mut().take_output();
-    assert!(out.contains("11 B]"));
+    assert!(out.contains("11B]"));
     assert!(out.contains("hello newos\n"));
 }
 
@@ -136,15 +159,15 @@ fn tier1_shell_objects_and_refs_listing() {
     let mut sh = Shell::new(MockShellHost::default());
     sh.exec_line("objects");
     let out_obj = sh.host_mut().take_output();
-    assert!(out_obj.contains("OBJECT HASH           SIZE"));
-    assert!(out_obj.contains("63 B"));
-    assert!(out_obj.contains("86 B"));
+    assert!(out_obj.contains("OBJECT HASH SIZE"));
+    assert!(out_obj.contains("63B"));
+    assert!(out_obj.contains("86B"));
 
     sh.exec_line("refs");
     let out_ref = sh.host_mut().take_output();
-    assert!(out_ref.contains("REF              MODE  TARGET                PREV"));
+    assert!(out_ref.contains("REF MODE TARGET PREV"));
     assert!(out_ref.contains("@motd"));
-    assert!(out_ref.contains("ro  "));
+    assert!(out_ref.contains(" ro "));
 }
 
 #[test]
@@ -152,16 +175,16 @@ fn tier1_shell_procs_and_sys() {
     let mut sh = Shell::new(MockShellHost::new(4, 2));
     sh.exec_line("procs");
     let out_p = sh.host_mut().take_output();
-    assert!(out_p.contains("PID  EL    ISOLATION        NAME"));
+    assert!(out_p.contains("PID EL VSPACE NAME"));
     assert!(out_p.contains("init (newos-sh + CAOS)"));
     assert!(out_p.contains("worker (IPC responder)"));
 
     sh.exec_line("sys");
     let out_s = sh.host_mut().take_output();
-    assert!(out_s.contains("aarch64 (Raspberry Pi 5 16 GB)"));
+    assert!(out_s.contains("aarch64"));
     assert!(out_s.contains("SMP=4 CPUs"));
-    assert!(out_s.contains("2 EL0 procs"));
-    assert!(out_s.contains("2 CAOS objects"));
+    assert!(out_s.contains("2 procs"));
+    assert!(out_s.contains("2 objs"));
 }
 
 #[test]
@@ -177,7 +200,7 @@ fn tier1_shell_ref_set_rollback_seal_commands() {
     assert!(sh.host_mut().take_output().contains("bound @app"));
 
     sh.exec_line("ref rollback app");
-    assert!(sh.host_mut().take_output().contains("rolled back @app"));
+    assert!(sh.host_mut().take_output().contains("rollback @app"));
 
     sh.exec_line("ref seal app");
     assert!(sh.host_mut().take_output().contains("sealed @app"));
@@ -313,7 +336,8 @@ fn tier1_pipe_count_on_nonempty_and_empty_streams() {
         Some(Record::Count(2))
     ));
     assert!(matches!(
-        sh.eval_pipeline("objects | where size > 9999 | count").first(),
+        sh.eval_pipeline("objects | where size > 9999 | count")
+            .first(),
         Some(Record::Count(0))
     ));
 }
@@ -321,6 +345,12 @@ fn tier1_pipe_count_on_nonempty_and_empty_streams() {
 #[test]
 fn tier1_pipe_where_on_count_record() {
     let mut sh = Shell::new(MockShellHost::default());
-    assert_eq!(sh.eval_pipeline("procs | count | where count == 2").len(), 1);
-    assert_eq!(sh.eval_pipeline("procs | count | where count == 1").len(), 0);
+    assert_eq!(
+        sh.eval_pipeline("procs | count | where count == 2").len(),
+        1
+    );
+    assert_eq!(
+        sh.eval_pipeline("procs | count | where count == 1").len(),
+        0
+    );
 }

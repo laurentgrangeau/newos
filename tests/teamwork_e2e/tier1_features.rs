@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
 use newos_abi::ring::SpscRing;
-use newos_abi::{CapId, ObjectType, ShutdownStatus, Rights, SysError, SyscallNumber};
+use newos_abi::{CapId, ObjectType, Rights, ShutdownStatus, SysError, SyscallNumber};
 use newos_kernel_core::cspace::{CNode, CapObject, Capability};
 use newos_kernel_core::elf::{MAX_LOAD_SEGMENTS, parse_elf64};
 use newos_kernel_core::ipc::{IpcMessage, KernelIpcState};

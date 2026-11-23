@@ -10,3 +10,6 @@ newos-abi = { workspace = true }
 newos-key-vault = { workspace = true }
 newos-ssh-proto = { workspace = true }
 zeroize = { version = "1", default-features = false }
+
+[lints]
+workspace = true

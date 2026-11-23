@@ -1,0 +1,30 @@
+[package]
+name = "newos-e2e-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dev-dependencies]
+newos-abi = { workspace = true }
+newos-kernel-core = { workspace = true }
+newos-shell-core = { workspace = true }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "e2e_kernel"
+path = "e2e/e2e_kernel.rs"
+
+[[test]]
+name = "e2e_shell"
+path = "e2e/e2e_shell.rs"
+
+[[test]]
+name = "e2e_bench"
+path = "e2e/e2e_bench.rs"
+
+[[test]]
+name = "teamwork_e2e"
+path = "teamwork_e2e/suite.rs"

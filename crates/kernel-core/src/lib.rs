@@ -44,7 +44,7 @@ pub struct FramebufferInfo {
 }
 
 /// Fixed-size, `no_alloc` boot descriptor handed from `newos-hal` to `newos-kernel-core`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BootInfo {
     pub hhdm_offset: u64,
     pub kernel_virt_base: u64,
@@ -67,6 +67,17 @@ impl BootInfo {
     pub fn usable_mib(&self) -> u64 {
         self.untyped.total_bytes() / (1024 * 1024)
     }
+}
+
+/// Explicit bootstrap process role used to assign least-privilege capabilities independently of
+/// spawn order / PID (`N5`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessRole {
+    Init,
+    Worker,
+    Netd,
+    Keyd,
+    Sshd,
 }
 
 /// Architecture-agnostic, 100% safe platform interface implemented by `newos-hal`.
@@ -93,6 +104,7 @@ pub trait HalPlatform: Write {
     fn probe_mapped_u64(&self, virt: VirtAddr, pattern: u64) -> Result<u64, SysError>;
     fn register_user_process(
         &mut self,
+        role: ProcessRole,
         entry: VirtAddr,
         user_sp: VirtAddr,
         user_shadow_sp: VirtAddr,
@@ -247,20 +259,52 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
         platform.exit(ShutdownStatus::Failed);
     };
 
-    match spawn_isolated_process(platform, "init", init_bytes, &mut info.untyped)
-        .and_then(|_| spawn_isolated_process(platform, "worker", worker_bytes, &mut info.untyped))
-        .and_then(|_| {
-            if let Some(netd) = info.netd_module {
-                spawn_isolated_process(platform, "newos-netd", netd, &mut info.untyped)?;
-            }
-            if let Some(keyd) = info.keyd_module {
-                spawn_isolated_process(platform, "newos-keyd", keyd, &mut info.untyped)?;
-            }
-            if let Some(sshd) = info.sshd_module {
-                spawn_isolated_process(platform, "newos-sshd", sshd, &mut info.untyped)?;
-            }
-            Ok(())
-        }) {
+    match spawn_isolated_process(
+        platform,
+        ProcessRole::Init,
+        "init",
+        init_bytes,
+        &mut info.untyped,
+    )
+    .and_then(|_| {
+        spawn_isolated_process(
+            platform,
+            ProcessRole::Worker,
+            "worker",
+            worker_bytes,
+            &mut info.untyped,
+        )
+    })
+    .and_then(|_| {
+        if let Some(netd) = info.netd_module {
+            spawn_isolated_process(
+                platform,
+                ProcessRole::Netd,
+                "newos-netd",
+                netd,
+                &mut info.untyped,
+            )?;
+        }
+        if let Some(keyd) = info.keyd_module {
+            spawn_isolated_process(
+                platform,
+                ProcessRole::Keyd,
+                "newos-keyd",
+                keyd,
+                &mut info.untyped,
+            )?;
+        }
+        if let Some(sshd) = info.sshd_module {
+            spawn_isolated_process(
+                platform,
+                ProcessRole::Sshd,
+                "newos-sshd",
+                sshd,
+                &mut info.untyped,
+            )?;
+        }
+        Ok(())
+    }) {
         Ok(()) => {
             platform.install_runtime_untyped(info.untyped);
             platform.start_userspace()
@@ -277,6 +321,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
 
 fn spawn_isolated_process<P: HalPlatform>(
     platform: &mut P,
+    role: ProcessRole,
     name: &str,
     elf_bytes: &[u8],
     untyped: &mut UntypedInventory,
@@ -287,7 +332,10 @@ fn spawn_isolated_process<P: HalPlatform>(
     let pie_base = 0x0040_0000u64 + (((entropy >> 8) & 0xFF) * PAGE_SIZE);
     let shadow_slide = ((entropy >> 16) & 0xFF) * PAGE_SIZE;
     let mut user_vspace = platform.create_user_vspace(untyped)?;
-    let stack_pages = if matches!(name, "newos-netd" | "newos-keyd" | "newos-sshd") {
+    let stack_pages = if matches!(
+        role,
+        ProcessRole::Netd | ProcessRole::Keyd | ProcessRole::Sshd
+    ) {
         USER_PQ_STACK_PAGES
     } else {
         USER_STACK_PAGES
@@ -302,10 +350,10 @@ fn spawn_isolated_process<P: HalPlatform>(
         stack_pages,
     )?;
     let root = user_vspace.root_phys();
-    let pid = platform.register_user_process(entry, user_sp, user_shadow_sp, root)?;
+    let pid = platform.register_user_process(role, entry, user_sp, user_shadow_sp, root)?;
     let _ = writeln!(
         platform,
-        "[newos] spawned EL0 `{name}` (pid={pid}, ttbr0={:#018x}, entry={:#018x}, sp={:#018x}, scs={:#018x}, segs={segs}, sha3_512={sha_prefix:#018x})",
+        "[newos] spawned EL0 `{name}` (pid={pid}, role={role:?}, ttbr0={:#018x}, entry={:#018x}, sp={:#018x}, scs={:#018x}, segs={segs}, measured_sha3_512={sha_prefix:#018x})",
         root.raw(),
         entry.raw(),
         user_sp.raw(),

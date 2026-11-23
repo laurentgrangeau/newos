@@ -284,7 +284,7 @@ fn tier2_cspace_retype_frame_wrong_type_no_write_or_oom() {
         .unwrap();
     assert_eq!(
         cnode.retype_frame_from(rw_untyped, &mut inv),
-        Err(SysError::OutOfMemory)
+        Err(SysError::InvalidArgument)
     );
 }
 
@@ -506,7 +506,10 @@ fn tier2_sched_yield_before_first_schedule_returns_none() {
 
 #[test]
 fn tier2_mem_unaligned_phys_virt_and_frame_rejected() {
-    assert_eq!(PhysAddr::new_aligned(0x1001), Err(SysError::InvalidArgument));
+    assert_eq!(
+        PhysAddr::new_aligned(0x1001),
+        Err(SysError::InvalidArgument)
+    );
     assert_eq!(
         VirtAddr::new_page_aligned(0x0040_0001),
         Err(SysError::InvalidArgument)
@@ -611,8 +614,8 @@ fn tier2_elf_rejects_wrong_type_and_wrong_machine() {
         p_filesz: 8,
         p_memsz: 8,
     };
-    let dyn_elf = build_elf64(0x0040_0000, 3, host_elf_machine(), 56, &[phdr], &[0; 8]);
-    assert_eq!(parse_elf64(&dyn_elf), Err(SysError::Unsupported));
+    let rel_elf = build_elf64(0x0040_0000, 1, host_elf_machine(), 56, &[phdr], &[0; 8]);
+    assert_eq!(parse_elf64(&rel_elf), Err(SysError::Unsupported));
 
     let wrong_arch = build_elf64(0x0040_0000, 2, wrong_elf_machine(), 56, &[phdr], &[0; 8]);
     assert_eq!(parse_elf64(&wrong_arch), Err(SysError::Unsupported));
@@ -714,7 +717,14 @@ fn tier2_elf_rejects_truncated_file_memsz_lt_filesz_and_small_phentsize() {
         p_filesz: 8,
         p_memsz: 4, // memsz < filesz
     };
-    let bad_sizes_elf = build_elf64(0x0040_0000, 2, host_elf_machine(), 56, &[bad_sizes], &[0; 8]);
+    let bad_sizes_elf = build_elf64(
+        0x0040_0000,
+        2,
+        host_elf_machine(),
+        56,
+        &[bad_sizes],
+        &[0; 8],
+    );
     assert_eq!(parse_elf64(&bad_sizes_elf), Err(SysError::InvalidArgument));
 
     let ok_phdr = PhdrSpec {

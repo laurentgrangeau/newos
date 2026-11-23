@@ -491,9 +491,10 @@ fn drain_worker_boot_log<const N: usize>(
     const MAX_BOOT_LOG_YIELDS: usize = 10_000;
     let mut line_buf = [0u8; 256];
     for _ in 0..MAX_BOOT_LOG_YIELDS {
-        if let Some((_badge, n)) = log_rx.poll_line(CapId::BOOTSTRAP_LOG_EP, &mut line_buf) {
+        if let Some((badge, n)) = log_rx.poll_line(CapId::BOOTSTRAP_LOG_EP, &mut line_buf) {
             if let Ok(line) = core::str::from_utf8(&line_buf[..n]) {
-                let _ = writeln!(out, "{line}");
+                // Stamp with kernel-verified sender badge so no daemon can forge another's prefix (`N17`).
+                let _ = writeln!(out, "[pid={badge}] {line}");
                 out.flush();
             }
             return;

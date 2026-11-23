@@ -1,4 +1,10 @@
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::type_complexity,
+    clippy::collapsible_if,
+    clippy::needless_range_loop,
+    clippy::manual_is_multiple_of
+)]
 
 mod helpers;
 mod tier1_features;

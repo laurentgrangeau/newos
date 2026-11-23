@@ -16,7 +16,7 @@ fn load_baseline_and_post_opt() -> (
     std::collections::BTreeMap<String, f64>,
     std::collections::BTreeMap<String, f64>,
 ) {
-    let content = fs::read_to_string("BENCHMARK_RESULTS.md")
+    let content = fs::read_to_string(crate::workspace_root().join("BENCHMARK_RESULTS.md"))
         .expect("BENCHMARK_RESULTS.md must exist with baseline and post-optimization results");
     let report = parse_benchmark_results_md(&content)
         .unwrap_or_else(|e| panic!("failed to parse BENCHMARK_RESULTS.md: {e}"));

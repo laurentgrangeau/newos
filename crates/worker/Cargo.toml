@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 newos-abi = { workspace = true }
 newos-user-rt = { workspace = true }
+
+[lints]
+workspace = true

@@ -735,9 +735,20 @@ impl KernelIpcState {
     }
 
     /// Receive a pending register-only fastpath IPC message from an `Endpoint` in `pid`'s `CSpace`.
+    ///
+    /// Refuses to consume a buffered `IpcCall` (`endpoint_state >= 2`) so a plain `IpcRecv` can
+    /// never swallow another task's synchronous call and hang the caller forever (`H3`).
     #[inline(always)]
     pub fn ipc_recv_for(&mut self, pid: usize, cap_id: CapId) -> Result<IpcMessage, SysError> {
         let (id, _) = self.lookup_endpoint_for(pid, cap_id, Rights::READ)?;
+        let idx = id as usize;
+        if idx >= MAX_ENDPOINTS {
+            return Err(SysError::InvalidArgument);
+        }
+        if self.endpoint_state[idx] >= 2 {
+            self.stats.would_blocks = self.stats.would_blocks.wrapping_add(1);
+            return Err(SysError::WouldBlock);
+        }
         self.ipc_recv_resolved(id).map(|(msg, _)| msg)
     }
 
@@ -844,6 +855,18 @@ impl KernelIpcState {
 
     /// Delete a single capability slot from `pid`'s `CSpace`, preserving cross-process CDT ancestry.
     pub fn cap_delete_for(&mut self, pid: usize, cap_id: CapId) -> Result<(), SysError> {
+        self.cap_delete_for_with_frame_reclaim_cb(pid, cap_id, |_, _| {})
+    }
+
+    /// Delete a single capability slot from `pid`'s `CSpace`, preserving cross-process CDT ancestry,
+    /// and invoking `on_deleted_frame(phys, can_reclaim)` if the deleted capability was a `Frame` (`M3`).
+    pub fn cap_delete_for_with_frame_reclaim_cb(
+        &mut self,
+        pid: usize,
+        cap_id: CapId,
+        mut on_deleted_frame: impl FnMut(PhysAddr, bool),
+    ) -> Result<(), SysError> {
+        let deleted_obj = self.cspace(pid)?.lookup(cap_id, Rights::NONE)?.object;
         let (slot, intra_parent, ext_parent) = self.cspace(pid)?.parent_info(cap_id)?;
         self.cspace_mut(pid)?.delete(cap_id)?;
 
@@ -862,7 +885,79 @@ impl KernelIpcState {
                 other_cn.reparent_external_children(old_ext, replacement);
             }
         }
+        if let CapObject::Frame { phys } = deleted_obj {
+            let can_reclaim = !self.has_live_frame_cap(phys);
+            on_deleted_frame(phys, can_reclaim);
+        }
         Ok(())
+    }
+
+    /// Clear all capabilities held by an exited non-root process `pid` (`M4`), invoking
+    /// `on_frame(phys, can_reclaim)` for any `Frame` capabilities it held.
+    pub fn clear_process_cspace(
+        &mut self,
+        pid: usize,
+        mut on_frame: impl FnMut(PhysAddr, bool),
+    ) -> Result<(), SysError> {
+        if pid == 0 || pid >= MAX_IPC_PROCS {
+            return Err(SysError::InvalidArgument);
+        }
+        let mut frames = [PhysAddr::new(0); ROOT_CSPACE_SLOTS];
+        let mut frame_len = 0usize;
+        self.proc_cspaces[pid - 1].clear_all(|cap| {
+            if let CapObject::Frame { phys } = cap.object
+                && !frames[..frame_len].contains(&phys)
+                && frame_len < frames.len()
+            {
+                frames[frame_len] = phys;
+                frame_len += 1;
+            }
+        });
+        for &phys in &frames[..frame_len] {
+            let can_reclaim = !self.has_live_frame_cap(phys);
+            on_frame(phys, can_reclaim);
+        }
+        Ok(())
+    }
+
+    /// Return `true` if any active `CSpace` holds a live `CapObject::Endpoint { id }` capability.
+    #[inline]
+    pub fn has_live_endpoint_cap(&self, id: u32) -> bool {
+        let obj = CapObject::Endpoint { id };
+        self.root_cspace.has_live_object(obj)
+            || self.proc_cspaces.iter().any(|cn| cn.has_live_object(obj))
+    }
+
+    /// Return `true` if any active `CSpace` holds a live `CapObject::Notification { id }` capability.
+    #[inline]
+    pub fn has_live_notif_cap(&self, id: u32) -> bool {
+        let obj = CapObject::Notification { id };
+        self.root_cspace.has_live_object(obj)
+            || self.proc_cspaces.iter().any(|cn| cn.has_live_object(obj))
+    }
+
+    /// Allocate a free endpoint ID (`0..MAX_ENDPOINTS`), recycling IDs whose capabilities have
+    /// all been deleted or revoked (`M5`).
+    fn alloc_endpoint_id(&mut self) -> Option<u32> {
+        if (self.next_endpoint_id as usize) < MAX_ENDPOINTS {
+            let id = u32::from(self.next_endpoint_id);
+            self.next_endpoint_id += 1;
+            return Some(id);
+        }
+        // Scan dynamic endpoint IDs (skipping reserved bootstrap IDs 0..=6) for any unused slot.
+        (7..(MAX_ENDPOINTS as u32)).find(|&id| !self.has_live_endpoint_cap(id))
+    }
+
+    /// Allocate a free notification ID (`0..MAX_NOTIFICATIONS`), recycling IDs whose capabilities
+    /// have all been deleted or revoked (`M5`).
+    fn alloc_notif_id(&mut self) -> Option<u32> {
+        if (self.next_notif_id as usize) < MAX_NOTIFICATIONS {
+            let id = u32::from(self.next_notif_id);
+            self.next_notif_id += 1;
+            return Some(id);
+        }
+        // Scan dynamic notification IDs (skipping reserved bootstrap IDs 0..=1) for any unused slot.
+        (2..(MAX_NOTIFICATIONS as u32)).find(|&id| !self.has_live_notif_cap(id))
     }
 
     /// Return `true` if any active `CSpace` holds a live `CapObject::Frame { phys }` capability.
@@ -911,29 +1006,23 @@ impl KernelIpcState {
                     .retype_frame_from_into(untyped_cap, slot, inv)
             }
             ObjectType::Endpoint => {
-                if (self.next_endpoint_id as usize) >= MAX_ENDPOINTS {
-                    return Err(SysError::OutOfMemory);
-                }
-                let ep_id = u32::from(self.next_endpoint_id);
+                let ep_id = self.alloc_endpoint_id().ok_or(SysError::OutOfMemory)?;
                 let cap_id = self.cspace_mut(pid)?.insert_retyped_child(
                     untyped_cap,
                     slot,
                     CapObject::Endpoint { id: ep_id },
                 )?;
-                self.next_endpoint_id += 1;
+                self.endpoint_state[ep_id as usize] = 0;
                 Ok(cap_id)
             }
             ObjectType::Notification => {
-                if (self.next_notif_id as usize) >= MAX_NOTIFICATIONS {
-                    return Err(SysError::OutOfMemory);
-                }
-                let notif_id = u32::from(self.next_notif_id);
+                let notif_id = self.alloc_notif_id().ok_or(SysError::OutOfMemory)?;
                 let cap_id = self.cspace_mut(pid)?.insert_retyped_child(
                     untyped_cap,
                     slot,
                     CapObject::Notification { id: notif_id },
                 )?;
-                self.next_notif_id += 1;
+                self.notifications[notif_id as usize] = 0;
                 Ok(cap_id)
             }
             _ => Err(SysError::Unsupported),

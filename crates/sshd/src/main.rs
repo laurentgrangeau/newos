@@ -56,14 +56,17 @@ impl KeyVaultClient for IpcKeyVault {
     }
 
     fn random_32(&mut self) -> Result<[u8; 32], SshError> {
+        // Fetch 8 tagged 4-byte CSPRNG chunks (`N1`): fail closed on any non-OK status tag
+        // so `REPLY_DENIED` (0) can NEVER become all-zero ML-KEM randomness.
         let mut out = [0u8; 32];
-        for i in 0..4 {
+        for i in 0..8 {
             let w = ipc_call_retry(
                 CapId::BOOTSTRAP_KEY_EP,
                 key_ipc::encode_word_req(key_ipc::OP_GET_RANDOM_U64, 0),
             )
             .map_err(|_| SshError::VaultError)?;
-            out[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+            let word32 = key_ipc::decode_random_u32_reply(w).ok_or(SshError::VaultError)?;
+            out[i * 4..i * 4 + 4].copy_from_slice(&word32.to_le_bytes());
         }
         Ok(out)
     }
@@ -171,9 +174,16 @@ fn main() -> ! {
     let mut vault = IpcKeyVault;
     let mut server = SshServer::new();
     let mut active_conn = false;
+    let mut conn_start_ms: u64 = 0;
+    let mut last_activity_ms: u64 = 0;
+    let freq_hz = newos_user_rt::timer_freq_hz();
+    let cycles_per_ms = (freq_hz / 1_000).max(1);
+    const LOGIN_GRACE_MS: u64 = 30_000;
+    const IDLE_TIMEOUT_MS: u64 = 600_000;
     let mut shell_in = [0u8; 256];
 
     loop {
+        let now_ms = newos_user_rt::read_cycles().unwrap_or(0) / cycles_per_ms;
         let Ok(status_word) =
             ipc_call_retry(CapId::BOOTSTRAP_NET_EP, net_ipc::encode_poll_status())
         else {
@@ -192,7 +202,25 @@ fn main() -> ! {
             let _ = newos_user_rt::yield_now();
             continue;
         }
-        active_conn = true;
+        if !active_conn {
+            active_conn = true;
+            conn_start_ms = now_ms;
+            last_activity_ms = now_ms;
+        }
+
+        // Enforce unauthenticated login grace timer (30s) and idle session timeout (10m) (`N3`).
+        let timed_out = (!server.is_shell_open()
+            && now_ms.saturating_sub(conn_start_ms) >= LOGIN_GRACE_MS)
+            || now_ms.saturating_sub(last_activity_ms) >= IDLE_TIMEOUT_MS;
+        if timed_out {
+            let _ = writeln!(out, "[sshd] closing session: timeout");
+            out.flush();
+            vault.close_session();
+            let _ = ipc_call_retry(CapId::BOOTSTRAP_NET_EP, net_ipc::encode_abort());
+            server.reset();
+            active_conn = false;
+            continue;
+        }
 
         // 1. Flush pending SSH wire TX bytes to `newos-netd`
         while !server.pending_tx().is_empty() {
@@ -208,6 +236,7 @@ fn main() -> ! {
         if (flags & net_ipc::STATUS_RX_AVAIL) != 0 {
             let mut rx_batch = [0u8; 256];
             let mut rx_len = 0usize;
+            let mut got_eof = false;
             while rx_len + net_ipc::MAX_CHUNK_BYTES <= rx_batch.len() {
                 match ipc_call_retry(CapId::BOOTSTRAP_NET_EP, net_ipc::encode_recv_chunk()) {
                     Ok(word) => {
@@ -216,6 +245,7 @@ fn main() -> ! {
                             vault.close_session();
                             server.reset();
                             active_conn = false;
+                            got_eof = true;
                             break;
                         }
                         let (bytes, n) = log_ipc::decode_chunk(word);
@@ -229,13 +259,27 @@ fn main() -> ! {
                 }
             }
 
+            // On EOF, discard any leftover bytes from the dead connection (`N10`).
+            if got_eof {
+                continue;
+            }
+
             if rx_len > 0 {
+                last_activity_ms = now_ms;
                 match server.feed_rx(&rx_batch[..rx_len], &mut vault, &mut shell_in) {
                     Ok(n_shell) if n_shell > 0 && server.is_shell_open() => {
-                        // Forward decrypted shell input chunks to `newos-init` (gated by `keyd`)
+                        // Forward decrypted shell input chunks to `newos-init` with retry (`N9`).
                         for chunk in shell_in[..n_shell].chunks(log_ipc::MAX_CHUNK_BYTES) {
                             let word = log_ipc::encode_chunk(chunk);
-                            let _ = newos_user_rt::ipc_send(CapId::BOOTSTRAP_SSH_SHELL_EP, word);
+                            for _ in 0..256 {
+                                match newos_user_rt::ipc_send(CapId::BOOTSTRAP_SSH_SHELL_EP, word) {
+                                    Ok(()) => break,
+                                    Err(newos_abi::SysError::WouldBlock) => {
+                                        let _ = newos_user_rt::yield_now();
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
                         }
                     }
                     Ok(_) => {}

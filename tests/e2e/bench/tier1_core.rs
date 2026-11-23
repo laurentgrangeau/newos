@@ -15,7 +15,10 @@ use crate::bench_parser::{
 fn sample_full_metric_output() -> String {
     let mut s = String::new();
     for (i, k) in KERNEL_SPEED_KEYS.iter().enumerate() {
-        s.push_str(&format!("METRIC {k} {:.2} ns/op\n", 50.0 + (i as f64) * 5.0));
+        s.push_str(&format!(
+            "METRIC {k} {:.2} ns/op\n",
+            50.0 + (i as f64) * 5.0
+        ));
     }
     for (i, k) in SHELL_SPEED_KEYS.iter().enumerate() {
         s.push_str(&format!(
@@ -109,7 +112,9 @@ fn tier1_bench_parse_metric_lines_accepts_backticked_keys() {
 
 #[test]
 fn tier1_bench_parse_markdown_baseline_only_section() {
-    let mut md = String::from("# Benchmark Results\n\n## Baseline\n\n| Metric | Value | Unit |\n|---|---|---|\n");
+    let mut md = String::from(
+        "# Benchmark Results\n\n## Baseline\n\n| Metric | Value | Unit |\n|---|---|---|\n",
+    );
     for k in all_metric_keys() {
         let unit = if is_speed_metric(k) { "ns/op" } else { "count" };
         md.push_str(&format!("| `{k}` | 42 | {unit} |\n"));
@@ -149,9 +154,7 @@ fn tier1_bench_parse_markdown_separate_baseline_and_post_opt_sections() {
 
 #[test]
 fn tier1_bench_parse_markdown_handles_commas_and_bold_numbers() {
-    let mut md = String::from(
-        "## Comparison\n| Metric | Baseline | Post-Opt |\n|---|---|---|\n",
-    );
+    let mut md = String::from("## Comparison\n| Metric | Baseline | Post-Opt |\n|---|---|---|\n");
     for k in all_metric_keys() {
         if is_ipc_metric(k) {
             md.push_str(&format!("| `{k}` | **1,250** | `625` |\n"));
@@ -190,7 +193,9 @@ fn tier1_bench_verify_ipc_reduced_passes_on_reduction() {
 
 #[test]
 fn tier1_bench_cargo_toml_workspace_edition_and_release_profile() {
-    let cargo_toml = fs::read_to_string("Cargo.toml").expect("Cargo.toml must exist at workspace root");
+    let root = crate::workspace_root();
+    let cargo_toml = fs::read_to_string(root.join("Cargo.toml"))
+        .expect("Cargo.toml must exist at workspace root");
     assert!(cargo_toml.contains("[workspace]"));
     assert!(cargo_toml.contains("edition = \"2024\""));
     assert!(cargo_toml.contains("[profile.release]"));
@@ -200,8 +205,9 @@ fn tier1_bench_cargo_toml_workspace_edition_and_release_profile() {
 
 #[test]
 fn tier1_bench_xtask_zero_external_deps_manifest() {
+    let root = crate::workspace_root();
     let xtask_toml =
-        fs::read_to_string("xtask/Cargo.toml").expect("xtask/Cargo.toml must exist");
+        fs::read_to_string(root.join("xtask/Cargo.toml")).expect("xtask/Cargo.toml must exist");
     assert!(xtask_toml.contains("name = \"xtask\""));
     assert!(!xtask_toml.contains("clap"));
     assert!(!xtask_toml.contains("serde"));
@@ -209,13 +215,12 @@ fn tier1_bench_xtask_zero_external_deps_manifest() {
 
 #[test]
 fn tier1_bench_xtask_compiles_offline_with_rustc() {
-    let cwd = std::env::current_dir().expect("cwd");
-    let xtask_dir = cwd.join("xtask");
-    let out_bin = std::env::temp_dir().join(format!(
-        "newos_xtask_e2e_check_{}",
-        std::process::id()
-    ));
+    let root = crate::workspace_root();
+    let xtask_dir = root.join("xtask");
+    let out_bin =
+        std::env::temp_dir().join(format!("newos_xtask_e2e_check_{}", std::process::id()));
     let status = Command::new("rustc")
+        .current_dir(&root)
         .env("CARGO_MANIFEST_DIR", &xtask_dir)
         .args([
             "--edition",
@@ -279,7 +284,9 @@ fn tier1_bench_parse_markdown_6col_category_metric_comparison_table() {
     }
     let report = parse_benchmark_results_md(&md).unwrap();
     assert_eq!(report.baseline.len(), 16);
-    let post = report.post_opt.expect("6-col M4 table must populate post_opt");
+    let post = report
+        .post_opt
+        .expect("6-col M4 table must populate post_opt");
     assert_eq!(post.len(), 16);
     assert_eq!(report.baseline["kernel.cnode.lookup"], 10.0);
     assert_eq!(post["kernel.cnode.lookup"], 4.0);

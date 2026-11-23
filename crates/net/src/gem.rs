@@ -268,14 +268,18 @@ impl<'a, T: MmioDmaTransport> GemNetDevice<'a, T> {
             .write32(REG_NCR, NCR_RXEN | NCR_TXEN | NCR_MPE)
             .map_err(|_| "gem ncr enable failed")?;
 
-        Ok(Self {
+        let dev = Self {
             transport,
             dma,
             rx_idx: 0,
             tx_idx: 0,
             rx_packets: 0,
             tx_packets: 0,
-        })
+        };
+        // Query PHY link status via Clause 22 MDIO during initialization (`P11`);
+        // best-effort so unit tests and pre-link boot continue cleanly.
+        let _ = dev.phy_link_up(1);
+        Ok(dev)
     }
 
     /// Perform an IEEE 802.3 Clause 22 MDIO register read on `phy_addr` (`0..=31`).
@@ -310,19 +314,34 @@ impl<'a, T: MmioDmaTransport> GemNetDevice<'a, T> {
     fn send_frame(&mut self, frame: &[u8]) {
         let len = frame.len().min(PKT_BUF_SIZE);
         let slot = self.tx_idx;
+        // Wait (bounded) until the hardware sets `TX_USED` on this descriptor so we never
+        // overwrite a TX buffer while DMA still owns it (`M9`).
+        for _ in 0..100_000u32 {
+            let _ = self.transport.dma_invalidate(&self.dma.tx_ring.0[slot]);
+            if (self.dma.tx_ring.0[slot].ctrl.load(Ordering::Acquire) & TX_USED) != 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
         let buf = &self.dma.tx_bufs[slot].0;
         for (i, &b) in frame[..len].iter().enumerate() {
             buf[i].store(b, Ordering::Relaxed);
         }
         let wrap = if slot + 1 == RING_SIZE { TX_WRAP } else { 0 };
         fence(Ordering::SeqCst);
-        let _ = self.transport.dma_clean(&self.dma.tx_bufs[slot]);
-        // Clear TX_USED (bit 31) and set TX_LAST + length so GEM transmits the frame
+        if self.transport.dma_clean(&self.dma.tx_bufs[slot]).is_err() {
+            return;
+        }
+        // Clear TX_USED (bit 31) and set TX_LAST + length so GEM transmits the frame.
+        // Note (`P5`): 16-byte GEM descriptors share a 64B cache line; on non-coherent hardware
+        // the descriptor rings must be placed in non-cacheable DMA memory supplied by the kernel.
         self.dma.tx_ring.0[slot]
             .ctrl
             .store((len as u32) | TX_LAST | wrap, Ordering::Release);
         fence(Ordering::SeqCst);
-        let _ = self.transport.dma_clean(&self.dma.tx_ring.0[slot]);
+        if self.transport.dma_clean(&self.dma.tx_ring.0[slot]).is_err() {
+            return;
+        }
 
         let _ = self
             .transport

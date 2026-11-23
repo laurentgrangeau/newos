@@ -35,37 +35,40 @@ apt-get install -y --no-install-recommends \
   dosfstools \
   libssl-dev
 
-# Allow non-root SSH users on this dev VM to use /dev/kvm immediately
+# Restrict /dev/kvm to the `kvm` group (0660) instead of world-writable 0666 (`M15`)
 cat <<'EOF' > /etc/udev/rules.d/99-kvm.rules
-KERNEL=="kvm", GROUP="kvm", MODE="0666"
+KERNEL=="kvm", GROUP="kvm", MODE="0660"
 EOF
 if [[ -e /dev/kvm ]]; then
-  chmod 0666 /dev/kvm
+  chgrp kvm /dev/kvm || true
+  chmod 0660 /dev/kvm
 fi
 
-# Install Rust toolchain (nightly + OS-dev components & targets) in /opt/rust
+# Install pinned Rust toolchain (nightly-2026-11-21 + OS-dev components & targets) in /opt/rust
 export RUSTUP_HOME="/opt/rust/rustup"
 export CARGO_HOME="/opt/rust/cargo"
 mkdir -p "${RUSTUP_HOME}" "${CARGO_HOME}"
 
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-  | sh -s -- -y --no-modify-path --default-toolchain nightly
+RUSTUP_INIT="$(mktemp)"
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "${RUSTUP_INIT}"
+sh "${RUSTUP_INIT}" -y --no-modify-path --default-toolchain nightly-2026-11-21
+rm -f "${RUSTUP_INIT}"
 
-export PATH="${CARGO_HOME}/bin:${PATH}"
+export PATH="${PATH}:${CARGO_HOME}/bin"
 
 rustup component add rust-src llvm-tools-preview clippy rustfmt
-rustup target add aarch64-unknown-none
+rustup target add aarch64-unknown-none aarch64-unknown-none-softfloat
 
 # Install Rust OS-dev cargo utilities
-cargo install cargo-binutils
+cargo install --locked cargo-binutils
 
-# Make /opt/rust usable by any SSH user on this dev VM
-chmod -R a+rwX /opt/rust
+# Make /opt/rust readable/executable (NOT world-writable) by non-root users (`M15`)
+chmod -R a+rX,go-w /opt/rust
 
 cat <<'EOF' > /etc/profile.d/rust.sh
 export RUSTUP_HOME="/opt/rust/rustup"
 export CARGO_HOME="/opt/rust/cargo"
-export PATH="${CARGO_HOME}/bin:${PATH}"
+export PATH="${PATH}:${CARGO_HOME}/bin"
 EOF
 chmod 0644 /etc/profile.d/rust.sh
 

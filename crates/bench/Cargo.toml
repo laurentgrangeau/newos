@@ -8,3 +8,6 @@ license.workspace = true
 newos-abi = { workspace = true }
 newos-kernel-core = { workspace = true }
 newos-shell-core = { workspace = true }
+
+[lints]
+workspace = true

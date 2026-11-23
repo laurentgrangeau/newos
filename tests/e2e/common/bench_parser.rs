@@ -325,11 +325,7 @@ pub fn parse_benchmark_results_md(md: &str) -> Result<BenchmarkReport, ParseErro
         }
 
         if line.starts_with('|') && line.ends_with('|') {
-            let cells: Vec<&str> = line
-                .trim_matches('|')
-                .split('|')
-                .map(str::trim)
-                .collect();
+            let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
             if is_separator_row(&cells) {
                 continue;
             }
@@ -463,8 +459,7 @@ pub fn verify_kernel_faster(
     }
 
     let geomean_ratio = (log_ratio_sum / (KERNEL_SPEED_KEYS.len() as f64)).exp();
-    if !geomean_ratio.is_finite() || post_sum >= base_sum || geomean_ratio >= 1.0 || improved == 0
-    {
+    if !geomean_ratio.is_finite() || post_sum >= base_sum || geomean_ratio >= 1.0 || improved == 0 {
         return Err(format!(
             "kernel not faster: base_sum={base_sum:.2}, post_sum={post_sum:.2}, geomean_ratio={geomean_ratio:.4}, improved={improved}/{}",
             KERNEL_SPEED_KEYS.len()
@@ -504,8 +499,7 @@ pub fn verify_shell_faster(
     }
 
     let geomean_ratio = (log_ratio_sum / (SHELL_SPEED_KEYS.len() as f64)).exp();
-    if !geomean_ratio.is_finite() || post_sum >= base_sum || geomean_ratio >= 1.0 || improved == 0
-    {
+    if !geomean_ratio.is_finite() || post_sum >= base_sum || geomean_ratio >= 1.0 || improved == 0 {
         return Err(format!(
             "shell not faster: base_sum={base_sum:.2}, post_sum={post_sum:.2}, geomean_ratio={geomean_ratio:.4}, improved={improved}/{}",
             SHELL_SPEED_KEYS.len()

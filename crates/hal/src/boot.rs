@@ -78,6 +78,8 @@ pub fn mp_response() -> Option<&'static MpResponse> {
 
 /// Extract a safe, `no_alloc` boot descriptor and bootstrap `UntypedInventory` from Limine.
 pub fn boot_info() -> BootInfo {
+    // If Limine fails to provide an HHDM response, `hhdm_offset` stays 0 and `Aarch64Platform::new`
+    // halts via `system_off(ShutdownStatus::Failed)` rather than panicking before UART init.
     let hhdm_offset = HHDM_REQUEST.response().map(|resp| resp.offset).unwrap_or(0);
     let kernel_virt_base = EXEC_ADDR_REQUEST
         .response()

@@ -40,11 +40,34 @@ pub fn verify_entropy_health(sample: &[u8; SEED_BLOCK_BYTES]) -> Result<(), RngE
 
     // 2. Adaptive Proportion Test (64-byte window, max 16 occurrences of any single byte value)
     let mut counts = [0u8; 256];
+    let mut unique = 0usize;
     for &b in sample {
+        if counts[b as usize] == 0 {
+            unique += 1;
+        }
         let c = counts[b as usize].saturating_add(1);
         counts[b as usize] = c;
         if c > 16 {
             return Err(RngError::HealthCheckFailed);
+        }
+    }
+    // Reject low-diversity repeating patterns (e.g. 2- or 4-byte cycles).
+    if unique < 16 {
+        return Err(RngError::HealthCheckFailed);
+    }
+
+    // 3. Constant-delta / linear counter check (rejects monotonic counters like 0,1,2,... `N12`).
+    let first_delta = sample[1].wrapping_sub(sample[0]);
+    let mut same_delta_run = 1usize;
+    for i in 2..sample.len() {
+        let d = sample[i].wrapping_sub(sample[i - 1]);
+        if d == first_delta {
+            same_delta_run += 1;
+            if same_delta_run >= 12 {
+                return Err(RngError::HealthCheckFailed);
+            }
+        } else {
+            same_delta_run = 0;
         }
     }
 

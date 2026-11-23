@@ -8,3 +8,6 @@ license.workspace = true
 newos-abi = { workspace = true }
 newos-net = { workspace = true }
 newos-user-rt = { workspace = true }
+
+[lints]
+workspace = true

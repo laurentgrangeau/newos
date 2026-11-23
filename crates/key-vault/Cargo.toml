@@ -10,3 +10,6 @@ newos-abi = { workspace = true }
 newos-rng = { workspace = true }
 subtle = { version = "2", default-features = false }
 zeroize = { version = "1", default-features = false, features = ["derive"] }
+
+[lints]
+workspace = true

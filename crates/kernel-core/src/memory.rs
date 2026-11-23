@@ -16,7 +16,7 @@ pub const HUGE_PAGE_MASK_2M: u64 = HUGE_PAGE_SIZE_2M - 1;
 pub const MAX_UNTYPED_REGIONS: usize = 64;
 
 /// Fixed-capacity zero-heap LIFO cache for reclaimed 4 KiB physical frames.
-pub const MAX_RECLAIMED_FRAMES: usize = 64;
+pub const MAX_RECLAIMED_FRAMES: usize = 512;
 
 /// 64-bit physical address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -197,7 +197,9 @@ impl UntypedRegion {
 
 /// Fixed-capacity, zero-heap inventory of bootstrap `Untyped` physical memory regions
 /// with a bounded LIFO free-frame cache for reclaimed 4 KiB pages.
-#[derive(Debug, Clone, Copy)]
+///
+/// Intentionally NOT `Copy` so a stray copy can never hand out the same physical frames twice.
+#[derive(Debug, Clone)]
 pub struct UntypedInventory {
     regions: [UntypedRegion; MAX_UNTYPED_REGIONS],
     count: usize,
@@ -517,12 +519,15 @@ pub trait VSpaceMapper {
     ) -> Result<(), SysError>;
 }
 
-/// Fixed-capacity, zero-heap reverse-mapping entry linking a physical `Frame` to a `(VSpace, VirtAddr)`.
+/// Fixed-capacity, zero-heap reverse-mapping entry linking a physical `Frame` to a `(VSpace, VirtAddr)`
+/// along with its W/X permissions to enforce system-wide W^X anti-aliasing (`M1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameMapping {
     pub vspace_root: PhysAddr,
     pub virt: VirtAddr,
     pub phys: PhysAddr,
+    pub writable: bool,
+    pub executable: bool,
 }
 
 impl FrameMapping {
@@ -530,11 +535,14 @@ impl FrameMapping {
         vspace_root: PhysAddr::new(0),
         virt: VirtAddr(0),
         phys: PhysAddr::new(0),
+        writable: false,
+        executable: false,
     };
 }
 
 /// Fixed-capacity reverse-mapping table (`#![forbid(unsafe_code)]`, `no_alloc`) enabling
-/// hardware PTE unmap + TLB flush when a `Frame` or parent `Untyped` capability is revoked (`H-3`).
+/// hardware PTE unmap + TLB flush when a `Frame` or parent `Untyped` capability is revoked (`H-3`),
+/// and system-wide W^X anti-aliasing checks across all VSpaces (`M1`).
 pub struct FrameMappingTracker<const MAX_MAPPINGS: usize> {
     entries: [FrameMapping; MAX_MAPPINGS],
     len: usize,
@@ -554,7 +562,7 @@ impl<const MAX_MAPPINGS: usize> FrameMappingTracker<MAX_MAPPINGS> {
         }
     }
 
-    /// Record a new `(vspace_root, virt) -> phys` mapping in O(1).
+    /// Record a new `(vspace_root, virt) -> phys` mapping in O(1) (defaulting to non-W/non-X flags).
     #[inline]
     pub fn record(
         &mut self,
@@ -562,6 +570,22 @@ impl<const MAX_MAPPINGS: usize> FrameMappingTracker<MAX_MAPPINGS> {
         virt: VirtAddr,
         phys: PhysAddr,
     ) -> Result<(), SysError> {
+        self.record_with_flags(vspace_root, virt, phys, false, false)
+    }
+
+    /// Record a new `(vspace_root, virt) -> phys` mapping with explicit W/X permission flags.
+    #[inline]
+    pub fn record_with_flags(
+        &mut self,
+        vspace_root: PhysAddr,
+        virt: VirtAddr,
+        phys: PhysAddr,
+        writable: bool,
+        executable: bool,
+    ) -> Result<(), SysError> {
+        if writable && executable {
+            return Err(SysError::InvalidArgument);
+        }
         if self.len >= MAX_MAPPINGS {
             return Err(SysError::OutOfMemory);
         }
@@ -569,9 +593,54 @@ impl<const MAX_MAPPINGS: usize> FrameMappingTracker<MAX_MAPPINGS> {
             vspace_root,
             virt,
             phys,
+            writable,
+            executable,
         };
         self.len += 1;
         Ok(())
+    }
+
+    /// Return `true` if mapping `phys` with `(writable, executable)` would violate system-wide
+    /// W^X anti-aliasing against an existing mapping of the same physical frame (`M1`).
+    #[inline]
+    pub fn conflicts_wx(&self, phys: PhysAddr, writable: bool, executable: bool) -> bool {
+        if !writable && !executable {
+            return false;
+        }
+        let mut i = 0;
+        while i < self.len {
+            let m = self.entries[i];
+            if m.phys == phys && ((writable && m.executable) || (executable && m.writable)) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Drain up to `out.len()` mappings belonging to `vspace_root` into `out` (used on process teardown).
+    #[inline]
+    pub fn drain_for_vspace(
+        &mut self,
+        vspace_root: PhysAddr,
+        out: &mut [Option<FrameMapping>],
+    ) -> usize {
+        if self.len == 0 || out.is_empty() {
+            return 0;
+        }
+        let mut n = 0usize;
+        let mut i = 0usize;
+        while i < self.len && n < out.len() {
+            if self.entries[i].vspace_root == vspace_root {
+                out[n] = Some(self.entries[i]);
+                n += 1;
+                self.len -= 1;
+                self.entries[i] = self.entries[self.len];
+            } else {
+                i += 1;
+            }
+        }
+        n
     }
 
     /// Remove a specific `(vspace_root, virt)` mapping entry (e.g., on `UnmapPage`) via swap-remove.
@@ -917,9 +986,9 @@ mod kani_proofs {
 
         match PageFlags::new_wx(writable, executable, user, device) {
             Ok(flags) => {
-                assert!(!(flags.writable() && flags.executable()));
-                assert_eq!(flags.writable(), writable);
-                assert_eq!(flags.executable(), executable);
+                assert!(!(flags.writable && flags.executable));
+                assert_eq!(flags.writable, writable);
+                assert_eq!(flags.executable, executable);
             }
             Err(SysError::InvalidArgument) => {
                 assert!(writable && executable);
@@ -944,8 +1013,8 @@ mod kani_proofs {
 
         let f1 = inv.retype_frame().unwrap();
         let f2 = inv.retype_frame().unwrap();
-        assert_ne!(f1.start(), f2.start());
-        assert!(f1.start().raw() >= base && f1.start().raw() + PAGE_SIZE <= base + len);
-        assert!(f2.start().raw() >= base && f2.start().raw() + PAGE_SIZE <= base + len);
+        assert_ne!(f1.start_addr(), f2.start_addr());
+        assert!(f1.start_addr().raw() >= base && f1.start_addr().raw() + PAGE_SIZE <= base + len);
+        assert!(f2.start_addr().raw() >= base && f2.start_addr().raw() + PAGE_SIZE <= base + len);
     }
 }

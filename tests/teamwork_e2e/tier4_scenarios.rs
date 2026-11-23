@@ -100,7 +100,7 @@ fn t4_scenario2_multiprocess_microkernel_simulation() {
                 0,
                 CapId::BOOTSTRAP_UNTYPED,
                 ObjectType::Endpoint,
-                20 + idx,
+                30 + idx,
                 &mut inv,
             )
             .unwrap();
@@ -119,7 +119,7 @@ fn t4_scenario2_multiprocess_microkernel_simulation() {
                 0,
                 CapId::BOOTSTRAP_UNTYPED,
                 ObjectType::Frame,
-                30 + idx,
+                40 + idx,
                 &mut inv,
             )
             .unwrap();

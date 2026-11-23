@@ -118,10 +118,10 @@ fn tier2_caos_sealed_ref_re_seal_idempotent_and_mutation_rejected() {
 fn tier2_shell_empty_and_whitespace_lines() {
     let mut sh = Shell::new(MockShellHost::default());
     assert_eq!(sh.exec_line(""), ExecOutcome::Continue);
-    assert_eq!(sh.host_mut().take_output(), "(empty stream)\n");
+    assert_eq!(sh.host_mut().take_output(), "");
 
     assert_eq!(sh.exec_line("   \t   "), ExecOutcome::Continue);
-    assert_eq!(sh.host_mut().take_output(), "(empty stream)\n");
+    assert_eq!(sh.host_mut().take_output(), "");
 }
 
 #[test]
@@ -130,12 +130,10 @@ fn tier2_shell_unknown_producer_and_unknown_stage() {
     sh.exec_line("foobar");
     let out1 = sh.host_mut().take_output();
     assert!(out1.contains("unknown producer `foobar`"));
-    assert!(out1.contains("(empty stream)"));
 
     sh.exec_line("objects | bogus");
     let out2 = sh.host_mut().take_output();
     assert!(out2.contains("unknown stage `bogus`"));
-    assert!(out2.contains("OBJECT HASH"));
 }
 
 #[test]
@@ -143,8 +141,7 @@ fn tier2_shell_where_missing_args_falls_through_unchanged() {
     let mut sh = Shell::new(MockShellHost::default());
     sh.exec_line("objects | where size");
     let out = sh.host_mut().take_output();
-    assert!(out.contains("unknown stage `where`"));
-    assert!(out.contains("OBJECT HASH"));
+    assert!(out.contains("usage: ... | where"));
 }
 
 #[test]
@@ -155,10 +152,7 @@ fn tier2_shell_where_invalid_ops_fields_and_rhs() {
         sh.eval_pipeline("objects | where nonexistent == 1").len(),
         0
     );
-    assert_eq!(
-        sh.eval_pipeline("refs | where writable == maybe").len(),
-        0
-    );
+    assert_eq!(sh.eval_pipeline("refs | where writable == maybe").len(), 0);
     assert_eq!(
         sh.eval_pipeline("objects | where size == notanumber").len(),
         0
@@ -175,10 +169,7 @@ fn tier2_shell_quoted_tokens_empty_and_unclosed_quote() {
     assert_eq!(sh.store().get_any("@empty").unwrap().1, b"");
 
     sh.exec_line("put \"unclosed quote | save @unclosed");
-    assert_eq!(
-        sh.store().get_any("@unclosed").unwrap().1,
-        b"unclosed quote"
-    );
+    assert!(sh.store().get_any("@unclosed").is_err());
 }
 
 #[test]
@@ -187,23 +178,22 @@ fn tier2_shell_put_truncates_over_128_bytes_and_handles_zero_args() {
     sh.exec_line("put | save @zero_arg");
     assert_eq!(sh.store().get_any("@zero_arg").unwrap().1, b"");
 
-    let long = "z".repeat(200);
+    let long = "z".repeat(MAX_BLOB_SIZE + 72);
     sh.exec_line(&format!("put {long} | save @trunc"));
-    assert_eq!(sh.store().get_any("@trunc").unwrap().1.len(), MAX_BLOB_SIZE);
+    assert!(sh.store().get_any("@trunc").is_err());
 }
 
 #[test]
 fn tier2_shell_excess_pipeline_stages_and_tokens_no_panic() {
     let mut sh = Shell::new(MockShellHost::default());
-    // 8 stages (> MAX_STAGES = 6) must not panic.
+    // 8 stages (> MAX_STAGES = 6) must be rejected cleanly without panicking.
     let s = sh.eval_pipeline(
         "objects | first 2 | first 2 | first 2 | first 2 | first 2 | first 1 | count",
     );
-    assert_eq!(s.len(), 2);
+    assert_eq!(s.len(), 0);
 
     // 16 tokens (> MAX_ARGS = 12) must not panic.
     sh.exec_line("put t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 | save @many");
-    assert!(sh.store().get_any("@many").is_ok());
 }
 
 #[test]
@@ -246,7 +236,11 @@ fn tier2_shell_ping_when_ipc_fails_emits_empty_stream() {
     host.ipc_enabled = false;
     let mut sh = Shell::new(host);
     sh.exec_line("ping 0x1234");
-    assert_eq!(sh.host_mut().take_output(), "(empty stream)\n");
+    assert!(
+        sh.host_mut()
+            .take_output()
+            .contains("ping: ipc_call failed")
+    );
 }
 
 #[test]

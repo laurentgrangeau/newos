@@ -2,6 +2,8 @@
 
 This document records reproducible **Pre-Optimization Baseline** measurements and (after M2+M3 optimizations) **Post-Optimization** comparison results for `newos` across **Kernel Speed** (9 metrics), **Shell Speed** (3 metrics), **IPC Consumption** (10 metrics), and **IPC Footprint** (6 metrics), measured by the zero-external-dependency, `#![forbid(unsafe_code)]` `newos-bench` harness (`crates/bench`).
 
+> **Measurement Caveat:** All timed benchmarks below are **host-side microbenchmarks** of the `kernel-core` and `shell-core` libraries (not bare-metal EL1/EL0 hardware timings), small kernel latency deltas are within run-to-run noise, and the IPC consumption metrics are deterministic structural counts produced by the harness.
+
 ## Environment & Build Metadata
 
 - **Host OS / Architecture**: `Darwin 27.2.0 arm64`

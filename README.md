@@ -1,6 +1,6 @@
 # NewOS
 
-> **Release:** [`v0.4.0`](https://github.com/laurentgrangeau/newos/releases/tag/v0.4.0) · `main` is on `0.5.0` development.
+> **Release:** [`v0.5.0`](https://github.com/laurentgrangeau/newos/releases/tag/v0.5.0) · Security Audit Hardening (Soft-Float EL1, KCFI/SSBS/W^X, SMP IPC, PQ-SSH, 445 Tests & CI).
 
 A pure **seL4-style 64-bit capability microkernel** and **post-UNIX EL0 environment** written in modern Rust — built solely for the **Raspberry Pi 5 16 GB** (`aarch64` / ARMv8.2-A quad-core BCM2712 Cortex-A76, with QEMU `aarch64` `virt` retained as a local test harness). Built with **zero kernel heap (`no_alloc` in EL1)**, **100% memory-safe Rust APIs (`#![forbid(unsafe_code)]` across core, board/GPIO/watchdog/storage/USB/GPU/AI drivers, networking, RNG, PQ-SSH, shell, userspace & benchmarks)**, **Kernel PIE + Limine KASLR**, **Userspace PIE + full ASLR + KCFI + LLVM ShadowCallStack (`x18`)**, **true quad-core SMP EL0 scheduling with GICv2 SGI wakeups & cross-core blocking IPC**, **isolated `TTBR0_EL1` address spaces (16-bit ASIDs + full NEON/FP save/restore)**, **EL0 crash isolation**, **live ACPI hardware discovery (`FADT`/`SPCR`/`MADT`/`GTDT`/`MCFG`)**, a **full Raspberry Pi 5 (16 GB) EL0 hardware driver stack** (**BCM2712 Watchdog**, **RP1 40-pin GPIO**, **VideoCore Mailbox**, **AVS TMON Thermal & Active Cooler Fan**, **RTC**, **RP1 UART/I2C/SPI/PWM**, **BCM2712 MIP MSI-X**, **PCIe ECAM**, **microSD SDHCI**, **NVMe 1.4**, **RP1 Dual xHCI USB 3.0**, **UEFI GOP Framebuffer**, **`brcm,bcm2712-iommu`**, **VideoCore VII V3D 7.1**, **Cortex-A76 NEON/DotProd AI Compute**, and **Hailo-8/8L/10H PCIe NPU**), a **3-process privilege-separated Pure Post-Quantum SSHv2 server (`newos-netd` + `newos-keyd` + `newos-sshd`)** with **hardware TRNG (`BCM2712 iproc-rng200` / `VirtIO-RNG`)**, an **EL0 `smoltcp` IPv4/IPv6 TCP/IP stack + RP1 Cadence GEM Gigabit Ethernet driver** (plus VirtIO 1.0+ for QEMU testing), a **FIPS 202 `SHA3-512` Content-Addressed Object Store (CAOS)**, and a **UTF-8 Typed Pipeline Shell (`newos-sh`)**.
 
@@ -16,7 +16,9 @@ A pure **seL4-style 64-bit capability microkernel** and **post-UNIX EL0 environm
 - **100% Memory-Safe Rust Interfaces & Formal Verification:**
   - `#![forbid(unsafe_code)]` is compiler-enforced on `newos-abi`, `newos-kernel-core`, `newos-kernel`, `newos-net`, `newos-rng`, `newos-wdt`, `newos-gpio`, `newos-board`, `newos-storage`, `newos-usb`, `newos-gpu`, `newos-ai`, `newos-key-vault`, `newos-ssh-proto`, `newos-netd`, `newos-keyd`, `newos-sshd`, `newos-ssh`, `newos-shell-core`, `newos-init`, `newos-worker`, `newos-bench`, and `tests/teamwork_e2e`.
   - Audited `unsafe` is strictly confined to hardware/paging/context-switch instructions in `crates/hal` (guarded by IRQ-disabling `IrqSpinLock`s, bounded descriptor helpers, and page-table-validated HHDM user copies) and the minimal `svc #0` / fault-recovery trampoline in `crates/user-rt` (with `set_fault_handler` implemented in safe Rust via `[AtomicU64; 8192]`), with documented `// SAFETY:` invariants on every site.
-  - **Miri & Kani Verification:** `cargo xtask host-test` verifies **148** unit tests across 14 crates and `cargo xtask miri` checks UB/aliasing/provenance across the core and hardware driver suites; `#[cfg(kani)]` bounded model checking harnesses (`cargo xtask verify`) prove `SpscRing` FIFO & corrupted-peer safety, `CNode` monotonic rights attenuation & generational `CapId` safety, `PageFlags` W^X exclusivity, and `UntypedInventory` disjointness.
+  - **Miri, Kani & E2E Verification:** `cargo test` runs **445** host tests (**150** unit tests across 15 crates + **295** E2E tests in `tests/e2e` and `tests/teamwork_e2e`) and `cargo xtask miri` checks UB/aliasing/provenance across the core and hardware driver suites (excluding multi-minute PQ lattice crates); `#[cfg(kani)]` bounded model checking harnesses (`cargo xtask verify`) prove `SpscRing` FIFO & corrupted-peer safety, `CNode` monotonic rights attenuation & generational `CapId` safety, `PageFlags` W^X exclusivity, and `UntypedInventory` disjointness.
+  - **DMA Trust Boundary & Unintegrated Driver Libraries:** Today `newos-netd` holds raw NIC MMIO + `VirtToPhys` without active IOMMU stage-1 page tables, so `newos-netd` is part of the trusted computing base for DMA. The 7 Raspberry Pi 5 hardware driver crates (`newos-wdt`, `newos-gpio`, `newos-board`, `newos-storage`, `newos-usb`, `newos-gpu`, `newos-ai`) are currently unintegrated `#![forbid(unsafe_code)]` EL0 driver libraries tested against unit mocks and not yet wired into the boot image.
+  - **Pure-PQ SSH Protocol & CAOS Hashing Notes:** The SSH server uses private pure-PQ algorithm names (`mlkem1024-sha3-512`, `ssh-mldsa87`, `chacha20-poly1305@openssh.com`) with `newos-ssh` (requiring `--fingerprint` by default) and is not wire-compatible with stock OpenSSH clients. CAOS object hashes (`ObjHash`) use a 64-bit prefix of `SHA3-512`; boot module digests are logged as boot-time measurements.
 - **Defense-in-Depth AArch64 Security Hardening:**
   - **KASLR, PIE & Full EL0 ASLR:** Kernel compiled as PIE (`-C relocation-model=pie`) with Limine KASLR; EL0 binaries compiled as PIE (`ET_DYN`) with streaming `R_AARCH64_RELATIVE` relocation, randomized code/stack/shadow-stack bases (seeded with early BCM2712 hardware TRNG on Pi 5), unmapped 4 KiB stack guard pages, and **FIPS 202 `SHA3-512`** boot attestation digests (zero SHA-2 anywhere in the OS).
   - **Pure Post-Quantum 3-Process SSHv2 Server (`newos-netd` + `newos-keyd` + `newos-sshd`):**
@@ -149,7 +151,7 @@ sequenceDiagram
 ```text
 newos/
 ├── rust-toolchain.toml          # Nightly toolchain + rust-src, llvm-tools-preview, aarch64-unknown-none
-├── Cargo.toml                   # Workspace manifest (v0.5.0; v0.4.0 released)
+├── Cargo.toml                   # Workspace manifest (v0.5.0)
 ├── BENCHMARK_RESULTS.md         # Reproducible 28-metric before/after kernel, shell & IPC benchmarks
 ├── targets/
 │   └── aarch64-newos-user.json  # Custom Cortex-A76 EL0 PIE target spec enabling KCFI + LLVM ShadowCallStack (x18)
@@ -219,7 +221,7 @@ To boot on a Raspberry Pi 5 (16 GB):
 ### Host Unit Tests, Miri, Kani, Clippy & Formatting
 ```bash
 cargo xtask host-test
-cargo xtask miri            # Miri UB / aliasing / provenance checks (110 tests)
+cargo xtask miri            # Miri UB / aliasing / provenance checks (core + drivers)
 cargo xtask verify          # Kani bounded model checking proofs (optional)
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings

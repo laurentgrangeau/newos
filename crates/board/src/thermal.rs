@@ -95,6 +95,20 @@ impl FanController {
         self.current_duty_pct
     }
 
+    /// Fail-safe thermal control update (`P14`): ramps fan to 100% duty on any sensor read error
+    /// or implausible temperature reading (`< -40 °C` or `> 125 °C`) instead of leaving fan off.
+    pub fn update_from_sensor(&mut self, reading: Result<i32, SysError>) -> u8 {
+        match reading {
+            Ok(temp_millic) if (-40_000..=125_000).contains(&temp_millic) => {
+                self.update(temp_millic)
+            }
+            _ => {
+                self.current_duty_pct = 100;
+                100
+            }
+        }
+    }
+
     #[inline]
     pub const fn duty_pct(&self) -> u8 {
         self.current_duty_pct

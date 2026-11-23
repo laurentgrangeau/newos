@@ -61,7 +61,10 @@ fn tier2_bench_rejects_non_numeric_nan_and_inf_values() {
     for bad in ["abc", "NaN", "inf", "-inf", "-5.0"] {
         let raw = format!("METRIC kernel.cnode.lookup {bad} ns/op\n");
         assert!(
-            matches!(parse_metric_lines(&raw), Err(ParseError::InvalidValue { .. })),
+            matches!(
+                parse_metric_lines(&raw),
+                Err(ParseError::InvalidValue { .. })
+            ),
             "value `{bad}` must be rejected"
         );
     }
@@ -214,7 +217,10 @@ fn tier2_bench_verify_ipc_reduced_rejects_nan_negative_and_fractional() {
 
     // NaN in post_opt must be rejected.
     let mut post_nan = base.clone();
-    post_nan.insert("ipc.shell_session.debug_write_syscalls".to_string(), f64::NAN);
+    post_nan.insert(
+        "ipc.shell_session.debug_write_syscalls".to_string(),
+        f64::NAN,
+    );
     post_nan.insert("ipc.total_consumption".to_string(), 200.0);
     assert!(verify_ipc_reduced(&base, &post_nan).is_err());
 

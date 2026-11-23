@@ -74,6 +74,12 @@ pub fn init_secondary() {
     enable_irq(SGI_RESCHEDULE);
 }
 
+/// Return the configured ARM Generic Virtual Timer PPI interrupt ID.
+#[inline]
+pub fn virt_timer_irq() -> u32 {
+    VIRT_TIMER_IRQ.load(Ordering::Acquire) as u32
+}
+
 /// Send a GICv2 Software Generated Interrupt (`0..16`) to the target CPU bitmask (`bits 0..7`).
 pub fn send_sgi(sgi_id: u32, target_cpu_mask: u8) {
     let gicd = GICD_VIRT_BASE.load(Ordering::Acquire) as usize;

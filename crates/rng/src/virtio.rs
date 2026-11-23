@@ -302,6 +302,12 @@ impl<'a, T: RngTransport> VirtioRngDevice<'a, T> {
             }
             core::hint::spin_loop();
         }
+        // Timeout: reset the device so the timed-out DMA descriptor is never left in flight (`N13`).
+        let _ = self.transport.write32(REG_STATUS, 0);
+        self.dma.avail.idx.store(0, Ordering::Release);
+        self.dma.used.idx.store(0, Ordering::Release);
+        self.avail_idx = 0;
+        self.last_used_idx = 0;
         Err(RngError::HardwareTimeout)
     }
 }

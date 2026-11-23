@@ -41,12 +41,15 @@ fn tier4_shell_full_interactive_operator_deploy_rollback_seal_session() {
     let (_, _) = run(&mut sh, "put \"config v2: mode=broken\" | save @app_cfg");
     let (_, ref_out) = run(&mut sh, "refs | where name == app_cfg");
     assert!(ref_out.contains("@app_cfg"));
-    assert!(ref_out.contains("rw  "));
-    assert!(!ref_out.contains("  -\n"), "updated ref must record PREV hash");
+    assert!(ref_out.contains(" rw "));
+    assert!(
+        !ref_out.contains("  -\n"),
+        "updated ref must record PREV hash"
+    );
 
     // Detect failure and rollback to v1
     let (_, rb_out) = run(&mut sh, "ref rollback app_cfg");
-    assert!(rb_out.contains("rolled back @app_cfg"));
+    assert!(rb_out.contains("rollback @app_cfg"));
     let (_, restored) = run(&mut sh, "get @app_cfg");
     assert!(restored.contains("config v1: mode=safe"));
 
@@ -117,7 +120,10 @@ fn tier4_shell_buffered_vs_unbuffered_exact_output_equivalence() {
     let mut direct = String::new();
     obj_stream.render(&mut direct);
     ref_stream.render(&mut direct);
-    assert!(direct.len() > 256, "combined table output must exceed 256 bytes");
+    assert!(
+        direct.len() > 256,
+        "combined table output must exceed 256 bytes"
+    );
 
     let mut buf256 = String::new();
     {

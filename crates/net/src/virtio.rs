@@ -243,6 +243,14 @@ impl<'a, T: MmioDmaTransport> VirtioNetDevice<'a, T> {
             &dma.tx_used,
         )?;
 
+        // 5b. Zero all four ring indices before publishing descriptors so re-initialization
+        // never sees stale used/avail entries from a previous session (`H6`).
+        dma.rx_avail.idx.store(0, Ordering::Release);
+        dma.rx_used.idx.store(0, Ordering::Release);
+        dma.tx_avail.idx.store(0, Ordering::Release);
+        dma.tx_used.idx.store(0, Ordering::Release);
+        fence(Ordering::SeqCst);
+
         // 6. Populate all RX buffers and publish to RX avail ring
         for i in 0..QUEUE_SIZE {
             let paddr = transport
@@ -383,6 +391,17 @@ impl<T: MmioDmaTransport> TxToken for VirtioTxToken<'_, T> {
 
         let idx = (self.desc_idx as usize) % QUEUE_SIZE;
         let tx_buf = &self.dma.tx_bufs[idx];
+
+        // Wait (bounded) if all TX ring slots are still in flight so we never overwrite a
+        // buffer owned by the VirtIO device (`M9`).
+        let avail_idx = self.dma.tx_avail.idx.load(Ordering::Acquire);
+        for _ in 0..100_000u32 {
+            let used_idx = self.dma.tx_used.idx.load(Ordering::Acquire);
+            if (avail_idx.wrapping_sub(used_idx) as usize) < QUEUE_SIZE {
+                break;
+            }
+            core::hint::spin_loop();
+        }
 
         // Prepend 12-byte zeroed `virtio_net_hdr_v1` + Ethernet frame
         for b in tx_buf.0.iter().take(VIRTIO_NET_HDR_LEN) {

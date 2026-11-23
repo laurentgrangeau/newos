@@ -627,8 +627,8 @@ pub mod key_ipc {
     pub const MLDSA87_PK_BYTES: usize = 2592;
     /// ML-DSA-87 (NIST FIPS 204) signature size in bytes.
     pub const MLDSA87_SIG_BYTES: usize = 4627;
-    /// Maximum random bytes `newos-sshd` may request per KEX window (`<= 64 B` cap).
-    pub const MAX_RANDOM_BYTES_PER_WINDOW: usize = 64;
+    /// Maximum random bytes `newos-sshd` may request per KEX window (`<= 256 B` cap with margin).
+    pub const MAX_RANDOM_BYTES_PER_WINDOW: usize = 256;
     /// Maximum chunk payload bytes carried in a single 64-bit IPC register word.
     pub const MAX_CHUNK_BYTES: usize = 7;
 
@@ -653,6 +653,23 @@ pub mod key_ipc {
     pub const REPLY_DENIED: u64 = 0;
     pub const REPLY_OK: u64 = 1;
     pub const REPLY_RATE_LIMITED: u64 = 2;
+
+    /// Encode 4 bytes of CSPRNG output with a non-zero `REPLY_OK` tag in bits `32..64` so a
+    /// `REPLY_DENIED` (0) or `REPLY_RATE_LIMITED` (2) error can NEVER be mistaken for random bytes (`N1`).
+    #[inline]
+    pub const fn encode_random_u32_reply(val: u32) -> u64 {
+        (REPLY_OK << 32) | (val as u64)
+    }
+
+    /// Decode a tagged 4-byte CSPRNG reply, returning `None` on any error status (`N1`).
+    #[inline]
+    pub const fn decode_random_u32_reply(word: u64) -> Option<u32> {
+        if (word >> 32) == REPLY_OK {
+            Some(word as u32)
+        } else {
+            None
+        }
+    }
 
     #[inline]
     pub const fn encode_word_req(op: u8, word_index: u32) -> u64 {

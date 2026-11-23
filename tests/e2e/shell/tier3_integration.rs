@@ -10,7 +10,8 @@ use crate::mock_shell_host::MockShellHost;
 #[test]
 fn tier3_shell_five_stage_caos_pipeline_chain() {
     let mut sh = Shell::new(MockShellHost::default());
-    let stream = sh.eval_pipeline("put \"payload-v1\" | save @item | where size == 10 | first 1 | count");
+    let stream =
+        sh.eval_pipeline("put \"payload-v1\" | save @item | where size == 10 | first 1 | count");
     assert!(matches!(stream.first(), Some(Record::Count(1))));
     assert_eq!(sh.store().get_any("@item").unwrap().1, b"payload-v1");
 }
@@ -18,7 +19,8 @@ fn tier3_shell_five_stage_caos_pipeline_chain() {
 #[test]
 fn tier3_shell_ping_pipeline_filter_and_count() {
     let mut sh = Shell::new(MockShellHost::default());
-    let s1 = sh.eval_pipeline("ping 0x100 | where label == ipc.reply | where value == 0x101 | count");
+    let s1 =
+        sh.eval_pipeline("ping 0x100 | where label == ipc.reply | where value == 0x101 | count");
     assert!(matches!(s1.first(), Some(Record::Count(1))));
 
     let s2 = sh.eval_pipeline("ping 0x100 | where value > 0x100 | first 1");
@@ -37,7 +39,7 @@ fn tier3_shell_procs_and_sys_consistency_single_vs_multi_proc() {
         Some(Record::Count(0))
     ));
     sh1.exec_line("sys");
-    assert!(sh1.host_mut().take_output().contains("1 EL0 procs"));
+    assert!(sh1.host_mut().take_output().contains("1 procs"));
 
     let mut sh2 = Shell::new(MockShellHost::new(4, 2));
     assert!(matches!(
@@ -49,7 +51,7 @@ fn tier3_shell_procs_and_sys_consistency_single_vs_multi_proc() {
         Some(Record::Count(1))
     ));
     sh2.exec_line("sys");
-    assert!(sh2.host_mut().take_output().contains("2 EL0 procs"));
+    assert!(sh2.host_mut().take_output().contains("2 procs"));
 }
 
 #[test]
@@ -79,7 +81,7 @@ fn tier3_shell_refs_audit_across_create_update_seal_lifecycle() {
     ));
     sh.host_mut().clear_output();
     sh.exec_line("sys");
-    assert!(sh.host_mut().take_output().contains("6 CAOS objects"));
+    assert!(sh.host_mut().take_output().contains("6 objs"));
 }
 
 #[test]

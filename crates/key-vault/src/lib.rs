@@ -54,6 +54,9 @@ pub struct KeyVault<E: EntropySource> {
     host_pk: [u8; key_ipc::MLDSA87_PK_BYTES],
     authorized_keys: &'static [[u8; key_ipc::MLDSA87_PK_BYTES]],
     pending_session_id: Option<[u8; 64]>,
+    seen_session_hashes: [[u8; 64]; 16],
+    seen_session_count: usize,
+    seen_session_cursor: usize,
     last_sign_ms: Option<i64>,
     random_bytes_in_window: usize,
 }
@@ -64,6 +67,9 @@ impl<E: EntropySource> Drop for KeyVault<E> {
             sid.zeroize();
         }
         self.pending_session_id = None;
+        for h in &mut self.seen_session_hashes {
+            h.zeroize();
+        }
     }
 }
 
@@ -98,6 +104,9 @@ impl<E: EntropySource> KeyVault<E> {
             host_pk,
             authorized_keys,
             pending_session_id: None,
+            seen_session_hashes: [[0u8; 64]; 16],
+            seen_session_count: 0,
+            seen_session_cursor: 0,
             last_sign_ms: None,
             random_bytes_in_window: 0,
         })
@@ -114,7 +123,20 @@ impl<E: EntropySource> KeyVault<E> {
         sha3_512(&self.host_pk)
     }
 
-    /// Issue 8 fresh bytes of fast-key-erasure CSPRNG randomness (capped at `<= 64` bytes per KEX).
+    /// Issue 4 fresh bytes of fast-key-erasure CSPRNG randomness for tagged IPC transport (`N1`).
+    pub fn get_random_u32(&mut self) -> Result<u32, VaultError> {
+        if self.random_bytes_in_window.saturating_add(4) > key_ipc::MAX_RANDOM_BYTES_PER_WINDOW {
+            return Err(VaultError::RandomBudgetExceeded);
+        }
+        let mut buf = [0u8; 4];
+        self.csprng.fill_bytes(&mut buf).map_err(VaultError::Rng)?;
+        self.random_bytes_in_window += 4;
+        let out = u32::from_le_bytes(buf);
+        buf.zeroize();
+        Ok(out)
+    }
+
+    /// Issue 8 fresh bytes of fast-key-erasure CSPRNG randomness.
     pub fn get_random_u64(&mut self) -> Result<u64, VaultError> {
         if self.random_bytes_in_window.saturating_add(8) > key_ipc::MAX_RANDOM_BYTES_PER_WINDOW {
             return Err(VaultError::RandomBudgetExceeded);
@@ -130,7 +152,8 @@ impl<E: EntropySource> KeyVault<E> {
     /// Produce a **hedged** FIPS 204 ML-DSA-87 signature over the 64-byte `SHA3-512` exchange hash
     /// `hash64` using domain context [`CTX_KEX`], rate-limited via `now_ms`.
     ///
-    /// Records `pending_session_id = Some(*hash64)` for single-use userauth replay binding.
+    /// Rejects previously seen exchange hashes (`N6`) and records `pending_session_id = Some(*hash64)`
+    /// for single-use userauth replay binding.
     pub fn sign_kex_hash(
         &mut self,
         hash64: &[u8; 64],
@@ -140,6 +163,15 @@ impl<E: EntropySource> KeyVault<E> {
             && now_ms.saturating_sub(prev_ms) < SIGN_RATE_LIMIT_MS
         {
             return Err(VaultError::RateLimited);
+        }
+
+        // Reject replayed exchange hashes so a compromised `sshd` cannot re-sign a captured login (`N6`).
+        let mut seen = subtle::Choice::from(0u8);
+        for prev in &self.seen_session_hashes[..self.seen_session_count] {
+            seen |= prev.ct_eq(hash64);
+        }
+        if bool::from(seen) {
+            return Err(VaultError::SessionIdMismatch);
         }
 
         let mut rnd_bytes = [0u8; 32];
@@ -164,6 +196,11 @@ impl<E: EntropySource> KeyVault<E> {
 
         self.last_sign_ms = Some(now_ms);
         self.pending_session_id = Some(*hash64);
+        self.seen_session_hashes[self.seen_session_cursor] = *hash64;
+        self.seen_session_cursor = (self.seen_session_cursor + 1) % self.seen_session_hashes.len();
+        if self.seen_session_count < self.seen_session_hashes.len() {
+            self.seen_session_count += 1;
+        }
         self.random_bytes_in_window = 0;
         Ok(out)
     }
@@ -340,8 +377,8 @@ impl<E: EntropySource> KeyVaultServer<E> {
                 word[..take].copy_from_slice(&pk[byte_off..byte_off + take]);
                 (u64::from_le_bytes(word), None)
             }
-            key_ipc::OP_GET_RANDOM_U64 => match self.vault.get_random_u64() {
-                Ok(val) => (val, None),
+            key_ipc::OP_GET_RANDOM_U64 => match self.vault.get_random_u32() {
+                Ok(val) => (key_ipc::encode_random_u32_reply(val), None),
                 Err(_) => (key_ipc::REPLY_DENIED, None),
             },
             key_ipc::OP_SIGN_KEX_RESET => {
@@ -485,12 +522,19 @@ mod tests {
         // FIPS 204 context separation: MUST fail under CTX_USERAUTH
         assert!(!vk.verify_with_context(&hash64, CTX_USERAUTH, &sig));
 
-        // Rate-limited within 1000 ms, allowed at +1000 ms
+        // Rate-limited within 1000 ms
+        let hash64_next = sha3_512(b"exchange-hash-test-2");
         assert_eq!(
-            vault.sign_kex_hash(&hash64, 1_500).err(),
+            vault.sign_kex_hash(&hash64_next, 1_500).err(),
             Some(VaultError::RateLimited)
         );
-        assert!(vault.sign_kex_hash(&hash64, 2_000).is_ok());
+        // Replaying the exact same exchange hash MUST be rejected (`N6`)
+        assert_eq!(
+            vault.sign_kex_hash(&hash64, 2_000).err(),
+            Some(VaultError::SessionIdMismatch)
+        );
+        // Fresh exchange hash at +1000 ms succeeds
+        assert!(vault.sign_kex_hash(&hash64_next, 2_000).is_ok());
     }
 
     #[test]
@@ -544,13 +588,13 @@ mod tests {
     }
 
     #[test]
-    fn random_budget_caps_at_64_bytes_per_kex_window() {
+    fn random_budget_caps_at_256_bytes_per_kex_window() {
         let mut vault =
             KeyVault::new(DeterministicTestEntropy(0x3333), b"rng-cap", &[]).expect("vault init");
-        for _ in 0..8 {
+        for _ in 0..(key_ipc::MAX_RANDOM_BYTES_PER_WINDOW / 8) {
             assert!(vault.get_random_u64().is_ok());
         }
-        // 9th call (> 64 bytes) MUST fail closed
+        // Exceeding MAX_RANDOM_BYTES_PER_WINDOW MUST fail closed
         assert_eq!(
             vault.get_random_u64(),
             Err(VaultError::RandomBudgetExceeded)

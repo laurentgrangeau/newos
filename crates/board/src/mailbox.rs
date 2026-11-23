@@ -111,6 +111,15 @@ impl<'a, T: MmioDmaTransport> VideoCoreMailbox<'a, T> {
         let msg = ((phys as u32) & !0xF) | MBOX_CHANNEL_PROP;
 
         // Wait until Mailbox 1 TX FIFO is not full
+        // Drain any stale/late replies from Mailbox 0 RX FIFO before sending a new request (`P12`).
+        for _ in 0..16u32 {
+            if (self.transport.read32(REG_MBOX0_STATUS)? & MBOX_STATUS_EMPTY) != 0 {
+                break;
+            }
+            let _ = self.transport.read32(REG_MBOX0_READ)?;
+        }
+
+        // Wait for Mailbox 1 TX FIFO to have space
         let mut ready = false;
         for _ in 0..MAX_POLL_ITERS {
             if (self.transport.read32(REG_MBOX1_STATUS)? & MBOX_STATUS_FULL) == 0 {
@@ -124,7 +133,7 @@ impl<'a, T: MmioDmaTransport> VideoCoreMailbox<'a, T> {
         }
         self.transport.write32(REG_MBOX1_WRITE, msg)?;
 
-        // Poll Mailbox 0 RX FIFO for matching channel 8 response
+        // Poll Mailbox 0 RX FIFO for matching channel 8 response and verify tag/status (`P12`).
         for _ in 0..MAX_POLL_ITERS {
             if (self.transport.read32(REG_MBOX0_STATUS)? & MBOX_STATUS_EMPTY) != 0 {
                 core::hint::spin_loop();
@@ -134,7 +143,7 @@ impl<'a, T: MmioDmaTransport> VideoCoreMailbox<'a, T> {
             if reply == msg {
                 self.transport.dma_invalidate(self.buf)?;
                 fence(Ordering::SeqCst);
-                if self.buf.get(1) != MBOX_RESPONSE_OK {
+                if self.buf.get(1) != MBOX_RESPONSE_OK || self.buf.get(2) != tag {
                     return Err(SysError::Unsupported);
                 }
                 return Ok((self.buf.get(5), self.buf.get(6)));

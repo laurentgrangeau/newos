@@ -29,10 +29,10 @@ pub fn signal_userspace_ready() {
     }
 }
 
-/// Record whether secondary core `cpu_id` (`1..8`) is currently idle in `wfi`.
+/// Record whether core `cpu_id` (`0..8`) is currently idle in `wfi`.
 #[inline]
 pub fn mark_ap_idle(cpu_id: usize, idle: bool) {
-    if (1..8).contains(&cpu_id) {
+    if cpu_id < 8 {
         let bit = 1u8 << cpu_id;
         if idle {
             IDLE_AP_MASK.fetch_or(bit, Ordering::Release);
@@ -83,9 +83,14 @@ pub fn bring_up_aps() -> usize {
         target_online += 1;
     }
 
-    while ONLINE_CPUS.load(Ordering::Acquire) < target_online {
+    // Bounded spin wait so a non-responsive secondary core cannot hang boot forever.
+    for _ in 0..50_000_000u32 {
+        if ONLINE_CPUS.load(Ordering::Acquire) >= target_online {
+            break;
+        }
         core::hint::spin_loop();
     }
+    let actual_online = ONLINE_CPUS.load(Ordering::Acquire);
 
     // Verify cross-core GICv2 SGI delivery to all secondary cores (CPU mask bits 1..target_online).
     if target_online > 1 {
@@ -103,7 +108,7 @@ pub fn bring_up_aps() -> usize {
         }
     }
 
-    target_online
+    actual_online
 }
 
 // SAFETY: Limine invokes this `extern "C"` AP entry point once per secondary core

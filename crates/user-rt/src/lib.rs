@@ -186,19 +186,27 @@ impl<const N: usize> Drop for BufferedConsole<N> {
 ///
 /// Yields and retries if the endpoint slot is temporarily full (`SysError::WouldBlock`).
 pub fn ipc_log_write(ep: CapId, msg: &str) -> Result<usize, SysError> {
+    const MAX_LOG_RETRIES: usize = 512;
     let bytes = msg.as_bytes();
     let mut offset = 0;
     while offset < bytes.len() {
         let end = (offset + newos_abi::log_ipc::MAX_CHUNK_BYTES).min(bytes.len());
         let word = newos_abi::log_ipc::encode_chunk(&bytes[offset..end]);
-        loop {
+        let mut sent = false;
+        for _ in 0..MAX_LOG_RETRIES {
             match ipc_send(ep, word) {
-                Ok(()) => break,
+                Ok(()) => {
+                    sent = true;
+                    break;
+                }
                 Err(SysError::WouldBlock) => {
                     let _ = yield_now();
                 }
                 Err(e) => return Err(e),
             }
+        }
+        if !sent {
+            return Err(SysError::WouldBlock);
         }
         offset = end;
     }
@@ -313,7 +321,7 @@ impl<const N: usize> IpcLogAssembler<N> {
             if b == b'\n' {
                 return self.emit_line(out);
             }
-            if b == b'\r' {
+            if b == b'\r' || (b < 0x20 && b != b'\t') || b == 0x7F {
                 continue;
             }
             if self.len < N {

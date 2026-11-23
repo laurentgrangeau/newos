@@ -79,12 +79,19 @@ impl ParsedElf64 {
         let Some((start, end, ent)) = self.rela_table else {
             return Ok(0);
         };
+        if ent < 24 {
+            return Err(SysError::InvalidArgument);
+        }
         let mut applied = 0usize;
         let mut off = start;
-        while off + ent <= end {
+        while let Some(next_off) = off.checked_add(ent) {
+            if next_off > end {
+                break;
+            }
             let r_offset = read_u64_le(bytes, off)?;
-            let r_info = read_u64_le(bytes, off + 8)?;
-            let r_addend = read_u64_le(bytes, off + 16)? as i64;
+            let r_info = read_u64_le(bytes, off.checked_add(8).ok_or(SysError::InvalidArgument)?)?;
+            let r_addend =
+                read_u64_le(bytes, off.checked_add(16).ok_or(SysError::InvalidArgument)?)? as i64;
             if (r_info as u32) == R_AARCH64_RELATIVE {
                 f(RelativeReloc {
                     offset: r_offset,
@@ -92,7 +99,7 @@ impl ParsedElf64 {
                 })?;
                 applied += 1;
             }
-            off += ent;
+            off = next_off;
         }
         Ok(applied)
     }
@@ -296,12 +303,16 @@ pub fn parse_elf64_with_base(bytes: &[u8], pie_base: u64) -> Result<ParsedElf64,
                 return Err(SysError::InvalidArgument);
             }
             let mut off = start;
-            while off + ent <= end {
-                let r_info = read_u64_le(bytes, off + 8)?;
+            while let Some(next_off) = off.checked_add(ent) {
+                if next_off > end {
+                    break;
+                }
+                let r_info =
+                    read_u64_le(bytes, off.checked_add(8).ok_or(SysError::InvalidArgument)?)?;
                 if (r_info as u32) == R_AARCH64_RELATIVE {
                     reloc_count += 1;
                 }
-                off += ent;
+                off = next_off;
             }
             rela_table = Some((start, end, ent));
         }

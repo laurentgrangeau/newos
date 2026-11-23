@@ -334,6 +334,7 @@ impl Default for SshServer {
 }
 
 impl SshServer {
+    #[allow(unknown_lints, clippy::large_unopt_stack_frames)]
     pub fn new() -> Self {
         let mut s = Self {
             state: ServerState::AwaitBanner,
@@ -440,19 +441,21 @@ impl SshServer {
         Ok(())
     }
 
-    /// Queue interactive shell output bytes as `SSH_MSG_CHANNEL_DATA`.
+    /// Queue interactive shell output bytes as one or more `SSH_MSG_CHANNEL_DATA` packets (`N9`).
     pub fn send_shell_output(&mut self, data: &[u8]) -> Result<(), SshError> {
         if self.state != ServerState::ShellOpen || data.is_empty() {
             return Ok(());
         }
         let mut body = [0u8; 1024];
-        let mut w = WireWriter::new(&mut body);
-        w.write_u8(MSG_CHANNEL_DATA)?;
-        w.write_u32(self.peer_channel_id)?;
-        let chunk = data.len().min(960);
-        w.write_string(&data[..chunk])?;
-        let len = w.len();
-        self.send_packet(&body[..len])
+        for chunk in data.chunks(960) {
+            let mut w = WireWriter::new(&mut body);
+            w.write_u8(MSG_CHANNEL_DATA)?;
+            w.write_u32(self.peer_channel_id)?;
+            w.write_string(chunk)?;
+            let len = w.len();
+            self.send_packet(&body[..len])?;
+        }
+        Ok(())
     }
 
     /// Feed incoming TCP bytes from `newos-netd`. Any decrypted interactive shell input
@@ -705,7 +708,10 @@ impl SshServer {
                 let username = r.read_str()?;
                 let service = r.read_str()?;
                 let method = r.read_str()?;
-                if service != "ssh-connection" || method != "publickey" {
+                if !matches!(username, "newos" | "root")
+                    || service != "ssh-connection"
+                    || method != "publickey"
+                {
                     self.send_userauth_failure()?;
                     return Err(SshError::AuthFailed);
                 }
@@ -812,7 +818,7 @@ impl SshServer {
                 shell_out[..take].copy_from_slice(&data[..take]);
                 Ok(take)
             }
-            (_, MSG_CHANNEL_WINDOW_ADJUST) => Ok(0),
+            (ServerState::ShellOpen, MSG_CHANNEL_WINDOW_ADJUST) => Ok(0),
             (_, MSG_CHANNEL_EOF | MSG_CHANNEL_CLOSE | MSG_DISCONNECT) => {
                 vault.close_session();
                 Err(SshError::Disconnected)
@@ -890,6 +896,7 @@ pub struct SshClient {
 }
 
 impl SshClient {
+    #[allow(unknown_lints, clippy::large_unopt_stack_frames)]
     pub fn new(
         username: &str,
         user_sk: SigningKey<MlDsa87>,
@@ -993,13 +1000,15 @@ impl SshClient {
             return Ok(());
         }
         let mut body = [0u8; 1024];
-        let mut w = WireWriter::new(&mut body);
-        w.write_u8(MSG_CHANNEL_DATA)?;
-        w.write_u32(0)?;
-        let chunk = data.len().min(960);
-        w.write_string(&data[..chunk])?;
-        let len = w.len();
-        self.send_packet(&body[..len])
+        for chunk in data.chunks(960) {
+            let mut w = WireWriter::new(&mut body);
+            w.write_u8(MSG_CHANNEL_DATA)?;
+            w.write_u32(0)?;
+            w.write_string(chunk)?;
+            let len = w.len();
+            self.send_packet(&body[..len])?;
+        }
+        Ok(())
     }
 
     pub fn feed_rx(
@@ -1079,6 +1088,11 @@ impl SshClient {
                 }
                 self.rx_seq = self.rx_seq.wrapping_add(1);
                 let pad_len = self.rx_buf[4] as usize;
+                // Bounds-check padding length before subtraction so a hostile server cannot crash
+                // the client before authentication (`N11`).
+                if pad_len < 4 || pad_len + 1 > packet_len {
+                    return Err(SshError::MalformedPacket);
+                }
                 let payload_len = packet_len - 1 - pad_len;
                 let mut payload = [0u8; MAX_PACKET_BODY];
                 payload[..payload_len].copy_from_slice(&self.rx_buf[5..5 + payload_len]);
@@ -1106,6 +1120,9 @@ impl SshClient {
         match (self.state, msg_type) {
             (ClientState::AwaitKexInit, MSG_KEXINIT) => {
                 validate_peer_kexinit(payload, false)?;
+                if payload.len() > self.server_kexinit.len() {
+                    return Err(SshError::PacketTooLarge);
+                }
                 self.server_kexinit[..payload.len()].copy_from_slice(payload);
                 self.server_kexinit_len = payload.len();
 
@@ -1340,9 +1357,7 @@ mod tests {
             let Some(sid) = self.pending_sid.take() else {
                 return Ok(false);
             };
-            if signed_data.len() < 68
-                || &signed_data[4..68] != &sid
-                || client_pk != &self.allowed_pk
+            if signed_data.len() < 68 || signed_data[4..68] != sid || client_pk != &self.allowed_pk
             {
                 return Ok(false);
             }

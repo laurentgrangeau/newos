@@ -189,6 +189,15 @@ impl<T: MmioTransport> Rp1I2c<T> {
             self.transport
                 .write32(self.base_off + DW_IC_DATA_CMD, u32::from(b) | stop)?;
         }
+        // Check DW_IC_RAW_INTR_STAT (0x34) for TX_ABRT (bit 6) so a NACKed/missing slave
+        // is reported as an error instead of silent success (`P12`).
+        const DW_IC_RAW_INTR_STAT: u64 = 0x34;
+        const DW_IC_CLR_TX_ABRT: u64 = 0x54;
+        const DW_IC_INTR_TX_ABRT: u32 = 1 << 6;
+        if (self.transport.read32(self.base_off + DW_IC_RAW_INTR_STAT)? & DW_IC_INTR_TX_ABRT) != 0 {
+            let _ = self.transport.read32(self.base_off + DW_IC_CLR_TX_ABRT);
+            return Err(SysError::InvalidArgument);
+        }
         Ok(())
     }
 

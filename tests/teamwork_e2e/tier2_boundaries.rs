@@ -48,7 +48,7 @@ fn t2_abi_invalid_enum_discriminants_return_none() {
     for bad in [13u64, 14, 255, u64::MAX] {
         assert_eq!(ObjectType::from_u64(bad), None);
     }
-    for bad in [0u64, 28, 100, u64::MAX] {
+    for bad in [0u64, 33, 100, u64::MAX] {
         assert_eq!(SyscallNumber::from_u64(bad), None);
     }
     for bad in [0u64, 8, 99, u64::MAX] {
@@ -446,13 +446,13 @@ fn t2_ipc_retype_exhaustion_and_unsupported_types() {
         Err(SysError::Unsupported)
     );
 
-    // Exhaust endpoint pool (2 bootstrap + 14 retyped = 16 max)
-    for i in 0..14 {
+    // Exhaust endpoint pool (7 bootstrap + 9 retyped = 16 max)
+    for i in 0..9 {
         ipc.untyped_retype_for(
             0,
             CapId::BOOTSTRAP_UNTYPED,
             ObjectType::Endpoint,
-            15 + i,
+            30 + i,
             &mut inv,
         )
         .unwrap();
@@ -462,7 +462,7 @@ fn t2_ipc_retype_exhaustion_and_unsupported_types() {
             0,
             CapId::BOOTSTRAP_UNTYPED,
             ObjectType::Endpoint,
-            35,
+            45,
             &mut inv
         ),
         Err(SysError::OutOfMemory)
@@ -474,7 +474,7 @@ fn t2_ipc_retype_exhaustion_and_unsupported_types() {
             0,
             CapId::BOOTSTRAP_UNTYPED,
             ObjectType::Notification,
-            35 + i,
+            40 + i,
             &mut inv,
         )
         .unwrap();
@@ -612,10 +612,10 @@ fn t2_memory_untyped_region_and_inventory_limits() {
 
     let mut inv = UntypedInventory::new();
     for i in 0..MAX_UNTYPED_REGIONS {
-        let base = 0x1000_0000 + (i as u64) * PAGE_SIZE * 2;
-        assert!(inv.push_raw_region(base, PAGE_SIZE * 2));
+        let base = 0x1000_0000 + (i as u64) * PAGE_SIZE * 16;
+        assert!(inv.push_raw_region(base, PAGE_SIZE * 16));
     }
-    assert!(!inv.push_raw_region(0x9000_0000, PAGE_SIZE * 2));
+    assert!(!inv.push_raw_region(0x9000_0000, PAGE_SIZE * 16));
 
     let mut frames = Vec::new();
     for _ in 0..=MAX_RECLAIMED_FRAMES {
@@ -780,7 +780,7 @@ fn t2_elf_truncated_magic_class_endian_type_machine_rejected() {
     assert_eq!(parse_elf64(&bad_endian), Err(SysError::Unsupported));
 
     let mut bad_type = base.clone();
-    bad_type[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    bad_type[16..18].copy_from_slice(&1u16.to_le_bytes()); // ET_REL (unsupported)
     assert_eq!(parse_elf64(&bad_type), Err(SysError::Unsupported));
 
     let mut bad_mach = base.clone();

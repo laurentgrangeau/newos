@@ -57,6 +57,7 @@ fn serve_net_loop<D: NetDevice>(
 ) -> ! {
     let mut has_reply = false;
     let mut reply_payload = 0u64;
+    let mut last_ip = stack.config().ip;
 
     loop {
         let now_ms = clock.now_millis();
@@ -74,6 +75,20 @@ fn serve_net_loop<D: NetDevice>(
                 out.flush();
             }
             TcpEvent::None => {}
+        }
+        let cur_ip = stack.config().ip;
+        if cur_ip != last_ip {
+            last_ip = cur_ip;
+            let _ = writeln!(
+                out,
+                "[netd] IPv4 updated: {}.{}.{}.{}/{}",
+                cur_ip[0],
+                cur_ip[1],
+                cur_ip[2],
+                cur_ip[3],
+                stack.config().prefix_len
+            );
+            out.flush();
         }
 
         match newos_user_rt::ipc_reply_recv(CapId::BOOTSTRAP_NET_EP, reply_payload, has_reply) {

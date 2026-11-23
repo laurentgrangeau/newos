@@ -7,7 +7,8 @@ use std::process::{Command, ExitCode};
 
 const LIMINE_BRANCH: &str = "v9.x-binary";
 const LIMINE_REPO: &str = "https://github.com/limine-bootloader/limine.git";
-const TARGET_TRIPLE: &str = "aarch64-unknown-none";
+// Soft-float target for EL1 kernel so LLVM never emits NEON/FP instructions on syscall/IRQ paths (`H2`).
+const KERNEL_TARGET_TRIPLE: &str = "aarch64-unknown-none-softfloat";
 const TARGET_CPU: &str = "cortex-a76";
 const EFI_FILENAME: &str = "BOOTAA64.EFI";
 const UEFI_DISK_BYTES: u64 = 64 * 1024 * 1024;
@@ -75,7 +76,7 @@ fn run_checked(cmd: &mut Command, label: &str) -> Result<(), String> {
 fn build_kernel(root: &Path, release: bool) -> Result<PathBuf, String> {
     let linker_script = root.join("crates/kernel/linker-aarch64.ld");
     let rustflags = format!(
-        "-C link-arg=-T{} -C relocation-model=pie -C link-arg=-pie -C target-cpu={TARGET_CPU} -Z sanitizer=kcfi",
+        "-C link-arg=-T{} -C relocation-model=pie -C link-arg=-pie -C link-arg=-z -C link-arg=relro -C link-arg=-z -C link-arg=now -C target-cpu={TARGET_CPU} -Z sanitizer=kcfi",
         linker_script.display()
     );
 
@@ -85,7 +86,7 @@ fn build_kernel(root: &Path, release: bool) -> Result<PathBuf, String> {
         "--package",
         "newos-kernel",
         "--target",
-        TARGET_TRIPLE,
+        KERNEL_TARGET_TRIPLE,
         "-Z",
         "build-std=core,compiler_builtins",
         "-Z",
@@ -94,11 +95,14 @@ fn build_kernel(root: &Path, release: bool) -> Result<PathBuf, String> {
     if release {
         cmd.arg("--release");
     }
-    run_checked(&mut cmd, "cargo build (newos-kernel aarch64/cortex-a76)")?;
+    run_checked(
+        &mut cmd,
+        "cargo build (newos-kernel aarch64-softfloat/cortex-a76)",
+    )?;
 
     Ok(root
         .join("target")
-        .join(TARGET_TRIPLE)
+        .join(KERNEL_TARGET_TRIPLE)
         .join(profile_dir(release))
         .join("newos-kernel"))
 }
@@ -107,7 +111,7 @@ fn build_user_elf(root: &Path, pkg: &str, dir: &str, release: bool) -> Result<Pa
     let linker_script = root.join(format!("crates/{dir}/linker-aarch64.ld"));
     let target_json = root.join("targets/aarch64-newos-user.json");
     let rustflags = format!(
-        "-C link-arg=-T{} -C relocation-model=pie -C link-arg=-pie -C target-cpu={TARGET_CPU} -Z fixed-x18 -Z sanitizer=kcfi -Z sanitizer=shadow-call-stack",
+        "-C link-arg=-T{} -C relocation-model=pie -C link-arg=-pie -C link-arg=-z -C link-arg=relro -C link-arg=-z -C link-arg=now -C target-cpu={TARGET_CPU} -Z fixed-x18 -Z sanitizer=kcfi -Z sanitizer=shadow-call-stack",
         linker_script.display()
     );
 
@@ -204,12 +208,12 @@ fn build_uefi_disk(interactive: bool, release: bool) -> Result<PathBuf, String> 
     let kernel_elf = build_kernel(&root, release)?;
     let init_elf = build_user_elf(&root, "newos-init", "init", release)?;
     let worker_elf = build_user_elf(&root, "newos-worker", "worker", release)?;
+    // Always compile the three SSH daemons so `cargo xtask test` verifies their target builds (`N20`).
+    let netd_elf = build_user_elf(&root, "newos-netd", "netd", release)?;
+    let keyd_elf = build_user_elf(&root, "newos-keyd", "keyd", release)?;
+    let sshd_elf = build_user_elf(&root, "newos-sshd", "sshd", release)?;
     let ssh_daemons = if interactive {
-        Some((
-            build_user_elf(&root, "newos-netd", "netd", release)?,
-            build_user_elf(&root, "newos-keyd", "keyd", release)?,
-            build_user_elf(&root, "newos-sshd", "sshd", release)?,
-        ))
+        Some((netd_elf, keyd_elf, sshd_elf))
     } else {
         None
     };
@@ -255,6 +259,7 @@ fn build_uefi_disk(interactive: bool, release: bool) -> Result<PathBuf, String> 
          serial: yes\n\n\
          /NewOS (QEMU virt test harness)\n\
          \x20   protocol: limine\n\
+         \x20   kaslr: yes\n\
          \x20   path: boot():/boot/newos-kernel\n\
          \x20   cmdline: {cmdline}\n\
          \x20   module_path: boot():/boot/newos-init\n\
@@ -449,11 +454,9 @@ fn run_miri_tests() -> Result<(), String> {
         "newos-gpu",
         "--package",
         "newos-ai",
-        "--package",
-        "newos-key-vault",
-        "--package",
-        "newos-ssh-proto",
     ]);
+    // Note (`H5`): `newos-key-vault` and `newos-ssh-proto` run multi-minute pure-PQ ML-DSA/ML-KEM
+    // lattice ops under Miri's interpreter; run them separately with `cargo +nightly miri test -p ...`.
     run_checked(&mut cmd, "cargo miri test")
 }
 
@@ -629,6 +632,13 @@ fn run_qemu(interactive: bool, release: bool) -> Result<(), String> {
     let pflash_arg = format!("if=pflash,format=raw,readonly=on,file={firmware}");
     let boot_drive_arg = format!("if=none,id=bootdisk,format=raw,readonly=on,file={disk_str}");
 
+    // Bind SSH host forwarding strictly to loopback (`127.0.0.1`) and only in interactive mode (`N19`).
+    let netdev_arg = if interactive {
+        "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22"
+    } else {
+        "user,id=net0"
+    };
+
     let mut qemu = Command::new("qemu-system-aarch64");
     qemu.args([
         "-M",
@@ -647,7 +657,7 @@ fn run_qemu(interactive: bool, release: bool) -> Result<(), String> {
         "-global",
         "virtio-mmio.force-legacy=false",
         "-netdev",
-        "user,id=net0,hostfwd=tcp::2222-:22",
+        netdev_arg,
         "-device",
         "virtio-net-device,netdev=net0",
         "-object",
@@ -661,17 +671,79 @@ fn run_qemu(interactive: bool, release: bool) -> Result<(), String> {
         "-device",
         "virtio-blk-device,drive=bootdisk",
     ]);
-    let status = qemu
-        .status()
-        .map_err(|e| format!("failed to launch qemu-system-aarch64: {e}"))?;
 
-    match status.code() {
-        Some(0) => {
-            println!("[xtask] QEMU (aarch64/cortex-a76) exited cleanly (PSCI SYSTEM_OFF)");
-            Ok(())
-        }
-        other => Err(format!(
-            "QEMU (aarch64/cortex-a76) exited with unexpected status {other:?}"
-        )),
+    if interactive {
+        let status = qemu
+            .status()
+            .map_err(|e| format!("failed to launch qemu-system-aarch64: {e}"))?;
+        return match status.code() {
+            Some(0) => {
+                println!("[xtask] QEMU (aarch64/cortex-a76) exited cleanly (PSCI SYSTEM_OFF)");
+                Ok(())
+            }
+            other => Err(format!(
+                "QEMU (aarch64/cortex-a76) exited with unexpected status {other:?}"
+            )),
+        };
     }
+
+    // Automated test mode (`H5`): capture serial output, enforce a hard 300s timeout, and verify
+    // the guest reported `PSCI SYSTEM_OFF (status=OK)` with zero `[newos] FAIL:` / `status=FAIL`.
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    qemu.stdout(Stdio::piped()).stderr(Stdio::inherit());
+    let mut child = qemu
+        .spawn()
+        .map_err(|e| format!("failed to launch qemu-system-aarch64: {e}"))?;
+    let mut stdout = child.stdout.take().ok_or("failed to capture QEMU stdout")?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), &chunk[..n]);
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("QEMU test timed out after 300s".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("failed waiting on QEMU: {e}")),
+        }
+    };
+    let serial_log = reader.join().unwrap_or_default();
+
+    if status.code() != Some(0) {
+        return Err(format!(
+            "QEMU (aarch64/cortex-a76) exited with unexpected status {:?}",
+            status.code()
+        ));
+    }
+    if serial_log.contains("PSCI SYSTEM_OFF (status=FAIL)")
+        || serial_log.contains("[newos] FAIL:")
+        || serial_log.contains("[init] FAIL:")
+        || serial_log.contains("FATAL AArch64 EL1")
+    {
+        return Err("QEMU guest reported test failure in serial output".to_string());
+    }
+    if !serial_log.contains("PSCI SYSTEM_OFF (status=OK)") {
+        return Err("QEMU guest did not reach `PSCI SYSTEM_OFF (status=OK)`".to_string());
+    }
+    println!("[xtask] QEMU (aarch64/cortex-a76) guest self-tests PASSED (status=OK)");
+    Ok(())
 }

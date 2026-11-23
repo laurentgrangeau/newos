@@ -9,6 +9,15 @@
 //! ./target/e2e/e2e_bench
 //! ```
 
+pub(crate) fn workspace_root() -> std::path::PathBuf {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    if manifest_dir.join("xtask").exists() {
+        manifest_dir.to_path_buf()
+    } else {
+        manifest_dir.parent().unwrap_or(manifest_dir).to_path_buf()
+    }
+}
+
 #[path = "common/bench_parser.rs"]
 pub(crate) mod bench_parser;
 

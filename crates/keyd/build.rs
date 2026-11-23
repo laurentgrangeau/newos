@@ -25,8 +25,14 @@ fn decode_hex_key(line: &str) -> Option<[u8; MLDSA87_PK_BYTES]> {
     let mut out = [0u8; MLDSA87_PK_BYTES];
     let bytes = hex_token.as_bytes();
     for i in 0..MLDSA87_PK_BYTES {
-        let hi = (bytes[i * 2] as char).to_digit(16)? as u8;
-        let lo = (bytes[i * 2 + 1] as char).to_digit(16)? as u8;
+        let hi = (bytes[i * 2] as char)
+            .to_digit(16)
+            .unwrap_or_else(|| panic!("invalid hex char in authorized key at byte {}", i * 2))
+            as u8;
+        let lo = (bytes[i * 2 + 1] as char)
+            .to_digit(16)
+            .unwrap_or_else(|| panic!("invalid hex char in authorized key at byte {}", i * 2 + 1))
+            as u8;
         out[i] = (hi << 4) | lo;
     }
     Some(out)
@@ -57,6 +63,11 @@ fn main() {
         if let Some(pk) = decode_hex_key(line) {
             keys.push(pk);
         }
+    }
+    if keys.is_empty() {
+        println!(
+            "cargo:warning=newos-keyd: no ML-DSA-87 authorized keys provisioned (fail-closed: all SSH logins will be rejected)"
+        );
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());

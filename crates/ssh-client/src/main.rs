@@ -73,15 +73,25 @@ fn cmd_keygen(path_arg: Option<&str>) -> Result<(), String> {
     seed.zeroize();
 
     let pk_bytes = sk.verifying_key().encode();
-    let seed_hex = encode_hex(&raw_seed);
+    let mut seed_hex = encode_hex(&raw_seed);
     raw_seed.zeroize();
 
-    fs::write(&key_path, format!("{seed_hex}\n"))
-        .map_err(|e| format!("write {}: {e}", key_path.display()))?;
-    #[cfg(unix)]
+    // Create private seed file atomically with mode 0600 on Unix (no default-umask race, `N18`).
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
+        use std::fs::OpenOptions;
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&key_path)
+            .map_err(|e| format!("create {} (0600): {e}", key_path.display()))?;
+        let write_res = writeln!(f, "{seed_hex}");
+        seed_hex.zeroize();
+        write_res.map_err(|e| format!("write {}: {e}", key_path.display()))?;
     }
 
     let pub_line = format!(
@@ -104,6 +114,7 @@ fn cmd_connect(args: &[String]) -> Result<(), String> {
     let mut key_path: Option<String> = None;
     let mut port: u16 = 22;
     let mut expected_fp_b64: Option<String> = None;
+    let mut allow_insecure_no_fp = false;
     let mut target: Option<String> = None;
 
     let mut i = 0;
@@ -111,7 +122,7 @@ fn cmd_connect(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "-i" => {
                 i += 1;
-                key_path = args.get(i).cloned();
+                key_path = Some(args.get(i).ok_or("missing key path after -i")?.clone());
             }
             "-p" => {
                 i += 1;
@@ -123,7 +134,14 @@ fn cmd_connect(args: &[String]) -> Result<(), String> {
             }
             "--fingerprint" => {
                 i += 1;
-                expected_fp_b64 = args.get(i).cloned();
+                expected_fp_b64 = Some(
+                    args.get(i)
+                        .ok_or("missing base64 value after --fingerprint")?
+                        .clone(),
+                );
+            }
+            "--insecure-no-host-key-check" => {
+                allow_insecure_no_fp = true;
             }
             other if !other.starts_with('-') => target = Some(other.to_string()),
             other => return Err(format!("unknown flag `{other}`")),
@@ -133,11 +151,20 @@ fn cmd_connect(args: &[String]) -> Result<(), String> {
 
     let key_file = key_path.ok_or("missing `-i <ml-dsa-87-key>`")?;
     let target = target.ok_or("missing `<user>@<host>` target")?;
+    // Refuse to connect without authenticating the server host key unless explicitly bypassed (`N2`).
+    if expected_fp_b64.is_none() && !allow_insecure_no_fp {
+        return Err(
+            "refusing unauthenticated connection: pass `--fingerprint SHA3-512:<base64>` \
+             (printed by newos-keyd at boot) or `--insecure-no-host-key-check`"
+                .to_string(),
+        );
+    }
     let (user, host) = target.split_once('@').unwrap_or(("newos", target.as_str()));
 
-    let mut seed_bytes = decode_hex_32(
-        &fs::read_to_string(&key_file).map_err(|e| format!("read {key_file}: {e}"))?,
-    )?;
+    let mut key_text =
+        fs::read_to_string(&key_file).map_err(|e| format!("read {key_file}: {e}"))?;
+    let mut seed_bytes = decode_hex_32(&key_text)?;
+    key_text.zeroize();
     let mut dsa_seed = B32::default();
     dsa_seed.copy_from_slice(&seed_bytes);
     seed_bytes.zeroize();
@@ -226,7 +253,17 @@ fn cmd_connect(args: &[String]) -> Result<(), String> {
                         .feed_rx(&net_buf[..r], cookie, sign_rnd, &mut shell_out)
                         .map_err(|e| format!("SSH rx: {e:?}"))?;
                     if out_n > 0 {
-                        let _ = stdout.write_all(&shell_out[..out_n]);
+                        // Filter raw terminal escape/control sequences from remote output.
+                        let mut clean = [0u8; 4096];
+                        let mut clean_n = 0;
+                        for &b in &shell_out[..out_n] {
+                            if b == b'\n' || b == b'\r' || b == b'\t' || (0x20..=0x7E).contains(&b)
+                            {
+                                clean[clean_n] = b;
+                                clean_n += 1;
+                            }
+                        }
+                        let _ = stdout.write_all(&clean[..clean_n]);
                         let _ = stdout.flush();
                     }
                 }

@@ -204,7 +204,7 @@ fn bench_kernel_memory_retype_frame() -> f64 {
 
     // Warmup on a copy
     {
-        let mut inv = prewarmed_inv;
+        let mut inv = prewarmed_inv.clone();
         let mut acc = 0u64;
         for _ in 0..10_000 {
             acc = acc.wrapping_add(inv.retype_frame().unwrap().start_addr().raw());
@@ -215,7 +215,7 @@ fn bench_kernel_memory_retype_frame() -> f64 {
     let mut samples = [0.0f64; SAMPLES];
     let measured_iters = 500_000usize;
     for sample in &mut samples {
-        let mut inv = prewarmed_inv;
+        let mut inv = prewarmed_inv.clone();
         let start = Instant::now();
         let mut acc = 0u64;
         for _ in 0..measured_iters {

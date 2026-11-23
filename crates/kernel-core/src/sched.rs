@@ -187,6 +187,77 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
         Ok(())
     }
 
+    /// Reclaim an `Exited` thread slot so a new process can reuse it (`M4`).
+    #[inline]
+    pub fn reclaim_slot(&mut self, slot: usize) {
+        if slot < MAX_THREADS {
+            self.threads[slot] = None;
+            self.priorities[slot] = 0;
+            if slot < 64 {
+                self.ready_mask &= !(1u64 << slot);
+            }
+            if self.current == Some(slot) {
+                self.current = None;
+            }
+        }
+    }
+
+    /// Mark `slot` as `Running` on an SMP core without demoting another core's `Running` thread (`P7`).
+    #[inline]
+    pub fn mark_running(&mut self, slot: usize) {
+        if let Some(Some(tcb)) = self.threads.get_mut(slot)
+            && tcb.state != ThreadState::Exited
+        {
+            tcb.state = ThreadState::Running;
+            tcb.quantum_remaining = DEFAULT_TIME_SLICE;
+            if slot < 64 {
+                self.ready_mask &= !(1u64 << slot);
+            }
+            self.current = Some(slot);
+        }
+    }
+
+    /// Return `slot` from `Running` back to `Ready` when descheduled on an SMP core (`P7`).
+    #[inline]
+    pub fn mark_ready(&mut self, slot: usize) {
+        if let Some(Some(tcb)) = self.threads.get_mut(slot)
+            && tcb.state == ThreadState::Running
+        {
+            tcb.state = ThreadState::Ready;
+            if slot < 64 {
+                self.ready_mask |= 1u64 << slot;
+            }
+        }
+    }
+
+    /// Account one hardware timer tick on the specific thread `slot` running on the calling CPU (`P7`).
+    ///
+    /// Returns `true` when `slot`'s quantum expires and at least one other `Ready` thread
+    /// with equal or higher priority is waiting to preempt it.
+    #[inline]
+    pub fn on_timer_tick_for(&mut self, slot: usize) -> bool {
+        let cur_prio = {
+            let Some(Some(tcb)) = self.threads.get_mut(slot) else {
+                return false;
+            };
+            if tcb.state != ThreadState::Running {
+                return false;
+            }
+            if tcb.quantum_remaining > 1 {
+                tcb.quantum_remaining -= 1;
+                return false;
+            }
+            tcb.quantum_remaining = DEFAULT_TIME_SLICE;
+            tcb.priority
+        };
+
+        let has_preemptor = self.has_ready_with_min_priority(cur_prio);
+        if has_preemptor && let Some(Some(tcb)) = self.threads.get_mut(slot) {
+            tcb.preemptions = tcb.preemptions.saturating_add(1);
+        }
+        has_preemptor
+    }
+
     /// Directly mark `slot` as the `Running` thread (used by direct-switch IPC fastpaths).
     #[inline]
     pub fn select_slot(&mut self, slot: usize) {
