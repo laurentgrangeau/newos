@@ -26,26 +26,26 @@ cargo xtask config --profile profiles/tinykernel.toml
 |---|---|---|---|---|---|
 | `scheduler` | `string` | `"priority-rr"`, `"round-robin"`, `"fifo"` | `"priority-rr"` | — | Compile-time scheduler policy: preemptive priority+RR (`priority-rr`), flat preemptive RR (`round-robin`), or cooperative non-preemptive FIFO (`fifo`, minimal overhead for tinykernel). |
 | `smp` | `bool` | `true`, `false` | `true` | — | Enables multi-core AP bring-up and `SmpScheduler` work-stealing (`false` = single-core uniprocessor). |
-| `userspace` | `bool` | `true`, `false` | `true` | Required by any `[userspace].* = true` | Enables EL0 ELF64 loader and isolated userspace process spawning (`false` = pure EL1 kernel). |
+| `userspace` | `bool` | `true`, `false` | `true` | Required by any `[domains].* = true` | Enables EL0 ELF64 loader and isolated EL0 protection domain spawning (`false` = pure EL1 kernel). |
 | `elf_attestation` | `bool` | `true`, `false` | `true` | Requires `"sha3"` in `[crypto].algorithms` | Measures loaded EL0 ELF binaries with FIPS 202 SHA3-512 at boot. |
 | `acpi` | `bool` | `true`, `false` | `true` | — | Enables ACPI RSDP/XSDT/FADT/SPCR/MADT/GTDT/MCFG hardware discovery (`false` = static `BoardDescriptor` only). |
 
 ---
 
-## `[userspace]` — Optional EL0 Daemons & Root Task
+## `[domains]` — Optional EL0 Protection Domains
 
 | Key | Type | Valid Values | Default | Dependencies | Description |
 |---|---|---|---|---|---|
-| `init` | `bool` | `true`, `false` | `true` | Requires `[kernel].userspace = true` | Builds and loads EL0 root task (`newos-init`). Without `shell`, compiles into a bare minimal root task. |
-| `worker` | `bool` | `true`, `false` | `true` | Requires `[kernel].userspace = true` | Builds and loads isolated EL0 test/IPC worker (`newos-worker`). |
-| `shell` | `bool` | `true`, `false` | `true` | Requires `init = true` | Enables `newos-sh` typed pipeline shell and CAOS object store inside `newos-init`. |
-| `netd` | `bool` | `true`, `false` | `true` | Requires `[net].enabled = true` and `ipv4` or `ipv6` | Builds and loads isolated EL0 network/DMA daemon (`newos-netd`). |
-| `keyd` | `bool` | `true`, `false` | `true` | Requires `"sha3"` and `"ml-dsa-87"` in `[crypto].algorithms` | Builds and loads isolated EL0 hardware-entropy & ML-DSA-87 signing vault (`newos-keyd`). |
-| `sshd` | `bool` | `true`, `false` | `true` | Requires `netd = true`, `keyd = true`, `shell = true`, and all 4 PQ algorithms in `[crypto].algorithms` | Builds and loads isolated EL0 SSHv2 daemon (`newos-sshd`). |
+| `supervisor` | `bool` | `true`, `false` | `true` | Requires `[kernel].userspace = true` | Builds and loads the EL0 supervisor protection domain (`newos-supervisor-pd`). Without `shell`, compiles into a bare minimal supervisor. |
+| `worker` | `bool` | `true`, `false` | `true` | Requires `[kernel].userspace = true` | Builds and loads isolated EL0 IPC worker protection domain (`newos-worker-pd`). |
+| `shell` | `bool` | `true`, `false` | `true` | Requires `supervisor = true` | Builds and stages the standalone EL0 `newos-shell-pd` typed pipeline shell + CAOS binary (`crates/shell-pd`) alongside `newos-supervisor-pd` shell support. |
+| `net` | `bool` | `true`, `false` | `true` | Requires `[net].enabled = true` and `ipv4` or `ipv6` | Builds and loads isolated EL0 network/DMA protection domain (`newos-net-pd`). |
+| `key` | `bool` | `true`, `false` | `true` | Requires `"sha3"` and `"ml-dsa-87"` in `[crypto].algorithms` | Builds and loads isolated EL0 hardware-entropy & ML-DSA-87 signing vault protection domain (`newos-key-pd`). |
+| `ssh` | `bool` | `true`, `false` | `true` | Requires `net = true`, `key = true`, `shell = true`, and all 4 PQ algorithms in `[crypto].algorithms` | Builds and loads isolated EL0 SSHv2 protection domain (`newos-ssh-pd`). |
 
 ---
 
-## `[net]` — Networking Stack (`newos-net` / `newos-netd`)
+## `[net]` — Networking Stack (`newos-net` / `newos-net-pd`)
 
 | Key | Type | Valid Values | Default | Dependencies | Description |
 |---|---|---|---|---|---|
@@ -56,7 +56,7 @@ cargo xtask config --profile profiles/tinykernel.toml
 | `udp` | `bool` | `true`, `false` | `true` | — | Enables UDP sockets (`newos-net/udp`). |
 | `icmp` | `bool` | `true`, `false` | `true` | — | Enables ICMPv4 / ICMPv6 sockets (`newos-net/icmp`). |
 | `dns` | `bool` | `true`, `false` | `true` | — | Enables DNS A (`ipv4`) / AAAA (`ipv6`) resolver (`newos-net/dns`). |
-| `drivers` | `string[]` | `"gem"`, `"virtio"` (any subset or `[]`) | `["gem", "virtio"]` | — | NIC hardware drivers compiled into `newos-net` / `newos-netd`: Raspberry Pi 5 RP1 Cadence GEM (`gem`) and QEMU VirtIO-Net v2 (`virtio`). |
+| `drivers` | `string[]` | `"gem"`, `"virtio"` (any subset or `[]`) | `["gem", "virtio"]` | — | NIC hardware drivers compiled into `newos-net` / `newos-net-pd`: Raspberry Pi 5 RP1 Cadence GEM (`gem`) and QEMU VirtIO-Net v2 (`virtio`). |
 
 ---
 
@@ -85,7 +85,7 @@ Every key is a `string[]` (pass `[]` to omit all drivers in that subsystem):
 | `ai` | `newos-ai` | `"compute"`, `"hailo"` | all 2 | — | ARMv8.2-A NEON/DotProd inference kernels and PCIe Hailo-8/8L/10H AI HAT+ NPU driver. |
 | `usb` | `newos-usb` | `"xhci"` | `["xhci"]` | — | RP1 dual Synopsys xHCI USB 3.0 / 2.0 host controller driver. |
 | `gpio` | `newos-gpio` | `"rp1"` | `["rp1"]` | — | RP1 40-pin Bank 0 GPIO driver. |
-| `wdt` | `newos-wdt` | `"bcm2712"` | `["bcm2712"]` | — | BCM2712 hardware power-management watchdog driver. |
+| `wdt` | `newos-wdt` | `"bcm2712"` | `["bcm2712"]` | — | BCM2712 hardware power-management watchdog driver (gates `newos-supervisor-pd/wdt` in PD 0 Supervisor). |
 | `board` | `newos-board` | `"mailbox"`, `"thermal"`, `"rtc"`, `"rp1-bus"` | all 4 | — | VideoCore Property Mailbox, AVS TMON thermal/fan controller, RTC, and RP1 UART/SPI/I2C/PWM bus drivers. |
 
 ---
@@ -101,11 +101,11 @@ Any profile option can also be overridden from the command line:
 | `--sched <priority-rr\|round-robin\|fifo>` | Override `[kernel].scheduler` |
 | `--no-smp` | Set `[kernel].smp = false` |
 | `--no-acpi` | Set `[kernel].acpi = false` |
-| `--no-userspace` | Disable `userspace` and all EL0 daemons |
-| `--no-shell` | Disable `shell` and `sshd` |
-| `--no-net` | Disable networking (`net.enabled`, `ipv4`, `ipv6`, `netd`, `sshd`) |
-| `--no-ssh` | Disable `sshd` and `keyd` |
+| `--no-domains` | Disable `userspace` and all EL0 protection domains |
+| `--no-shell` | Disable `shell` and `ssh` |
+| `--no-net` | Disable networking (`net.enabled`, `ipv4`, `ipv6`, `net`, `ssh`) |
+| `--no-ssh` | Disable `ssh` and `key` |
 | `--ipv4-only` | Enable IPv4 and disable IPv6 |
 | `--ipv6-only` | Enable IPv6 and disable IPv4 |
-| `--no-crypto` | Clear `[crypto].algorithms` and disable crypto-dependent features (`elf_attestation`, `keyd`, `sshd`, `caos-snapshot`, `csprng`) |
+| `--no-crypto` | Clear `[crypto].algorithms` and disable crypto-dependent features (`elf_attestation`, `key`, `ssh`, `caos-snapshot`, `csprng`) |
 | `--release` | Build with release profile |

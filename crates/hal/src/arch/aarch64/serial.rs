@@ -4,20 +4,24 @@ use core::fmt::{self, Write};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use super::syscall::IrqSpinLock;
+
 const UART_DR_OFF: usize = 0x00;
 const UART_FR_OFF: usize = 0x18;
 const UART_FR_RXFE: u32 = 1 << 4;
 const UART_FR_TXFF: u32 = 1 << 5;
 
 static PL011_VIRT_BASE: AtomicU64 = AtomicU64::new(0);
+static PL011_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
 
 /// Initialize PL011 virtual MMIO base address.
 pub fn init_virt(virt_base: u64) {
     PL011_VIRT_BASE.store(virt_base, Ordering::Release);
 }
 
-/// Non-blocking 1-byte read from PL011 RX FIFO.
+/// Non-blocking 1-byte read from PL011 RX FIFO (SMP-synchronized via `PL011_LOCK`).
 pub fn try_read_byte() -> Option<u8> {
+    let _guard = PL011_LOCK.lock();
     let base = PL011_VIRT_BASE.load(Ordering::Acquire) as usize;
     if base == 0 {
         return None;
@@ -34,6 +38,10 @@ pub fn try_read_byte() -> Option<u8> {
 }
 
 pub struct Pl011;
+
+/// Lock-bypassing PL011 writer reserved strictly for fatal EL1 panic/exception paths
+/// so a crash while holding `PL011_LOCK` never deadlocks.
+pub struct UnlockedPl011;
 
 impl Default for Pl011 {
     #[inline]
@@ -58,13 +66,12 @@ impl Pl011 {
             write_volatile(dr, u32::from(byte));
         }
     }
-}
 
-impl Write for Pl011 {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
+    /// Write `s` directly to PL011 without acquiring `PL011_LOCK` (fatal panic/exception path only).
+    pub fn write_str_unlocked(&self, s: &str) {
         let base = PL011_VIRT_BASE.load(Ordering::Acquire) as usize;
         if base == 0 {
-            return Ok(());
+            return;
         }
         let fr = (base + UART_FR_OFF) as *const u32;
         let dr = (base + UART_DR_OFF) as *mut u32;
@@ -74,6 +81,20 @@ impl Write for Pl011 {
             }
             Self::write_byte_mmio(fr, dr, byte);
         }
+    }
+}
+
+impl Write for Pl011 {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let _guard = PL011_LOCK.lock();
+        self.write_str_unlocked(s);
+        Ok(())
+    }
+}
+
+impl Write for UnlockedPl011 {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        Pl011::new().write_str_unlocked(s);
         Ok(())
     }
 }

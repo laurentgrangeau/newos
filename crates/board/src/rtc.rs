@@ -1,6 +1,6 @@
 //! Raspberry Pi 5 Real-Time Clock (RTC) Driver & Gregorian Calendar Codec.
 //!
-//! Supports both Unix-epoch <-> Gregorian `DateTime` conversion and the
+//! Supports both UTC-epoch <-> Gregorian `DateTime` conversion and the
 //! capability-scoped Raspberry Pi 5 RTC seconds / alarm / trickle-charge interface.
 
 use crate::MmioTransport;
@@ -18,10 +18,10 @@ pub struct DateTime {
 }
 
 impl DateTime {
-    /// Convert Unix timestamp (seconds since `1970-01-01 00:00:00 UTC`) to civil `DateTime`.
+    /// Convert UTC epoch timestamp (seconds since `1970-01-01 00:00:00 UTC`) to civil `DateTime`.
     ///
     /// Uses Howard Hinnant's branchless civil-from-days algorithm (exact across all leap years).
-    pub const fn from_unix_secs(secs: u64) -> Self {
+    pub const fn from_epoch_secs(secs: u64) -> Self {
         let days = (secs / 86_400) as i64;
         let rem = (secs % 86_400) as u32;
         let hour = (rem / 3600) as u8;
@@ -49,8 +49,8 @@ impl DateTime {
         }
     }
 
-    /// Convert a validated civil UTC `DateTime` (`year >= 1970`) to Unix seconds.
-    pub const fn to_unix_secs(self) -> Result<u64, SysError> {
+    /// Convert a validated civil UTC `DateTime` (`year >= 1970`) to UTC epoch seconds.
+    pub const fn to_epoch_secs(self) -> Result<u64, SysError> {
         if self.year < 1970
             || self.month < 1
             || self.month > 12
@@ -95,15 +95,15 @@ impl<T: MmioTransport> Rpi5Rtc<T> {
         Self { transport }
     }
 
-    pub fn read_unix_secs(&self) -> Result<u64, SysError> {
+    pub fn read_epoch_secs(&self) -> Result<u64, SysError> {
         Ok(u64::from(self.transport.read32(REG_RTC_TIME_SECS)?))
     }
 
     pub fn read_datetime(&self) -> Result<DateTime, SysError> {
-        Ok(DateTime::from_unix_secs(self.read_unix_secs()?))
+        Ok(DateTime::from_epoch_secs(self.read_epoch_secs()?))
     }
 
-    pub fn set_unix_secs(&self, secs: u32) -> Result<(), SysError> {
+    pub fn set_epoch_secs(&self, secs: u32) -> Result<(), SysError> {
         self.transport.write32(REG_RTC_TIME_SECS, secs)
     }
 
@@ -146,8 +146,8 @@ mod tests {
     }
 
     #[test]
-    fn datetime_unix_roundtrip_including_leap_day() {
-        let epoch = DateTime::from_unix_secs(0);
+    fn datetime_epoch_roundtrip_including_leap_day() {
+        let epoch = DateTime::from_epoch_secs(0);
         assert_eq!(
             epoch,
             DateTime {
@@ -159,7 +159,7 @@ mod tests {
                 second: 0,
             }
         );
-        assert_eq!(epoch.to_unix_secs(), Ok(0));
+        assert_eq!(epoch.to_epoch_secs(), Ok(0));
 
         // 2024-02-29 12:34:56 UTC (leap day)
         let leap = DateTime {
@@ -170,9 +170,9 @@ mod tests {
             minute: 34,
             second: 56,
         };
-        let ts = leap.to_unix_secs().expect("valid leap day");
+        let ts = leap.to_epoch_secs().expect("valid leap day");
         assert_eq!(ts, 1_709_210_096);
-        assert_eq!(DateTime::from_unix_secs(ts), leap);
+        assert_eq!(DateTime::from_epoch_secs(ts), leap);
     }
 
     #[test]

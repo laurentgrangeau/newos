@@ -78,7 +78,7 @@ fn main() -> ExitCode {
                    --profile <profiles/*.toml>            Load declarative TOML system composition profile\n\
                    --board <rpi5|qemu-virt>               Override target board\n\
                    --sched <priority-rr|round-robin|fifo> Override kernel scheduler policy\n\
-                   --no-smp | --no-acpi | --no-userspace | --no-shell | --no-net | --no-ssh | --no-crypto\n\
+                   --no-smp | --no-acpi | --no-domains | --no-shell | --no-net | --no-ssh | --no-crypto\n\
                    --ipv4-only | --ipv6-only              Select single-stack networking\n\
                    --release                              Build in release mode"
             );
@@ -269,57 +269,75 @@ fn package_gpt_esp_image(
     Ok(())
 }
 
-/// Build enabled EL0 userspace modules for `profile` and return `(boot_filename, host_path)` pairs.
+/// Build enabled EL0 protection domain modules for `profile` and return `(boot_filename, host_path)` pairs.
 fn build_profile_modules(
     root: &Path,
     profile: &BuildProfile,
-    include_daemons: bool,
+    include_domains: bool,
     release: bool,
 ) -> Result<Vec<(&'static str, PathBuf)>, String> {
     let mut modules = Vec::new();
     if !profile.userspace {
         return Ok(modules);
     }
-    if profile.init {
-        let init_feats = profile.init_features();
+    if profile.supervisor {
+        let supervisor_feats = profile.supervisor_features();
         let elf = build_user_elf(
             root,
-            "newos-init",
-            "init",
+            "newos-supervisor-pd",
+            "supervisor-pd",
             &profile.cpu,
-            Some(&init_feats),
+            Some(&supervisor_feats),
             release,
         )?;
-        modules.push(("newos-init", elf));
+        modules.push(("newos-supervisor-pd", elf));
+    }
+    if profile.shell && include_domains {
+        let elf = build_user_elf(
+            root,
+            "newos-shell-pd",
+            "shell-pd",
+            &profile.cpu,
+            None,
+            release,
+        )?;
+        modules.push(("newos-shell-pd", elf));
     }
     if profile.worker {
-        let elf = build_user_elf(root, "newos-worker", "worker", &profile.cpu, None, release)?;
-        modules.push(("newos-worker", elf));
-    }
-    if profile.netd {
-        let netd_feats = profile.netd_features();
         let elf = build_user_elf(
             root,
-            "newos-netd",
-            "netd",
+            "newos-worker-pd",
+            "worker-pd",
             &profile.cpu,
-            Some(&netd_feats),
+            None,
             release,
         )?;
-        if include_daemons {
-            modules.push(("newos-netd", elf));
+        modules.push(("newos-worker-pd", elf));
+    }
+    if profile.net {
+        let net_feats = profile.net_pd_features();
+        let elf = build_user_elf(
+            root,
+            "newos-net-pd",
+            "net-pd",
+            &profile.cpu,
+            Some(&net_feats),
+            release,
+        )?;
+        if include_domains {
+            modules.push(("newos-net-pd", elf));
         }
     }
-    if profile.keyd {
-        let elf = build_user_elf(root, "newos-keyd", "keyd", &profile.cpu, None, release)?;
-        if include_daemons {
-            modules.push(("newos-keyd", elf));
+    if profile.key {
+        let elf = build_user_elf(root, "newos-key-pd", "key-pd", &profile.cpu, None, release)?;
+        if include_domains {
+            modules.push(("newos-key-pd", elf));
         }
     }
-    if profile.sshd {
-        let elf = build_user_elf(root, "newos-sshd", "sshd", &profile.cpu, None, release)?;
-        if include_daemons {
-            modules.push(("newos-sshd", elf));
+    if profile.ssh {
+        let elf = build_user_elf(root, "newos-ssh-pd", "ssh-pd", &profile.cpu, None, release)?;
+        if include_domains {
+            modules.push(("newos-ssh-pd", elf));
         }
     }
     Ok(modules)
@@ -979,7 +997,7 @@ fn run_qemu(profile: &BuildProfile, interactive: bool, release: bool) -> Result<
     }
     if serial_log.contains("PSCI SYSTEM_OFF (status=FAIL)")
         || serial_log.contains("[newos] FAIL:")
-        || serial_log.contains("[init] FAIL:")
+        || serial_log.contains("[supervisor-pd] FAIL:")
         || serial_log.contains("FATAL AArch64 EL1")
     {
         return Err("QEMU guest reported test failure in serial output".to_string());

@@ -14,13 +14,13 @@ userspace = false          # Valid: true | false (false = pure EL1 kernel, no EL
 elf_attestation = false    # Valid: true | false (requires "sha3" in [crypto].algorithms)
 acpi = false               # Valid: true | false (false = static BoardDescriptor only)
 
-[userspace]
-init = false               # Valid: true | false (requires [kernel].userspace = true)
+[domains]
+supervisor = false               # Valid: true | false (requires [kernel].userspace = true)
 worker = false             # Valid: true | false (requires [kernel].userspace = true)
-shell = false              # Valid: true | false (requires init = true)
-netd = false               # Valid: true | false (requires [net].enabled = true and ipv4 or ipv6)
-keyd = false               # Valid: true | false (requires "sha3" and "ml-dsa-87" in [crypto])
-sshd = false               # Valid: true | false (requires netd, keyd, shell, and all 4 PQ crypto algs)
+shell = false              # Valid: true | false (requires supervisor = true)
+net = false               # Valid: true | false (requires [net].enabled = true and ipv4 or ipv6)
+key = false               # Valid: true | false (requires "sha3" and "ml-dsa-87" in [crypto])
+ssh = false               # Valid: true | false (requires net, key, shell, and all 4 PQ crypto algs)
 
 [net]
 enabled = false            # Valid: true | false (master switch for networking)

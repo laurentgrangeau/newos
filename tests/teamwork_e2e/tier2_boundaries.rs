@@ -4,7 +4,7 @@ use newos_abi::ring::SpscRing;
 use newos_abi::{CapId, ObjectType, Rights, SysError, SyscallNumber};
 use newos_kernel_core::cspace::{CNode, CapObject, Capability};
 use newos_kernel_core::elf::{MAX_LOAD_SEGMENTS, parse_elf64};
-use newos_kernel_core::ipc::{KernelIpcState, MAX_IPC_PROCS};
+use newos_kernel_core::ipc::{KernelIpcState, MAX_IPC_DOMAINS};
 use newos_kernel_core::memory::{
     FrameMappingTracker, MAX_RECLAIMED_FRAMES, MAX_UNTYPED_REGIONS, PAGE_SIZE, PageFlags, PhysAddr,
     PhysFrame, PhysFrame2M, UntypedInventory, UntypedRegion, VirtAddr,
@@ -326,24 +326,24 @@ fn t2_ipc_invalid_pid_rejected_across_apis() {
     ipc.init_bootstrap_caps(None).unwrap();
 
     assert_eq!(
-        ipc.cspace(MAX_IPC_PROCS).err(),
+        ipc.cspace(MAX_IPC_DOMAINS).err(),
         Some(SysError::InvalidArgument)
     );
     assert_eq!(ipc.cspace_mut(99).err(), Some(SysError::InvalidArgument));
     assert_eq!(
-        ipc.ipc_send_for(MAX_IPC_PROCS, CapId::BOOTSTRAP_EP, 1),
+        ipc.ipc_send_for(MAX_IPC_DOMAINS, CapId::BOOTSTRAP_EP, 1),
         Err(SysError::InvalidArgument)
     );
     assert_eq!(
-        ipc.notify_signal_for(MAX_IPC_PROCS, CapId::BOOTSTRAP_NOTIF, 1),
+        ipc.notify_signal_for(MAX_IPC_DOMAINS, CapId::BOOTSTRAP_NOTIF, 1),
         Err(SysError::InvalidArgument)
     );
     assert_eq!(
-        ipc.init_worker_bootstrap_caps(0),
+        ipc.init_worker_pd_bootstrap_caps(0),
         Err(SysError::InvalidArgument)
     );
     assert_eq!(
-        ipc.init_worker_bootstrap_caps(MAX_IPC_PROCS),
+        ipc.init_worker_pd_bootstrap_caps(MAX_IPC_DOMAINS),
         Err(SysError::InvalidArgument)
     );
     assert_eq!(
@@ -351,7 +351,7 @@ fn t2_ipc_invalid_pid_rejected_across_apis() {
         Err(SysError::InvalidArgument)
     );
     assert_eq!(
-        ipc.register_child_caps_in_root(MAX_IPC_PROCS),
+        ipc.register_child_caps_in_root(MAX_IPC_DOMAINS),
         Err(SysError::InvalidArgument)
     );
 }
@@ -1078,7 +1078,7 @@ fn t2_shell_malformed_commands_stages_args_and_fatal_read_error() {
         "objects | where size > nope",
         "objects | first abc",
         "ping zzz",
-        "procs | save @x",
+        "domains | save @x",
         "objects | | count",
         "objects | first 1 | first 1 | first 1 | first 1 | first 1 | first 1 | count",
         "put a b c d e f g h i j k l m n o p",
@@ -1105,7 +1105,7 @@ fn t2_shell_malformed_commands_stages_args_and_fatal_read_error() {
             "malformed command {cmd:?} must not silently succeed with an object table; output={out:?}"
         );
         let lower = out.to_ascii_lowercase();
-        let has_diag = out.contains("newos-sh:")
+        let has_diag = out.contains("newos-shell-pd:")
             || lower.contains("error")
             || lower.contains("usage")
             || lower.contains("invalid")
@@ -1219,8 +1219,8 @@ fn t2_safety_forbid_unsafe_code_on_all_8_safe_crates() {
         ("kernel-core", "crates/kernel-core/src/lib.rs"),
         ("kernel", "crates/kernel/src/main.rs"),
         ("shell-core", "crates/shell-core/src/lib.rs"),
-        ("init", "crates/init/src/main.rs"),
-        ("worker", "crates/worker/src/main.rs"),
+        ("supervisor-pd", "crates/supervisor-pd/src/main.rs"),
+        ("worker-pd", "crates/worker-pd/src/main.rs"),
         ("net", "crates/net/src/lib.rs"),
         ("bench", "crates/bench/src/main.rs"),
     ];

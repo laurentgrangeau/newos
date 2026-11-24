@@ -35,7 +35,7 @@ pub fn early_init() -> (Platform, BootInfo) {
 
 /// Panic handler helper callable from `crates/kernel`.
 pub fn handle_panic(info: &core::panic::PanicInfo<'_>) -> ! {
-    let mut serial = arch::early_serial();
+    let mut serial = arch::early_serial_unlocked();
     let _ = writeln!(serial, "[newos-kernel] PANIC: {info}");
     arch::system_off(ShutdownStatus::Failed)
 }

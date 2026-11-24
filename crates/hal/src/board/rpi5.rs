@@ -1,6 +1,6 @@
 //! Raspberry Pi 5 (16 GB, BCM2712 Cortex-A76 + RP1 Southbridge) board descriptor.
 
-use super::{BoardDescriptor, MmioRegion};
+use super::{BoardDescriptor, IrqLine, MmioRegion};
 
 pub const RPI5_BCM2712: BoardDescriptor = BoardDescriptor {
     name: "rpi5-16gb",
@@ -13,4 +13,7 @@ pub const RPI5_BCM2712: BoardDescriptor = BoardDescriptor {
     net_mmio: Some(MmioRegion::new(0x1F_0010_0000, 4 * 4096)),
     rng_mmio: Some(MmioRegion::new(0x10_7D20_8000, 0x28)),
     wdt_mmio: Some(MmioRegion::new(0x10_7D20_0000, 0x100)),
+    net_irq: Some(IrqLine::mip(6)),
+    rng_irq: None,
+    uart_irq: Some(IrqLine::gic(153)),
 };

@@ -137,6 +137,16 @@ unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
         }
     }
 
-    // Enter multi-core EL0 scheduler on this secondary Cortex-A76 core.
+    // Enter multi-core EL0 scheduler on this secondary Cortex-A76 core, pivoting to the
+    // per-CPU guarded EL1 kernel stack when provisioned.
+    let top = super::guarded_el1_stack_top(cpu_id as usize);
+    if top != 0 {
+        extern "C" fn ap_sched_trampoline() -> ! {
+            super::syscall::ap_enter_scheduler()
+        }
+        // SAFETY: `top` is a 16-byte-aligned 32 KiB mapped stack with an unmapped 4 KiB guard
+        // page beneath it, and `ap_sched_trampoline` never returns.
+        unsafe { super::pivot_sp_and_jump(top, ap_sched_trampoline) }
+    }
     super::syscall::ap_enter_scheduler()
 }

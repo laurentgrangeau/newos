@@ -21,11 +21,11 @@ pub struct MockShellHost {
 }
 
 impl MockShellHost {
-    pub fn new(online_cpus: u16, proc_count: u16) -> Self {
+    pub fn new(online_cpus: u16, domain_count: u16) -> Self {
         Self {
             sys_info_val: SysInfo {
                 online_cpus,
-                proc_count,
+                domain_count,
                 interactive_shell: false,
             },
             output: String::new(),

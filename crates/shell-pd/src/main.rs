@@ -1,0 +1,144 @@
+#![no_std]
+#![no_main]
+
+//! Standalone Isolated EL0 Typed Pipeline Shell (`newos-shell-pd`).
+//!
+//! Runs in its own `TTBR0_EL1` address space supervised by PD 0 (`newos-supervisor-pd`).
+//! Holds zero MMIO capabilities and zero `PowerControl` write rights; if `newos-shell-pd`
+//! crashes, PD 0 reclaims all of its frames and respawns it automatically.
+
+use core::fmt::Write;
+use core::panic::PanicInfo;
+use newos_abi::{CapId, ShutdownStatus, SysError, auth_gate_ipc, log_ipc};
+use newos_shell_core::shell::{Shell, ShellHost, SysInfo};
+use newos_user_rt::{BufferedConsole, IpcLogAssembler};
+
+newos_user_rt::entry!(main);
+
+struct StandaloneShellHost {
+    log_rx: IpcLogAssembler<256>,
+    ssh_in_buf: [u8; 7],
+    ssh_in_pos: usize,
+    ssh_in_len: usize,
+    ssh_session_authorized: bool,
+}
+
+impl StandaloneShellHost {
+    fn new() -> Self {
+        Self {
+            log_rx: IpcLogAssembler::new(),
+            ssh_in_buf: [0; 7],
+            ssh_in_pos: 0,
+            ssh_in_len: 0,
+            ssh_session_authorized: false,
+        }
+    }
+
+    fn poll_auth_gate(&mut self) {
+        while let Ok((badge, payload)) = newos_user_rt::ipc_recv(CapId::BOOTSTRAP_AUTH_GATE_EP) {
+            if badge != auth_gate_ipc::BADGE_KEY {
+                continue;
+            }
+            if payload == auth_gate_ipc::SESSION_OPEN {
+                self.ssh_session_authorized = true;
+            } else if payload == auth_gate_ipc::SESSION_CLOSE {
+                self.ssh_session_authorized = false;
+                self.ssh_in_pos = 0;
+                self.ssh_in_len = 0;
+            }
+        }
+    }
+}
+
+impl ShellHost for StandaloneShellHost {
+    fn write_debug(&mut self, s: &str) {
+        let mut out = BufferedConsole::<256>::new();
+        let _ = out.write_str(s);
+        out.flush();
+        if self.ssh_session_authorized {
+            let bytes = s.as_bytes();
+            let mut off = 0usize;
+            while off < bytes.len() {
+                let end = (off + log_ipc::MAX_CHUNK_BYTES).min(bytes.len());
+                let word = log_ipc::encode_chunk(&bytes[off..end]);
+                let _ = newos_user_rt::ipc_send(CapId::BOOTSTRAP_SSH_OUT_EP, word);
+                off = end;
+            }
+        }
+    }
+
+    fn sys_info(&mut self) -> SysInfo {
+        let s = newos_user_rt::sys_info();
+        SysInfo {
+            online_cpus: s.online_cpus,
+            domain_count: s.domain_count,
+            interactive_shell: s.interactive_shell,
+        }
+    }
+
+    fn read_debug_byte(&mut self) -> Result<u8, SysError> {
+        self.poll_auth_gate();
+        if self.ssh_in_pos < self.ssh_in_len {
+            let b = self.ssh_in_buf[self.ssh_in_pos];
+            self.ssh_in_pos += 1;
+            return Ok(b);
+        }
+        if self.ssh_session_authorized
+            && let Ok((_badge, word)) = newos_user_rt::ipc_recv(CapId::BOOTSTRAP_SSH_SHELL_EP)
+        {
+            let (chunk, len) = log_ipc::decode_chunk(word);
+            if len > 0 {
+                self.ssh_in_buf = chunk;
+                self.ssh_in_len = len;
+                self.ssh_in_pos = 1;
+                return Ok(chunk[0]);
+            }
+        }
+        newos_user_rt::debug_read_byte()
+    }
+
+    fn poll_background_log(&mut self, out: &mut [u8]) -> Option<(u64, usize)> {
+        self.log_rx.poll_line(CapId::BOOTSTRAP_LOG_EP, out)
+    }
+
+    fn ipc_send(&mut self, cap: CapId, payload: u64) -> Result<(), SysError> {
+        newos_user_rt::ipc_send(cap, payload)
+    }
+
+    fn ipc_recv(&mut self, cap: CapId) -> Result<(u64, u64), SysError> {
+        newos_user_rt::ipc_recv(cap)
+    }
+
+    fn ipc_call(&mut self, cap: CapId, payload: u64) -> Result<(u64, u64), SysError> {
+        newos_user_rt::ipc_call(cap, payload)
+    }
+
+    fn yield_now(&mut self) -> Result<u64, SysError> {
+        newos_user_rt::yield_now()
+    }
+
+    fn read_cycles(&mut self) -> Result<u64, SysError> {
+        newos_user_rt::read_cycles()
+    }
+
+    fn trigger_user_fault(&mut self) {
+        newos_user_rt::trigger_user_fault()
+    }
+
+    fn exit(&mut self, _code: ShutdownStatus) -> ! {
+        newos_user_rt::thread_exit()
+    }
+}
+
+fn main() -> ! {
+    let mut sh = Shell::new(StandaloneShellHost::new());
+    sh.run_interactive()
+}
+
+#[panic_handler]
+fn panic(_info: &PanicInfo<'_>) -> ! {
+    let mut out = BufferedConsole::<128>::new();
+    let _ = out.write_str("[newos-shell-pd] PANIC in isolated EL0 shell; exiting for respawn\n");
+    out.flush();
+    newos_user_rt::thread_exit()
+}

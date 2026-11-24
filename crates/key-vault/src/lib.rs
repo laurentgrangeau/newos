@@ -2,7 +2,7 @@
 
 //! ML-DSA-87 Entropy & Signing Vault (`newos-key-vault`).
 //!
-//! Designed for `newos-keyd` (PID 3):
+//! Designed for `newos-key-pd` (PD 3):
 //! - Ephemeral **ML-DSA-87** host keypair generated at boot from health-checked HW TRNG +
 //!   fast-key-erasure ChaCha20 CSPRNG (`newos-rng`). The private key never leaves this vault.
 //! - **Hedged** FIPS 204 signing with 32 bytes of fresh CSPRNG randomness per signature
@@ -164,7 +164,7 @@ impl<E: EntropySource> KeyVault<E> {
             return Err(VaultError::RateLimited);
         }
 
-        // Reject replayed exchange hashes so a compromised `sshd` cannot re-sign a captured login (`N6`).
+        // Reject replayed exchange hashes so a compromised `ssh-pd` cannot re-sign a captured login (`N6`).
         let mut seen = subtle::Choice::from(0u8);
         for prev in &self.seen_session_hashes[..self.seen_session_count] {
             seen |= prev.ct_eq(hash64);
@@ -313,10 +313,10 @@ impl<E: EntropySource> KeyVaultServer<E> {
     /// Process a single 64-bit IPC request from `BOOTSTRAP_KEY_EP`.
     ///
     /// Returns `(reply_word, optional_auth_gate_signal)` where `optional_auth_gate_signal`
-    /// is sent to `newos-init` over `CapId::BOOTSTRAP_AUTH_GATE_EP`.
+    /// is sent to `newos-supervisor-pd` over `CapId::BOOTSTRAP_AUTH_GATE_EP`.
     pub fn handle_ipc_word(&mut self, badge: u64, req: u64, now_ms: i64) -> (u64, Option<u64>) {
-        // Strictly reject any caller other than `newos-sshd` (PID 4).
-        if badge != key_ipc::BADGE_SSHD {
+        // Strictly reject any caller other than `newos-ssh-pd` (PD 4).
+        if badge != key_ipc::BADGE_SSH {
             return (key_ipc::REPLY_DENIED, None);
         }
 
@@ -609,21 +609,23 @@ mod tests {
             KeyVault::new(DeterministicTestEntropy(0x4444), b"ipc-srv", allowed_static).unwrap();
         let mut srv = KeyVaultServer::new(vault);
 
-        // Wrong badge (e.g., PID 2 netd) is rejected
-        assert_eq!(
-            srv.handle_ipc_word(
-                2,
-                key_ipc::encode_word_req(key_ipc::OP_GET_RANDOM_U64, 0),
-                0
-            ),
-            (key_ipc::REPLY_DENIED, None)
-        );
+        // Wrong badge (e.g., `net-pd` role badge or legacy raw PD 4) is rejected
+        for wrong_badge in [newos_abi::role_badge::ROLE_NET as u64, 4] {
+            assert_eq!(
+                srv.handle_ipc_word(
+                    wrong_badge,
+                    key_ipc::encode_word_req(key_ipc::OP_GET_RANDOM_U64, 0),
+                    0
+                ),
+                (key_ipc::REPLY_DENIED, None)
+            );
+        }
 
         // Stream KEX hash + commit
         let sid = sha3_512(b"ipc-session");
         assert_eq!(
             srv.handle_ipc_word(
-                key_ipc::BADGE_SSHD,
+                key_ipc::BADGE_SSH,
                 key_ipc::encode_word_req(key_ipc::OP_SIGN_KEX_RESET, 0),
                 1_000
             ),
@@ -632,13 +634,13 @@ mod tests {
         for chunk in sid.chunks(key_ipc::MAX_CHUNK_BYTES) {
             let req = key_ipc::encode_chunk_req(key_ipc::OP_SIGN_KEX_PUSH_BASE, chunk);
             assert_eq!(
-                srv.handle_ipc_word(key_ipc::BADGE_SSHD, req, 1_000),
+                srv.handle_ipc_word(key_ipc::BADGE_SSH, req, 1_000),
                 (key_ipc::REPLY_OK, None)
             );
         }
         assert_eq!(
             srv.handle_ipc_word(
-                key_ipc::BADGE_SSHD,
+                key_ipc::BADGE_SSH,
                 key_ipc::encode_word_req(key_ipc::OP_SIGN_KEX_COMMIT, 0),
                 1_000
             ),
@@ -658,14 +660,14 @@ mod tests {
         sig_bytes.copy_from_slice(sig.encode().as_slice());
 
         let _ = srv.handle_ipc_word(
-            key_ipc::BADGE_SSHD,
+            key_ipc::BADGE_SSH,
             key_ipc::encode_word_req(key_ipc::OP_VERIFY_RESET, 0),
             1_000,
         );
         for c in client_pk.chunks(key_ipc::MAX_CHUNK_BYTES) {
             assert_eq!(
                 srv.handle_ipc_word(
-                    key_ipc::BADGE_SSHD,
+                    key_ipc::BADGE_SSH,
                     key_ipc::encode_chunk_req(key_ipc::OP_VERIFY_PUSH_PK_BASE, c),
                     1_000
                 )
@@ -676,7 +678,7 @@ mod tests {
         for c in signed_data.chunks(key_ipc::MAX_CHUNK_BYTES) {
             assert_eq!(
                 srv.handle_ipc_word(
-                    key_ipc::BADGE_SSHD,
+                    key_ipc::BADGE_SSH,
                     key_ipc::encode_chunk_req(key_ipc::OP_VERIFY_PUSH_MSG_BASE, c),
                     1_000
                 )
@@ -687,7 +689,7 @@ mod tests {
         for c in sig_bytes.chunks(key_ipc::MAX_CHUNK_BYTES) {
             assert_eq!(
                 srv.handle_ipc_word(
-                    key_ipc::BADGE_SSHD,
+                    key_ipc::BADGE_SSH,
                     key_ipc::encode_chunk_req(key_ipc::OP_VERIFY_PUSH_SIG_BASE, c),
                     1_000
                 )
@@ -697,7 +699,7 @@ mod tests {
         }
         assert_eq!(
             srv.handle_ipc_word(
-                key_ipc::BADGE_SSHD,
+                key_ipc::BADGE_SSH,
                 key_ipc::encode_word_req(key_ipc::OP_VERIFY_COMMIT, 0),
                 1_000
             ),
@@ -707,7 +709,7 @@ mod tests {
         // Close session -> emits SESSION_CLOSE
         assert_eq!(
             srv.handle_ipc_word(
-                key_ipc::BADGE_SSHD,
+                key_ipc::BADGE_SSH,
                 key_ipc::encode_word_req(key_ipc::OP_CLOSE_SESSION, 0),
                 2_000
             ),

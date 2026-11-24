@@ -115,24 +115,27 @@ pub fn boot_info() -> BootInfo {
         })
     });
 
-    let mut init_module = None;
+    let mut supervisor_module = None;
+    let mut shell_module = None;
     let mut worker_module = None;
-    let mut netd_module = None;
-    let mut keyd_module = None;
-    let mut sshd_module = None;
+    let mut net_module = None;
+    let mut key_module = None;
+    let mut ssh_module = None;
     if let Some(resp) = MODULES_REQUEST.response() {
         for file in resp.modules() {
             let path = file.path();
-            if path.ends_with("newos-init") {
-                init_module = Some(file.data());
-            } else if path.ends_with("newos-worker") {
+            if path.ends_with("newos-supervisor-pd") {
+                supervisor_module = Some(file.data());
+            } else if path.ends_with("newos-shell-pd") {
+                shell_module = Some(file.data());
+            } else if path.ends_with("newos-worker-pd") {
                 worker_module = Some(file.data());
-            } else if path.ends_with("newos-netd") {
-                netd_module = Some(file.data());
-            } else if path.ends_with("newos-keyd") {
-                keyd_module = Some(file.data());
-            } else if path.ends_with("newos-sshd") {
-                sshd_module = Some(file.data());
+            } else if path.ends_with("newos-net-pd") {
+                net_module = Some(file.data());
+            } else if path.ends_with("newos-key-pd") {
+                key_module = Some(file.data());
+            } else if path.ends_with("newos-ssh-pd") {
+                ssh_module = Some(file.data());
             }
         }
     }
@@ -151,11 +154,12 @@ pub fn boot_info() -> BootInfo {
         cpu_count,
         rsdp_addr,
         framebuffer,
-        init_module,
+        supervisor_module,
+        shell_module,
         worker_module,
-        netd_module,
-        keyd_module,
-        sshd_module,
+        net_module,
+        key_module,
+        ssh_module,
         interactive_shell,
         qemu_virt,
     }

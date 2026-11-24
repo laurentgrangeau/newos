@@ -1,11 +1,11 @@
-//! Typed Pipeline Shell (`newos-sh`).
+//! Typed Pipeline Shell (`newos-shell-pd`).
 //!
 //! Instead of piping untyped ASCII text through regexes, stages pass typed `Record` values
-//! (`Proc`, `Object`, `Ref`, `Metric`, `Count`) directly through structured `|` pipelines:
+//! (`Domain`, `Object`, `Ref`, `Metric`, `Count`) directly through structured `|` pipelines:
 //!   - `put "hello newos" | save @note`
 //!   - `objects | where size > 20`
 //!   - `refs | where writable == false`
-//!   - `procs | where pid == 1 | count`
+//!   - `domains | where id == 1 | count`
 
 use core::fmt::{self, Write};
 use newos_abi::{CapId, ShutdownStatus, SysError};
@@ -29,19 +29,19 @@ const _: () = {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SysInfo {
     pub online_cpus: u16,
-    pub proc_count: u16,
+    pub domain_count: u16,
     pub interactive_shell: bool,
 }
 
-/// Host/OS syscall boundary for `newos-sh`.
+/// Host/OS syscall boundary for `newos-shell-pd`.
 ///
-/// Implemented by EL0 `InitShellHost` (`crates/init`), host `BenchmarkHost`
+/// Implemented by EL0 `SupervisorShellHost` (`crates/supervisor-pd`), host `BenchmarkHost`
 /// (`crates/bench`), and unit-test mocks.
 pub trait ShellHost {
     /// Emit a UTF-8 slice to the debug console (single `DebugWrite` syscall boundary).
     fn write_debug(&mut self, s: &str);
 
-    /// Read current system info (`online_cpus`, `proc_count`, `interactive_shell`).
+    /// Read current system info (`online_cpus`, `domain_count`, `interactive_shell`).
     fn sys_info(&mut self) -> SysInfo;
 
     /// Non-blocking 1-byte console read (default: `Err(SysError::WouldBlock)`).
@@ -78,7 +78,7 @@ pub trait ShellHost {
     }
 
     /// Deliberately trigger an EL0 hardware fault (`crash` command).
-    /// EL0 `init` diverges (`!`); host tests may record the call and return.
+    /// EL0 `supervisor-pd` diverges (`!`); host tests may record the call and return.
     fn trigger_user_fault(&mut self) {}
 
     /// Terminate the root task (`exit` / `shutdown` in `run_interactive`).
@@ -89,7 +89,7 @@ pub trait ShellHost {
     }
 
     /// Handle the `net [dhcp|ping|resolve]` producer command.
-    /// EL0 `init` implements this using `newos-net`; host/bench default is no-op.
+    /// EL0 `supervisor-pd` implements this using `newos-net`; host/bench default is no-op.
     fn handle_net(
         &mut self,
         _subcmd: &str,
@@ -229,8 +229,8 @@ pub enum ExecOutcome {
 #[derive(Clone, Copy)]
 pub enum Record {
     Count(usize),
-    Proc {
-        pid: u64,
+    Domain {
+        id: u64,
         el: u64,
         name: &'static str,
     },
@@ -324,17 +324,17 @@ impl RecordStream {
             return;
         }
         match self.items[0] {
-            Record::Proc { .. } => {
-                let _ = out.write_str("PID EL VSPACE NAME\n");
+            Record::Domain { .. } => {
+                let _ = out.write_str("PD  EL VSPACE NAME\n");
                 let mut line = AsciiLine::<96>::new();
                 for rec in &self.items[..self.len] {
-                    if let Record::Proc { pid, el, name } = rec {
+                    if let Record::Domain { id, el, name } = rec {
                         line.clear();
-                        line.push_u64(*pid);
+                        line.push_u64(*id);
                         line.push_str(" EL");
                         line.push_u64(*el);
                         line.push_str(" #");
-                        line.push_u64(*pid);
+                        line.push_u64(*id);
                         line.push_byte(b' ');
                         line.push_str(name);
                         line.push_byte(b'\n');
@@ -489,7 +489,7 @@ impl<const N: usize> AsciiLine<N> {
 
 const BANNER_TEXT: &str = concat!(
     "\n================================================================\n",
-    "  newos-sh: Typed Pipeline Shell + CAOS\n",
+    "  newos-shell-pd: Typed Pipeline Shell + CAOS\n",
     "  Try: `get @guide`, `objects | where size > 20`, `help`\n",
     "================================================================\n\n",
 );
@@ -507,10 +507,10 @@ enum ParseError {
 #[inline]
 const fn parse_error_msg(err: ParseError) -> &'static str {
     match err {
-        ParseError::UnclosedQuote => "newos-sh: unclosed quote\n",
-        ParseError::TooManyStages => "newos-sh: too many pipeline stages (max 6)\n",
-        ParseError::EmptyStage => "newos-sh: empty pipeline stage\n",
-        ParseError::TooManyArgs => "newos-sh: too many arguments (max 12)\n",
+        ParseError::UnclosedQuote => "newos-shell-pd: unclosed quote\n",
+        ParseError::TooManyStages => "newos-shell-pd: too many pipeline stages (max 6)\n",
+        ParseError::EmptyStage => "newos-shell-pd: empty pipeline stage\n",
+        ParseError::TooManyArgs => "newos-shell-pd: too many arguments (max 12)\n",
     }
 }
 
@@ -660,19 +660,19 @@ impl<H: ShellHost> Shell<H> {
             return Err("sealed ref allowed write!");
         }
 
-        // 5. Typed pipeline filter & reduction: `procs | where pid == 1 | count` -> 1
+        // 5. Typed pipeline filter & reduction: `domains | where id == 1 | count` -> 1
         self.scratch_stream.clear();
         let _ = eval_pipeline_with(
             &mut self.store,
             &mut self.host,
             &mut self.cached_sys_info,
-            "procs | where pid == 1 | count",
+            "domains | where id == 1 | count",
             true,
             &mut self.scratch_stream,
         );
         match self.scratch_stream.first() {
             Some(Record::Count(1)) => {}
-            _ => return Err("typed pipeline `procs | where pid == 1 | count` failed"),
+            _ => return Err("typed pipeline `domains | where id == 1 | count` failed"),
         }
 
         Ok(())
@@ -869,7 +869,7 @@ impl<H: ShellHost> Shell<H> {
             "crash" => {
                 if !silent {
                     self.host.write_debug(
-                        "[newos-sh] triggering deliberate EL0 `udf #0` fault (kernel stays alive)...\n",
+                        "[newos-shell-pd] triggering deliberate EL0 `udf #0` fault (kernel stays alive)...\n",
                     );
                 }
                 self.host.trigger_user_fault();
@@ -930,8 +930,8 @@ impl<H: ShellHost> Shell<H> {
                     ));
                     row.push_u64(u64::from(info.online_cpus));
                     row.push_str(" CPUs, ");
-                    row.push_u64(u64::from(info.proc_count));
-                    row.push_str(" procs, ");
+                    row.push_u64(u64::from(info.domain_count));
+                    row.push_str(" domains, ");
                     row.push_u64(obj_count as u64);
                     row.push_str(" objs)\n");
                     self.host.write_debug(row.as_str());
@@ -1230,16 +1230,16 @@ fn eval_producer_tokens_with<H: ShellHost>(
     }
 
     match toks[0] {
-        "procs" => {
+        "domains" => {
             let info = sys_info_cached_with(host, cached_sys_info);
-            stream.push(Record::Proc {
-                pid: 0,
+            stream.push(Record::Domain {
+                id: 0,
                 el: 0,
-                name: "init (newos-sh + CAOS)",
+                name: "supervisor-pd (shell + CAOS)",
             });
-            if info.proc_count > 1 {
-                stream.push(Record::Proc {
-                    pid: 1,
+            if info.domain_count > 1 {
+                stream.push(Record::Domain {
+                    id: 1,
                     el: 0,
                     name: "worker (IPC responder)",
                 });
@@ -1377,7 +1377,7 @@ fn eval_producer_tokens_with<H: ShellHost>(
             if !silent {
                 write_quoted_err(
                     host,
-                    "newos-sh: unknown producer `",
+                    "newos-shell-pd: unknown producer `",
                     other,
                     "` (try `help`)\n",
                 );
@@ -1493,7 +1493,12 @@ fn eval_transform_tokens_with<H: ShellHost>(
         other => {
             stream.clear();
             if !silent {
-                write_quoted_err(host, "newos-sh: unknown stage `", other, "` (try `help`)\n");
+                write_quoted_err(
+                    host,
+                    "newos-shell-pd: unknown stage `",
+                    other,
+                    "` (try `help`)\n",
+                );
             }
             false
         }
@@ -1504,7 +1509,7 @@ const HELP_TEXT: &str = concat!(
     "Typed Pipelines & CAOS:\n",
     "  put <text>               Store immutable object -> Object\n",
     "  get <@ref | obj:hash>    Read object content\n",
-    "  objects / refs / procs   Emit Object / Ref / Proc records\n",
+    "  objects / refs / domains   Emit Object / Ref / Domain records\n",
     "  ref set|seal|rollback    Manage capability-gated Refs\n",
     "  ping [hex] / bench       IPC round-trip & cycle bench\n",
     "  net [dhcp|ping|resolve]  EL0 smoltcp + GEM / VirtIO\n",
@@ -1577,7 +1582,7 @@ impl EqOp {
 }
 
 enum WherePredicate<'a> {
-    Pid(CmpOp, u64),
+    Id(CmpOp, u64),
     El(CmpOp, u64),
     Size(CmpOp, u64),
     Value(CmpOp, u64),
@@ -1590,7 +1595,7 @@ enum WherePredicate<'a> {
 impl<'a> WherePredicate<'a> {
     fn parse(field: &str, op: &str, rhs: &'a str) -> Option<Self> {
         match field {
-            "pid" => Some(Self::Pid(CmpOp::parse(op)?, parse_u64(rhs)?)),
+            "id" => Some(Self::Id(CmpOp::parse(op)?, parse_u64(rhs)?)),
             "el" => Some(Self::El(CmpOp::parse(op)?, parse_u64(rhs)?)),
             "size" => Some(Self::Size(CmpOp::parse(op)?, parse_u64(rhs)?)),
             "value" => Some(Self::Value(CmpOp::parse(op)?, parse_u64(rhs)?)),
@@ -1612,9 +1617,9 @@ impl<'a> WherePredicate<'a> {
     #[inline]
     fn matches(&self, rec: Record) -> bool {
         match (self, rec) {
-            (Self::Pid(op, r), Record::Proc { pid, .. }) => op.eval(pid, *r),
-            (Self::El(op, r), Record::Proc { el, .. }) => op.eval(el, *r),
-            (Self::Name(op, r), Record::Proc { name, .. }) => op.eval_eq(name == *r),
+            (Self::Id(op, r), Record::Domain { id, .. }) => op.eval(id, *r),
+            (Self::El(op, r), Record::Domain { el, .. }) => op.eval(el, *r),
+            (Self::Name(op, r), Record::Domain { name, .. }) => op.eval_eq(name == *r),
             (Self::Size(op, r), Record::Object(meta)) => op.eval(meta.size as u64, *r),
             (Self::Name(op, r), Record::Ref(meta)) => {
                 op.eval_eq(&meta.name[..meta.name_len as usize] == r.as_bytes())
@@ -1760,7 +1765,7 @@ mod tests {
             self.sys_info_syscalls += 1;
             SysInfo {
                 online_cpus: 2,
-                proc_count: 2,
+                domain_count: 2,
                 interactive_shell: false,
             }
         }
@@ -1815,8 +1820,8 @@ mod tests {
         assert_eq!(sh.host().sys_info_syscalls, 1);
         assert!(sh.host().output_str().contains("SMP=2 CPUs"));
 
-        // Subsequent `procs` and `sys` reuse the cached `SysInfo` without extra syscalls.
-        assert_eq!(sh.exec_line("procs"), ExecOutcome::Continue);
+        // Subsequent `domains` and `sys` reuse the cached `SysInfo` without extra syscalls.
+        assert_eq!(sh.exec_line("domains"), ExecOutcome::Continue);
         assert_eq!(sh.exec_line("sys"), ExecOutcome::Continue);
         assert_eq!(sh.host().sys_info_syscalls, 1);
     }
@@ -1824,7 +1829,7 @@ mod tests {
     #[test]
     fn pipelines_filter_slice_count_and_save() {
         let mut sh = Shell::new(MockHost::new());
-        let s1 = sh.eval_pipeline("procs | where pid == 1 | count");
+        let s1 = sh.eval_pipeline("domains | where id == 1 | count");
         assert!(matches!(s1.first(), Some(Record::Count(1))));
 
         let s2 = sh.eval_pipeline("objects | where size > 20 | first 1");
@@ -1945,7 +1950,7 @@ mod tests {
     fn where_predicate_edge_cases_and_malformed_stage_fallthrough() {
         let mut sh = Shell::new(MockHost::new());
         // Hex RHS comparison
-        let hex_match = sh.eval_pipeline("procs | where pid == 0x1 | count");
+        let hex_match = sh.eval_pipeline("domains | where id == 0x1 | count");
         assert!(matches!(hex_match.first(), Some(Record::Count(1))));
 
         // Invalid RHS clears stream cleanly
@@ -1981,7 +1986,7 @@ mod tests {
             fn sys_info(&mut self) -> SysInfo {
                 SysInfo {
                     online_cpus: 4,
-                    proc_count: 2,
+                    domain_count: 2,
                     interactive_shell: true,
                 }
             }
@@ -2041,7 +2046,7 @@ mod tests {
         }
 
         // Verify eval_pipeline_ref reuses scratch_stream cleanly.
-        let r = sh.eval_pipeline_ref("procs | where pid == 1 | count");
+        let r = sh.eval_pipeline_ref("domains | where id == 1 | count");
         assert!(matches!(r.first(), Some(Record::Count(1))));
     }
 
@@ -2172,7 +2177,7 @@ mod tests {
             fn sys_info(&mut self) -> SysInfo {
                 SysInfo {
                     online_cpus: 1,
-                    proc_count: 1,
+                    domain_count: 1,
                     interactive_shell: false,
                 }
             }
@@ -2200,7 +2205,7 @@ mod tests {
             fn sys_info(&mut self) -> SysInfo {
                 SysInfo {
                     online_cpus: 1,
-                    proc_count: 1,
+                    domain_count: 1,
                     interactive_shell: true,
                 }
             }
@@ -2233,7 +2238,7 @@ mod tests {
             fn sys_info(&mut self) -> SysInfo {
                 SysInfo {
                     online_cpus: 1,
-                    proc_count: 1,
+                    domain_count: 1,
                     interactive_shell: true,
                 }
             }
@@ -2295,7 +2300,7 @@ mod tests {
             sh.host_mut().out_len = 0;
             assert_eq!(sh.exec_line(cmd), ExecOutcome::Continue);
             assert!(
-                sh.host().output_str().contains("newos-sh:"),
+                sh.host().output_str().contains("newos-shell-pd:"),
                 "missing diagnostic for `{cmd}`"
             );
             assert_eq!(
@@ -2325,7 +2330,7 @@ mod tests {
         let mut sh = Shell::new(MockHost::new());
         for cmd in [
             "objects | bogus_stage",
-            "procs | save @x",
+            "domains | save @x",
             r#"put "abc" | save @motd"#,
         ] {
             assert!(
@@ -2351,7 +2356,7 @@ mod tests {
             fn sys_info(&mut self) -> SysInfo {
                 SysInfo {
                     online_cpus: 4,
-                    proc_count: 2,
+                    domain_count: 2,
                     interactive_shell: true,
                 }
             }

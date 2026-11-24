@@ -66,7 +66,7 @@ fn main() {
     }
     if keys.is_empty() {
         println!(
-            "cargo:warning=newos-keyd: no ML-DSA-87 authorized keys provisioned (fail-closed: all SSH logins will be rejected)"
+            "cargo:warning=newos-key-pd: no ML-DSA-87 authorized keys provisioned (fail-closed: all SSH logins will be rejected)"
         );
     }
 

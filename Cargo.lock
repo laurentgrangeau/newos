@@ -264,16 +264,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "newos-init"
-version = "0.8.0"
-dependencies = [
- "newos-abi",
- "newos-net",
- "newos-shell-core",
- "newos-user-rt",
-]
-
-[[package]]
 name = "newos-kernel"
 version = "0.8.0"
 dependencies = [
@@ -290,6 +280,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "newos-key-pd"
+version = "0.8.0"
+dependencies = [
+ "newos-abi",
+ "newos-key-vault",
+ "newos-rng",
+ "newos-user-rt",
+]
+
+[[package]]
 name = "newos-key-vault"
 version = "0.8.0"
 dependencies = [
@@ -302,16 +302,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "newos-keyd"
-version = "0.8.0"
-dependencies = [
- "newos-abi",
- "newos-key-vault",
- "newos-rng",
- "newos-user-rt",
-]
-
-[[package]]
 name = "newos-net"
 version = "0.8.0"
 dependencies = [
@@ -320,7 +310,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "newos-netd"
+name = "newos-net-pd"
 version = "0.8.0"
 dependencies = [
  "newos-abi",
@@ -344,6 +334,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "newos-shell-pd"
+version = "0.8.0"
+dependencies = [
+ "newos-abi",
+ "newos-shell-core",
+ "newos-user-rt",
+]
+
+[[package]]
 name = "newos-ssh"
 version = "0.8.0"
 dependencies = [
@@ -352,6 +351,15 @@ dependencies = [
  "newos-key-vault",
  "newos-ssh-proto",
  "zeroize",
+]
+
+[[package]]
+name = "newos-ssh-pd"
+version = "0.8.0"
+dependencies = [
+ "newos-abi",
+ "newos-ssh-proto",
+ "newos-user-rt",
 ]
 
 [[package]]
@@ -367,20 +375,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "newos-sshd"
-version = "0.8.0"
-dependencies = [
- "newos-abi",
- "newos-ssh-proto",
- "newos-user-rt",
-]
-
-[[package]]
 name = "newos-storage"
 version = "0.8.0"
 dependencies = [
  "newos-abi",
  "newos-crypto",
+]
+
+[[package]]
+name = "newos-supervisor-pd"
+version = "0.8.0"
+dependencies = [
+ "newos-abi",
+ "newos-net",
+ "newos-shell-core",
+ "newos-user-rt",
+ "newos-wdt",
 ]
 
 [[package]]
@@ -405,7 +415,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "newos-worker"
+name = "newos-worker-pd"
 version = "0.8.0"
 dependencies = [
  "newos-abi",

@@ -1,13 +1,13 @@
 #![no_std]
 #![no_main]
 
-//! Isolated EL0 Entropy & ML-DSA-87 Signing Vault (`newos-keyd`, PID 3).
+//! Isolated EL0 Entropy & ML-DSA-87 Signing Vault (`newos-key-pd`, PD 3).
 //!
 //! Strict least-privilege capability set:
 //! - `CapId::BOOTSTRAP_RNG_MMIO` (`R|W`) — BCM2712 RNG200 (Pi 5) or VirtIO-RNG (QEMU)
 //! - `CapId::BOOTSTRAP_VSPACE` (`R` only, QEMU only — omitted on Pi 5)
-//! - `CapId::BOOTSTRAP_KEY_EP` (`R|W`, server) — narrow RPCs exclusively from `newos-sshd` (badge 4)
-//! - `CapId::BOOTSTRAP_AUTH_GATE_EP` (`W`, badge 3) — signals `SESSION_OPEN`/`SESSION_CLOSE` to `init`
+//! - `CapId::BOOTSTRAP_KEY_EP` (`R|W`, server) — narrow RPCs exclusively from `newos-ssh-pd` (badge 4)
+//! - `CapId::BOOTSTRAP_AUTH_GATE_EP` (`W`, badge 3) — signals `SESSION_OPEN`/`SESSION_CLOSE` to `supervisor-pd`
 //! - `CapId::BOOTSTRAP_LOG_EP` (`W`, badge 3) — write-only diagnostic log
 //!
 //! Explicitly holds ZERO access to `NET_MMIO`, `NET_EP`, `SSH_SHELL_EP`, `CONSOLE`, `POWER`,
@@ -56,7 +56,7 @@ fn serve_vault<E: EntropySource>(
         Err(err) => {
             let _ = writeln!(
                 out,
-                "[keyd] FAIL-CLOSED: HW RNG/health check failed ({driver_name}, {err:?}); exiting"
+                "[key-pd] FAIL-CLOSED: HW RNG/health check failed ({driver_name}, {err:?}); exiting"
             );
             out.flush();
             newos_user_rt::thread_exit();
@@ -68,10 +68,18 @@ fn serve_vault<E: EntropySource>(
     let fp_str = core::str::from_utf8(&fp_b64).unwrap_or("?");
     let _ = writeln!(
         out,
-        "[keyd] online ({driver_name}, hostkey=ssh-mldsa87, authorized_keys={}, SHA3-512:{fp_str})",
+        "[key-pd] online ({driver_name}, hostkey=ssh-mldsa87, authorized_keys={}, SHA3-512:{fp_str})",
         AUTHORIZED_KEYS.len(),
     );
     out.flush();
+
+    const SSH_KEY_RING_VADDR: u64 = 0x0000_6000_0001_0000;
+    let _ssh_key_ring = newos_user_rt::map_shared_ring_pair(
+        CapId::BOOTSTRAP_VSPACE,
+        CapId::BOOTSTRAP_SSH_KEY_RING,
+        SSH_KEY_RING_VADDR,
+    )
+    .ok();
 
     let mut server = KeyVaultServer::new(vault);
     let mut has_reply = false;
@@ -84,8 +92,8 @@ fn serve_vault<E: EntropySource>(
                 let now_ms = (now_cycles.saturating_sub(start_cycles) / cycles_per_ms) as i64;
                 let (mut reply, gate_signal) = server.handle_ipc_word(badge, req, now_ms);
                 if let Some(sig) = gate_signal {
-                    // Fail-closed auth-gate delivery (`N7`): if `init` cannot be notified,
-                    // refuse to report `REPLY_OK` to `sshd` so auth state never diverges.
+                    // Fail-closed auth-gate delivery (`N7`): if `supervisor-pd` cannot be notified,
+                    // refuse to report `REPLY_OK` to `ssh-pd` so auth state never diverges.
                     let mut delivered = false;
                     for _ in 0..256 {
                         match newos_user_rt::ipc_send(CapId::BOOTSTRAP_AUTH_GATE_EP, sig) {
@@ -94,7 +102,7 @@ fn serve_vault<E: EntropySource>(
                                 break;
                             }
                             Err(SysError::WouldBlock) => {
-                                let _ = newos_user_rt::yield_now();
+                                let _ = newos_user_rt::sleep_ms(1);
                             }
                             Err(_) => break,
                         }
@@ -108,10 +116,23 @@ fn serve_vault<E: EntropySource>(
             }
             Err(SysError::WouldBlock) => {
                 has_reply = false;
-                let _ = newos_user_rt::yield_now();
+                if let Ok((bits, _)) =
+                    newos_user_rt::notify_wait(CapId::BOOTSTRAP_KEY_NOTIF, u64::MAX, 5_000_000)
+                    && (bits & newos_abi::RING_PEER_RESET_BIT) != 0
+                {
+                    let _ = writeln!(
+                        out,
+                        "[key-pd] peer reset signal received; cleared ring state"
+                    );
+                    out.flush();
+                }
             }
             Err(err) => {
-                let _ = writeln!(out, "[keyd] fatal IPC error (code={}); exiting", err as u64);
+                let _ = writeln!(
+                    out,
+                    "[key-pd] fatal IPC error (code={}); exiting",
+                    err as u64
+                );
                 out.flush();
                 newos_user_rt::thread_exit();
             }
@@ -134,7 +155,7 @@ fn main() -> ! {
         Err(e) => {
             let _ = writeln!(
                 out,
-                "[keyd] FAIL-CLOSED: no HW RNG via BOOTSTRAP_RNG_MMIO ({e:?}); exiting"
+                "[key-pd] FAIL-CLOSED: no HW RNG via BOOTSTRAP_RNG_MMIO ({e:?}); exiting"
             );
             out.flush();
             newos_user_rt::thread_exit();
@@ -152,7 +173,7 @@ fn main() -> ! {
                     &mut out,
                 ),
                 Err(e) => {
-                    let _ = writeln!(out, "[keyd] FAIL-CLOSED: virtio-rng init failed ({e:?})");
+                    let _ = writeln!(out, "[key-pd] FAIL-CLOSED: virtio-rng init failed ({e:?})");
                     out.flush();
                     newos_user_rt::thread_exit();
                 }
@@ -169,7 +190,7 @@ fn main() -> ! {
             Err(e) => {
                 let _ = writeln!(
                     out,
-                    "[keyd] FAIL-CLOSED: bcm2712-rng200 init failed ({e:?})"
+                    "[key-pd] FAIL-CLOSED: bcm2712-rng200 init failed ({e:?})"
                 );
                 out.flush();
                 newos_user_rt::thread_exit();
@@ -180,6 +201,6 @@ fn main() -> ! {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    let _ = newos_user_rt::ipc_log_write(CapId::BOOTSTRAP_LOG_EP, "[keyd] PANIC in EL0\n");
+    let _ = newos_user_rt::ipc_log_write(CapId::BOOTSTRAP_LOG_EP, "[key-pd] PANIC in EL0\n");
     newos_user_rt::thread_exit()
 }

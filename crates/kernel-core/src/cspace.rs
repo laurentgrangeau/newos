@@ -16,7 +16,7 @@ pub enum CapObject {
     Thread { id: u32 },
     Endpoint { id: u32 },
     Notification { id: u32 },
-    IrqHandler { irq: u16 },
+    IrqHandler { irq: u16, is_mip: bool },
     MmioRegion { phys: PhysAddr, len: u64 },
     Console,
     PowerControl,
@@ -230,7 +230,9 @@ impl<const SLOTS: usize> CNode<SLOTS> {
                 slot.parent = 0;
                 slot.ext_cnode = 0;
                 slot.ext_slot = 0;
-                slot.bump_generation();
+                // Reset generation to 1 because the entire owning process and VSpace are torn down;
+                // a freshly respawned process expects its `CapId::BOOTSTRAP_*` handles at gen 1.
+                slot.generation = 1;
                 on_removed(cap);
             }
         }

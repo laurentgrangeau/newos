@@ -9,7 +9,7 @@
 //! - **KDF:** FIPS 202 `SHAKE256`
 //! - **Transport Hardening:** `kex-strict` (Terrapin CVE-2023-48795 mitigation)
 //! - **Zero legacy crypto:** no RSA, DH, ECDH, X25519, Ed25519, SHA-1, SHA-2, CBC/CTR, or passwords.
-//! - **Minimal session surface:** single interactive `newos-sh` shell (`session` + `pty-req`/`shell`).
+//! - **Minimal session surface:** single interactive `newos-shell-pd` shell (`session` + `pty-req`/`shell`).
 
 pub mod aead;
 pub mod wire;
@@ -91,7 +91,7 @@ pub enum SshError {
     Disconnected,
 }
 
-/// Abstract cryptographic vault interface implemented by `newos-sshd` over `BOOTSTRAP_KEY_EP`
+/// Abstract cryptographic vault interface implemented by `newos-ssh-pd` over `BOOTSTRAP_KEY_EP`
 /// (and by direct in-process `KeyVault` in host unit/E2E tests).
 pub trait KeyVaultClient {
     fn host_public_key(&mut self) -> Result<[u8; MLDSA87_PK_BYTES], SshError>;
@@ -282,7 +282,7 @@ pub fn build_userauth_signed_data(
     w.write_str("publickey")?;
     w.write_bool(true)?;
     w.write_str(ALG_HOST_KEY)?;
-    // Compact SHA3-512 key-blob commitment inside signed_data (keeps `signed_data <= 512 B` for keyd)
+    // Compact SHA3-512 key-blob commitment inside signed_data (keeps `signed_data <= 512 B` for key-pd)
     let pk_digest = sha3_512(client_pk);
     w.write_string(&pk_digest)?;
     Ok(w.len())
@@ -395,7 +395,7 @@ impl SshServer {
         self.state == ServerState::ShellOpen
     }
 
-    /// Pending encrypted wire bytes ready to transmit to `newos-netd`.
+    /// Pending encrypted wire bytes ready to transmit to `newos-net-pd`.
     pub fn pending_tx(&self) -> &[u8] {
         &self.tx_buf[self.tx_off..self.tx_len]
     }
@@ -456,7 +456,7 @@ impl SshServer {
         Ok(())
     }
 
-    /// Feed incoming TCP bytes from `newos-netd`. Any decrypted interactive shell input
+    /// Feed incoming TCP bytes from `newos-net-pd`. Any decrypted interactive shell input
     /// is written into `shell_in_out` and its byte count is returned.
     pub fn feed_rx<V: KeyVaultClient>(
         &mut self,
@@ -621,7 +621,7 @@ impl SshServer {
                 ek_arr.copy_from_slice(q_c);
                 let ek = EncapsulationKey1024::new(&ek_arr).map_err(|_| SshError::CryptoFailure)?;
 
-                // Encapsulate with 32 bytes from `newos-keyd` fast-key-erasure CSPRNG
+                // Encapsulate with 32 bytes from `newos-key-pd` fast-key-erasure CSPRNG
                 let mut rnd_bytes = vault.random_32()?;
                 let mut m = KemB32::default();
                 m.copy_from_slice(&rnd_bytes);

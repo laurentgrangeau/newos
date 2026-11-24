@@ -25,6 +25,11 @@ pub use virtio::{VirtioNetDevice, VirtioNetDma};
 
 use newos_abi::SysError;
 
+/// Optional interrupt-acknowledgement hook implemented by hardware NIC drivers.
+pub trait IrqAckDevice {
+    fn ack_interrupts(&self);
+}
+
 /// Capability-scoped MMIO + DMA translation & cache-coherency transport injected by EL0 `user-rt`.
 pub trait MmioDmaTransport {
     fn read32(&self, offset: u64) -> Result<u32, SysError>;

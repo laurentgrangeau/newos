@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
 
-//! Modular EL0 Root Task (`newos-init`).
+//! Modular EL0 Root Task (`newos-supervisor-pd`).
 //!
 //! - With `feature = "shell"` (default): launches the full Crash Supervisor, CAOS store,
-//!   and `newos-sh` typed pipeline shell (with optional networking & SSH auth-gate).
+//!   and `newos-shell-pd` typed pipeline shell (with optional networking & SSH auth-gate).
 //! - With `--no-default-features`: compiles into a bare minimal EL0 root task with zero
 //!   shell, zero networking, zero SSH, and zero crypto dependencies.
 
@@ -33,7 +33,7 @@ fn minimal_main() -> ! {
     let mut out = newos_user_rt::BufferedConsole::<256>::new();
     let _ = writeln!(
         out,
-        "[init] minimal EL0 root task online (shell=false, net={}, ssh=false)",
+        "[supervisor-pd] minimal EL0 root task online (shell=false, net={}, ssh=false)",
         cfg!(feature = "net"),
     );
     out.flush();
@@ -49,6 +49,6 @@ fn minimal_main() -> ! {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    let _ = newos_user_rt::debug_log("[init] PANIC in EL0\n");
+    let _ = newos_user_rt::debug_log("[supervisor-pd] PANIC in EL0\n");
     newos_user_rt::exit(ShutdownStatus::Failed)
 }

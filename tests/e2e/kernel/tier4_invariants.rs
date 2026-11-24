@@ -288,7 +288,7 @@ fn tier4_kernel_designated_authority_negative_invariants() {
 
     let mut ipc = KernelIpcState::new();
     let (notif, _, _) = ipc.init_bootstrap_caps(None).unwrap();
-    let _ = ipc.init_worker_bootstrap_caps(1).unwrap();
+    let _ = ipc.init_worker_pd_bootstrap_caps(1).unwrap();
     let (_, w1_cnode) = ipc.register_child_caps_in_root(1).unwrap();
 
     // 1. Worker cannot access PowerControl, VSpace, or Console::READ.

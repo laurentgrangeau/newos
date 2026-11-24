@@ -344,7 +344,7 @@ fn t1_ipc_init_bootstrap_caps_with_and_without_mmio() {
 fn t1_ipc_worker_bootstrap_isolation_and_child_caps() {
     let mut ipc = KernelIpcState::new();
     ipc.init_bootstrap_caps(None).unwrap();
-    let (w_notif, w_ep) = ipc.init_worker_bootstrap_caps(1).unwrap();
+    let (w_notif, w_ep) = ipc.init_worker_pd_bootstrap_caps(1).unwrap();
     let (child_thread, child_cnode) = ipc.register_child_caps_in_root(1).unwrap();
 
     assert!(ipc.notify_poll_for(1, w_notif).is_ok());
@@ -468,7 +468,7 @@ fn t1_ipc_cross_process_grant_and_frame_collecting_revoke() {
 
     let mut ipc = KernelIpcState::new();
     ipc.init_bootstrap_caps(None).unwrap();
-    ipc.init_worker_bootstrap_caps(1).unwrap();
+    ipc.init_worker_pd_bootstrap_caps(1).unwrap();
     let (_, child_cnode) = ipc.register_child_caps_in_root(1).unwrap();
 
     let frame_cap = ipc
@@ -952,11 +952,11 @@ fn t1_shell_typed_pipelines_where_first_count_save() {
     let count_stream = sh.eval_pipeline("objects | where size > 5 | count");
     assert!(matches!(count_stream.first(), Some(Record::Count(n)) if n >= 3));
 
-    let first_stream = sh.eval_pipeline("procs | where pid == 1 | first 1");
+    let first_stream = sh.eval_pipeline("domains | where id == 1 | first 1");
     assert_eq!(first_stream.len(), 1);
     assert!(matches!(
         first_stream.first(),
-        Some(Record::Proc { pid: 1, .. })
+        Some(Record::Domain { id: 1, .. })
     ));
 
     let writable_refs = sh.eval_pipeline("refs | where writable == true | count");
@@ -967,9 +967,9 @@ fn t1_shell_typed_pipelines_where_first_count_save() {
 fn t1_shell_sys_info_caching_and_ping_ipc_fastpath() {
     let mut sh = Shell::new(MockShellHost::new());
     sh.exec_line("sys");
-    sh.exec_line("procs");
+    sh.exec_line("domains");
     sh.exec_line("sys");
-    sh.eval_pipeline("procs | where pid == 1 | count");
+    sh.eval_pipeline("domains | where id == 1 | count");
     assert_eq!(sh.host().sys_info_calls, 1);
 
     sh.exec_line("ping 0x2A");

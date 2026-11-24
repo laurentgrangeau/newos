@@ -41,7 +41,7 @@ cargo xtask bench --json
 - **Shell Speed (3 metrics, `ns/op`)**:
   - `shell.caos.put_get_ref`: CAOS `ObjectStore` put (unique + deduplicated), `set_ref` (create + update), `get_any`, `get_by_hash`, `rollback_ref`, and `object_count`.
   - `shell.pipeline.eval`: 4-pipeline typed stream evaluation suite (`where`, `first`, `count` over `objects`, `refs`, `procs`).
-  - `shell.session.full`: Full 14-command deterministic `newos-sh` session executed via `Shell::exec_line`.
+  - `shell.session.full`: Full 14-command deterministic `newos-shell-pd` session executed via `Shell::exec_line`.
 - **IPC Consumption (10 metrics, exact syscall counts & payload/chunk bytes)**:
   - `ipc.shell_session.debug_write_syscalls`: Exact `ShellHost::write_debug` (`DebugWrite`) syscalls emitted during the 14-command session.
   - `ipc.shell_session.sys_info_syscalls`: Exact `ShellHost::sys_info` (`SysInfo`) syscalls during the 14-command session.
@@ -214,3 +214,17 @@ METRIC ipc.footprint.shell_bytes 6296 bytes
 ```
 
 > Verification note: `cargo xtask bench --markdown` (28-row Markdown table used in the `After (M2+M3)` column above) and `cargo xtask bench --json` (valid JSON with a 28-element `metrics` array) were both executed and verified to exit `0` with all 28 metrics intact.
+
+---
+
+## On-Target AArch64 Cycle & Tail-Latency Benchmarks (Phase 3a)
+
+In addition to the 28 host-side microbenchmarks above (`crates/bench`), `crates/init/src/full.rs` executes an on-target AArch64 `CNTVCT_EL0` (`read_cycles()`) benchmark pass (`[bench-aarch64]`) at the end of `cargo xtask test --release` (QEMU `aarch64` `virt`, `-cpu cortex-a76`, 4 CPUs, `rustc 1.102.0-nightly`):
+
+| Workload | Samples | `p50` (ticks) | `p99` (ticks) | `max` (ticks) | Notes |
+|---|---:|---:|---:|---:|---|
+| `IpcCall` round-trip (`init` ↔ `worker`, separate `TTBR0_EL1`) | 256 | `9,668` | `20,362` | `23,006` | Cross-VSpace context switch |
+| `NotifySignal` + `NotifyWait` fastpath | 256 | `453` | `688` | `2,298` | Zero-block notification consumption |
+| `SpscRing` 4 KiB framed byte burst (`try_push_bytes`/`try_pop_bytes`) | 16 × 256 B | — | — | `28,413` total | **0 syscalls** in data path |
+
+> Note: `p99.9` is also printed by `[bench-aarch64]` on subsequent runs. Host-side `crates/bench` measurements above remain the pre/post M2+M3 reference baseline (`rustc 1.100.0`).

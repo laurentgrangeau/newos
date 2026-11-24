@@ -44,12 +44,20 @@ fn device_mair_index() -> u64 {
         asm!("mrs {}, mair_el1", out(reg) mair, options(nomem, nostack, preserves_flags));
     }
     let mut found = 0u8;
+    let mut fallback = None;
     for idx in 0..8u8 {
         let attr = ((mair >> (u64::from(idx) * 8)) & 0xFF) as u8;
-        if attr == 0x00 || attr == 0x04 {
+        if attr == 0x00 {
             found = idx;
+            fallback = None;
             break;
         }
+        if attr == 0x04 && fallback.is_none() {
+            fallback = Some(idx);
+        }
+    }
+    if let Some(fb) = fallback {
+        found = fb;
     }
     CACHED_DEVICE_MAIR_IDX.store(found, Ordering::Relaxed);
     u64::from(found)
@@ -76,6 +84,39 @@ fn tlbi_va(virt: VirtAddr) {
             "dsb ish",
             "isb",
             page = in(reg) page,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[inline]
+fn tlbi_va_asid(virt: VirtAddr, asid: u16) {
+    let val = (u64::from(asid) << 48) | ((virt.raw() >> 12) & 0x0000_0FFF_FFFF_FFFF);
+    // SAFETY: Invalidates TLB entries for `(virt, asid)` across the Inner Shareable domain.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vae1is, {val}",
+            "dsb ish",
+            "isb",
+            val = in(reg) val,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Invalidate all TLB entries tagged with `asid` across the Inner Shareable domain.
+#[inline]
+pub fn tlbi_asid(asid: u16) {
+    let val = u64::from(asid) << 48;
+    // SAFETY: `tlbi aside1is` flushes all EL0/EL1 non-global TLB entries for `asid`.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi aside1is, {val}",
+            "dsb ish",
+            "isb",
+            val = in(reg) val,
             options(nostack, preserves_flags),
         );
     }
@@ -188,6 +229,124 @@ impl Aarch64VSpace {
             ((v >> 21) & 0x1FF) as usize, // L2
             ((v >> 12) & 0x1FF) as usize, // L3
         ]
+    }
+
+    /// Unmap a 4 KiB page using targeted `tlbi vae1is` when `asid` is provided (or `tlbi vaae1is`
+    /// otherwise), returning `(frame, is_device)` where `is_device` is `true` if the leaf PTE
+    /// carried the `Device` MAIR index (`MmioMap` pages must never be zeroed or reclaimed as RAM).
+    pub fn unmap_4k_asid(
+        &mut self,
+        virt: VirtAddr,
+        asid: Option<u16>,
+    ) -> Result<(PhysFrame, bool), SysError> {
+        let [i0, i1, i2, i3] = Self::indices(virt);
+        let l1 = self
+            .next_table_existing(self.l0_phys, i0)
+            .ok_or(SysError::InvalidArgument)?;
+        let l2 = self
+            .next_table_existing(l1, i1)
+            .ok_or(SysError::InvalidArgument)?;
+        let l3 = self
+            .next_table_existing(l2, i2)
+            .ok_or(SysError::InvalidArgument)?;
+
+        let pte = self.read_desc(l3, i3)?;
+        if (pte & DESC_VALID) == 0 {
+            return Err(SysError::InvalidArgument);
+        }
+
+        let dev_idx = device_mair_index();
+        let attr_idx = (pte >> 2) & 0x7;
+        let is_device = attr_idx == dev_idx && dev_idx != 0;
+
+        self.write_desc(l3, i3, 0)?;
+        if let Some(a) = asid {
+            tlbi_va_asid(virt, a);
+        } else {
+            tlbi_va(virt);
+        }
+        let frame = PhysFrame::from_aligned(PhysAddr::new(pte & DESC_ADDR_MASK))?;
+        Ok((frame, is_device))
+    }
+
+    /// Walk the entire user-half (`L0[0..256]`) 4-level page-table hierarchy, clearing every
+    /// entry and invoking `on_frame(frame, is_table)` for every non-device 4 KiB leaf frame
+    /// (`is_table = false`) and every L3/L2/L1/L0 page-table frame (`is_table = true`, already zeroed).
+    ///
+    /// Caller MUST ensure no CPU is actively executing with this `VSpace` loaded in `TTBR0_EL1`
+    /// and MUST follow up with `tlbi_asid(asid)`.
+    pub fn reclaim_all_user_frames(&mut self, mut on_frame: impl FnMut(PhysFrame, bool)) {
+        let dev_idx = device_mair_index();
+        for i0 in 0..256usize {
+            let Ok(l0_desc) = self.read_desc(self.l0_phys, i0) else {
+                continue;
+            };
+            if (l0_desc & DESC_VALID) == 0 || (l0_desc & DESC_TABLE_OR_PAGE) == 0 {
+                continue;
+            }
+            let l1_phys = l0_desc & DESC_ADDR_MASK;
+            let _ = self.write_desc(self.l0_phys, i0, 0);
+
+            for i1 in 0..512usize {
+                let Ok(l1_desc) = self.read_desc(l1_phys, i1) else {
+                    continue;
+                };
+                if (l1_desc & DESC_VALID) == 0 || (l1_desc & DESC_TABLE_OR_PAGE) == 0 {
+                    continue;
+                }
+                let l2_phys = l1_desc & DESC_ADDR_MASK;
+                let _ = self.write_desc(l1_phys, i1, 0);
+
+                for i2 in 0..512usize {
+                    let Ok(l2_desc) = self.read_desc(l2_phys, i2) else {
+                        continue;
+                    };
+                    if (l2_desc & DESC_VALID) == 0 || (l2_desc & DESC_TABLE_OR_PAGE) == 0 {
+                        continue;
+                    }
+                    let l3_phys = l2_desc & DESC_ADDR_MASK;
+                    let _ = self.write_desc(l2_phys, i2, 0);
+
+                    for i3 in 0..512usize {
+                        let Ok(pte) = self.read_desc(l3_phys, i3) else {
+                            continue;
+                        };
+                        if (pte & DESC_VALID) == 0 {
+                            continue;
+                        }
+                        let _ = self.write_desc(l3_phys, i3, 0);
+                        let attr_idx = (pte >> 2) & 0x7;
+                        let is_device = attr_idx == dev_idx && dev_idx != 0;
+                        if !is_device
+                            && let Ok(frame) =
+                                PhysFrame::from_aligned(PhysAddr::new(pte & DESC_ADDR_MASK))
+                        {
+                            on_frame(frame, false);
+                        }
+                    }
+
+                    if let Ok(l3_fr) = PhysFrame::from_aligned(PhysAddr::new(l3_phys)) {
+                        self.zero_frame(&l3_fr);
+                        on_frame(l3_fr, true);
+                    }
+                }
+
+                if let Ok(l2_fr) = PhysFrame::from_aligned(PhysAddr::new(l2_phys)) {
+                    self.zero_frame(&l2_fr);
+                    on_frame(l2_fr, true);
+                }
+            }
+
+            if let Ok(l1_fr) = PhysFrame::from_aligned(PhysAddr::new(l1_phys)) {
+                self.zero_frame(&l1_fr);
+                on_frame(l1_fr, true);
+            }
+        }
+
+        if let Ok(l0_fr) = PhysFrame::from_aligned(PhysAddr::new(self.l0_phys)) {
+            self.zero_frame(&l0_fr);
+            on_frame(l0_fr, true);
+        }
     }
 
     fn next_table_or_create(
@@ -347,25 +506,8 @@ impl VSpaceMapper for Aarch64VSpace {
     }
 
     fn unmap_4k(&mut self, virt: VirtAddr) -> Result<PhysFrame, SysError> {
-        let [i0, i1, i2, i3] = Self::indices(virt);
-        let l1 = self
-            .next_table_existing(self.l0_phys, i0)
-            .ok_or(SysError::InvalidArgument)?;
-        let l2 = self
-            .next_table_existing(l1, i1)
-            .ok_or(SysError::InvalidArgument)?;
-        let l3 = self
-            .next_table_existing(l2, i2)
-            .ok_or(SysError::InvalidArgument)?;
-
-        let pte = self.read_desc(l3, i3)?;
-        if (pte & DESC_VALID) == 0 {
-            return Err(SysError::InvalidArgument);
-        }
-
-        self.write_desc(l3, i3, 0)?;
-        tlbi_va(virt);
-        PhysFrame::from_aligned(PhysAddr::new(pte & DESC_ADDR_MASK))
+        let (frame, _is_device) = self.unmap_4k_asid(virt, None)?;
+        Ok(frame)
     }
 
     fn map_2m(

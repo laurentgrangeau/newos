@@ -3,19 +3,17 @@
 //! Safe EL0 userspace runtime & `svc #0` syscall SDK for NewOS (Raspberry Pi 5 16 GB, `aarch64`).
 //!
 //! Confines the minimal 64-bit `svc #0` assembly trampoline inside this crate so
-//! all userspace services (`init`, drivers, apps) remain free of `unsafe` code.
+//! all userspace services (`supervisor-pd`, drivers, apps) remain free of `unsafe` code.
 
 use core::arch::asm;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU64, Ordering};
 use newos_abi::{
-    CAP_MINT_SET_BADGE, CapId, DmaCacheOp, ObjectType, Rights, ShutdownStatus, SysError,
-    SyscallNumber,
+    CAP_MINT_SET_BADGE, CapId, DmaCacheOp, DomainRoleId, IrqTriggerMode, NOTIFY_WAIT_TIMEOUT,
+    ObjectType, Rights, ShutdownStatus, SysError, SyscallNumber,
 };
 
 pub const DEBUG_WRITE_MAX: usize = 1024;
-const SYS_INFO_UNCACHED: u64 = u64::MAX;
-static SYS_INFO_CACHE: AtomicU64 = AtomicU64::new(SYS_INFO_UNCACHED);
 static TIMER_FREQ_CACHE: AtomicU64 = AtomicU64::new(0);
 
 const RECOVERY_STACK_SIZE: usize = 64 * 1024;
@@ -214,7 +212,7 @@ pub fn ipc_log_write(ep: CapId, msg: &str) -> Result<usize, SysError> {
 }
 
 /// Buffered `core::fmt::Write` sink for non-root processes without a direct
-/// `Console` capability, routing output over `CapId::BOOTSTRAP_LOG_EP` to `init`.
+/// `Console` capability, routing output over `CapId::BOOTSTRAP_LOG_EP` to `supervisor-pd`.
 pub struct IpcLogConsole<const N: usize = 256> {
     ep: CapId,
     buf: [u8; N],
@@ -295,9 +293,9 @@ impl<const N: usize> LogSlot<N> {
     };
 }
 
-/// Per-sender line reassembler used by the console owner (`init`) to drain
+/// Per-sender line reassembler used by the console owner (`supervisor-pd`) to drain
 /// 7-byte fastpath IPC log chunks from `CapId::BOOTSTRAP_LOG_EP` into complete lines without
-/// interleaving or truncating concurrent daemons (`worker`, `netd`, `keyd`, `sshd`).
+/// interleaving or truncating concurrent protection domains (`worker-pd`, `net-pd`, `key-pd`, `ssh-pd`).
 pub struct IpcLogAssembler<const N: usize = 256> {
     slots: [LogSlot<N>; MAX_LOG_ASSEMBLER_SLOTS],
     pending_chunk: [u8; newos_abi::log_ipc::MAX_CHUNK_BYTES],
@@ -492,6 +490,62 @@ pub fn thread_exit() -> ! {
 /// Acknowledge and unmask a hardware IRQ via a designated `IrqHandler` capability (`Rights::WRITE`).
 pub fn irq_ack(irq_cap: CapId) -> Result<u16, SysError> {
     raw_syscall(SyscallNumber::IrqAck, irq_cap.raw(), 0, 0, 0).map(|v| v as u16)
+}
+
+/// Bind an `IrqHandler` capability (`Rights::WRITE`) to a `Notification` capability (`Rights::WRITE`)
+/// at `badge_bit` (`0..=63`) with the given trigger mode.
+pub fn irq_bind(
+    irq_cap: CapId,
+    notif_cap: CapId,
+    badge_bit: u8,
+    mode: IrqTriggerMode,
+) -> Result<(), SysError> {
+    raw_syscall(
+        SyscallNumber::IrqBind,
+        irq_cap.raw(),
+        notif_cap.raw(),
+        u64::from(badge_bit),
+        mode as u64,
+    )
+    .map(|_| ())
+}
+
+/// Block until `(notification_word & mask) != 0` or `timeout_ns` elapses (`0` = wait forever).
+///
+/// Returns `(matched_bits, timed_out)`. Rejects `mask == 0` with [`SysError::InvalidArgument`].
+pub fn notify_wait(cap: CapId, mask: u64, timeout_ns: u64) -> Result<(u64, bool), SysError> {
+    raw_syscall_full(SyscallNumber::NotifyWait, cap.raw(), mask, timeout_ns, 0)
+        .map(|(bits, flags)| (bits, (flags & NOTIFY_WAIT_TIMEOUT) != 0))
+}
+
+/// Block until the monotonic counter `CNTVCT_EL0` reaches `deadline_ticks`.
+pub fn sleep_until(deadline_ticks: u64) -> Result<(), SysError> {
+    raw_syscall(SyscallNumber::SleepUntil, deadline_ticks, 0, 0, 0).map(|_| ())
+}
+
+/// Sleep for `ms` milliseconds using `CNTVCT_EL0` and `timer_freq_hz()`.
+pub fn sleep_ms(ms: u64) -> Result<(), SysError> {
+    if ms == 0 {
+        return Ok(());
+    }
+    let freq = timer_freq_hz().max(1);
+    let ticks = ((u128::from(ms) * u128::from(freq)) / 1_000).max(1) as u64;
+    let deadline = read_cycles()?.saturating_add(ticks);
+    sleep_until(deadline)
+}
+
+/// Map an entire page-aligned, page-isolated `MmioRegion` capability into `vspace_cap`
+/// (`Rights::WRITE`) at `vaddr` with `Device-nGnRnE` + `UXN` + `PXN`.
+///
+/// Returns the mapped byte length.
+pub fn mmio_map(vspace_cap: CapId, mmio_cap: CapId, vaddr: u64) -> Result<u64, SysError> {
+    raw_syscall(
+        SyscallNumber::MmioMap,
+        vspace_cap.raw(),
+        mmio_cap.raw(),
+        vaddr,
+        0,
+    )
 }
 
 /// Register an EL0 supervisor recovery entry point invoked if an EL0 hardware fault occurs.
@@ -695,6 +749,38 @@ pub fn frame_map(
     .map(|_| ())
 }
 
+/// Bidirectional pair of lock-free `SpscRing<128>` channels fitting in a single 4 KiB shared frame.
+#[repr(C, align(4096))]
+pub struct SharedRingPair {
+    pub a_to_b: newos_abi::ring::SpscRing<128>,
+    pub b_to_a: newos_abi::ring::SpscRing<128>,
+}
+
+const _: () = assert!(core::mem::size_of::<SharedRingPair>() == 4096);
+
+/// Map a shared 4 KiB `Frame` capability at page-aligned `vaddr` and return a safe shared reference
+/// to the interior-mutable `SharedRingPair` backed by atomic operations.
+pub fn map_shared_ring_pair(
+    vspace_cap: CapId,
+    frame_cap: CapId,
+    vaddr: u64,
+) -> Result<&'static SharedRingPair, SysError> {
+    if (vaddr & 0xFFF) != 0 || vaddr == 0 {
+        return Err(SysError::InvalidArgument);
+    }
+    frame_map(
+        vspace_cap,
+        frame_cap,
+        vaddr,
+        Rights::READ.union(Rights::WRITE),
+    )?;
+    // SAFETY: `frame_map` mapped a zeroed 4 KiB RW RAM page at 4 KiB-aligned `vaddr`.
+    // `SharedRingPair` is `#[repr(C, align(4096))]`, `size_of == 4096`, and consists solely
+    // of interior-mutable atomics (`AtomicUsize` / `AtomicU64`) where all-zero bits are a valid
+    // initial state and concurrent cross-process `&` access is race-free.
+    Ok(unsafe { &*(vaddr as *const SharedRingPair) })
+}
+
 /// Set scheduling priority (`0..=255`, higher value = higher priority) on `thread_cap` (`Rights::WRITE`).
 pub fn set_priority(thread_cap: CapId, priority: u8) -> Result<(), SysError> {
     raw_syscall(
@@ -742,7 +828,7 @@ pub fn trigger_user_fault() -> ! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SysInfo {
     pub online_cpus: u16,
-    pub proc_count: u16,
+    pub domain_count: u16,
     pub interactive_shell: bool,
 }
 
@@ -760,19 +846,14 @@ pub fn debug_read_byte() -> Result<u8, SysError> {
 const fn decode_sys_info(raw: u64) -> SysInfo {
     SysInfo {
         online_cpus: (raw & 0xFFFF) as u16,
-        proc_count: ((raw >> 16) & 0xFFFF) as u16,
+        domain_count: ((raw >> 16) & 0xFFFF) as u16,
         interactive_shell: ((raw >> 32) & 1) != 0,
     }
 }
 
-/// Read-only microkernel system info (`online_cpus`, `proc_count`, `interactive_shell`) via `BOOTSTRAP_POWER`.
-///
-/// Static after boot; cached in an `AtomicU64` after the first successful syscall.
+/// Read live microkernel system info (`online_cpus`, active `domain_count`, `interactive_shell`)
+/// via `BOOTSTRAP_POWER` (`Rights::READ`).
 pub fn sys_info() -> SysInfo {
-    let cached = SYS_INFO_CACHE.load(Ordering::Relaxed);
-    if cached != SYS_INFO_UNCACHED {
-        return decode_sys_info(cached);
-    }
     match raw_syscall(
         SyscallNumber::SysInfo,
         CapId::BOOTSTRAP_POWER.raw(),
@@ -780,12 +861,56 @@ pub fn sys_info() -> SysInfo {
         0,
         0,
     ) {
-        Ok(raw) => {
-            SYS_INFO_CACHE.store(raw, Ordering::Relaxed);
-            decode_sys_info(raw)
-        }
+        Ok(raw) => decode_sys_info(raw),
         Err(_) => decode_sys_info(0),
     }
+}
+
+/// Respawn an exited/crashed EL0 protection domain from its immutable boot module with fresh ASLR
+/// (`BOOTSTRAP_POWER`, `Rights::WRITE`). Returns the new PD ID.
+pub fn domain_respawn(role: DomainRoleId) -> Result<usize, SysError> {
+    raw_syscall(
+        SyscallNumber::DomainRespawn,
+        CapId::BOOTSTRAP_POWER.raw(),
+        role as u64,
+        0,
+        0,
+    )
+    .map(|pd_id| pd_id as usize)
+}
+
+/// Terminate and tear down a non-supervisor EL0 protection domain via its `Thread` capability (`Rights::WRITE`).
+pub fn domain_destroy(thread_cap: CapId) -> Result<(), SysError> {
+    raw_syscall(SyscallNumber::DomainDestroy, thread_cap.raw(), 0, 0, 0).map(|_| ())
+}
+
+/// Read and clear the last recorded hardware fault info for `pd_id` (`BOOTSTRAP_POWER`, `Rights::READ`).
+///
+/// Returns `(role, esr_el1, elr_el1)`.
+pub fn domain_get_fault_info(pd_id: usize) -> Result<(DomainRoleId, u64, u64), SysError> {
+    let (packed, elr) = raw_syscall_full(
+        SyscallNumber::DomainGetFaultInfo,
+        CapId::BOOTSTRAP_POWER.raw(),
+        pd_id as u64,
+        0,
+        0,
+    )?;
+    let role = DomainRoleId::from_u64(packed >> 56).ok_or(SysError::InvalidArgument)?;
+    let esr = packed & 0x00FF_FFFF_FFFF_FFFF;
+    Ok((role, esr, elr))
+}
+
+/// Read kernel physical memory stats (`BOOTSTRAP_POWER`, `Rights::READ`).
+///
+/// Returns `(remaining_frames, reclaimed_cache_len)`.
+pub fn mem_stats() -> Result<(u64, u64), SysError> {
+    raw_syscall_full(
+        SyscallNumber::MemStats,
+        CapId::BOOTSTRAP_POWER.raw(),
+        0,
+        0,
+        0,
+    )
 }
 
 /// Shut down the system cleanly with `code` using an explicit `PowerControl` capability (`Rights::WRITE`).

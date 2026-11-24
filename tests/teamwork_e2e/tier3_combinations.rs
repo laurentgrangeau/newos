@@ -24,8 +24,8 @@ fn t3_cspace_ipc_memory_three_hop_delegation_and_reclaim() {
 
     let mut ipc = KernelIpcState::new();
     ipc.init_bootstrap_caps(None).unwrap();
-    ipc.init_worker_bootstrap_caps(1).unwrap();
-    ipc.init_worker_bootstrap_caps(2).unwrap();
+    ipc.init_worker_pd_bootstrap_caps(1).unwrap();
+    ipc.init_worker_pd_bootstrap_caps(2).unwrap();
     let (_, cnode1) = ipc.register_child_caps_in_root(1).unwrap();
     let (_, cnode2) = ipc.register_child_caps_in_root(2).unwrap();
 
@@ -336,8 +336,8 @@ fn t3_shell_interactive_repl_roundtrip_and_exit() {
 fn t3_sched_smp_ipc_worker_fault_isolation() {
     let mut ipc = KernelIpcState::new();
     let (_, _, fault_notif) = ipc.init_bootstrap_caps(None).unwrap();
-    ipc.init_worker_bootstrap_caps(1).unwrap();
-    ipc.init_worker_bootstrap_caps(2).unwrap();
+    ipc.init_worker_pd_bootstrap_caps(1).unwrap();
+    ipc.init_worker_pd_bootstrap_caps(2).unwrap();
 
     let mut smp = SmpScheduler::<2, 8>::new(2);
     let (c1, _t1) = smp.spawn_balanced(16).unwrap();

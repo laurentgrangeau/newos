@@ -28,30 +28,30 @@ fn tier3_shell_ping_pipeline_filter_and_count() {
 }
 
 #[test]
-fn tier3_shell_procs_and_sys_consistency_single_vs_multi_proc() {
+fn tier3_shell_domains_and_sys_consistency_single_vs_multi_domain() {
     let mut sh1 = Shell::new(MockShellHost::new(1, 1));
     assert!(matches!(
-        sh1.eval_pipeline("procs | count").first(),
+        sh1.eval_pipeline("domains | count").first(),
         Some(Record::Count(1))
     ));
     assert!(matches!(
-        sh1.eval_pipeline("procs | where pid == 1 | count").first(),
+        sh1.eval_pipeline("domains | where id == 1 | count").first(),
         Some(Record::Count(0))
     ));
     sh1.exec_line("sys");
-    assert!(sh1.host_mut().take_output().contains("1 procs"));
+    assert!(sh1.host_mut().take_output().contains("1 domains"));
 
     let mut sh2 = Shell::new(MockShellHost::new(4, 2));
     assert!(matches!(
-        sh2.eval_pipeline("procs | count").first(),
+        sh2.eval_pipeline("domains | count").first(),
         Some(Record::Count(2))
     ));
     assert!(matches!(
-        sh2.eval_pipeline("procs | where pid == 1 | count").first(),
+        sh2.eval_pipeline("domains | where id == 1 | count").first(),
         Some(Record::Count(1))
     ));
     sh2.exec_line("sys");
-    assert!(sh2.host_mut().take_output().contains("2 procs"));
+    assert!(sh2.host_mut().take_output().contains("2 domains"));
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn tier3_shell_buffered_writer_reduces_writes_without_truncating_session() {
     }
 
     let mut sh = Shell::new(MockShellHost::default());
-    for cmd in ["help", "objects", "refs", "procs", "sys", "ping 0x42"] {
+    for cmd in ["help", "objects", "refs", "domains", "sys", "ping 0x42"] {
         sh.exec_line(cmd);
     }
     let session_output = sh.host_mut().take_output();

@@ -4,15 +4,18 @@
 //! (MMIO physical base `0x1F_0010_0000`, module ID `0x0007_0109`), running in EL0
 //! via capability-scoped `MmioRead32`/`MmioWrite32` and `VirtToPhys`.
 
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering, fence};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use newos_abi::SysError;
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{
+    Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken,
+};
 use smoltcp::time::Instant;
 
 use crate::MmioDmaTransport;
 
-const RING_SIZE: usize = 8;
+const RING_SIZE: usize = 32;
 const PKT_BUF_SIZE: usize = 2048; // Divides 4096 evenly -> never crosses a 4 KiB page boundary!
+const PKT_BUF_WORDS: usize = PKT_BUF_SIZE / 8;
 
 // Cadence GEM (MACB) MMIO register offsets
 pub const REG_NCR: u64 = 0x0000;
@@ -23,6 +26,8 @@ pub const REG_TSR: u64 = 0x0014;
 pub const REG_RBQP: u64 = 0x0018;
 pub const REG_TBQP: u64 = 0x001C;
 pub const REG_RSR: u64 = 0x0020;
+pub const REG_ISR: u64 = 0x0024;
+pub const REG_IER: u64 = 0x0028;
 pub const REG_IDR: u64 = 0x002C;
 pub const REG_MAN: u64 = 0x0034;
 pub const REG_SA1B: u64 = 0x0088;
@@ -30,6 +35,13 @@ pub const REG_SA1T: u64 = 0x008C;
 pub const REG_MID: u64 = 0x00FC;
 pub const REG_TBQPH: u64 = 0x04C8;
 pub const REG_RBQPH: u64 = 0x04D4;
+
+// ISR / IER bits (RX complete + TX complete)
+const ISR_RCOMP: u32 = 1 << 1;
+const ISR_TCOMP: u32 = 1 << 7;
+// NCFGR / DMACFG hardware checksum offload bits
+const NCFGR_RXCOEN: u32 = 1 << 24;
+const DMACFG_TXCOEN: u32 = 1 << 11;
 
 // NSR bits
 const NSR_IDLE: u32 = 1 << 2;
@@ -121,11 +133,51 @@ impl GemDesc64 {
 struct GemDescRing([GemDesc64; RING_SIZE]);
 
 #[repr(C, align(2048))]
-struct GemPacketBuf([AtomicU8; PKT_BUF_SIZE]);
+struct GemPacketBuf([AtomicU64; PKT_BUF_WORDS]);
 
 impl GemPacketBuf {
     const fn new() -> Self {
-        Self([const { AtomicU8::new(0) }; PKT_BUF_SIZE])
+        Self([const { AtomicU64::new(0) }; PKT_BUF_WORDS])
+    }
+
+    #[inline]
+    fn write_bytes(&self, src: &[u8]) {
+        let full_words = src.len() / 8;
+        for (w, slot) in self.0.iter().enumerate().take(full_words) {
+            let off = w * 8;
+            let val = u64::from_le_bytes([
+                src[off],
+                src[off + 1],
+                src[off + 2],
+                src[off + 3],
+                src[off + 4],
+                src[off + 5],
+                src[off + 6],
+                src[off + 7],
+            ]);
+            slot.store(val, Ordering::Relaxed);
+        }
+        let rem = src.len() & 7;
+        if rem > 0 {
+            let mut tail = [0u8; 8];
+            tail[..rem].copy_from_slice(&src[full_words * 8..]);
+            self.0[full_words].store(u64::from_le_bytes(tail), Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn read_bytes(&self, dst: &mut [u8]) {
+        let full_words = dst.len() / 8;
+        for (w, slot) in self.0.iter().enumerate().take(full_words) {
+            let bytes = slot.load(Ordering::Relaxed).to_le_bytes();
+            let off = w * 8;
+            dst[off..off + 8].copy_from_slice(&bytes);
+        }
+        let rem = dst.len() & 7;
+        if rem > 0 {
+            let bytes = self.0[full_words].load(Ordering::Relaxed).to_le_bytes();
+            dst[full_words * 8..].copy_from_slice(&bytes[..rem]);
+        }
     }
 }
 
@@ -190,9 +242,9 @@ impl<'a, T: MmioDmaTransport> GemNetDevice<'a, T> {
             .write32(REG_SA1T, sa1t)
             .map_err(|_| "gem sa1t failed")?;
 
-        // 3. Configure 64-bit DMA mode with 2 KiB RX buffers
+        // 3. Configure 64-bit DMA mode with 2 KiB RX buffers + TX hardware checksum offload
         transport
-            .write32(REG_DMACFG, DMACFG_64BIT_2K)
+            .write32(REG_DMACFG, DMACFG_64BIT_2K | DMACFG_TXCOEN)
             .map_err(|_| "gem dmacfg failed")?;
 
         // 4. Populate 64-bit RX descriptors (owned by GEM hardware: RX_USED = 0)
@@ -256,8 +308,11 @@ impl<'a, T: MmioDmaTransport> GemNetDevice<'a, T> {
             .write32(REG_TBQPH, (tx_ring_phys >> 32) as u32)
             .map_err(|_| "gem tbqph failed")?;
 
-        // 7. Preserve firmware PHY/RGMII config in NCFGR while enabling Full-Duplex + Gigabit + FCS strip
+        // 7. Preserve firmware PHY/RGMII config in NCFGR while enabling Full-Duplex + Gigabit + FCS strip + RX CSUM offload
         let prev_ncfgr = transport.read32(REG_NCFGR).unwrap_or(0);
+        let _ = transport.write32(REG_NCFGR, prev_ncfgr | NCFGR_RXCOEN);
+        // Enable RX/TX completion interrupts for IRQ-driven EL0 `net-pd` wakeup
+        let _ = transport.write32(REG_IER, ISR_RCOMP | ISR_TCOMP);
         let ncfgr = prev_ncfgr | NCFGR_SPD | NCFGR_FD | NCFGR_GIGE | NCFGR_RFCS;
         transport
             .write32(REG_NCFGR, ncfgr)
@@ -323,10 +378,7 @@ impl<'a, T: MmioDmaTransport> GemNetDevice<'a, T> {
             }
             core::hint::spin_loop();
         }
-        let buf = &self.dma.tx_bufs[slot].0;
-        for (i, &b) in frame[..len].iter().enumerate() {
-            buf[i].store(b, Ordering::Relaxed);
-        }
+        self.dma.tx_bufs[slot].write_bytes(&frame[..len]);
         let wrap = if slot + 1 == RING_SIZE { TX_WRAP } else { 0 };
         fence(Ordering::SeqCst);
         if self.transport.dma_clean(&self.dma.tx_bufs[slot]).is_err() {
@@ -349,6 +401,17 @@ impl<'a, T: MmioDmaTransport> GemNetDevice<'a, T> {
         self.tx_idx = (slot + 1) % RING_SIZE;
         self.tx_packets += 1;
     }
+
+    /// Acknowledge and clear pending Cadence GEM RX/TX interrupt status bits.
+    pub fn ack_interrupts(&self) {
+        let _ = self.transport.read32(REG_ISR);
+    }
+}
+
+impl<T: MmioDmaTransport> crate::IrqAckDevice for GemNetDevice<'_, T> {
+    fn ack_interrupts(&self) {
+        GemNetDevice::ack_interrupts(self);
+    }
 }
 
 pub struct GemRxToken<'a> {
@@ -364,9 +427,7 @@ impl RxToken for GemRxToken<'_> {
     {
         let mut local = [0u8; 1536];
         let n = self.frame_len.min(local.len());
-        for (i, dst) in local[..n].iter_mut().enumerate() {
-            *dst = self.buf.0[i].load(Ordering::Relaxed);
-        }
+        self.buf.read_bytes(&mut local[..n]);
         let res = f(&local[..n]);
         // Recycle RX descriptor back to GEM hardware by clearing RX_USED (bit 0)
         fence(Ordering::SeqCst);
@@ -404,6 +465,7 @@ impl<'b, T: MmioDmaTransport> Device for GemNetDevice<'b, T> {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        let _ = self.transport.read32(REG_ISR);
         let prev_slot = (self.rx_idx + RING_SIZE - 1) % RING_SIZE;
         let _ = self.transport.dma_clean(&self.dma.rx_ring.0[prev_slot]);
 
@@ -452,6 +514,11 @@ impl<'b, T: MmioDmaTransport> Device for GemNetDevice<'b, T> {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = 1500;
+        let mut csum = ChecksumCapabilities::default();
+        csum.ipv4 = Checksum::None;
+        csum.tcp = Checksum::None;
+        csum.udp = Checksum::None;
+        caps.checksum = csum;
         caps
     }
 }

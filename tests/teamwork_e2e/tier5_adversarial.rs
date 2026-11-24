@@ -36,7 +36,7 @@ fn count_refs(store: &ObjectStore) -> usize {
 fn t5_kernel_frame_reclaim_guards_live_cap_and_shared_mapping() {
     let mut ipc = KernelIpcState::new();
     let _ = ipc.init_bootstrap_caps(None).expect("bootstrap caps");
-    let _ = ipc.init_worker_bootstrap_caps(1).expect("worker 1 caps");
+    let _ = ipc.init_worker_pd_bootstrap_caps(1).expect("worker 1 caps");
     let (_, w1_cnode) = ipc
         .register_child_caps_in_root(1)
         .expect("register worker 1");
@@ -145,7 +145,7 @@ fn t5_kernel_frame_reclaim_guards_live_cap_and_shared_mapping() {
 fn t5_kernel_cdt_return_to_origin_move_delete_revoke() {
     let mut ipc = KernelIpcState::new();
     let _ = ipc.init_bootstrap_caps(None).expect("bootstrap caps");
-    let _ = ipc.init_worker_bootstrap_caps(1).expect("worker 1 caps");
+    let _ = ipc.init_worker_pd_bootstrap_caps(1).expect("worker 1 caps");
     let (_, w1_cnode) = ipc
         .register_child_caps_in_root(1)
         .expect("register worker 1");
@@ -301,7 +301,7 @@ fn t5_shell_syntax_error_in_later_stage_causes_no_side_effects() {
         sh.host_mut().clear_output();
         assert_eq!(sh.exec_line(cmd), ExecOutcome::Continue);
         assert!(
-            sh.host().output.contains("newos-sh:"),
+            sh.host().output.contains("newos-shell-pd:"),
             "expected parse diagnostic for `{cmd}`, got {:?}",
             sh.host().output
         );
@@ -331,7 +331,7 @@ fn t5_shell_failed_transform_clears_eval_pipeline_stream() {
     let mut sh = Shell::new(MockShellHost::new());
     for cmd in [
         "objects | bogus_stage",
-        "procs | save @x",
+        "domains | save @x",
         r#"put "abc" | save @motd"#,
     ] {
         let owned = sh.eval_pipeline(cmd);
@@ -408,7 +408,7 @@ impl ShellHost for EdgeReadLineHost {
     fn sys_info(&mut self) -> SysInfo {
         SysInfo {
             online_cpus: 1,
-            proc_count: 1,
+            domain_count: 1,
             interactive_shell: true,
         }
     }

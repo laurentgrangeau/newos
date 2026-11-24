@@ -26,8 +26,8 @@ use newos_abi::{Rights, ShutdownStatus, SysError};
 #[cfg(feature = "userspace")]
 const USER_STACK_BASE: u64 = 0x0000_7fff_f000_0000;
 #[cfg(feature = "userspace")]
-const USER_STACK_PAGES: u64 = 16; // 64 KiB EL0 data stack
-/// 1 MiB EL0 data stack for daemons (`newos-netd`, `newos-keyd`, `newos-sshd`)
+pub const USER_STACK_PAGES: u64 = 16; // 64 KiB EL0 data stack
+/// 1 MiB EL0 data stack for protection domains (`newos-net-pd`, `newos-key-pd`, `newos-ssh-pd`)
 /// running NIST Level 5 ML-DSA-87 / ML-KEM-1024 lattice math.
 pub const USER_PQ_STACK_PAGES: u64 = 256;
 #[cfg(feature = "userspace")]
@@ -57,11 +57,12 @@ pub struct BootInfo {
     pub cpu_count: usize,
     pub rsdp_addr: u64,
     pub framebuffer: Option<FramebufferInfo>,
-    pub init_module: Option<&'static [u8]>,
+    pub supervisor_module: Option<&'static [u8]>,
+    pub shell_module: Option<&'static [u8]>,
     pub worker_module: Option<&'static [u8]>,
-    pub netd_module: Option<&'static [u8]>,
-    pub keyd_module: Option<&'static [u8]>,
-    pub sshd_module: Option<&'static [u8]>,
+    pub net_module: Option<&'static [u8]>,
+    pub key_module: Option<&'static [u8]>,
+    pub ssh_module: Option<&'static [u8]>,
     pub interactive_shell: bool,
     pub qemu_virt: bool,
 }
@@ -74,15 +75,42 @@ impl BootInfo {
     }
 }
 
-/// Explicit bootstrap process role used to assign least-privilege capabilities independently of
-/// spawn order / PID (`N5`).
+/// Explicit bootstrap protection domain role used to assign least-privilege capabilities
+/// independently of spawn order / PD ID (`N5`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProcessRole {
-    Init,
+pub enum DomainRole {
+    Supervisor,
+    Shell,
     Worker,
-    Netd,
-    Keyd,
-    Sshd,
+    Net,
+    Key,
+    Ssh,
+}
+
+impl DomainRole {
+    #[inline]
+    pub const fn to_abi(self) -> newos_abi::DomainRoleId {
+        match self {
+            Self::Supervisor => newos_abi::DomainRoleId::Supervisor,
+            Self::Shell => newos_abi::DomainRoleId::Shell,
+            Self::Worker => newos_abi::DomainRoleId::Worker,
+            Self::Net => newos_abi::DomainRoleId::Net,
+            Self::Key => newos_abi::DomainRoleId::Key,
+            Self::Ssh => newos_abi::DomainRoleId::Ssh,
+        }
+    }
+
+    #[inline]
+    pub const fn from_abi(id: newos_abi::DomainRoleId) -> Self {
+        match id {
+            newos_abi::DomainRoleId::Supervisor => Self::Supervisor,
+            newos_abi::DomainRoleId::Shell => Self::Shell,
+            newos_abi::DomainRoleId::Worker => Self::Worker,
+            newos_abi::DomainRoleId::Net => Self::Net,
+            newos_abi::DomainRoleId::Key => Self::Key,
+            newos_abi::DomainRoleId::Ssh => Self::Ssh,
+        }
+    }
 }
 
 /// Architecture-agnostic platform interface implemented by `newos-hal`.
@@ -110,9 +138,9 @@ pub trait HalPlatform: Write {
     fn vspace_mut(&mut self) -> &mut Self::VSpace;
     fn create_user_vspace(&self, untyped: &mut UntypedInventory) -> Result<Self::VSpace, SysError>;
     fn probe_mapped_u64(&self, virt: VirtAddr, pattern: u64) -> Result<u64, SysError>;
-    fn register_user_process(
+    fn register_domain(
         &mut self,
-        role: ProcessRole,
+        role: DomainRole,
         entry: VirtAddr,
         user_sp: VirtAddr,
         user_shadow_sp: VirtAddr,
@@ -122,13 +150,15 @@ pub trait HalPlatform: Write {
     fn random_u64(&mut self) -> u64 {
         0
     }
+    /// Record an immutable boot module ELF slice for runtime `DomainRespawn` supervision.
+    fn register_boot_module(&mut self, _role: DomainRole, _elf_bytes: &'static [u8]) {}
     /// Hand remaining bootstrap `UntypedInventory` to the HAL for runtime `MapPage`/`UnmapPage` syscalls.
     fn install_runtime_untyped(&mut self, _untyped: UntypedInventory) {}
     fn start_userspace(&mut self) -> !;
     fn exit(&mut self, code: ShutdownStatus) -> !;
 }
 
-/// Microkernel boot entry: verify Phases 1–3 + SMP, then load isolated EL0 `init` & `worker`.
+/// Microkernel boot entry: verify Phases 1–3 + SMP, then load isolated EL0 protection domains.
 pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
     let sec = platform.security_features();
     let board = if platform.board_name() != "generic" {
@@ -210,7 +240,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
         platform.exit(ShutdownStatus::Failed);
     }
 
-    // Phase 1: VBAR_EL1 #BRK & ARM Generic Timer verification
+    // VBAR_EL1 #BRK & ARM Generic Timer verification
     let before_bp = platform.breakpoint_count();
     platform.trigger_breakpoint();
     if platform.breakpoint_count() != before_bp + 1 {
@@ -227,44 +257,44 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
     platform.disable_interrupts();
     let _ = writeln!(
         platform,
-        "[newos] phase-1 HAL, SMP & Generic Timer self-check: OK (cpus={}, bp={}, timer={})",
+        "[newos] HAL, SMP & timer: OK (cpus={}, bp={}, timer={})",
         platform.online_cpus(),
         platform.breakpoint_count(),
         platform.timer_count(),
     );
 
-    // Phase 2: Untyped retype + 4-level VSpace map / probe / unmap verification
+    // Untyped retype + 4-level VSpace map / probe / unmap verification
     if let Err(err) = verify_phase2_memory(platform, &mut info.untyped) {
-        let _ = writeln!(platform, "[newos] FAIL: phase-2 memory self-check: {err:?}");
+        let _ = writeln!(platform, "[newos] FAIL: memory & VSpace: {err:?}");
         platform.exit(ShutdownStatus::Failed);
     }
     let _ = writeln!(
         platform,
-        "[newos] phase-2 Untyped & 4-level VSpace self-check: OK (retyped_frames={}, remaining={} MiB)",
+        "[newos] memory & VSpace: OK (retyped_frames={}, remaining={} MiB)",
         info.untyped.retyped_frames(),
         info.untyped.remaining_bytes() / (1024 * 1024),
     );
 
-    // Phase 3: CSpace, Untyped retype, badged minting & transitive CDT revoke
+    // CSpace, Untyped retype, badged minting & transitive CDT revoke
     match verify_phase3_cspace(&mut info.untyped) {
         Ok((occupied, revoked)) => {
             let _ = writeln!(
                 platform,
-                "[newos] phase-3 CSpace & CDT self-check: OK (active_caps={occupied}, revoked={revoked})",
+                "[newos] CSpace & CDT: OK (active_caps={occupied}, revoked={revoked})",
             );
         }
         Err(err) => {
-            let _ = writeln!(platform, "[newos] FAIL: phase-3 CSpace self-check: {err:?}");
+            let _ = writeln!(platform, "[newos] FAIL: CSpace & CDT: {err:?}");
             platform.exit(ShutdownStatus::Failed);
         }
     }
 
-    // Phase 4+: Pure EL1 tinykernel mode (no userspace) OR optional EL0 module bootstrap.
+    // EL1-only mode (no userspace) OR EL0 module bootstrap.
     #[cfg(not(feature = "userspace"))]
     {
         let _ = writeln!(
             platform,
-            "[newos] pure EL1 tinykernel boot complete (userspace=false, sched={}, smp={})",
+            "[newos] EL1 boot complete (userspace=false, sched={}, smp={})",
             sched::ACTIVE_SCHED_POLICY.as_str(),
             cfg!(feature = "smp"),
         );
@@ -279,10 +309,10 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
 
     #[cfg(feature = "userspace")]
     {
-        let Some(init_bytes) = info.init_module else {
+        let Some(supervisor_bytes) = info.supervisor_module else {
             let _ = writeln!(
                 platform,
-                "[newos] no EL0 init module supplied; pure EL1 kernel boot complete"
+                "[newos] no EL0 supervisor-pd module supplied; pure EL1 kernel boot complete"
             );
             if info.qemu_virt {
                 platform.exit(ShutdownStatus::Success)
@@ -293,47 +323,73 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
             }
         };
 
-        let spawn_result = spawn_isolated_process(
+        platform.register_boot_module(DomainRole::Supervisor, supervisor_bytes);
+        if let Some(shell_bytes) = info.shell_module {
+            platform.register_boot_module(DomainRole::Shell, shell_bytes);
+        }
+        if let Some(worker_bytes) = info.worker_module {
+            platform.register_boot_module(DomainRole::Worker, worker_bytes);
+        }
+        if let Some(net_bytes) = info.net_module {
+            platform.register_boot_module(DomainRole::Net, net_bytes);
+        }
+        if let Some(key_bytes) = info.key_module {
+            platform.register_boot_module(DomainRole::Key, key_bytes);
+        }
+        if let Some(ssh_bytes) = info.ssh_module {
+            platform.register_boot_module(DomainRole::Ssh, ssh_bytes);
+        }
+
+        let spawn_result = spawn_isolated_domain(
             platform,
-            ProcessRole::Init,
-            "init",
-            init_bytes,
+            DomainRole::Supervisor,
+            "newos-supervisor-pd",
+            supervisor_bytes,
             &mut info.untyped,
         )
         .and_then(|_| {
-            if let Some(worker_bytes) = info.worker_module {
-                spawn_isolated_process(
+            if let Some(shell_bytes) = info.shell_module {
+                spawn_isolated_domain(
                     platform,
-                    ProcessRole::Worker,
-                    "worker",
+                    DomainRole::Shell,
+                    "newos-shell-pd",
+                    shell_bytes,
+                    &mut info.untyped,
+                )?;
+            }
+            if let Some(worker_bytes) = info.worker_module {
+                spawn_isolated_domain(
+                    platform,
+                    DomainRole::Worker,
+                    "newos-worker-pd",
                     worker_bytes,
                     &mut info.untyped,
                 )?;
             }
-            if let Some(netd) = info.netd_module {
-                spawn_isolated_process(
+            if let Some(net_bytes) = info.net_module {
+                spawn_isolated_domain(
                     platform,
-                    ProcessRole::Netd,
-                    "newos-netd",
-                    netd,
+                    DomainRole::Net,
+                    "newos-net-pd",
+                    net_bytes,
                     &mut info.untyped,
                 )?;
             }
-            if let Some(keyd) = info.keyd_module {
-                spawn_isolated_process(
+            if let Some(key_bytes) = info.key_module {
+                spawn_isolated_domain(
                     platform,
-                    ProcessRole::Keyd,
-                    "newos-keyd",
-                    keyd,
+                    DomainRole::Key,
+                    "newos-key-pd",
+                    key_bytes,
                     &mut info.untyped,
                 )?;
             }
-            if let Some(sshd) = info.sshd_module {
-                spawn_isolated_process(
+            if let Some(ssh_bytes) = info.ssh_module {
+                spawn_isolated_domain(
                     platform,
-                    ProcessRole::Sshd,
-                    "newos-sshd",
-                    sshd,
+                    DomainRole::Ssh,
+                    "newos-ssh-pd",
+                    ssh_bytes,
                     &mut info.untyped,
                 )?;
             }
@@ -348,7 +404,7 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
             Err(err) => {
                 let _ = writeln!(
                     platform,
-                    "[newos] FAIL: failed to spawn EL0 processes: {err:?}"
+                    "[newos] FAIL: failed to spawn EL0 protection domains: {err:?}"
                 );
                 platform.exit(ShutdownStatus::Failed);
             }
@@ -357,9 +413,9 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
 }
 
 #[cfg(feature = "userspace")]
-fn spawn_isolated_process<P: HalPlatform>(
+fn spawn_isolated_domain<P: HalPlatform>(
     platform: &mut P,
-    role: ProcessRole,
+    role: DomainRole,
     name: &str,
     elf_bytes: &[u8],
     untyped: &mut UntypedInventory,
@@ -373,10 +429,7 @@ fn spawn_isolated_process<P: HalPlatform>(
     let pie_base = 0x0040_0000u64 + (((entropy >> 8) & 0xFF) * PAGE_SIZE);
     let shadow_slide = ((entropy >> 16) & 0xFF) * PAGE_SIZE;
     let mut user_vspace = platform.create_user_vspace(untyped)?;
-    let stack_pages = if matches!(
-        role,
-        ProcessRole::Netd | ProcessRole::Keyd | ProcessRole::Sshd
-    ) {
+    let stack_pages = if matches!(role, DomainRole::Net | DomainRole::Key | DomainRole::Ssh) {
         USER_PQ_STACK_PAGES
     } else {
         USER_STACK_PAGES
@@ -391,10 +444,10 @@ fn spawn_isolated_process<P: HalPlatform>(
         stack_pages,
     )?;
     let root = user_vspace.root_phys();
-    let pid = platform.register_user_process(role, entry, user_sp, user_shadow_sp, root)?;
+    let pd_id = platform.register_domain(role, entry, user_sp, user_shadow_sp, root)?;
     let _ = writeln!(
         platform,
-        "[newos] spawned EL0 `{name}` (pid={pid}, role={role:?}, ttbr0={:#018x}, entry={:#018x}, sp={:#018x}, scs={:#018x}, segs={segs}, measured_sha3_512={sha_prefix:#018x})",
+        "[newos] spawned EL0 `{name}` (pd={pd_id}, role={role:?}, ttbr0={:#018x}, entry={:#018x}, sp={:#018x}, scs={:#018x}, segs={segs}, measured_sha3_512={sha_prefix:#018x})",
         root.raw(),
         entry.raw(),
         user_sp.raw(),
@@ -406,7 +459,7 @@ fn spawn_isolated_process<P: HalPlatform>(
 /// ELF64 loader mapping an `ET_EXEC` or PIE `ET_DYN`
 /// binary into an isolated `VSpace` with ASLR code/stack/SCS slides and `R_AARCH64_RELATIVE` relocations.
 #[cfg(feature = "userspace")]
-fn load_elf64_into_vspace<V: VSpaceMapper>(
+pub fn load_elf64_into_vspace<V: VSpaceMapper>(
     vspace: &mut V,
     elf_bytes: &[u8],
     untyped: &mut UntypedInventory,
@@ -605,11 +658,12 @@ mod tests {
             cpu_count: 4,
             rsdp_addr: 0x000e_0000,
             framebuffer: None,
-            init_module: None,
+            supervisor_module: None,
+            shell_module: None,
             worker_module: None,
-            netd_module: None,
-            keyd_module: None,
-            sshd_module: None,
+            net_module: None,
+            key_module: None,
+            ssh_module: None,
             interactive_shell: false,
             qemu_virt: false,
         };

@@ -1,12 +1,12 @@
 #![no_std]
 #![no_main]
 
-//! Isolated EL0 Network & DMA Plane Daemon (`newos-netd`, PID 2).
+//! Isolated EL0 Network & DMA Plane Protection Domain (`newos-net-pd`, PD 2).
 //!
 //! Strict least-privilege capability set:
 //! - `CapId::BOOTSTRAP_NET_MMIO` (`R|W`) — RP1 Cadence GEM (Pi 5) or VirtIO-Net (QEMU)
 //! - `CapId::BOOTSTRAP_VSPACE` (`R` only) — `VirtToPhys` DMA translation only
-//! - `CapId::BOOTSTRAP_NET_EP` (`R|W`) — server endpoint for `newos-sshd` (badge 4) & `init` (0x1000)
+//! - `CapId::BOOTSTRAP_NET_EP` (`R|W`) — server endpoint for `newos-ssh-pd` (badge 4) & `supervisor-pd` (0x1000)
 //! - `CapId::BOOTSTRAP_LOG_EP` (`W`, badge 2) — write-only diagnostic log
 //!
 //! Explicitly holds ZERO access to `RNG_MMIO`, `KEY_EP`, `AUTH_GATE_EP`, `SSH_SHELL_EP`,
@@ -57,7 +57,7 @@ impl MmioDmaTransport for CapNetTransport {
     }
 }
 
-fn serve_net_loop<D: NetDevice>(
+fn serve_net_loop<D: NetDevice + newos_net::IrqAckDevice>(
     mut stack: NetStack<'_, D>,
     mut clock: CycleClock<fn() -> u64>,
     out: &mut IpcLogConsole<256>,
@@ -66,29 +66,90 @@ fn serve_net_loop<D: NetDevice>(
     let mut reply_payload = 0u64;
     let mut last_ip = stack.config().ip;
 
+    const NET_SSH_RING_VADDR: u64 = 0x0000_6000_0000_0000;
+    let net_ssh_ring = newos_user_rt::map_shared_ring_pair(
+        CapId::BOOTSTRAP_VSPACE,
+        CapId::BOOTSTRAP_NET_SSH_RING,
+        NET_SSH_RING_VADDR,
+    )
+    .ok();
+
+    let irq_bound = newos_user_rt::irq_bind(
+        CapId::BOOTSTRAP_NET_IRQ,
+        CapId::BOOTSTRAP_NET_NOTIF,
+        0,
+        newos_abi::IrqTriggerMode::LevelHigh,
+    )
+    .is_ok();
+    const IRQ_BIT: u64 = 1 << 0;
+    const TX_DOORBELL_BIT: u64 = 1 << 1;
+    const SSH_RX_READY_BIT: u64 = 1 << 0;
+
+    let mut ring_buf = [0u8; 256];
+
     loop {
+        // Drain outbound TCP payloads submitted by `ssh-pd` over the shared `SpscRing` (`b_to_a`).
+        if let Some(ring) = net_ssh_ring {
+            while let Some(n) = ring.b_to_a.try_pop_bytes(&mut ring_buf) {
+                if n > 0 {
+                    let _ = stack.send(&ring_buf[..n]);
+                }
+            }
+        }
+
         let now_ms = clock.now_millis();
         match stack.poll(now_ms) {
             TcpEvent::Connected => {
-                let _ = writeln!(out, "[netd] TCP :{} client connected", stack.listen_port());
+                let _ = writeln!(
+                    out,
+                    "[net-pd] TCP :{} client connected",
+                    stack.listen_port()
+                );
                 out.flush();
+                let _ = newos_user_rt::notify_signal(CapId::BOOTSTRAP_SSH_NOTIF, SSH_RX_READY_BIT);
             }
             TcpEvent::Disconnected => {
                 let _ = writeln!(
                     out,
-                    "[netd] TCP :{} client disconnected",
+                    "[net-pd] TCP :{} client disconnected",
                     stack.listen_port()
                 );
                 out.flush();
+                let _ = newos_user_rt::notify_signal(CapId::BOOTSTRAP_SSH_NOTIF, SSH_RX_READY_BIT);
             }
             TcpEvent::None => {}
         }
+
+        // Forward inbound TCP payloads into the shared `SpscRing` (`a_to_b`) and ring `ssh-pd`'s doorbell.
+        if let Some(ring) = net_ssh_ring
+            && stack.can_recv()
+        {
+            let mut pushed_any = false;
+            for _ in 0..4 {
+                if !stack.can_recv() {
+                    break;
+                }
+                let n = stack.recv(&mut ring_buf);
+                if n == 0 {
+                    break;
+                }
+                if ring.a_to_b.try_push_bytes(&ring_buf[..n]) == Ok(n) {
+                    pushed_any = true;
+                } else {
+                    break;
+                }
+            }
+            if pushed_any {
+                let _ = newos_user_rt::notify_signal(CapId::BOOTSTRAP_SSH_NOTIF, SSH_RX_READY_BIT);
+            }
+        }
+
         let cur_ip = stack.config().ip;
         if cur_ip != last_ip {
             last_ip = cur_ip;
             let _ = writeln!(
                 out,
-                "[netd] IPv4 updated: {}.{}.{}.{}/{}",
+                "[net-pd] IPv4 updated: {}.{}.{}.{}/{}",
                 cur_ip[0],
                 cur_ip[1],
                 cur_ip[2],
@@ -106,10 +167,30 @@ fn serve_net_loop<D: NetDevice>(
             }
             Err(SysError::WouldBlock) => {
                 has_reply = false;
-                let _ = newos_user_rt::yield_now();
+                let delay_ms = stack.poll_delay_ms(now_ms).unwrap_or(20).clamp(1, 50);
+                let mask = IRQ_BIT | TX_DOORBELL_BIT | newos_abi::RING_PEER_RESET_BIT;
+                if let Ok((bits, _timed_out)) = newos_user_rt::notify_wait(
+                    CapId::BOOTSTRAP_NET_NOTIF,
+                    mask,
+                    delay_ms.saturating_mul(1_000_000),
+                ) {
+                    if (bits & newos_abi::RING_PEER_RESET_BIT) != 0 {
+                        stack.abort();
+                    }
+                    if irq_bound && (bits & IRQ_BIT) != 0 {
+                        stack.device().ack_interrupts();
+                        let _ = newos_user_rt::irq_ack(CapId::BOOTSTRAP_NET_IRQ);
+                    }
+                } else {
+                    let _ = newos_user_rt::sleep_ms(delay_ms);
+                }
             }
             Err(err) => {
-                let _ = writeln!(out, "[netd] fatal IPC error (code={}); exiting", err as u64);
+                let _ = writeln!(
+                    out,
+                    "[net-pd] fatal IPC error (code={}); exiting",
+                    err as u64
+                );
                 out.flush();
                 newos_user_rt::thread_exit();
             }
@@ -123,14 +204,14 @@ fn handle_request<D: NetDevice>(
     op: u8,
     payload: &[u8],
 ) -> u64 {
-    // Only `newos-init` (read-only status) and `newos-sshd` (full TCP stream) are authorized.
-    if badge == net_ipc::BADGE_INIT {
+    // Only `newos-supervisor-pd` (read-only status) and `newos-ssh-pd` (full TCP stream) are authorized.
+    if badge == net_ipc::BADGE_SUPERVISOR {
         if op == net_ipc::OP_POLL_STATUS {
             return encode_status(stack);
         }
         return 0;
     }
-    if badge != net_ipc::BADGE_SSHD {
+    if badge != net_ipc::BADGE_SSH {
         return 0;
     }
 
@@ -188,7 +269,7 @@ fn main() -> ! {
     else {
         let _ = writeln!(
             out,
-            "[netd] no NIC detected via BOOTSTRAP_NET_MMIO; exiting"
+            "[net-pd] no NIC detected via BOOTSTRAP_NET_MMIO; exiting"
         );
         out.flush();
         newos_user_rt::thread_exit();
@@ -197,7 +278,7 @@ fn main() -> ! {
     let mac = nic.mac();
     let _ = writeln!(
         out,
-        "[netd] online ({}, ipv4={}, ipv6={}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, tcp=:{} cntfrq={}Hz)",
+        "[net-pd] online ({}, ipv4={}, ipv6={}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, tcp=:{} cntfrq={}Hz)",
         nic.driver_name(),
         cfg!(feature = "ipv4"),
         cfg!(feature = "ipv6"),
@@ -229,7 +310,7 @@ fn main() -> ! {
                 serve_net_loop(stack, clock, &mut out)
             }
             Err(e) => {
-                let _ = writeln!(out, "[netd] virtio-net init failed: {e}");
+                let _ = writeln!(out, "[net-pd] virtio-net init failed: {e}");
                 out.flush();
                 newos_user_rt::thread_exit();
             }
@@ -248,7 +329,7 @@ fn main() -> ! {
                 serve_net_loop(stack, clock, &mut out)
             }
             Err(e) => {
-                let _ = writeln!(out, "[netd] rpi5-rp1-gem init failed: {e}");
+                let _ = writeln!(out, "[net-pd] rpi5-rp1-gem init failed: {e}");
                 out.flush();
                 newos_user_rt::thread_exit();
             }
@@ -260,6 +341,6 @@ fn main() -> ! {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    let _ = newos_user_rt::ipc_log_write(CapId::BOOTSTRAP_LOG_EP, "[netd] PANIC in EL0\n");
+    let _ = newos_user_rt::ipc_log_write(CapId::BOOTSTRAP_LOG_EP, "[net-pd] PANIC in EL0\n");
     newos_user_rt::thread_exit()
 }

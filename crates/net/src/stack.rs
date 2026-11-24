@@ -1,6 +1,6 @@
 //! Persistent EL0 `smoltcp` Network Stack (`NetStack`).
 //!
-//! Designed for `newos-netd` (PID 2): initializes the NIC once, maintains an automatic DHCPv4
+//! Designed for `newos-net-pd` (PD 2): initializes the NIC once, maintains an automatic DHCPv4
 //! lease (with `NetConfig::QEMU_DEFAULT` fallback), and serves a persistent single-connection
 //! TCP listener (port 22) with 32 KiB RX/TX ring buffers sized for ML-KEM-1024 + ML-DSA-87
 //! post-quantum SSH handshakes.
@@ -35,12 +35,15 @@ pub enum TcpEvent {
     Disconnected,
 }
 
-/// Static backing buffers owned by the caller (e.g., `newos-netd` main/BSS)
+/// Maximum concurrent sockets in `NetStackStorage` (DHCPv4 + multi-session TCP + DNS/ICMP).
+pub const MAX_SOCKETS: usize = 8;
+
+/// Static backing buffers owned by the caller (e.g., `newos-net-pd` main/BSS)
 /// and borrowed by [`NetStack`].
 pub struct NetStackStorage<'a> {
     pub tcp_rx_buf: [u8; TCP_BUF_SIZE],
     pub tcp_tx_buf: [u8; TCP_BUF_SIZE],
-    pub sockets: [SocketStorage<'a>; 2],
+    pub sockets: [SocketStorage<'a>; MAX_SOCKETS],
 }
 
 impl Default for NetStackStorage<'_> {
@@ -54,7 +57,7 @@ impl NetStackStorage<'_> {
         Self {
             tcp_rx_buf: [0u8; TCP_BUF_SIZE],
             tcp_tx_buf: [0u8; TCP_BUF_SIZE],
-            sockets: [SocketStorage::EMPTY, SocketStorage::EMPTY],
+            sockets: [SocketStorage::EMPTY; MAX_SOCKETS],
         }
     }
 }
@@ -201,6 +204,11 @@ impl<'a, D: Device> NetStack<'a, D> {
         }
     }
 
+    /// Access the underlying `NetDevice` (e.g. for hardware interrupt acknowledgement).
+    pub fn device(&self) -> &D {
+        &self.device
+    }
+
     /// Drive `smoltcp` RX/TX, DHCPv4 lease state (when `ipv4` is enabled), and automatic TCP re-listen.
     pub fn poll(&mut self, now_ms: i64) -> TcpEvent {
         let _ = self.iface.poll(
@@ -307,6 +315,14 @@ impl<'a, D: Device> NetStack<'a, D> {
     #[inline]
     pub fn config(&self) -> NetConfig {
         self.cfg
+    }
+
+    /// Return the recommended milliseconds until the next `smoltcp` timer event,
+    /// enabling `net-pd` to block in `NotifyWait` instead of busy-polling.
+    pub fn poll_delay_ms(&mut self, now_ms: i64) -> Option<u64> {
+        self.iface
+            .poll_delay(Instant::from_millis(now_ms), &self.sockets)
+            .map(|d| d.total_millis())
     }
 
     #[inline]

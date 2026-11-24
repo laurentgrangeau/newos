@@ -4,7 +4,7 @@
 //! Isolated EL0 Worker Process (`worker`).
 //!
 //! Runs in its own hardware `TTBR0_EL1` `VSpace` at the exact same virtual base (`0x400000`)
-//! as `init`, communicating solely via capability-checked microkernel `Endpoint` IPC.
+//! as `supervisor-pd`, communicating solely via capability-checked microkernel `Endpoint` IPC.
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -27,6 +27,10 @@ fn main() -> ! {
     loop {
         match newos_user_rt::ipc_reply_recv(CapId::BOOTSTRAP_EP, reply_payload, has_reply) {
             Ok((_badge, payload)) => {
+                if payload == 0xDEAD_C0DE {
+                    // Deliberate EL0 hardware fault used by Phase 2 chaos-respawn self-tests.
+                    newos_user_rt::trigger_user_fault();
+                }
                 reply_payload = payload.wrapping_add(1);
                 has_reply = true;
             }

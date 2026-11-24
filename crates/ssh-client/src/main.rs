@@ -102,7 +102,7 @@ fn cmd_keygen(path_arg: Option<&str>) -> Result<(), String> {
     println!("  Private seed (0600): {}", key_path.display());
     println!("  Public key:          {}", pub_path.display());
     println!(
-        "Add {} to authorized_keys.mldsa87 before building newos-keyd.",
+        "Add {} to authorized_keys.mldsa87 before building newos-key-pd.",
         pub_path.display()
     );
     Ok(())
@@ -153,7 +153,7 @@ fn cmd_connect(args: &[String]) -> Result<(), String> {
     if expected_fp_b64.is_none() && !allow_insecure_no_fp {
         return Err(
             "refusing unauthenticated connection: pass `--fingerprint SHA3-512:<base64>` \
-             (printed by newos-keyd at boot) or `--insecure-no-host-key-check`"
+             (printed by newos-key-pd at boot) or `--insecure-no-host-key-check`"
                 .to_string(),
         );
     }

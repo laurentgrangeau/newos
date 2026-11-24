@@ -33,8 +33,8 @@ const SESSION_COMMANDS: [&str; 14] = [
     "ref seal @demo",
     "objects | where size > 20",
     "refs | where writable == false",
-    "procs | where pid == 1 | count",
-    "procs",
+    "domains | where id == 1 | count",
+    "domains",
     "sys",
     "history",
 ];
@@ -325,7 +325,7 @@ impl ShellHost for BenchmarkHost {
         self.sys_info_syscalls += 1;
         SysInfo {
             online_cpus: 2,
-            proc_count: 2,
+            domain_count: 2,
             interactive_shell: false,
         }
     }
@@ -369,7 +369,7 @@ impl ShellHost for ReplBenchHost {
         self.sys_info_syscalls += 1;
         SysInfo {
             online_cpus: 2,
-            proc_count: 2,
+            domain_count: 2,
             interactive_shell: true,
         }
     }
@@ -403,7 +403,7 @@ impl ShellHost for ZeroSizedHost {
     fn sys_info(&mut self) -> SysInfo {
         SysInfo {
             online_cpus: 2,
-            proc_count: 2,
+            domain_count: 2,
             interactive_shell: false,
         }
     }
@@ -442,7 +442,7 @@ impl ShellHost for PingBenchHost {
     fn sys_info(&mut self) -> SysInfo {
         SysInfo {
             online_cpus: 2,
-            proc_count: 2,
+            domain_count: 2,
             interactive_shell: false,
         }
     }
@@ -514,7 +514,7 @@ fn bench_shell_pipeline_eval() -> f64 {
         b"another-structured-record-value-04",
         b"tiny5",
         b"capability-store-entry-number-06",
-        b"post-unix-pipeline-benchmark-blob-07",
+        b"typed-pipeline-benchmark-blob-07",
         b"final-seeded-object-for-where-clause-08",
     ];
     let ref_names = ["@r1", "@r2", "@r3", "@r4"];
@@ -528,7 +528,7 @@ fn bench_shell_pipeline_eval() -> f64 {
     let pipelines = [
         "objects | where size > 20 | first 8 | count",
         "refs | where writable == false | count",
-        "procs | where pid == 1 | count",
+        "domains | where id == 1 | count",
         "objects | where size >= 10 | where size <= 100 | first 4",
     ];
 
@@ -541,7 +541,7 @@ fn bench_shell_pipeline_eval() -> f64 {
                     Some(Record::Count(c)) => c as u64,
                     Some(Record::Object(m)) => m.hash.0,
                     Some(Record::Ref(m)) => m.target.0,
-                    Some(Record::Proc { pid, .. }) => pid,
+                    Some(Record::Domain { id, .. }) => id,
                     Some(Record::Metric { value, .. }) => value,
                     None => 0,
                 };

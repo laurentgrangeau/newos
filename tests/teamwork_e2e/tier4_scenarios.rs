@@ -27,7 +27,7 @@ fn t4_scenario1_full_multicommand_shell_session() {
     let session = [
         "help",
         "sys",
-        "procs | where pid == 1 | count",
+        "domains | where id == 1 | count",
         "put \"config v1\" | save @cfg",
         "put \"config v2\" | save @cfg",
         "put \"temp orphan\"",
@@ -90,7 +90,7 @@ fn t4_scenario2_multiprocess_microkernel_simulation() {
 
     for idx in 0..3usize {
         let pid = idx + 1;
-        ipc.init_worker_bootstrap_caps(pid).unwrap();
+        ipc.init_worker_pd_bootstrap_caps(pid).unwrap();
         let (_, cnode_cap) = ipc.register_child_caps_in_root(pid).unwrap();
         worker_cnodes[idx] = cnode_cap;
 
@@ -324,8 +324,8 @@ fn t4_scenario5_full_workspace_safety_and_unsafe_budget_audit() {
         ("kernel-core", "crates/kernel-core/src/lib.rs"),
         ("kernel", "crates/kernel/src/main.rs"),
         ("shell-core", "crates/shell-core/src/lib.rs"),
-        ("init", "crates/init/src/main.rs"),
-        ("worker", "crates/worker/src/main.rs"),
+        ("supervisor-pd", "crates/supervisor-pd/src/main.rs"),
+        ("worker-pd", "crates/worker-pd/src/main.rs"),
         ("net", "crates/net/src/lib.rs"),
         ("bench", "crates/bench/src/main.rs"),
     ] {
@@ -439,9 +439,9 @@ fn t4_scenario6_deterministic_adversarial_fuzz_stress_1024() {
         "save @motd",
         "objects",
         "refs",
-        "procs",
+        "domains",
         "where size > 10",
-        "where pid == 1",
+        "where id == 1",
         "where badfield != 0",
         "where size > nope",
         "first 2",
@@ -552,7 +552,7 @@ fn t4_scenario6_deterministic_adversarial_fuzz_stress_1024() {
     let (notif, ep, _) = ipc
         .init_bootstrap_caps(Some((PhysAddr::new(0x0A00_0000), 0x200)))
         .unwrap();
-    ipc.init_worker_bootstrap_caps(1).unwrap();
+    ipc.init_worker_pd_bootstrap_caps(1).unwrap();
     let (_, cnode1) = ipc.register_child_caps_in_root(1).unwrap();
 
     for _ in 0..1024usize {

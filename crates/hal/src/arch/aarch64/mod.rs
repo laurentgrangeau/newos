@@ -13,7 +13,7 @@ use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use newos_abi::{ShutdownStatus, SysError, cpu_isa};
 use newos_kernel_core::memory::{CpuSecurityFeatures, PhysAddr, UntypedInventory, VirtAddr};
-use newos_kernel_core::{BootInfo, HalPlatform, ProcessRole};
+use newos_kernel_core::{BootInfo, DomainRole, HalPlatform};
 
 const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
@@ -358,17 +358,80 @@ global_asm!(
     "ldp x0,  x1,  [x0, #0]",
     "eret",
     "__newos_unhandled_el1:",
-    "b __newos_unhandled_el1",
+    "adrp x9, {emerg_stack}",
+    "add x9, x9, :lo12:{emerg_stack}",
+    "add sp, x9, #4096",
+    "mrs x0, esr_el1",
+    "mrs x1, elr_el1",
+    "mrs x2, far_el1",
+    "mrs x3, spsr_el1",
+    "bl {unhandled_el1}",
+    "1: wfi",
+    "b 1b",
     sync_el1 = sym aarch64_sync_el1_handler,
     irq_el1 = sym aarch64_irq_el1_handler,
     sync_el0 = sym syscall::sync_el0_dispatch,
     irq_el0 = sym syscall::irq_el0_dispatch,
+    unhandled_el1 = sym aarch64_unhandled_el1_handler,
+    emerg_stack = sym EL1_EMERGENCY_STACK,
 );
+
+/// Static 4 KiB emergency stack used exclusively by `__newos_unhandled_el1` so an EL1
+/// stack overflow into a guard page prints diagnostics instead of double-faulting.
+#[repr(C, align(16))]
+struct EmergencyStack([u8; 4096]);
+
+static EL1_EMERGENCY_STACK: EmergencyStack = EmergencyStack([0; 4096]);
+
+/// Per-CPU top-of-stack virtual addresses for guarded 32 KiB EL1 stacks (4 KiB unmapped guard below).
+static EL1_GUARDED_STACK_TOPS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Return the top-of-stack VA for `cpu_id`'s guarded EL1 stack (or `0` if not mapped).
+#[inline]
+pub fn guarded_el1_stack_top(cpu_id: usize) -> u64 {
+    if cpu_id < EL1_GUARDED_STACK_TOPS.len() {
+        EL1_GUARDED_STACK_TOPS[cpu_id].load(Ordering::Acquire)
+    } else {
+        0
+    }
+}
+
+/// Pivot `SP_EL1` to `new_sp` and branch directly to diverging `target`.
+///
+/// # Safety
+/// `new_sp` must be 16-byte aligned and point to the top of a valid, writable EL1 stack.
+pub unsafe fn pivot_sp_and_jump(new_sp: u64, target: extern "C" fn() -> !) -> ! {
+    // SAFETY: Caller guarantees `new_sp` is valid and `target` never returns.
+    unsafe {
+        asm!(
+            "mov sp, {sp}",
+            "br {target}",
+            sp = in(reg) new_sp,
+            target = in(reg) target,
+            options(noreturn),
+        );
+    }
+}
 
 // SAFETY: `__newos_aarch64_vectors` is defined by the `global_asm!` block above as a
 // 2 KiB-aligned EL1 exception vector table.
 unsafe extern "C" {
     static __newos_aarch64_vectors: u8;
+}
+
+extern "C" fn aarch64_unhandled_el1_handler(esr: u64, elr: u64, far: u64, spsr: u64) -> ! {
+    let mut s = serial::UnlockedPl011;
+    let _ = writeln!(
+        s,
+        "[newos-hal] FATAL unhandled EL1 exception ESR={:#018x} ELR={:#018x} FAR={:#018x} SPSR={:#018x}",
+        esr, elr, far, spsr
+    );
+    system_off(ShutdownStatus::Failed)
 }
 
 extern "C" fn aarch64_irq_el1_handler() {
@@ -378,12 +441,18 @@ extern "C" fn aarch64_irq_el1_handler() {
             smp::record_ap_sgi_ack();
         } else if irq_id == gic::virt_timer_irq() {
             // Mask and disable the virtual timer so an idle core in EL1 never enters a
-            // continuous timer-IRQ storm (`P9`), and record the tick for the boot self-check (`H5`).
+            // continuous timer-IRQ storm (`P9`), record the tick for boot self-check (`H5`),
+            // and wake any threads whose `SleepUntil` / `NotifyWait` deadline has expired.
             // SAFETY: Disabling `CNTV_CTL_EL0` (`IMASK=1, ENABLE=0`) in EL1 IRQ context.
             unsafe {
                 asm!("msr cntv_ctl_el0, {}", "isb", in(reg) 2u64, options(nomem, nostack));
             }
             TIMER_COUNT.fetch_add(1, Ordering::Release);
+            syscall::wake_expired_timers();
+        } else if (32..1020).contains(&irq_id) {
+            // Route external SPIs arriving while in EL1 (e.g., idle `wfi` or inside a syscall)
+            // through the exact same mask+signal path as EL0 IRQs so edge IRQs are never dropped.
+            syscall::dispatch_peripheral_spi(irq_id);
         }
         gic::end_of_interrupt(iar);
     }
@@ -410,7 +479,7 @@ extern "C" fn aarch64_sync_el1_handler() {
         return;
     }
 
-    let mut s = serial::Pl011::new();
+    let mut s = serial::UnlockedPl011;
     let _ = writeln!(
         s,
         "[newos-hal] FATAL AArch64 EL1 sync exception EC={:#x} ISS={:#x} ELR={:#018x}",
@@ -467,7 +536,7 @@ pub fn system_off(code: ShutdownStatus) -> ! {
             }
         }
     }
-    let mut s = serial::Pl011::new();
+    let mut s = serial::UnlockedPl011;
     let psci_fn = match code {
         ShutdownStatus::Success => {
             let _ = writeln!(s, "[newos-aarch64] PSCI SYSTEM_OFF (status=OK)");
@@ -731,7 +800,46 @@ impl Aarch64Platform {
     pub fn init(info: &mut BootInfo) -> Self {
         use newos_kernel_core::memory::{PageFlags, PhysFrame, VSpaceMapper};
         let board = crate::board::select_board(info.qemu_virt);
+        if info.hhdm_offset == 0 {
+            let mut s = serial::UnlockedPl011;
+            let _ = writeln!(
+                s,
+                "[newos-hal] FATAL: Limine HHDM offset is 0; halting via PSCI"
+            );
+            system_off(ShutdownStatus::Failed);
+        }
         let mut vspace = paging::Aarch64VSpace::from_current_ttbr1(info.hhdm_offset);
+
+        // Allocate per-CPU guarded 32 KiB EL1 kernel stacks in `TTBR1_EL1` with an unmapped
+        // 4 KiB guard page directly below each core's stack.
+        const KERNEL_STACK_BASE: u64 = 0xffff_b010_0000_0000;
+        const KERNEL_GUARD_BYTES: u64 = 4096;
+        const KERNEL_STACK_PAGES: u64 = 8;
+        const KERNEL_STACK_STRIDE: u64 = KERNEL_GUARD_BYTES + KERNEL_STACK_PAGES * 4096;
+        if let Ok(stack_flags) = PageFlags::new_wx(true, false, false, false) {
+            for cpu in 0..EL1_GUARDED_STACK_TOPS.len() {
+                let base = KERNEL_STACK_BASE + (cpu as u64) * KERNEL_STACK_STRIDE;
+                let mut ok = true;
+                for p in 0..KERNEL_STACK_PAGES {
+                    let va = base + KERNEL_GUARD_BYTES + p * 4096;
+                    let mapped = VirtAddr::new_page_aligned(va)
+                        .and_then(|v| {
+                            info.untyped
+                                .retype_frame()
+                                .and_then(|fr| vspace.map_4k(v, fr, stack_flags, &mut info.untyped))
+                        })
+                        .is_ok();
+                    if !mapped {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    EL1_GUARDED_STACK_TOPS[cpu]
+                        .store(base + KERNEL_STACK_STRIDE, Ordering::Release);
+                }
+            }
+        }
 
         // Discover hardware dynamically from ACPI (FADT/SPCR/MADT/GTDT/MCFG) when enabled,
         // falling back to the active `BoardDescriptor`.
@@ -811,7 +919,12 @@ impl Aarch64Platform {
                     )
                 };
                 if magic == VIRTIO_MAGIC && dev_id == VIRTIO_DEV_NET {
-                    found = Some((PhysAddr::new(net_mmio_phys + off), base_va, SLOT_STRIDE));
+                    found = Some((
+                        PhysAddr::new(net_mmio_phys + off),
+                        base_va,
+                        SLOT_STRIDE,
+                        Some(crate::board::IrqLine::gic(48 + slot as u16)),
+                    ));
                     break;
                 }
             }
@@ -821,8 +934,11 @@ impl Aarch64Platform {
                 PhysAddr::new(net_mmio_phys),
                 NET_MMIO_VIRT,
                 NET_MMIO_PAGES * 4096,
+                board.net_irq,
             ))
         };
+        let net_irq = net_mmio.and_then(|(_, _, _, irq)| irq);
+        let net_mmio = net_mmio.map(|(pa, va, len, _)| (pa, va, len));
 
         // Map capability-scoped Hardware RNG MMIO window (Device-nGnRnE):
         // - Raspberry Pi 5 (BCM2712 `iproc-rng200`): `0x10_7D20_8000` (scoped to `0x28` bytes)
@@ -849,7 +965,12 @@ impl Aarch64Platform {
                         )
                     };
                     if magic == VIRTIO_MAGIC && dev_id == VIRTIO_DEV_RNG {
-                        found = Some((PhysAddr::new(net_mmio_phys + off), base_va, SLOT_STRIDE));
+                        found = Some((
+                            PhysAddr::new(net_mmio_phys + off),
+                            base_va,
+                            SLOT_STRIDE,
+                            Some(crate::board::IrqLine::gic(48 + slot as u16)),
+                        ));
                         break;
                     }
                 }
@@ -863,7 +984,7 @@ impl Aarch64Platform {
                 .is_ok()
         {
             // Optionally mix 64 bits of hardware TRNG into `ENTROPY_STATE` for EL0 ASLR
-            // before handing `BOOTSTRAP_RNG_MMIO` exclusively to `newos-keyd`.
+            // before handing `BOOTSTRAP_RNG_MMIO` exclusively to `newos-key-pd`.
             // SAFETY: `RNG_MMIO_VIRT` was just mapped as Device-nGnRnE to BCM2712 `iproc-rng200`.
             unsafe {
                 let ctrl = RNG_MMIO_VIRT as *mut u32;
@@ -884,10 +1005,14 @@ impl Aarch64Platform {
                 PhysAddr::new(RPI5_RNG200_PHYS),
                 RNG_MMIO_VIRT,
                 RPI5_RNG200_LEN,
+                board.rng_irq,
             ))
         } else {
             None
         };
+        let rng_irq = rng_mmio.and_then(|(_, _, _, irq)| irq);
+        let rng_mmio = rng_mmio.map(|(pa, va, len, _)| (pa, va, len));
+        syscall::register_board_irqs(net_irq, rng_irq, board.uart_irq);
 
         // Map GICv2 / GIC-400 Distributor & CPU Interface (ACPI MADT -> board descriptor fallback):
         const GICD_VIRT: u64 = 0xffff_b002_0000_0000;
@@ -947,10 +1072,10 @@ impl Aarch64Platform {
             rng_mmio,
             wdt_mmio,
             info.qemu_virt,
-            info.netd_module.is_some(),
+            info.net_module.is_some(),
         );
 
-        // Map Raspberry Pi 5 Phase 2 board peripherals (Device-nGnRnE) and grant capabilities to `init`:
+        // Map Raspberry Pi 5 board peripherals (Device-nGnRnE) and grant capabilities to `init`:
         // - Slot 19 (`BOOTSTRAP_GPIO_MMIO`): RP1 IO_BANK0 / RIO0 / PADS_BANK0 (40-pin GPIO 0..=27)
         // - Slot 20 (`BOOTSTRAP_MBOX_MMIO`): BCM2712 VideoCore Property Mailbox (`0x10_7C01_3000`)
         // - Slot 21 (`BOOTSTRAP_THERMAL_MMIO`): BCM2712 AVS TMON Thermal Sensor (`0x10_7D5D_2000`)
@@ -1031,7 +1156,7 @@ impl Aarch64Platform {
                 syscall::register_init_mmio_cap(22, PhysAddr::new(RP1_UART0_PHYS), 0x1000);
             }
 
-            // Phase 3: BCM2712 MIP MSI-X (`0x10_0013_0000`), microSD SDHCI (`0x10_00ff_f000`),
+            // BCM2712 MIP MSI-X (`0x10_0013_0000`), microSD SDHCI (`0x10_00ff_f000`),
             // RP1 dual xHCI USB 3.0 (`0x1f_0020_0000` / `0x1f_0030_0000`), and PCIe ECAM.
             const RPI5_MIP_PHYS: u64 = 0x10_0013_0000;
             const RPI5_MIP_VIRT: u64 = 0xffff_b00b_0000_0000;
@@ -1086,7 +1211,7 @@ impl Aarch64Platform {
 
             // PCIe ECAM and BCM2712 IOMMU are intentionally kept kernel-owned (`P4`):
             // never hand raw PCIe configuration space or IOMMU registers to EL0 `init`.
-            // Phase 4: VideoCore VII V3D 7.1 (`0x10_0200_0000` Hub + `0x10_0200_8000` Core 0).
+            // VideoCore VII V3D 7.1 (`0x10_0200_0000` Hub + `0x10_0200_8000` Core 0).
             const RPI5_V3D_PHYS: u64 = 0x10_0200_0000;
             const RPI5_V3D_LEN: u64 = 0x9000;
             const RPI5_V3D_VIRT: u64 = 0xffff_b010_0000_0000;
@@ -1177,6 +1302,15 @@ impl Write for Aarch64Platform {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.serial.write_str(s)
     }
+}
+
+pub(super) fn next_aslr_entropy() -> u64 {
+    let mut x =
+        ENTROPY_STATE.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed) ^ syscall::read_cntvct();
+    // SplitMix64 finalizer for uniform ASLR slide distribution
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
 }
 
 impl HalPlatform for Aarch64Platform {
@@ -1285,15 +1419,15 @@ impl HalPlatform for Aarch64Platform {
         paging::probe_mapped_u64(&self.vspace, virt, pattern)
     }
 
-    fn register_user_process(
+    fn register_domain(
         &mut self,
-        role: ProcessRole,
+        role: DomainRole,
         entry: VirtAddr,
         user_sp: VirtAddr,
         user_shadow_sp: VirtAddr,
         vspace_root: PhysAddr,
     ) -> Result<usize, SysError> {
-        syscall::register_user_process(
+        syscall::register_domain(
             role,
             entry.raw(),
             user_sp.raw(),
@@ -1302,11 +1436,24 @@ impl HalPlatform for Aarch64Platform {
         )
     }
 
+    fn register_boot_module(&mut self, role: DomainRole, elf_bytes: &'static [u8]) {
+        syscall::register_boot_module(role, elf_bytes);
+    }
+
     fn install_runtime_untyped(&mut self, untyped: UntypedInventory) {
         syscall::set_untyped_inventory(untyped);
     }
 
     fn start_userspace(&mut self) -> ! {
+        let top = guarded_el1_stack_top(0);
+        if top != 0 {
+            extern "C" fn bsp_userspace_trampoline() -> ! {
+                syscall::start_userspace()
+            }
+            // SAFETY: `top` is a 16-byte-aligned 32 KiB mapped stack with an unmapped 4 KiB
+            // guard page beneath it, and `bsp_userspace_trampoline` never returns.
+            unsafe { pivot_sp_and_jump(top, bsp_userspace_trampoline) }
+        }
         syscall::start_userspace()
     }
 

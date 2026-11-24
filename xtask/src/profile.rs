@@ -18,13 +18,13 @@ pub struct BuildProfile {
     pub elf_attestation: bool,
     pub acpi: bool,
 
-    // [userspace]
-    pub init: bool,
+    // [domains]
+    pub supervisor: bool,
     pub worker: bool,
     pub shell: bool,
-    pub netd: bool,
-    pub keyd: bool,
-    pub sshd: bool,
+    pub net: bool,
+    pub key: bool,
+    pub ssh: bool,
 
     // [net]
     pub net_enabled: bool,
@@ -62,12 +62,12 @@ impl BuildProfile {
             userspace: true,
             elf_attestation: true,
             acpi: true,
-            init: true,
+            supervisor: true,
             worker: true,
             shell: true,
-            netd: true,
-            keyd: true,
-            sshd: true,
+            net: true,
+            key: true,
+            ssh: true,
             net_enabled: true,
             ipv4: true,
             ipv6: true,
@@ -142,12 +142,12 @@ impl BuildProfile {
                 ("kernel", "elf_attestation") => p.elf_attestation = parse_bool(val, line_no)?,
                 ("kernel", "acpi") => p.acpi = parse_bool(val, line_no)?,
 
-                ("userspace", "init") => p.init = parse_bool(val, line_no)?,
-                ("userspace", "worker") => p.worker = parse_bool(val, line_no)?,
-                ("userspace", "shell") => p.shell = parse_bool(val, line_no)?,
-                ("userspace", "netd") => p.netd = parse_bool(val, line_no)?,
-                ("userspace", "keyd") => p.keyd = parse_bool(val, line_no)?,
-                ("userspace", "sshd") => p.sshd = parse_bool(val, line_no)?,
+                ("domains", "supervisor") => p.supervisor = parse_bool(val, line_no)?,
+                ("domains", "worker") => p.worker = parse_bool(val, line_no)?,
+                ("domains", "shell") => p.shell = parse_bool(val, line_no)?,
+                ("domains", "net") => p.net = parse_bool(val, line_no)?,
+                ("domains", "key") => p.key = parse_bool(val, line_no)?,
+                ("domains", "ssh") => p.ssh = parse_bool(val, line_no)?,
 
                 ("net", "enabled") => p.net_enabled = parse_bool(val, line_no)?,
                 ("net", "ipv4") => p.ipv4 = parse_bool(val, line_no)?,
@@ -200,29 +200,29 @@ impl BuildProfile {
                 }
                 "--no-smp" => self.smp = false,
                 "--no-acpi" => self.acpi = false,
-                "--no-userspace" => {
+                "--no-domains" => {
                     self.userspace = false;
-                    self.init = false;
+                    self.supervisor = false;
                     self.worker = false;
                     self.shell = false;
-                    self.netd = false;
-                    self.keyd = false;
-                    self.sshd = false;
+                    self.net = false;
+                    self.key = false;
+                    self.ssh = false;
                 }
                 "--no-shell" => {
                     self.shell = false;
-                    self.sshd = false;
+                    self.ssh = false;
                 }
                 "--no-net" => {
                     self.net_enabled = false;
                     self.ipv4 = false;
                     self.ipv6 = false;
-                    self.netd = false;
-                    self.sshd = false;
+                    self.net = false;
+                    self.ssh = false;
                 }
                 "--no-ssh" => {
-                    self.sshd = false;
-                    self.keyd = false;
+                    self.ssh = false;
+                    self.key = false;
                 }
                 "--ipv4-only" => {
                     self.net_enabled = true;
@@ -237,8 +237,8 @@ impl BuildProfile {
                 "--no-crypto" => {
                     self.crypto_algorithms.clear();
                     self.elf_attestation = false;
-                    self.keyd = false;
-                    self.sshd = false;
+                    self.key = false;
+                    self.ssh = false;
                     self.storage_drivers.retain(|d| d != "caos-snapshot");
                     self.rng_drivers.retain(|d| d != "csprng");
                 }
@@ -273,19 +273,21 @@ impl BuildProfile {
             ));
         }
         if !self.userspace
-            && (self.init || self.worker || self.shell || self.netd || self.keyd || self.sshd)
+            && (self.supervisor || self.worker || self.shell || self.net || self.key || self.ssh)
         {
             return Err(
-                "Profile error: userspace daemons enabled while `[kernel].userspace = false`"
+                "Profile error: EL0 protection domains enabled while `[kernel].userspace = false`"
                     .into(),
             );
         }
-        if self.shell && !self.init {
-            return Err("Profile error: `[userspace].shell = true` requires `init = true`".into());
-        }
-        if self.netd && (!self.net_enabled || (!self.ipv4 && !self.ipv6)) {
+        if self.shell && !self.supervisor {
             return Err(
-                "Profile error: `[userspace].netd = true` requires `[net].enabled = true` and at least one of `ipv4` or `ipv6`"
+                "Profile error: `[domains].shell = true` requires `supervisor = true`".into(),
+            );
+        }
+        if self.net && (!self.net_enabled || (!self.ipv4 && !self.ipv6)) {
+            return Err(
+                "Profile error: `[domains].net = true` requires `[net].enabled = true` and at least one of `ipv4` or `ipv6`"
                     .into(),
             );
         }
@@ -295,23 +297,23 @@ impl BuildProfile {
                     .into(),
             );
         }
-        if self.keyd && !(self.has_crypto("sha3") && self.has_crypto("ml-dsa-87")) {
+        if self.key && !(self.has_crypto("sha3") && self.has_crypto("ml-dsa-87")) {
             return Err(
-                "Profile error: `[userspace].keyd = true` requires `sha3` and `ml-dsa-87` in `[crypto].algorithms`"
+                "Profile error: `[domains].key = true` requires `sha3` and `ml-dsa-87` in `[crypto].algorithms`"
                     .into(),
             );
         }
-        if self.sshd {
-            if !self.netd || !self.keyd || !self.shell {
+        if self.ssh {
+            if !self.net || !self.key || !self.shell {
                 return Err(
-                    "Profile error: `[userspace].sshd = true` requires `netd`, `keyd`, and `shell`"
+                    "Profile error: `[domains].ssh = true` requires `net`, `key`, and `shell`"
                         .into(),
                 );
             }
             for req in ["sha3", "chacha20-poly1305", "ml-kem-1024", "ml-dsa-87"] {
                 if !self.has_crypto(req) {
                     return Err(format!(
-                        "Profile error: `[userspace].sshd = true` requires `{req}` in `[crypto].algorithms`"
+                        "Profile error: `[domains].ssh = true` requires `{req}` in `[crypto].algorithms`"
                     ));
                 }
             }
@@ -359,8 +361,8 @@ impl BuildProfile {
         feats
     }
 
-    /// Resolve Cargo `--features` list for `newos-init` (`--no-default-features`).
-    pub fn init_features(&self) -> Vec<String> {
+    /// Resolve Cargo `--features` list for `newos-supervisor-pd` (`--no-default-features`).
+    pub fn supervisor_features(&self) -> Vec<String> {
         let mut feats = Vec::new();
         if self.shell {
             feats.push("shell".into());
@@ -374,17 +376,20 @@ impl BuildProfile {
                 feats.push("ipv6".into());
             }
         }
-        if self.sshd {
+        if self.ssh {
             feats.push("ssh".into());
         }
         if self.worker {
             feats.push("worker-supervisor".into());
         }
+        if !self.wdt_drivers.is_empty() {
+            feats.push("wdt".into());
+        }
         feats
     }
 
-    /// Resolve Cargo `--features` list for `newos-netd` (`--no-default-features`).
-    pub fn netd_features(&self) -> Vec<String> {
+    /// Resolve Cargo `--features` list for `newos-net-pd` (`--no-default-features`).
+    pub fn net_pd_features(&self) -> Vec<String> {
         let mut feats = Vec::new();
         if self.ipv4 {
             feats.push("ipv4".into());
@@ -432,16 +437,16 @@ impl BuildProfile {
             "  newos-kernel features: {}",
             self.kernel_features().join(",")
         );
-        let _ = writeln!(out, "Userspace (EL0):");
+        let _ = writeln!(out, "Protection Domains (EL0):");
         let _ = writeln!(
             out,
-            "  INIT=[{}]  WORKER=[{}]  SHELL=[{}]  NETD=[{}]  KEYD=[{}]  SSHD=[{}]",
-            yn(self.init),
+            "  SUPERVISOR=[{}]  WORKER=[{}]  SHELL=[{}]  NET=[{}]  KEY=[{}]  SSH=[{}]",
+            yn(self.supervisor),
             yn(self.worker),
             yn(self.shell),
-            yn(self.netd),
-            yn(self.keyd),
-            yn(self.sshd)
+            yn(self.net),
+            yn(self.key),
+            yn(self.ssh)
         );
         let _ = writeln!(out, "Networking:");
         let _ = writeln!(
@@ -488,13 +493,13 @@ NewOS Profile Options Reference (profiles/*.toml)
   elf_attestation   bool       true | false  (depends on crypto: sha3)
   acpi              bool       true | false
 
-[userspace]
-  init              bool       true | false  (depends on kernel.userspace)
+[domains]
+  supervisor        bool       true | false  (depends on kernel.userspace)
   worker            bool       true | false  (depends on kernel.userspace)
-  shell             bool       true | false  (depends on userspace.init)
-  netd              bool       true | false  (depends on net.enabled + ipv4|ipv6)
-  keyd              bool       true | false  (depends on crypto: sha3, ml-dsa-87)
-  sshd              bool       true | false  (depends on netd, keyd, shell, all 4 PQ crypto)
+  shell             bool       true | false  (depends on domains.supervisor)
+  net               bool       true | false  (depends on net.enabled + ipv4|ipv6)
+  key               bool       true | false  (depends on crypto: sha3, ml-dsa-87)
+  ssh               bool       true | false  (depends on net, key, shell, all 4 PQ crypto)
 
 [net]
   enabled           bool       true | false
@@ -586,7 +591,7 @@ mod tests {
             .to_path_buf();
         let profiles = [
             "profiles/tinykernel.toml",
-            "profiles/minimal-init.toml",
+            "profiles/minimal-supervisor.toml",
             "profiles/rpi5-net.toml",
             "profiles/rpi5-full.toml",
             "profiles/qemu-virt-full.toml",
@@ -627,7 +632,7 @@ mod tests {
         p2.validate()
             .expect("--no-crypto override must leave valid profile");
         assert!(p2.crypto_algorithms.is_empty());
-        assert!(!p2.sshd && !p2.keyd && !p2.elf_attestation);
+        assert!(!p2.ssh && !p2.key && !p2.elf_attestation);
 
         let mut p3 = BuildProfile::default_full("rpi5");
         p3.apply_cli_overrides(&["--ipv6-only".into()]).unwrap();

@@ -59,7 +59,7 @@ impl MockShellHost {
             sys_info_calls: 0,
             sys_info_val: SysInfo {
                 online_cpus: 4,
-                proc_count: 2,
+                domain_count: 2,
                 interactive_shell: true,
             },
             ipc_call_calls: 0,
@@ -199,7 +199,7 @@ impl ShellHost for DefaultIpcFallbackHost {
     fn sys_info(&mut self) -> SysInfo {
         SysInfo {
             online_cpus: 2,
-            proc_count: 2,
+            domain_count: 2,
             interactive_shell: false,
         }
     }

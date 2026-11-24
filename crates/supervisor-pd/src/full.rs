@@ -1,5 +1,5 @@
-//! EL0 Root Task (`init`), Crash Supervisor, Content-Addressed Object Store (CAOS),
-//! and Typed Pipeline Shell (`newos-sh`).
+//! EL0 Root Task (`supervisor-pd`), Crash Supervisor, Content-Addressed Object Store (CAOS),
+//! and Typed Pipeline Shell (`newos-shell-pd`).
 //!
 
 use core::fmt::Write;
@@ -40,8 +40,8 @@ impl MmioDmaTransport for CapMmioDmaTransport {
 }
 
 /// EL0 `ShellHost` adapter connecting `newos-shell-core` to `newos-user-rt`, `newos-net`,
-/// and the `newos-keyd`-gated `newos-sshd` interactive shell channel.
-struct InitShellHost {
+/// and the `newos-key-pd`-gated `newos-ssh-pd` interactive shell channel.
+struct SupervisorShellHost {
     net_cfg: Option<NetConfig>,
     cached_nic: Option<Option<NicKind>>,
     log_rx: IpcLogAssembler<256>,
@@ -51,7 +51,7 @@ struct InitShellHost {
     ssh_rx_len: usize,
 }
 
-impl InitShellHost {
+impl SupervisorShellHost {
     const fn new() -> Self {
         Self::with_log_rx(IpcLogAssembler::new())
     }
@@ -68,11 +68,11 @@ impl InitShellHost {
         }
     }
 
-    /// Poll `CapId::BOOTSTRAP_AUTH_GATE_EP` (`newos-keyd` PID 3 write-only -> `init` read-only)
-    /// to open/close the SSH shell channel strictly on `keyd`'s ML-DSA-87 verification.
+    /// Poll `CapId::BOOTSTRAP_AUTH_GATE_EP` (`newos-key-pd` PD 3 write-only -> `supervisor-pd` read-only)
+    /// to open/close the SSH shell channel strictly on `key-pd`'s ML-DSA-87 verification.
     fn poll_ssh_auth_gate(&mut self) {
         while let Ok((badge, word)) = newos_user_rt::ipc_recv(CapId::BOOTSTRAP_AUTH_GATE_EP) {
-            if badge != newos_abi::auth_gate_ipc::BADGE_KEYD {
+            if badge != newos_abi::auth_gate_ipc::BADGE_KEY {
                 continue;
             }
             match word {
@@ -316,7 +316,7 @@ impl InitShellHost {
     }
 }
 
-impl ShellHost for InitShellHost {
+impl ShellHost for SupervisorShellHost {
     fn write_debug(&mut self, s: &str) {
         let _ = newos_user_rt::debug_write_all(s);
         if self.ssh_session_authorized {
@@ -339,7 +339,7 @@ impl ShellHost for InitShellHost {
         let info = newos_user_rt::sys_info();
         SysInfo {
             online_cpus: info.online_cpus,
-            proc_count: info.proc_count,
+            domain_count: info.domain_count,
             interactive_shell: info.interactive_shell,
         }
     }
@@ -357,7 +357,7 @@ impl ShellHost for InitShellHost {
                 return Ok(b);
             }
             if let Ok((badge, word)) = newos_user_rt::ipc_recv(CapId::BOOTSTRAP_SSH_SHELL_EP)
-                && badge == newos_abi::key_ipc::BADGE_SSHD
+                && badge == newos_abi::key_ipc::BADGE_SSH
             {
                 let (bytes, n) = newos_abi::log_ipc::decode_chunk(word);
                 if n > 0 {
@@ -426,7 +426,7 @@ impl ShellHost for InitShellHost {
 
 /// EL0 supervisor fault-recovery entry point.
 ///
-/// Re-entrancy invariant: `init` is single-threaded. On any EL0 hardware fault (including a
+/// Re-entrancy invariant: `supervisor-pd` is single-threaded. On any EL0 hardware fault (including a
 /// subsequent fault inside a recovered interactive shell), the kernel discards the faulted
 /// context and resets `SP_EL0` to the 16-byte-aligned top of the 64 KiB
 /// `SUPERVISOR_RECOVERY_STACK` before entering `supervisor_recover`. No stack growth occurs
@@ -440,23 +440,23 @@ extern "C" fn supervisor_recover() -> ! {
             if info.interactive_shell {
                 let _ = writeln!(
                     out,
-                    "[init-supervisor] recovered from EL0 fault (bits={:#x}) — restarting `newos-sh`!",
+                    "[init-supervisor] recovered from EL0 fault (bits={:#x}) — restarting `newos-shell-pd`!",
                     bits
                 );
                 out.flush();
                 let _ = newos_user_rt::set_fault_handler(supervisor_recover);
-                let mut sh = Shell::new(InitShellHost::new());
+                let mut sh = Shell::new(SupervisorShellHost::new());
                 sh.run_interactive()
             } else if bits == (1 << 6) {
                 let _ = writeln!(
                     out,
-                    "[init] phase-6 EL0 crash isolation & supervisor recovery: OK (fault_bits={:#x})",
+                    "[supervisor-pd] EL0 fault isolation & supervisor recovery: OK (fault_bits={:#x})",
                     bits
                 );
                 out.flush();
                 newos_user_rt::exit(ShutdownStatus::Success)
             } else {
-                let _ = writeln!(out, "[init] FAIL: unexpected fault bits {bits:#x}");
+                let _ = writeln!(out, "[supervisor-pd] FAIL: unexpected fault bits {bits:#x}");
                 out.flush();
                 newos_user_rt::exit(ShutdownStatus::Failed)
             }
@@ -464,7 +464,7 @@ extern "C" fn supervisor_recover() -> ! {
         other => {
             let _ = writeln!(
                 out,
-                "[init] FAIL: unexpected fault notification bits: {other:?}"
+                "[supervisor-pd] FAIL: unexpected fault notification bits: {other:?}"
             );
             out.flush();
             newos_user_rt::exit(ShutdownStatus::Failed)
@@ -474,30 +474,151 @@ extern "C" fn supervisor_recover() -> ! {
 
 /// Drain `worker`'s startup log line over `CapId::BOOTSTRAP_LOG_EP` as the sole console owner.
 ///
-/// Prints any complete daemon lines that arrive concurrently and waits until `worker` (PID 1,
-/// kernel-stamped badge `1`) finishes its boot line so `init` does not block on `BOOTSTRAP_EP`
-/// while `worker` is still writing to `BOOTSTRAP_LOG_EP`. Bounded by `MAX_BOOT_LOG_YIELDS` so
-/// `init` cannot hang forever if `worker` fails to start or `BOOTSTRAP_LOG_EP` is revoked.
+/// Prints any complete protection domain lines that arrive concurrently and waits until `worker` (verified
+/// via its kernel-stamped `role_badge::ROLE_WORKER` tag, independent of PD) finishes its boot
+/// line so `supervisor-pd` does not block on `BOOTSTRAP_EP` while `worker` is still writing to
+/// `BOOTSTRAP_LOG_EP`. Bounded by `MAX_BOOT_LOG_YIELDS` so `supervisor-pd` cannot hang forever if
+/// `worker` fails to start or `BOOTSTRAP_LOG_EP` is revoked.
 fn drain_worker_boot_log<const N: usize>(
     log_rx: &mut IpcLogAssembler<256>,
     out: &mut BufferedConsole<N>,
 ) {
-    const WORKER_BADGE: u64 = 1;
     const MAX_BOOT_LOG_YIELDS: usize = 10_000;
     let mut line_buf = [0u8; 256];
     for _ in 0..MAX_BOOT_LOG_YIELDS {
         while let Some((badge, n)) = log_rx.poll_line(CapId::BOOTSTRAP_LOG_EP, &mut line_buf) {
+            let role = newos_abi::role_badge::decode_log_role(badge);
+            let pid = newos_abi::role_badge::decode_log_pd_id(badge);
+            let role_name = newos_abi::role_badge::role_name(role);
             if let Ok(line) = core::str::from_utf8(&line_buf[..n]) {
-                // Stamp with kernel-verified sender badge so no daemon can forge another's prefix (`N17`).
-                let _ = writeln!(out, "[pid={badge}] {line}");
+                // Stamp with kernel-verified sender role + diagnostic PD so no protection domain can forge
+                // another's prefix (`N17`).
+                let _ = writeln!(out, "[{role_name} pid={pid}] {line}");
                 out.flush();
             }
-            if badge == WORKER_BADGE {
+            if role == newos_abi::role_badge::ROLE_WORKER {
                 return;
             }
         }
         if newos_user_rt::yield_now().is_err() {
             return;
+        }
+    }
+}
+
+#[cfg(feature = "wdt")]
+struct CapWdtTransport;
+
+#[cfg(feature = "wdt")]
+impl newos_wdt::WdtTransport for CapWdtTransport {
+    fn read32(&self, offset: u64) -> Result<u32, SysError> {
+        newos_user_rt::mmio_read32(CapId::BOOTSTRAP_WDT_MMIO, offset)
+    }
+
+    fn write32(&self, offset: u64, val: u32) -> Result<(), SysError> {
+        newos_user_rt::mmio_write32(CapId::BOOTSTRAP_WDT_MMIO, offset, val)
+    }
+}
+
+/// Interactive-mode minimal Root Supervisor loop (PD 0).
+///
+/// Arms the Raspberry Pi 5 `Bcm2712Watchdog` (8,000 ms timeout) when `BOOTSTRAP_WDT_MMIO` is
+/// provisioned and `wdt` feature is enabled, pets it every 2,000 ms, and listens on
+/// `BOOTSTRAP_FAULT_NOTIF` via `NotifyWait` to inspect and respawn crashed permanent protection domains
+/// (`Shell`, `Net`, `Key`, `Ssh`) with exponential backoff and restart-intensity limits.
+fn run_root_supervisor(out: &mut BufferedConsole<1024>) -> ! {
+    #[cfg(feature = "wdt")]
+    let (wdt, wdt_armed) = {
+        let mut wdt = newos_wdt::Bcm2712Watchdog::new(CapWdtTransport);
+        let armed = wdt.arm(8_000).is_ok();
+        if armed {
+            let _ = writeln!(
+                out,
+                "[supervisor] BCM2712 hardware watchdog armed (8000 ms)"
+            );
+            out.flush();
+        }
+        (wdt, armed)
+    };
+
+    const MAX_ROLES: usize = 6;
+    const MAX_RESTARTS_IN_WINDOW: u32 = 5;
+    let mut restart_counts = [0u32; MAX_ROLES];
+    let mut backoff_ms = [10u64; MAX_ROLES];
+    let mut window_start_cycles = [0u64; MAX_ROLES];
+    let freq = newos_user_rt::timer_freq_hz().max(1);
+    let window_ticks = freq.saturating_mul(10); // 10 s intensity window
+
+    loop {
+        match newos_user_rt::notify_wait(CapId::BOOTSTRAP_FAULT_NOTIF, 0xFF, 2_000_000_000) {
+            Ok((bits, _timed_out)) => {
+                #[cfg(feature = "wdt")]
+                if wdt_armed {
+                    let _ = wdt.pet();
+                }
+                if bits == 0 {
+                    continue;
+                }
+                for pid in 1..8usize {
+                    if (bits & (1u64 << pid)) == 0 {
+                        continue;
+                    }
+                    let Ok((role, esr, elr)) = newos_user_rt::domain_get_fault_info(pid) else {
+                        continue;
+                    };
+                    let _ = writeln!(
+                        out,
+                        "[supervisor] isolated fault pid={pid} role={role:?} ESR={esr:#x} ELR={elr:#018x}"
+                    );
+                    out.flush();
+                    let is_permanent = matches!(
+                        role,
+                        newos_abi::DomainRoleId::Shell
+                            | newos_abi::DomainRoleId::Net
+                            | newos_abi::DomainRoleId::Key
+                            | newos_abi::DomainRoleId::Ssh
+                    );
+                    if !is_permanent {
+                        continue;
+                    }
+                    let idx = (role as usize).min(MAX_ROLES - 1);
+                    let now = newos_user_rt::read_cycles().unwrap_or(0);
+                    if now.saturating_sub(window_start_cycles[idx]) > window_ticks {
+                        window_start_cycles[idx] = now;
+                        restart_counts[idx] = 0;
+                        backoff_ms[idx] = 10;
+                    }
+                    if restart_counts[idx] >= MAX_RESTARTS_IN_WINDOW {
+                        let _ = writeln!(
+                            out,
+                            "[supervisor] circuit-breaker tripped for {role:?} (>= {MAX_RESTARTS_IN_WINDOW} crashes/10s)"
+                        );
+                        out.flush();
+                        continue;
+                    }
+                    let delay = backoff_ms[idx];
+                    let _ = newos_user_rt::sleep_ms(delay);
+                    backoff_ms[idx] = (delay.saturating_mul(2)).min(1_000);
+                    restart_counts[idx] += 1;
+                    match newos_user_rt::domain_respawn(role) {
+                        Ok(new_pid) => {
+                            let _ = writeln!(
+                                out,
+                                "[supervisor] respawned {role:?} as pid={new_pid} (backoff={delay}ms)"
+                            );
+                            out.flush();
+                        }
+                        Err(e) => {
+                            let _ =
+                                writeln!(out, "[supervisor] respawn failed for {role:?}: {e:?}");
+                            out.flush();
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                let _ = newos_user_rt::sleep_ms(50);
+            }
         }
     }
 }
@@ -509,20 +630,19 @@ pub fn main() -> ! {
     let _ = newos_user_rt::set_fault_handler(supervisor_recover);
 
     if info.interactive_shell {
-        if info.proc_count > 1 {
-            drain_worker_boot_log(&mut log_rx, &mut out);
-            // Deterministic readiness handshake so `worker` is in its IPC loop before prompt.
-            let _ = newos_user_rt::ipc_call(CapId::BOOTSTRAP_EP, 0x5245_4144);
-        }
-        let mut sh = Shell::new(InitShellHost::with_log_rx(log_rx));
-        sh.run_interactive()
+        // Standalone `newos-shell-pd` runs in its own isolated EL0 process; PD 0 serves as the
+        // minimal root supervisor + hardware watchdog loop.
+        run_root_supervisor(&mut out)
     }
 
     // Automated self-test mode (`cargo xtask test`)
-    let _ = writeln!(out, "[init] hello from EL0 (isolated TTBR0_EL1 VSpace)!");
+    let _ = writeln!(
+        out,
+        "[supervisor-pd] hello from EL0 (isolated TTBR0_EL1 VSpace)!"
+    );
     out.flush();
 
-    if info.proc_count > 1 {
+    if info.domain_count > 1 {
         drain_worker_boot_log(&mut log_rx, &mut out);
     }
 
@@ -530,13 +650,13 @@ pub fn main() -> ! {
     const PING_PAYLOAD: u64 = 0xA110_C0DE;
     if newos_user_rt::ipc_call(CapId::BOOTSTRAP_EP, PING_PAYLOAD) != Ok((0x5E14, PING_PAYLOAD + 1))
     {
-        let _ = writeln!(out, "[init] FAIL: missing IPC reply from worker");
+        let _ = writeln!(out, "[supervisor-pd] FAIL: missing IPC reply from worker");
         out.flush();
         newos_user_rt::exit(ShutdownStatus::Failed);
     }
     let _ = writeln!(
         out,
-        "[init] multi-process isolated TTBR0_EL1 IPC ping-pong with `worker`: OK"
+        "[supervisor-pd] multi-process isolated TTBR0_EL1 IPC ping-pong with `worker`: OK"
     );
 
     // 64-bit Notification coalescing + userspace SpscRing check
@@ -545,7 +665,10 @@ pub fn main() -> ! {
         || newos_user_rt::notify_poll(CapId::BOOTSTRAP_NOTIF) != Ok(0b101)
         || newos_user_rt::notify_poll(CapId::BOOTSTRAP_NOTIF) != Ok(0)
     {
-        let _ = writeln!(out, "[init] FAIL: Notification capability check failed");
+        let _ = writeln!(
+            out,
+            "[supervisor-pd] FAIL: Notification capability check failed"
+        );
         out.flush();
         newos_user_rt::exit(ShutdownStatus::Failed);
     }
@@ -557,7 +680,7 @@ pub fn main() -> ! {
         *slot = (i as u64) * 7;
     }
     if ring.try_push_slice(&tx_batch) != RING_BURST {
-        let _ = writeln!(out, "[init] FAIL: SpscRing batch push failed");
+        let _ = writeln!(out, "[supervisor-pd] FAIL: SpscRing batch push failed");
         out.flush();
         newos_user_rt::exit(ShutdownStatus::Failed);
     }
@@ -567,7 +690,10 @@ pub fn main() -> ! {
         || ring.try_pop_slice(&mut rx_batch) != RING_BURST
         || rx_batch != tx_batch
     {
-        let _ = writeln!(out, "[init] FAIL: SpscRing batch pop/notify mismatch");
+        let _ = writeln!(
+            out,
+            "[supervisor-pd] FAIL: SpscRing batch pop/notify mismatch"
+        );
         out.flush();
         newos_user_rt::exit(ShutdownStatus::Failed);
     }
@@ -582,22 +708,22 @@ pub fn main() -> ! {
     let avg_cycles = t1.saturating_sub(t0) / (ROUNDTRIPS * 2);
     let _ = writeln!(
         out,
-        "[init] phase-5 IPC, Notification & TTBR0 switch self-check: OK (~{avg_cycles} cycles/TTBR0-switch)"
+        "[supervisor-pd] IPC, notifications & TTBR0 switch: OK (~{avg_cycles} cycles/TTBR0-switch)"
     );
 
-    // EL0 CAOS + Typed Pipeline Shell (`newos-sh`) self-check
-    let mut sh = Shell::new(InitShellHost::new());
+    // EL0 CAOS + Typed Pipeline Shell (`newos-shell-pd`) self-check
+    let mut sh = Shell::new(SupervisorShellHost::new());
     if let Err(msg) = sh.run_self_test() {
         let _ = writeln!(
             out,
-            "[init] FAIL: EL0 CAOS & typed pipeline self-check: {msg}"
+            "[supervisor-pd] FAIL: EL0 CAOS & typed pipeline self-check: {msg}"
         );
         out.flush();
         newos_user_rt::exit(ShutdownStatus::Failed);
     }
     let _ = writeln!(
         out,
-        "[init] EL0 CAOS (dedup/rollback/seal) & typed `|` pipeline self-check: OK"
+        "[supervisor-pd] EL0 CAOS (dedup/rollback/seal) & typed `|` pipeline self-check: OK"
     );
 
     // EL0 Networking: capability-scoped NIC (Pi 5 RP1 GEM or QEMU VirtIO-net) + live DHCPv4 + ICMP ping
@@ -613,7 +739,7 @@ pub fn main() -> ! {
                 let dns = leased.dns.unwrap_or([0; 4]);
                 let _ = writeln!(
                     out,
-                    "[init] EL0 LIVE DHCPv4 ({}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}): ip={}.{}.{}.{}/{}, gw={}.{}.{}.{}, dns={}.{}.{}.{}",
+                    "[supervisor-pd] EL0 LIVE DHCPv4 ({}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}): ip={}.{}.{}.{}/{}, gw={}.{}.{}.{}, dns={}.{}.{}.{}",
                     nic.driver_name(),
                     mac[0],
                     mac[1],
@@ -638,7 +764,7 @@ pub fn main() -> ! {
                 leased
             }
             Err(msg) => {
-                let _ = writeln!(out, "[init] FAIL: live DHCPv4 lease: {msg}");
+                let _ = writeln!(out, "[supervisor-pd] FAIL: live DHCPv4 lease: {msg}");
                 out.flush();
                 newos_user_rt::exit(ShutdownStatus::Failed);
             }
@@ -658,7 +784,7 @@ pub fn main() -> ! {
             Ok(res) => {
                 let _ = writeln!(
                     out,
-                    "[init] EL0 LIVE ICMP ping {}.{}.{}.{} ({}): OK (seq={})",
+                    "[supervisor-pd] EL0 LIVE ICMP ping {}.{}.{}.{} ({}): OK (seq={})",
                     res.target[0],
                     res.target[1],
                     res.target[2],
@@ -668,7 +794,7 @@ pub fn main() -> ! {
                 );
             }
             Err(msg) => {
-                let _ = writeln!(out, "[init] FAIL: live ICMP ping: {msg}");
+                let _ = writeln!(out, "[supervisor-pd] FAIL: live ICMP ping: {msg}");
                 out.flush();
                 newos_user_rt::exit(ShutdownStatus::Failed);
             }
@@ -678,11 +804,11 @@ pub fn main() -> ! {
             Ok(frame_len) => {
                 let _ = writeln!(
                     out,
-                    "[init] EL0 smoltcp IPv4/UDP stack ({frame_len}B Ethernet frame): OK"
+                    "[supervisor-pd] EL0 smoltcp IPv4/UDP stack ({frame_len}B Ethernet frame): OK"
                 );
             }
             Err(msg) => {
-                let _ = writeln!(out, "[init] FAIL: EL0 smoltcp stack check: {msg}");
+                let _ = writeln!(out, "[supervisor-pd] FAIL: EL0 smoltcp stack check: {msg}");
                 out.flush();
                 newos_user_rt::exit(ShutdownStatus::Failed);
             }
@@ -691,15 +817,249 @@ pub fn main() -> ! {
 
     // Unauthorized MMIO capability rejection
     if newos_user_rt::mmio_read32(CapId::NULL, 0) != Err(SysError::InvalidCapability) {
-        let _ = writeln!(out, "[init] FAIL: unauthorized MMIO read was not rejected");
+        let _ = writeln!(
+            out,
+            "[supervisor-pd] FAIL: unauthorized MMIO read was not rejected"
+        );
         out.flush();
         newos_user_rt::exit(ShutdownStatus::Failed);
+    }
+
+    // Phase 1 EL1 hardening & blocking event primitives self-test:
+    // 1. NotifyWait: zero-mask rejection, partial-mask fastpath, timeout wakeup, preserved bits.
+    if newos_user_rt::notify_wait(CapId::BOOTSTRAP_NOTIF, 0, 0) != Err(SysError::InvalidArgument) {
+        let _ = writeln!(
+            out,
+            "[supervisor-pd] FAIL: NotifyWait(mask=0) was not rejected"
+        );
+        out.flush();
+        newos_user_rt::exit(ShutdownStatus::Failed);
+    }
+    let _ = newos_user_rt::notify_poll(CapId::BOOTSTRAP_NOTIF);
+    if newos_user_rt::notify_signal(CapId::BOOTSTRAP_NOTIF, 0b1010_0101).is_err()
+        || newos_user_rt::notify_wait(CapId::BOOTSTRAP_NOTIF, 0b0000_1111, 0)
+            != Ok((0b0000_0101, false))
+        || newos_user_rt::notify_wait(CapId::BOOTSTRAP_NOTIF, 0b0000_1111, 5_000_000)
+            != Ok((0, true))
+        || newos_user_rt::notify_wait(CapId::BOOTSTRAP_NOTIF, 0b1111_0000, 0)
+            != Ok((0b1010_0000, false))
+    {
+        let _ = writeln!(
+            out,
+            "[supervisor-pd] FAIL: NotifyWait fastpath/timeout/preserve check"
+        );
+        out.flush();
+        newos_user_rt::exit(ShutdownStatus::Failed);
+    }
+    // 2. SleepUntil / sleep_ms: immediate past deadline + timed sleep across idle WFI.
+    let t0 = newos_user_rt::read_cycles().unwrap_or(0);
+    let freq = newos_user_rt::timer_freq_hz().max(1);
+    let min_ticks = (freq / 100).max(1); // 10 ms
+    if newos_user_rt::sleep_until(0).is_err()
+        || newos_user_rt::sleep_ms(10).is_err()
+        || newos_user_rt::read_cycles().unwrap_or(0).saturating_sub(t0) < min_ticks
+    {
+        let _ = writeln!(
+            out,
+            "[supervisor-pd] FAIL: SleepUntil/sleep_ms deadline check"
+        );
+        out.flush();
+        newos_user_rt::exit(ShutdownStatus::Failed);
+    }
+    // 3. IrqBind / IrqAck: validation, binding, duplicate rejection, and ack.
+    if newos_user_rt::irq_bind(
+        CapId::NULL,
+        CapId::BOOTSTRAP_NOTIF,
+        0,
+        newos_abi::IrqTriggerMode::LevelHigh,
+    ) != Err(SysError::InvalidCapability)
+        || newos_user_rt::irq_bind(
+            CapId::BOOTSTRAP_UART_IRQ,
+            CapId::BOOTSTRAP_NOTIF,
+            64,
+            newos_abi::IrqTriggerMode::LevelHigh,
+        ) != Err(SysError::InvalidArgument)
+        || newos_user_rt::irq_bind(
+            CapId::BOOTSTRAP_UART_IRQ,
+            CapId::BOOTSTRAP_NOTIF,
+            1,
+            newos_abi::IrqTriggerMode::LevelHigh,
+        )
+        .is_err()
+        || newos_user_rt::irq_bind(
+            CapId::BOOTSTRAP_UART_IRQ,
+            CapId::BOOTSTRAP_NOTIF,
+            1,
+            newos_abi::IrqTriggerMode::LevelHigh,
+        ) != Err(SysError::SlotOccupied)
+        || newos_user_rt::irq_ack(CapId::BOOTSTRAP_UART_IRQ).is_err()
+    {
+        let _ = writeln!(out, "[supervisor-pd] FAIL: IrqBind/IrqAck check");
+        out.flush();
+        newos_user_rt::exit(ShutdownStatus::Failed);
+    }
+    // 4. MmioMap: unaligned VA, invalid cap, and sub-page shared MMIO rejection.
+    if newos_user_rt::mmio_map(CapId::BOOTSTRAP_VSPACE, CapId::BOOTSTRAP_NET_MMIO, 0x1234)
+        != Err(SysError::InvalidArgument)
+        || newos_user_rt::mmio_map(CapId::BOOTSTRAP_VSPACE, CapId::NULL, 0x2000_0000)
+            != Err(SysError::InvalidCapability)
+    {
+        let _ = writeln!(out, "[supervisor-pd] FAIL: MmioMap validation check");
+        out.flush();
+        newos_user_rt::exit(ShutdownStatus::Failed);
+    }
+    let _ = writeln!(
+        out,
+        "[supervisor-pd] Phase 1 EL1 primitives (NotifyWait, SleepUntil, IrqBind/IrqAck, MmioMap): OK"
+    );
+
+    // Phase 2 Chaos Respawn & Zero-Leak Reclamation self-test:
+    // Deliberately crash `worker` twice via `udf #0` (`0xDEAD_C0DE`), verify fault notification +
+    // `DomainGetFaultInfo`, verify `DomainRespawn` restores IPC service, and prove exact 0-frame leak.
+    let _ = newos_user_rt::notify_poll(CapId::BOOTSTRAP_FAULT_NOTIF);
+    let mut rem_after_cycle = [0u64; 2];
+    for cycle in 0..2usize {
+        if newos_user_rt::ipc_call(CapId::BOOTSTRAP_EP, 0xDEAD_C0DE)
+            != Err(SysError::InvalidCapability)
+        {
+            let _ = writeln!(
+                out,
+                "[supervisor-pd] FAIL: Phase 2 worker crash trigger (cycle={cycle})"
+            );
+            out.flush();
+            newos_user_rt::exit(ShutdownStatus::Failed);
+        }
+        if newos_user_rt::notify_wait(CapId::BOOTSTRAP_FAULT_NOTIF, 1 << 1, 1_000_000_000)
+            != Ok((1 << 1, false))
+        {
+            let _ = writeln!(
+                out,
+                "[supervisor-pd] FAIL: Phase 2 fault NotifyWait (cycle={cycle})"
+            );
+            out.flush();
+            newos_user_rt::exit(ShutdownStatus::Failed);
+        }
+        match newos_user_rt::domain_get_fault_info(1) {
+            Ok((newos_abi::DomainRoleId::Worker, esr, _elr)) if (esr >> 26) == 0 => {}
+            other => {
+                let _ = writeln!(
+                    out,
+                    "[supervisor-pd] FAIL: Phase 2 DomainGetFaultInfo mismatch (cycle={cycle}): {other:?}"
+                );
+                out.flush();
+                newos_user_rt::exit(ShutdownStatus::Failed);
+            }
+        }
+        let (rem_frames, reclaimed_len) = match newos_user_rt::mem_stats() {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(out, "[supervisor-pd] FAIL: Phase 2 MemStats error: {e:?}");
+                out.flush();
+                newos_user_rt::exit(ShutdownStatus::Failed);
+            }
+        };
+        if reclaimed_len == 0 {
+            let _ = writeln!(
+                out,
+                "[supervisor-pd] FAIL: Phase 2 expected reclaimed frames > 0"
+            );
+            out.flush();
+            newos_user_rt::exit(ShutdownStatus::Failed);
+        }
+        rem_after_cycle[cycle] = rem_frames;
+        if newos_user_rt::domain_respawn(newos_abi::DomainRoleId::Worker) != Ok(1) {
+            let _ = writeln!(
+                out,
+                "[supervisor-pd] FAIL: Phase 2 DomainRespawn(Worker) (cycle={cycle})"
+            );
+            out.flush();
+            newos_user_rt::exit(ShutdownStatus::Failed);
+        }
+        drain_worker_boot_log(&mut log_rx, &mut out);
+        let probe = 0xBEEF_0001u64 + cycle as u64;
+        if newos_user_rt::ipc_call(CapId::BOOTSTRAP_EP, probe) != Ok((0x5E14, probe + 1)) {
+            let _ = writeln!(
+                out,
+                "[supervisor-pd] FAIL: Phase 2 respawned worker IPC check (cycle={cycle})"
+            );
+            out.flush();
+            newos_user_rt::exit(ShutdownStatus::Failed);
+        }
+    }
+    if rem_after_cycle[0] != rem_after_cycle[1] {
+        let _ = writeln!(
+            out,
+            "[supervisor-pd] FAIL: Phase 2 frame leak across respawn cycles ({} != {})",
+            rem_after_cycle[0], rem_after_cycle[1]
+        );
+        out.flush();
+        newos_user_rt::exit(ShutdownStatus::Failed);
+    }
+    let _ = writeln!(
+        out,
+        "[supervisor-pd] Phase 2 chaos respawn & zero-leak reclamation (2 cycles, remaining_frames={}): OK",
+        rem_after_cycle[1]
+    );
+
+    // Phase 3a On-Target AArch64 Cycle & Tail-Latency Benchmark Suite (256 samples each):
+    // Measures real EL0<->EL1<->EL0 IpcCall round-trip, NotifySignal+NotifyWait fastpath,
+    // and shared-memory SpscRing 4 KiB framed byte burst on AArch64 CNTVCT_EL0.
+    {
+        const SAMPLES: usize = 256;
+        let mut ipc_samples = [0u64; SAMPLES];
+        for (i, slot) in ipc_samples.iter_mut().enumerate() {
+            let t0 = newos_user_rt::read_cycles().unwrap_or(0);
+            let _ = newos_user_rt::ipc_call(CapId::BOOTSTRAP_EP, 0x3A00_0000 + i as u64);
+            let t1 = newos_user_rt::read_cycles().unwrap_or(0);
+            *slot = t1.saturating_sub(t0);
+        }
+        ipc_samples.sort_unstable();
+        let ipc_p50 = ipc_samples[SAMPLES / 2];
+        let ipc_p99 = ipc_samples[(SAMPLES * 99) / 100];
+        let ipc_p999 = ipc_samples[(SAMPLES * 999) / 1000];
+        let ipc_max = ipc_samples[SAMPLES - 1];
+
+        let _ = newos_user_rt::notify_poll(CapId::BOOTSTRAP_NOTIF);
+        let mut notif_samples = [0u64; SAMPLES];
+        for slot in &mut notif_samples {
+            let t0 = newos_user_rt::read_cycles().unwrap_or(0);
+            let _ = newos_user_rt::notify_signal(CapId::BOOTSTRAP_NOTIF, 1);
+            let _ = newos_user_rt::notify_wait(CapId::BOOTSTRAP_NOTIF, 1, 0);
+            let t1 = newos_user_rt::read_cycles().unwrap_or(0);
+            *slot = t1.saturating_sub(t0);
+        }
+        notif_samples.sort_unstable();
+        let notif_p50 = notif_samples[SAMPLES / 2];
+        let notif_p99 = notif_samples[(SAMPLES * 99) / 100];
+        let notif_p999 = notif_samples[(SAMPLES * 999) / 1000];
+        let notif_max = notif_samples[SAMPLES - 1];
+
+        let ring = newos_abi::ring::SpscRing::<64>::new();
+        let src = [0x5Au8; 256];
+        let mut dst = [0u8; 256];
+        let t0 = newos_user_rt::read_cycles().unwrap_or(0);
+        for _ in 0..16usize {
+            // 16 x 256 B = 4 KiB framed SpscRing burst (zero syscalls in data path)
+            if ring.try_push_bytes(&src) != Ok(256) || ring.try_pop_bytes(&mut dst) != Some(256) {
+                let _ = writeln!(
+                    out,
+                    "[supervisor-pd] FAIL: Phase 3a SpscRing byte burst check"
+                );
+                out.flush();
+                newos_user_rt::exit(ShutdownStatus::Failed);
+            }
+        }
+        let ring_4k_cycles = newos_user_rt::read_cycles().unwrap_or(0).saturating_sub(t0);
+        let _ = writeln!(
+            out,
+            "[bench-aarch64] IpcCall(ticks): p50={ipc_p50} p99={ipc_p99} p99.9={ipc_p999} max={ipc_max} | NotifyWait(ticks): p50={notif_p50} p99={notif_p99} p99.9={notif_p999} max={notif_max} | SpscRing-4KiB(ticks): {ring_4k_cycles} (0 syscalls)"
+        );
     }
 
     // Deliberate EL0 hardware fault (`udf #0`) -> supervisor recovery
     let _ = writeln!(
         out,
-        "[init] triggering deliberate EL0 hardware fault (`udf #0`) to verify crash isolation..."
+        "[supervisor-pd] triggering deliberate EL0 hardware fault (`udf #0`) to verify crash isolation..."
     );
     out.flush();
     newos_user_rt::trigger_user_fault()

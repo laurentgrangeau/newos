@@ -1,6 +1,6 @@
 //! QEMU `aarch64` `virt` machine board descriptor (test & emulation harness).
 
-use super::{BoardDescriptor, MmioRegion};
+use super::{BoardDescriptor, IrqLine, MmioRegion};
 
 pub const QEMU_VIRT_AARCH64: BoardDescriptor = BoardDescriptor {
     name: "qemu-virt-test",
@@ -13,4 +13,7 @@ pub const QEMU_VIRT_AARCH64: BoardDescriptor = BoardDescriptor {
     net_mmio: Some(MmioRegion::new(0x0A00_0000, 4 * 4096)),
     rng_mmio: Some(MmioRegion::new(0x0A00_0000, 4 * 4096)),
     wdt_mmio: None,
+    net_irq: None,
+    rng_irq: None,
+    uart_irq: Some(IrqLine::gic(33)),
 };

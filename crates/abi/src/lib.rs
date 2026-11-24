@@ -1,12 +1,12 @@
 #![no_std]
 
-//! Shared ABI contract between the microkernel (EL1) and EL0 userspace.
+//! Shared ABI contract between the microkernel (EL1) and EL0 protection domains.
 
 pub mod ring;
 #[cfg(feature = "sha3")]
 pub use newos_crypto::sha3;
 
-/// Unforgeable handle indexing a slot inside a process's capability space (`CSpace`).
+/// Unforgeable handle indexing a slot inside a protection domain's capability space (`CSpace`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct CapId(pub u64);
@@ -15,10 +15,10 @@ impl CapId {
     /// Sentinel representing an empty / null capability slot.
     pub const NULL: Self = Self(0);
 
-    /// Well-known bootstrap `Notification` capability installed in `init`'s CSpace (slot 1, gen 1).
+    /// Well-known bootstrap `Notification` capability installed in `supervisor-pd`'s CSpace (slot 1, gen 1).
     pub const BOOTSTRAP_NOTIF: Self = Self((1u64 << 32) | 1);
 
-    /// Well-known bootstrap `Endpoint` capability installed in `init`'s CSpace (slot 2, gen 1).
+    /// Well-known bootstrap `Endpoint` capability installed in `supervisor-pd`'s CSpace (slot 2, gen 1).
     pub const BOOTSTRAP_EP: Self = Self((1u64 << 32) | 2);
 
     /// Well-known bootstrap Fault `Notification` capability (slot 3, gen 1) signaled on EL0 faults.
@@ -47,34 +47,34 @@ impl CapId {
 
     /// Well-known bootstrap Console Log `Endpoint` capability (slot 11, gen 1).
     ///
-    /// PID 0 (`init`, console owner) holds `Rights::ALL`; non-root processes (`pid >= 1`)
-    /// hold write-only (`Rights::WRITE`) with an immutable kernel-stamped `badge = pid as u64`.
+    /// PD 0 (`supervisor-pd`, console owner) holds `Rights::ALL`; non-supervisor protection domains
+    /// (`pd_id >= 1`) hold write-only (`Rights::WRITE`) with an immutable kernel-stamped badge.
     pub const BOOTSTRAP_LOG_EP: Self = Self((1u64 << 32) | 11);
 
     /// Well-known bootstrap Hardware RNG MMIO capability (slot 12, gen 1), exclusively owned
-    /// by `newos-keyd` (BCM2712 RNG200 on Raspberry Pi 5 or VirtIO-RNG slot on QEMU).
+    /// by `newos-key-pd` (BCM2712 RNG200 on Raspberry Pi 5 or VirtIO-RNG slot on QEMU).
     pub const BOOTSTRAP_RNG_MMIO: Self = Self((1u64 << 32) | 12);
 
     /// Well-known bootstrap Network Data-Plane `Endpoint` capability (slot 13, gen 1)
-    /// connecting `newos-netd` (server) to `newos-sshd` (badge 4) and `newos-init` (badge 0x1000).
+    /// connecting `newos-net-pd` to `newos-ssh-pd` and `newos-supervisor-pd`.
     pub const BOOTSTRAP_NET_EP: Self = Self((1u64 << 32) | 13);
 
     /// Well-known bootstrap Cryptographic Vault `Endpoint` capability (slot 14, gen 1)
-    /// connecting `newos-keyd` (server) exclusively to `newos-sshd` (badge 4).
+    /// connecting `newos-key-pd` exclusively to `newos-ssh-pd`.
     pub const BOOTSTRAP_KEY_EP: Self = Self((1u64 << 32) | 14);
 
     /// Well-known bootstrap SSH Shell input `Endpoint` capability (slot 15, gen 1):
-    /// unidirectional `newos-sshd` (`Rights::WRITE`, badge 4) -> `newos-init` (`Rights::READ`),
+    /// unidirectional `newos-ssh-pd` (`Rights::WRITE`) -> `newos-supervisor-pd` (`Rights::READ`),
     /// gated by `BOOTSTRAP_AUTH_GATE_EP`.
     pub const BOOTSTRAP_SSH_SHELL_EP: Self = Self((1u64 << 32) | 15);
 
     /// Well-known bootstrap Cryptographic Auth-Gate `Endpoint` capability (slot 16, gen 1).
-    /// `newos-keyd` holds write-only (`Rights::WRITE`, badge 3); `newos-init` holds read-only
-    /// (`Rights::READ`). `newos-sshd` explicitly does NOT hold this capability.
+    /// `newos-key-pd` holds write-only (`Rights::WRITE`); `newos-supervisor-pd` holds read-only
+    /// (`Rights::READ`). `newos-ssh-pd` explicitly does NOT hold this capability.
     pub const BOOTSTRAP_AUTH_GATE_EP: Self = Self((1u64 << 32) | 16);
 
     /// Well-known bootstrap SSH Shell output `Endpoint` capability (slot 17, gen 1):
-    /// unidirectional `newos-init` (`Rights::WRITE`) -> `newos-sshd` (`Rights::READ`, badge 4).
+    /// unidirectional `newos-supervisor-pd` (`Rights::WRITE`) -> `newos-ssh-pd` (`Rights::READ`).
     pub const BOOTSTRAP_SSH_OUT_EP: Self = Self((1u64 << 32) | 17);
 
     /// Well-known bootstrap Hardware Watchdog MMIO capability (slot 18, gen 1),
@@ -118,6 +118,30 @@ impl CapId {
 
     /// Well-known bootstrap BCM2712 IOMMU (`brcm,bcm2712-iommu`) MMIO capability (slot 29, gen 1, `0x10_0000_5000`).
     pub const BOOTSTRAP_IOMMU_MMIO: Self = Self((1u64 << 32) | 29);
+
+    /// Well-known bootstrap network controller `IrqHandler` capability (slot 30, gen 1).
+    pub const BOOTSTRAP_NET_IRQ: Self = Self((1u64 << 32) | 30);
+
+    /// Well-known bootstrap hardware RNG `IrqHandler` capability (slot 31, gen 1).
+    pub const BOOTSTRAP_RNG_IRQ: Self = Self((1u64 << 32) | 31);
+
+    /// Well-known bootstrap console UART `IrqHandler` capability (slot 32, gen 1).
+    pub const BOOTSTRAP_UART_IRQ: Self = Self((1u64 << 32) | 32);
+
+    /// Well-known bootstrap `net-pd` event `Notification` capability (slot 33, gen 1).
+    pub const BOOTSTRAP_NET_NOTIF: Self = Self((1u64 << 32) | 33);
+
+    /// Well-known bootstrap `ssh-pd` event `Notification` capability (slot 34, gen 1).
+    pub const BOOTSTRAP_SSH_NOTIF: Self = Self((1u64 << 32) | 34);
+
+    /// Well-known bootstrap `key-pd` event `Notification` capability (slot 35, gen 1).
+    pub const BOOTSTRAP_KEY_NOTIF: Self = Self((1u64 << 32) | 35);
+
+    /// Well-known bootstrap shared-memory `Frame` capability for `net-pd` <-> `ssh-pd` `SpscRing` (slot 36, gen 1).
+    pub const BOOTSTRAP_NET_SSH_RING: Self = Self((1u64 << 32) | 36);
+
+    /// Well-known bootstrap shared-memory `Frame` capability for `ssh-pd` <-> `key-pd` `SpscRing` (slot 37, gen 1).
+    pub const BOOTSTRAP_SSH_KEY_RING: Self = Self((1u64 << 32) | 37);
 
     #[inline]
     pub const fn new(raw: u64) -> Self {
@@ -259,7 +283,7 @@ pub enum SyscallNumber {
     MmioRead32 = 10,
     /// Non-blocking 1-byte read from the early debug serial console: `(console_cap)` (`Rights::READ`).
     DebugRead = 11,
-    /// Read packed system info `(power_cap)` (`Rights::READ`) -> `(interactive << 32) | (proc_count << 16) | online_cpus`.
+    /// Read packed system info `(power_cap)` (`Rights::READ`) -> `(interactive << 32) | (domain_count << 16) | online_cpus`.
     SysInfo = 12,
     /// Capability-scoped 32-bit MMIO write `(mmio_cap_id, byte_offset, value)` for EL0 drivers.
     MmioWrite32 = 13,
@@ -306,6 +330,30 @@ pub enum SyscallNumber {
     DmaCacheOp = 31,
     /// Read probed ARMv8.2-A Cortex-A76 ISA feature bitmask & cache/PA geometry: `(power_cap)` (`Rights::READ`).
     CpuFeatures = 32,
+    /// Block until `(notif_word & mask) != 0` or `timeout_ns` elapses (`0` = wait forever):
+    /// `(notif_cap, mask, timeout_ns)` -> `(x0 = 0, x1 = matched_bits, x2 = flags)`.
+    NotifyWait = 33,
+    /// Bind an `IrqHandler` cap (`Rights::WRITE`) to a `Notification` cap (`Rights::WRITE`):
+    /// `(irq_cap, notif_cap, badge_bit_index, trigger_mode)` -> `0`.
+    IrqBind = 34,
+    /// Sleep until `CNTVCT_EL0 >= deadline_ticks` (returns `0` immediately if already reached):
+    /// `(deadline_ticks)` -> `0`.
+    SleepUntil = 35,
+    /// Map a page-aligned, page-isolated `MmioRegion` cap into `vspace_cap` (`Rights::WRITE`)
+    /// with `Device-nGnRnE` + `UXN` + `PXN`: `(vspace_cap, mmio_cap, vaddr)` -> mapped byte length.
+    MmioMap = 36,
+    /// Respawn an exited/crashed EL0 protection domain from its immutable boot module with fresh ASLR:
+    /// `(power_cap, role_discriminant)` (`Rights::WRITE` on `power_cap`) -> `new_pd_id`.
+    DomainRespawn = 37,
+    /// Terminate and tear down a non-supervisor EL0 protection domain via its `Thread` capability
+    /// (`Rights::WRITE`): `(thread_cap)` -> `0`. Rejects PD 0 with `InvalidArgument`.
+    DomainDestroy = 38,
+    /// Read and clear the last recorded hardware fault info for `pd_id` (`power_cap` `Rights::READ`):
+    /// `(power_cap, pd_id)` -> `(x0 = 0, x1 = (role << 56) | (esr & 0x00FF_FFFF_FFFF_FFFF), x2 = elr)`.
+    DomainGetFaultInfo = 39,
+    /// Read kernel physical memory reclamation statistics (`power_cap` `Rights::READ`):
+    /// `(power_cap)` -> `(x0 = 0, x1 = remaining_frames, x2 = reclaimed_cache_len)`.
+    MemStats = 40,
 }
 
 impl SyscallNumber {
@@ -344,6 +392,70 @@ impl SyscallNumber {
             30 => Some(Self::IrqAck),
             31 => Some(Self::DmaCacheOp),
             32 => Some(Self::CpuFeatures),
+            33 => Some(Self::NotifyWait),
+            34 => Some(Self::IrqBind),
+            35 => Some(Self::SleepUntil),
+            36 => Some(Self::MmioMap),
+            37 => Some(Self::DomainRespawn),
+            38 => Some(Self::DomainDestroy),
+            39 => Some(Self::DomainGetFaultInfo),
+            40 => Some(Self::MemStats),
+            _ => None,
+        }
+    }
+}
+
+/// Stable EL0 protection domain role discriminant used by [`SyscallNumber::DomainRespawn`] and
+/// [`SyscallNumber::DomainGetFaultInfo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u64)]
+pub enum DomainRoleId {
+    Supervisor = 0,
+    Shell = 1,
+    Worker = 2,
+    Net = 3,
+    Key = 4,
+    Ssh = 5,
+}
+
+impl DomainRoleId {
+    #[inline]
+    pub const fn from_u64(raw: u64) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Supervisor),
+            1 => Some(Self::Shell),
+            2 => Some(Self::Worker),
+            3 => Some(Self::Net),
+            4 => Some(Self::Key),
+            5 => Some(Self::Ssh),
+            _ => None,
+        }
+    }
+}
+
+/// Flag returned in `x2` by [`SyscallNumber::NotifyWait`] when the wait timed out without matching bits.
+pub const NOTIFY_WAIT_TIMEOUT: u64 = 1;
+
+/// Notification badge bit signaled by the kernel when a shared-ring peer is respawned and its
+/// shared `SpscRing` frame has been zeroed/reset.
+pub const RING_PEER_RESET_BIT: u64 = 1 << 63;
+
+/// Hardware interrupt trigger mode for [`SyscallNumber::IrqBind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u64)]
+pub enum IrqTriggerMode {
+    /// Active-high level-sensitive interrupt (GIC `ICFGR` bit 1 = 0).
+    LevelHigh = 0,
+    /// Rising-edge triggered interrupt (GIC `ICFGR` bit 1 = 1).
+    EdgeRising = 1,
+}
+
+impl IrqTriggerMode {
+    #[inline]
+    pub const fn from_u64(raw: u64) -> Option<Self> {
+        match raw {
+            0 => Some(Self::LevelHigh),
+            1 => Some(Self::EdgeRising),
             _ => None,
         }
     }
@@ -499,7 +611,56 @@ pub mod log_ipc {
     }
 }
 
-/// Register-only IPC wire protocol for `CapId::BOOTSTRAP_NET_EP` (`newos-netd` <-> `newos-sshd`/`init`).
+/// Kernel-minted opaque role tags for capability-native IPC caller identity.
+///
+/// The kernel stamps these role tags into bootstrap endpoint capability badges according to
+/// `DomainRole` rather than raw PD ID, making IPC caller authentication completely independent
+/// of spawn order, omitted optional modules, or PD slot reuse.
+pub mod role_badge {
+    /// Role tag for `newos-supervisor-pd`.
+    pub const ROLE_SUPERVISOR: u32 = 0x1000;
+    /// Role tag for `newos-worker-pd-pd`.
+    pub const ROLE_WORKER: u32 = 0x1001;
+    /// Role tag for `newos-net-pd`.
+    pub const ROLE_NET: u32 = 0x1002;
+    /// Role tag for `newos-key-pd`.
+    pub const ROLE_KEY: u32 = 0x1003;
+    /// Role tag for `newos-ssh-pd`.
+    pub const ROLE_SSH: u32 = 0x1004;
+
+    /// Pack a `(role_tag, diagnostic_pd_id)` pair into a single 64-bit `BOOTSTRAP_LOG_EP` badge.
+    #[inline]
+    pub const fn encode_log_badge(role: u32, pd_id: u32) -> u64 {
+        ((role as u64) << 32) | (pd_id as u64)
+    }
+
+    /// Extract the kernel-verified `role_tag` from a `BOOTSTRAP_LOG_EP` badge.
+    #[inline]
+    pub const fn decode_log_role(badge: u64) -> u32 {
+        (badge >> 32) as u32
+    }
+
+    /// Extract the diagnostic PD ID from a `BOOTSTRAP_LOG_EP` badge.
+    #[inline]
+    pub const fn decode_log_pd_id(badge: u64) -> u32 {
+        badge as u32
+    }
+
+    /// Human-readable role name for console log prefixes.
+    #[inline]
+    pub const fn role_name(role: u32) -> &'static str {
+        match role {
+            ROLE_SUPERVISOR => "supervisor",
+            ROLE_WORKER => "worker",
+            ROLE_NET => "net-pd",
+            ROLE_KEY => "key-pd",
+            ROLE_SSH => "ssh-pd",
+            _ => "pd",
+        }
+    }
+}
+
+/// Register-only IPC wire protocol for `CapId::BOOTSTRAP_NET_EP` (`newos-net-pd` <-> `newos-ssh-pd`/`supervisor-pd`).
 ///
 /// Each 64-bit request word carries an opcode in bits `56..64` and up to 7 payload bytes in bits `0..56`:
 /// - `OP_POLL_STATUS (0x01)`: query connection/readiness bits + active IPv4 address
@@ -524,10 +685,10 @@ pub mod net_ipc {
     pub const STATUS_RX_AVAIL: u64 = 1 << 1;
     pub const STATUS_TX_READY: u64 = 1 << 2;
 
-    /// Kernel-stamped IPC badge for `newos-init` querying `newos-netd` status.
-    pub const BADGE_INIT: u64 = 0x1000;
-    /// Kernel-stamped IPC badge for `newos-sshd` (PID 4) owning the TCP :22 stream.
-    pub const BADGE_SSHD: u64 = 4;
+    /// Kernel-stamped IPC role badge for `newos-supervisor-pd` querying `newos-net-pd` status.
+    pub const BADGE_SUPERVISOR: u64 = crate::role_badge::ROLE_SUPERVISOR as u64;
+    /// Kernel-stamped IPC role badge for `newos-ssh-pd` owning the TCP :22 stream.
+    pub const BADGE_SSH: u64 = crate::role_badge::ROLE_SSH as u64;
 
     #[inline]
     pub const fn encode_poll_status() -> u64 {
@@ -608,32 +769,32 @@ pub mod net_ipc {
 }
 
 /// Cryptographic shell auth-gate signals sent over `CapId::BOOTSTRAP_AUTH_GATE_EP`
-/// (`newos-keyd` PID 3 write-only -> `newos-init` PID 0 read-only).
+/// (`newos-key-pd` write-only -> `newos-supervisor-pd` read-only).
 pub mod auth_gate_ipc {
-    /// Kernel-stamped IPC badge of `newos-keyd` (PID 3).
-    pub const BADGE_KEYD: u64 = 3;
-    /// Signal `newos-init` to open `BOOTSTRAP_SSH_SHELL_EP` after valid ML-DSA-87 userauth.
+    /// Kernel-stamped IPC role badge of `newos-key-pd`.
+    pub const BADGE_KEY: u64 = crate::role_badge::ROLE_KEY as u64;
+    /// Signal `newos-supervisor-pd` to open `BOOTSTRAP_SSH_SHELL_EP` after valid ML-DSA-87 userauth.
     pub const SESSION_OPEN: u64 = 0x5345_5353_4F50_454E;
-    /// Signal `newos-init` to close `BOOTSTRAP_SSH_SHELL_EP` on disconnect.
+    /// Signal `newos-supervisor-pd` to close `BOOTSTRAP_SSH_SHELL_EP` on disconnect.
     pub const SESSION_CLOSE: u64 = 0x5345_5353_434C_4F53;
 }
 
 /// Narrow, register-only IPC RPC protocol for `CapId::BOOTSTRAP_KEY_EP`
-/// (`newos-sshd` PID 4 -> `newos-keyd` PID 3).
+/// (`newos-ssh-pd` -> `newos-key-pd`).
 ///
-/// The ML-DSA-87 host private key never leaves `newos-keyd`.
+/// The ML-DSA-87 host private key never leaves `newos-key-pd`.
 pub mod key_ipc {
     /// ML-DSA-87 (NIST FIPS 204) public key size in bytes.
     pub const MLDSA87_PK_BYTES: usize = 2592;
     /// ML-DSA-87 (NIST FIPS 204) signature size in bytes.
     pub const MLDSA87_SIG_BYTES: usize = 4627;
-    /// Maximum random bytes `newos-sshd` may request per KEX window (`<= 256 B` cap with margin).
+    /// Maximum random bytes `newos-ssh-pd` may request per KEX window (`<= 256 B` cap with margin).
     pub const MAX_RANDOM_BYTES_PER_WINDOW: usize = 256;
     /// Maximum chunk payload bytes carried in a single 64-bit IPC register word.
     pub const MAX_CHUNK_BYTES: usize = 7;
 
-    /// Kernel-stamped IPC badge of `newos-sshd` (PID 4).
-    pub const BADGE_SSHD: u64 = 4;
+    /// Kernel-stamped IPC role badge of `newos-ssh-pd`.
+    pub const BADGE_SSH: u64 = crate::role_badge::ROLE_SSH as u64;
 
     /// Opcode tags in bits `56..64` of the 64-bit IPC request word.
     pub const OP_GET_HOST_PK_WORD: u8 = 0x01;
@@ -767,14 +928,43 @@ mod tests {
             (30, SyscallNumber::IrqAck),
             (31, SyscallNumber::DmaCacheOp),
             (32, SyscallNumber::CpuFeatures),
+            (33, SyscallNumber::NotifyWait),
+            (34, SyscallNumber::IrqBind),
+            (35, SyscallNumber::SleepUntil),
+            (36, SyscallNumber::MmioMap),
+            (37, SyscallNumber::DomainRespawn),
+            (38, SyscallNumber::DomainDestroy),
+            (39, SyscallNumber::DomainGetFaultInfo),
+            (40, SyscallNumber::MemStats),
         ];
         assert_eq!(SyscallNumber::from_u64(0), None);
         for (raw, variant) in expected_syscalls {
             assert_eq!(variant as u64, raw);
             assert_eq!(SyscallNumber::from_u64(raw), Some(variant));
         }
-        assert_eq!(SyscallNumber::from_u64(33), None);
+        assert_eq!(SyscallNumber::from_u64(41), None);
         assert_eq!(SyscallNumber::from_u64(99), None);
+
+        for (raw, role) in [
+            (0, DomainRoleId::Supervisor),
+            (1, DomainRoleId::Shell),
+            (2, DomainRoleId::Worker),
+            (3, DomainRoleId::Net),
+            (4, DomainRoleId::Key),
+            (5, DomainRoleId::Ssh),
+        ] {
+            assert_eq!(role as u64, raw);
+            assert_eq!(DomainRoleId::from_u64(raw), Some(role));
+        }
+        assert_eq!(DomainRoleId::from_u64(6), None);
+
+        assert_eq!(IrqTriggerMode::from_u64(0), Some(IrqTriggerMode::LevelHigh));
+        assert_eq!(
+            IrqTriggerMode::from_u64(1),
+            Some(IrqTriggerMode::EdgeRising)
+        );
+        assert_eq!(IrqTriggerMode::from_u64(2), None);
+        assert_eq!(NOTIFY_WAIT_TIMEOUT, 1);
 
         assert_eq!(DmaCacheOp::from_u64(0), Some(DmaCacheOp::Clean));
         assert_eq!(DmaCacheOp::from_u64(1), Some(DmaCacheOp::Invalidate));

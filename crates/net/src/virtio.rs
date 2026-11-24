@@ -3,13 +3,14 @@
 //! Runs in EL0 using capability-scoped `MmioRead32`/`MmioWrite32` and `VirtToPhys`.
 //! Every DMA ring and packet buffer is page-aligned (`<= 4096B`) so it never crosses a page boundary.
 
-use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering, fence};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
-const QUEUE_SIZE: usize = 8;
+const QUEUE_SIZE: usize = 32;
 const VIRTIO_NET_HDR_LEN: usize = 12;
 const PKT_BUF_SIZE: usize = 2048; // Divides 4096 evenly -> never crosses a 4 KiB page boundary!
+const PKT_BUF_WORDS: usize = PKT_BUF_SIZE / 8;
 
 // Modern VirtIO-MMIO v2 register offsets
 const REG_DRIVER_FEATURES: u64 = 0x020;
@@ -93,11 +94,67 @@ struct UsedRing {
 }
 
 #[repr(C, align(2048))]
-struct PacketBuf([AtomicU8; PKT_BUF_SIZE]);
+struct PacketBuf([AtomicU64; PKT_BUF_WORDS]);
 
 impl PacketBuf {
     const fn new() -> Self {
-        Self([const { AtomicU8::new(0) }; PKT_BUF_SIZE])
+        Self([const { AtomicU64::new(0) }; PKT_BUF_WORDS])
+    }
+
+    /// Write 12-byte zeroed `virtio_net_hdr_v1` followed by `frame` using 64-bit word strides.
+    #[inline]
+    fn write_virtio_tx(&self, frame: &[u8]) {
+        self.0[0].store(0, Ordering::Relaxed);
+        // Word 1 holds bytes 8..11 (zero header) + frame[0..4]
+        let mut w1 = [0u8; 8];
+        let first = frame.len().min(4);
+        w1[4..4 + first].copy_from_slice(&frame[..first]);
+        self.0[1].store(u64::from_le_bytes(w1), Ordering::Relaxed);
+        let rest = &frame[first..];
+        let full_words = rest.len() / 8;
+        for i in 0..full_words {
+            let off = i * 8;
+            let val = u64::from_le_bytes([
+                rest[off],
+                rest[off + 1],
+                rest[off + 2],
+                rest[off + 3],
+                rest[off + 4],
+                rest[off + 5],
+                rest[off + 6],
+                rest[off + 7],
+            ]);
+            self.0[2 + i].store(val, Ordering::Relaxed);
+        }
+        let rem = rest.len() & 7;
+        if rem > 0 {
+            let mut tail = [0u8; 8];
+            tail[..rem].copy_from_slice(&rest[full_words * 8..]);
+            self.0[2 + full_words].store(u64::from_le_bytes(tail), Ordering::Relaxed);
+        }
+    }
+
+    /// Read `dst.len()` Ethernet frame bytes starting at offset 12 (`VIRTIO_NET_HDR_LEN`).
+    #[inline]
+    fn read_virtio_rx(&self, dst: &mut [u8]) {
+        if dst.is_empty() {
+            return;
+        }
+        let w1 = self.0[1].load(Ordering::Relaxed).to_le_bytes();
+        let first = dst.len().min(4);
+        dst[..first].copy_from_slice(&w1[4..4 + first]);
+        let rest = &mut dst[first..];
+        let full_words = rest.len() / 8;
+        for i in 0..full_words {
+            let bytes = self.0[2 + i].load(Ordering::Relaxed).to_le_bytes();
+            let off = i * 8;
+            rest[off..off + 8].copy_from_slice(&bytes);
+        }
+        let rem = rest.len() & 7;
+        if rem > 0 {
+            let bytes = self.0[2 + full_words].load(Ordering::Relaxed).to_le_bytes();
+            rest[full_words * 8..].copy_from_slice(&bytes[..rem]);
+        }
     }
 }
 
@@ -278,7 +335,8 @@ impl<'a, T: MmioDmaTransport> VirtioNetDevice<'a, T> {
         })
     }
 
-    fn ack_interrupts(&self) {
+    /// Acknowledge and clear pending VirtIO-MMIO interrupt status bits.
+    pub fn ack_interrupts(&self) {
         if let Ok(isr) = self.transport.read32(self.slot_base + REG_INTERRUPT_STATUS)
             && isr != 0
         {
@@ -286,6 +344,12 @@ impl<'a, T: MmioDmaTransport> VirtioNetDevice<'a, T> {
                 .transport
                 .write32(self.slot_base + REG_INTERRUPT_ACK, isr);
         }
+    }
+}
+
+impl<T: MmioDmaTransport> crate::IrqAckDevice for VirtioNetDevice<'_, T> {
+    fn ack_interrupts(&self) {
+        VirtioNetDevice::ack_interrupts(self);
     }
 }
 
@@ -388,13 +452,8 @@ impl<T: MmioDmaTransport> TxToken for VirtioTxToken<'_, T> {
             core::hint::spin_loop();
         }
 
-        // Prepend 12-byte zeroed `virtio_net_hdr_v1` + Ethernet frame
-        for b in tx_buf.0.iter().take(VIRTIO_NET_HDR_LEN) {
-            b.store(0, Ordering::Relaxed);
-        }
-        for (i, &byte) in self.scratch[..frame_len].iter().enumerate() {
-            tx_buf.0[VIRTIO_NET_HDR_LEN + i].store(byte, Ordering::Relaxed);
-        }
+        // Prepend 12-byte zeroed `virtio_net_hdr_v1` + Ethernet frame (64-bit word-stride)
+        tx_buf.write_virtio_tx(&self.scratch[..frame_len]);
 
         if let Ok(paddr) = self.transport.virt_to_phys(tx_buf) {
             self.dma.tx_desc.0[idx].addr.store(paddr, Ordering::Relaxed);
@@ -447,9 +506,7 @@ impl<T: MmioDmaTransport> Device for VirtioNetDevice<'_, T> {
             .saturating_sub(VIRTIO_NET_HDR_LEN)
             .min(self.rx_scratch.len());
         let rx_buf = &self.dma.rx_bufs[desc_id % QUEUE_SIZE];
-        for (i, dst) in self.rx_scratch[..frame_len].iter_mut().enumerate() {
-            *dst = rx_buf.0[VIRTIO_NET_HDR_LEN + i].load(Ordering::Relaxed);
-        }
+        rx_buf.read_virtio_rx(&mut self.rx_scratch[..frame_len]);
 
         // Immediately recycle RX descriptor back to the device
         let avail_idx = self.dma.rx_avail.idx.load(Ordering::Relaxed);

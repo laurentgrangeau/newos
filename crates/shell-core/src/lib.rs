@@ -1,6 +1,6 @@
 #![no_std]
 
-//! Content-Addressed Object Store (CAOS) and Typed Pipeline Shell (`newos-sh`).
+//! Content-Addressed Object Store (CAOS) and Typed Pipeline Shell (`newos-shell-pd`).
 
 pub mod caos;
 pub mod shell;

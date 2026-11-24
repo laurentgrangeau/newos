@@ -15,8 +15,8 @@ pub const HUGE_PAGE_MASK_2M: u64 = HUGE_PAGE_SIZE_2M - 1;
 /// Maximum number of usable physical memory regions tracked at bootstrap (sized for RPi5 16 GB UEFI maps).
 pub const MAX_UNTYPED_REGIONS: usize = 64;
 
-/// Fixed-capacity LIFO cache for reclaimed 4 KiB physical frames.
-pub const MAX_RECLAIMED_FRAMES: usize = 512;
+/// Fixed-capacity LIFO cache for reclaimed 4 KiB physical frames (4 MiB capacity, 8 KiB inline).
+pub const MAX_RECLAIMED_FRAMES: usize = 1024;
 
 /// 64-bit physical address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -274,6 +274,12 @@ impl UntypedInventory {
             i += 1;
         }
         rem
+    }
+
+    /// Remaining allocatable 4 KiB physical frames (untyped regions + reclaimed LIFO cache).
+    #[inline]
+    pub fn remaining_frames(&self) -> u64 {
+        self.remaining_bytes() / PAGE_SIZE
     }
 
     /// Return an unmapped, exclusively owned 4 KiB `PhysFrame` to the LIFO reuse cache.

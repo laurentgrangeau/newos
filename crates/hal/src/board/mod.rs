@@ -21,6 +21,26 @@ impl MmioRegion {
     }
 }
 
+/// Hardware interrupt line owned by a board peripheral (GIC SPI or BCM2712 MIP MSI-X).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrqLine {
+    pub irq: u16,
+    pub is_mip: bool,
+}
+
+impl IrqLine {
+    pub const fn gic(irq: u16) -> Self {
+        Self { irq, is_mip: false }
+    }
+
+    pub const fn mip(vector: u16) -> Self {
+        Self {
+            irq: vector,
+            is_mip: true,
+        }
+    }
+}
+
 /// Static hardware description of a target board / SoC.
 #[derive(Debug, Clone, Copy)]
 pub struct BoardDescriptor {
@@ -34,6 +54,9 @@ pub struct BoardDescriptor {
     pub net_mmio: Option<MmioRegion>,
     pub rng_mmio: Option<MmioRegion>,
     pub wdt_mmio: Option<MmioRegion>,
+    pub net_irq: Option<IrqLine>,
+    pub rng_irq: Option<IrqLine>,
+    pub uart_irq: Option<IrqLine>,
 }
 
 /// Select the active compiled-in [`BoardDescriptor`] based on runtime cmdline hints.

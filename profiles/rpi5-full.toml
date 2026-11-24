@@ -1,6 +1,6 @@
 # NewOS Raspberry Pi 5 Full System Composition Profile
 # Full SMP microkernel, priority+RR scheduler, verified boot ELF attestation,
-# dual-stack IPv4/IPv6, SSH (`netd` + `keyd` + `sshd`),
+# dual-stack IPv4/IPv6, SSH (`net-pd` + `key-pd` + `ssh-pd`),
 # and all Raspberry Pi 5 (BCM2712 + RP1) hardware drivers.
 
 [target]
@@ -15,13 +15,13 @@ userspace = true           # Valid: true | false (false = pure EL1 kernel, no EL
 elf_attestation = true     # Valid: true | false (requires "sha3" in [crypto].algorithms)
 acpi = true                # Valid: true | false (false = static BoardDescriptor only)
 
-[userspace]
-init = true                # Valid: true | false (requires [kernel].userspace = true)
+[domains]
+supervisor = true                # Valid: true | false (requires [kernel].userspace = true)
 worker = true              # Valid: true | false (requires [kernel].userspace = true)
-shell = true               # Valid: true | false (requires init = true)
-netd = true                # Valid: true | false (requires [net].enabled = true and ipv4 or ipv6)
-keyd = true                # Valid: true | false (requires "sha3" and "ml-dsa-87" in [crypto])
-sshd = true                # Valid: true | false (requires netd, keyd, shell, and all 4 PQ crypto algs)
+shell = true               # Valid: true | false (requires supervisor = true)
+net = true                # Valid: true | false (requires [net].enabled = true and ipv4 or ipv6)
+key = true                # Valid: true | false (requires "sha3" and "ml-dsa-87" in [crypto])
+ssh = true                # Valid: true | false (requires net, key, shell, and all 4 PQ crypto algs)
 
 [net]
 enabled = true             # Valid: true | false (master switch for networking)

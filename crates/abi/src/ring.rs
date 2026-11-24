@@ -199,11 +199,142 @@ impl<const N: usize> SpscRing<N> {
         let tail = self.producer.tail.load(Ordering::Acquire) & (N - 1);
         ((tail + 1) & (N - 1)) == head
     }
+
+    /// Push a length-prefixed byte frame into the word ring with a single `Release` tail commit.
+    ///
+    /// Format: 1 header word `((0x5249_4E47 << 32) | byte_len)` followed by `ceil(byte_len / 8)`
+    /// little-endian 64-bit payload words. Returns `Err(SysError::WouldBlock)` if the ring does
+    /// not have space for the entire frame (no partial writes), or `Err(SysError::InvalidArgument)`
+    /// if `data` exceeds the ring's maximum frame capacity.
+    pub fn try_push_bytes(&self, data: &[u8]) -> Result<usize, SysError> {
+        const MAGIC_SHIFTED: u64 = 0x5249_4E47u64 << 32;
+        let payload_words = data.len().div_ceil(8);
+        let total_words = 1 + payload_words;
+        if total_words > self.capacity() || data.len() > u32::MAX as usize {
+            return Err(SysError::InvalidArgument);
+        }
+
+        let tail = self.producer.tail.load(Ordering::Relaxed) & (N - 1);
+        let mut head = self.producer.cached_head.load(Ordering::Relaxed) & (N - 1);
+        let mut used = tail.wrapping_sub(head) & (N - 1);
+        let mut free = (N - 1) - used;
+        if free < total_words {
+            head = self.consumer.head.load(Ordering::Acquire) & (N - 1);
+            self.producer.cached_head.store(head, Ordering::Relaxed);
+            used = tail.wrapping_sub(head) & (N - 1);
+            free = (N - 1) - used;
+            if free < total_words {
+                return Err(SysError::WouldBlock);
+            }
+        }
+
+        let header = MAGIC_SHIFTED | (data.len() as u64);
+        self.slots[tail].store(header, Ordering::Relaxed);
+        let mut idx = (tail + 1) & (N - 1);
+        let mut off = 0usize;
+        while off < data.len() {
+            let mut buf = [0u8; 8];
+            let chunk = (data.len() - off).min(8);
+            buf[..chunk].copy_from_slice(&data[off..off + chunk]);
+            self.slots[idx].store(u64::from_le_bytes(buf), Ordering::Relaxed);
+            idx = (idx + 1) & (N - 1);
+            off += chunk;
+        }
+        self.producer.tail.store(idx, Ordering::Release);
+        Ok(data.len())
+    }
+
+    /// Pop one length-prefixed byte frame written by [`Self::try_push_bytes`] with a single
+    /// `Acquire` load and `Release` head commit.
+    ///
+    /// Returns `None` if empty or if the frame header is corrupted (safely resynchronizing head
+    /// to tail on corrupted peer headers without panicking). Truncates to `out.len()` if `out` is
+    /// smaller than the framed payload while still consuming the full frame from the ring.
+    pub fn try_pop_bytes(&self, out: &mut [u8]) -> Option<usize> {
+        const MAGIC: u64 = 0x5249_4E47;
+        let head = self.consumer.head.load(Ordering::Relaxed) & (N - 1);
+        let mut tail = self.consumer.cached_tail.load(Ordering::Relaxed) & (N - 1);
+        if head == tail {
+            tail = self.producer.tail.load(Ordering::Acquire) & (N - 1);
+            self.consumer.cached_tail.store(tail, Ordering::Relaxed);
+            if head == tail {
+                return None;
+            }
+        }
+
+        let avail = tail.wrapping_sub(head) & (N - 1);
+        let header = self.slots[head].load(Ordering::Relaxed);
+        if (header >> 32) != MAGIC {
+            // Corrupted peer header: drop ring contents safely without panicking.
+            self.consumer.head.store(tail, Ordering::Release);
+            return None;
+        }
+        let byte_len = (header & 0xFFFF_FFFF) as usize;
+        let payload_words = byte_len.div_ceil(8);
+        let total_words = 1usize.saturating_add(payload_words);
+        if total_words > avail || total_words > self.capacity() {
+            // Incomplete or bogus frame length from corrupted peer: resync safely.
+            self.consumer.head.store(tail, Ordering::Release);
+            return None;
+        }
+
+        let copy_len = byte_len.min(out.len());
+        let mut idx = (head + 1) & (N - 1);
+        let mut copied = 0usize;
+        for _ in 0..payload_words {
+            let w = self.slots[idx].load(Ordering::Relaxed).to_le_bytes();
+            if copied < copy_len {
+                let n = (copy_len - copied).min(8);
+                out[copied..copied + n].copy_from_slice(&w[..n]);
+                copied += n;
+            }
+            idx = (idx + 1) & (N - 1);
+        }
+        self.consumer.head.store(idx, Ordering::Release);
+        Some(copy_len)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spsc_ring_bytes_roundtrip_wraparound_and_corrupted_header() {
+        let ring = SpscRing::<16>::new();
+        assert_eq!(ring.try_pop_bytes(&mut [0u8; 32]), None);
+
+        // Push & pop across wraparound multiple times
+        for i in 0..10u8 {
+            let msg = [
+                i,
+                i + 1,
+                i + 2,
+                i + 3,
+                i + 4,
+                i + 5,
+                i + 6,
+                i + 7,
+                i + 8,
+                i + 9,
+            ];
+            assert_eq!(ring.try_push_bytes(&msg), Ok(msg.len()));
+            let mut out = [0u8; 32];
+            assert_eq!(ring.try_pop_bytes(&mut out), Some(msg.len()));
+            assert_eq!(&out[..msg.len()], &msg);
+        }
+
+        // Oversized payload rejected with InvalidArgument
+        assert_eq!(
+            ring.try_push_bytes(&[0xAA; 256]),
+            Err(SysError::InvalidArgument)
+        );
+
+        // Corrupted peer header is safely dropped without panicking
+        assert_eq!(ring.try_push(0xDEAD_BEEF_0000_0010), Ok(()));
+        assert_eq!(ring.try_pop_bytes(&mut [0u8; 32]), None);
+        assert!(ring.is_empty());
+    }
 
     #[test]
     fn spsc_ring_fill_overflow_and_wraparound() {

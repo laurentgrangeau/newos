@@ -1,4 +1,4 @@
-//! Opaque-box E2E test suite for `newos-shell-core` (CAOS + `newos-sh` typed pipeline shell).
+//! Opaque-box E2E test suite for `newos-shell-core` (CAOS + `newos-shell-pd` typed pipeline shell).
 //!
 //! Compile & run offline with:
 //! ```bash

@@ -1,4 +1,4 @@
-//! Tier 1 (Feature Coverage) E2E tests for `newos-shell-core` (CAOS + `newos-sh` + pipelines).
+//! Tier 1 (Feature Coverage) E2E tests for `newos-shell-core` (CAOS + `newos-shell-pd` + pipelines).
 //! Covers 22 isolated happy-path tests: 6 CAOS + 10 Shell commands + 6 Pipelines.
 
 use core::fmt::Write as _;
@@ -171,19 +171,19 @@ fn tier1_shell_objects_and_refs_listing() {
 }
 
 #[test]
-fn tier1_shell_procs_and_sys() {
+fn tier1_shell_domains_and_sys() {
     let mut sh = Shell::new(MockShellHost::new(4, 2));
-    sh.exec_line("procs");
+    sh.exec_line("domains");
     let out_p = sh.host_mut().take_output();
-    assert!(out_p.contains("PID EL VSPACE NAME"));
-    assert!(out_p.contains("init (newos-sh + CAOS)"));
+    assert!(out_p.contains("PD  EL VSPACE NAME"));
+    assert!(out_p.contains("supervisor-pd (shell + CAOS)"));
     assert!(out_p.contains("worker (IPC responder)"));
 
     sh.exec_line("sys");
     let out_s = sh.host_mut().take_output();
     assert!(out_s.contains("aarch64"));
     assert!(out_s.contains("SMP=4 CPUs"));
-    assert!(out_s.contains("2 procs"));
+    assert!(out_s.contains("2 domains"));
     assert!(out_s.contains("2 objs"));
 }
 
@@ -263,11 +263,11 @@ fn tier1_shell_exit_and_shutdown_outcomes() {
 fn tier1_shell_history_recording_and_listing() {
     let mut sh = Shell::new(MockShellHost::default());
     sh.record_history("sys");
-    sh.record_history("procs | count");
+    sh.record_history("domains | count");
     sh.exec_line("history");
     let out = sh.host_mut().take_output();
     assert!(out.contains("1  sys\n"));
-    assert!(out.contains("2  procs | count\n"));
+    assert!(out.contains("2  domains | count\n"));
 }
 
 #[test]
@@ -332,7 +332,7 @@ fn tier1_pipe_first_default_and_explicit_n() {
 fn tier1_pipe_count_on_nonempty_and_empty_streams() {
     let mut sh = Shell::new(MockShellHost::default());
     assert!(matches!(
-        sh.eval_pipeline("procs | count").first(),
+        sh.eval_pipeline("domains | count").first(),
         Some(Record::Count(2))
     ));
     assert!(matches!(
@@ -346,11 +346,11 @@ fn tier1_pipe_count_on_nonempty_and_empty_streams() {
 fn tier1_pipe_where_on_count_record() {
     let mut sh = Shell::new(MockShellHost::default());
     assert_eq!(
-        sh.eval_pipeline("procs | count | where count == 2").len(),
+        sh.eval_pipeline("domains | count | where count == 2").len(),
         1
     );
     assert_eq!(
-        sh.eval_pipeline("procs | count | where count == 1").len(),
+        sh.eval_pipeline("domains | count | where count == 1").len(),
         0
     );
 }

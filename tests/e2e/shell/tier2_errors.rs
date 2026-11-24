@@ -199,7 +199,7 @@ fn tier2_shell_excess_pipeline_stages_and_tokens_no_panic() {
 #[test]
 fn tier2_shell_save_non_object_upstream_and_missing_name() {
     let mut sh = Shell::new(MockShellHost::default());
-    sh.exec_line("procs | save @bad");
+    sh.exec_line("domains | save @bad");
     assert!(
         sh.host_mut()
             .take_output()

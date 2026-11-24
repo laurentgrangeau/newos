@@ -10,6 +10,10 @@ pub fn early_serial() -> aarch64::serial::Pl011 {
     aarch64::serial::Pl011::new()
 }
 
+pub fn early_serial_unlocked() -> aarch64::serial::UnlockedPl011 {
+    aarch64::serial::UnlockedPl011
+}
+
 pub fn system_off(code: newos_abi::ShutdownStatus) -> ! {
     aarch64::system_off(code)
 }
