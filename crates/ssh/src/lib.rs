@@ -893,7 +893,33 @@ pub struct SshClient {
     user_pk: [u8; MLDSA87_PK_BYTES],
 }
 
+/// Explicit host-key verification policy required by [`SshClient::new_with_policy`].
+///
+/// Prevents library callers from accidentally skipping SHA3-512 host-key pinning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostKeyPolicy {
+    /// Fail closed unless the server's ML-DSA-87 host key matches this 64-byte `SHA3-512` digest.
+    Pinned([u8; 64]),
+    /// Explicitly opt out of host-key verification (e.g., ephemeral QEMU/lab testing only).
+    InsecureAcceptAny,
+}
+
 impl SshClient {
+    /// Construct an `SshClient` with an explicit [`HostKeyPolicy`] (preferred safe constructor).
+    #[allow(unknown_lints, clippy::large_unopt_stack_frames)]
+    pub fn new_with_policy(
+        username: &str,
+        user_sk: SigningKey<MlDsa87>,
+        policy: HostKeyPolicy,
+        kem_seed: [u8; 64],
+    ) -> Self {
+        let expected_fingerprint = match policy {
+            HostKeyPolicy::Pinned(fp) => Some(fp),
+            HostKeyPolicy::InsecureAcceptAny => None,
+        };
+        Self::new(username, user_sk, expected_fingerprint, kem_seed)
+    }
+
     #[allow(unknown_lints, clippy::large_unopt_stack_frames)]
     pub fn new(
         username: &str,

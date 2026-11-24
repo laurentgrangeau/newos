@@ -421,6 +421,7 @@ pub struct PageFlags {
     pub executable: bool,
     pub user: bool,
     pub no_cache: bool,
+    pub dma_nc: bool,
 }
 
 impl PageFlags {
@@ -439,7 +440,19 @@ impl PageFlags {
             executable,
             user,
             no_cache,
+            dma_nc: false,
         })
+    }
+
+    /// Construct Normal Non-Cacheable (MAIR `0x44`) page flags for DMA descriptor rings (`H4`).
+    pub const fn new_dma_nc(writable: bool, user: bool) -> Self {
+        Self {
+            writable,
+            executable: false,
+            user,
+            no_cache: false,
+            dma_nc: true,
+        }
     }
 
     pub const KERNEL_RW: Self = Self {
@@ -447,6 +460,7 @@ impl PageFlags {
         executable: false,
         user: false,
         no_cache: false,
+        dma_nc: false,
     };
 
     pub const KERNEL_RO: Self = Self {
@@ -454,6 +468,7 @@ impl PageFlags {
         executable: false,
         user: false,
         no_cache: false,
+        dma_nc: false,
     };
 
     pub const KERNEL_RX: Self = Self {
@@ -461,6 +476,7 @@ impl PageFlags {
         executable: true,
         user: false,
         no_cache: false,
+        dma_nc: false,
     };
 }
 
@@ -552,6 +568,14 @@ impl FrameMapping {
 pub struct FrameMappingTracker<const MAX_MAPPINGS: usize> {
     entries: [FrameMapping; MAX_MAPPINGS],
     len: usize,
+    /// Physical frames that have been mapped `writable` since allocation/zeroing.
+    /// Prevents write-then-unmap-then-execute W^X bypasses across time until the frame
+    /// is zeroed and reclaimed.
+    ever_written: [PhysAddr; MAX_MAPPINGS],
+    ever_written_len: usize,
+    /// Physical frames currently pinned for hardware DMA (`DmaMap`), preventing reclamation.
+    dma_pinned: [PhysAddr; MAX_MAPPINGS],
+    dma_pinned_len: usize,
 }
 
 impl<const MAX_MAPPINGS: usize> Default for FrameMappingTracker<MAX_MAPPINGS> {
@@ -565,7 +589,92 @@ impl<const MAX_MAPPINGS: usize> FrameMappingTracker<MAX_MAPPINGS> {
         Self {
             entries: [FrameMapping::EMPTY; MAX_MAPPINGS],
             len: 0,
+            ever_written: [PhysAddr::new(0); MAX_MAPPINGS],
+            ever_written_len: 0,
+            dma_pinned: [PhysAddr::new(0); MAX_MAPPINGS],
+            dma_pinned_len: 0,
         }
+    }
+
+    /// Record that `phys` has been mapped writable (enforcing W^X across time).
+    #[inline]
+    pub fn mark_ever_written(&mut self, phys: PhysAddr) {
+        if self.was_ever_written(phys) {
+            return;
+        }
+        if self.ever_written_len < MAX_MAPPINGS {
+            self.ever_written[self.ever_written_len] = phys;
+            self.ever_written_len += 1;
+        }
+    }
+
+    /// Return `true` if `phys` has been mapped writable since its last zero-and-reclaim.
+    #[inline]
+    pub fn was_ever_written(&self, phys: PhysAddr) -> bool {
+        let mut i = 0;
+        while i < self.ever_written_len {
+            if self.ever_written[i] == phys {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Clear `phys` from the `ever_written` history (call ONLY after zeroing and reclaiming the frame).
+    #[inline]
+    pub fn clear_ever_written(&mut self, phys: PhysAddr) {
+        let mut i = 0;
+        while i < self.ever_written_len {
+            if self.ever_written[i] == phys {
+                self.ever_written_len -= 1;
+                self.ever_written[i] = self.ever_written[self.ever_written_len];
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    /// Pin `phys` for active DMA (`DmaMap`), preventing physical frame reclamation while pinned.
+    #[inline]
+    pub fn pin_dma(&mut self, phys: PhysAddr) -> Result<(), SysError> {
+        if self.is_dma_pinned(phys) {
+            return Ok(());
+        }
+        if self.dma_pinned_len >= MAX_MAPPINGS {
+            return Err(SysError::OutOfMemory);
+        }
+        self.dma_pinned[self.dma_pinned_len] = phys;
+        self.dma_pinned_len += 1;
+        Ok(())
+    }
+
+    /// Unpin `phys` from DMA (`DmaUnmap`).
+    #[inline]
+    pub fn unpin_dma(&mut self, phys: PhysAddr) -> bool {
+        let mut i = 0;
+        while i < self.dma_pinned_len {
+            if self.dma_pinned[i] == phys {
+                self.dma_pinned_len -= 1;
+                self.dma_pinned[i] = self.dma_pinned[self.dma_pinned_len];
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Return `true` if `phys` is currently pinned for hardware DMA.
+    #[inline]
+    pub fn is_dma_pinned(&self, phys: PhysAddr) -> bool {
+        let mut i = 0;
+        while i < self.dma_pinned_len {
+            if self.dma_pinned[i] == phys {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     /// Record a new `(vspace_root, virt) -> phys` mapping in O(1) (defaulting to non-W/non-X flags).
@@ -603,15 +712,21 @@ impl<const MAX_MAPPINGS: usize> FrameMappingTracker<MAX_MAPPINGS> {
             executable,
         };
         self.len += 1;
+        if writable {
+            self.mark_ever_written(phys);
+        }
         Ok(())
     }
 
     /// Return `true` if mapping `phys` with `(writable, executable)` would violate system-wide
-    /// W^X anti-aliasing against an existing mapping of the same physical frame (`M1`).
+    /// W^X anti-aliasing against an existing mapping OR a write-then-unmap-then-execute sequence.
     #[inline]
     pub fn conflicts_wx(&self, phys: PhysAddr, writable: bool, executable: bool) -> bool {
         if !writable && !executable {
             return false;
+        }
+        if executable && self.was_ever_written(phys) {
+            return true;
         }
         let mut i = 0;
         while i < self.len {
@@ -1022,5 +1137,39 @@ mod kani_proofs {
         assert_ne!(f1.start_addr(), f2.start_addr());
         assert!(f1.start_addr().raw() >= base && f1.start_addr().raw() + PAGE_SIZE <= base + len);
         assert!(f2.start_addr().raw() >= base && f2.start_addr().raw() + PAGE_SIZE <= base + len);
+    }
+}
+
+#[cfg(test)]
+mod audit_memory_tests {
+    use super::*;
+
+    #[test]
+    fn wx_rejects_write_then_unmap_then_execute_until_reclaimed() {
+        let mut tracker = FrameMappingTracker::<16>::new();
+        let root = PhysAddr::new(0x10_0000);
+        let va1 = VirtAddr::new_page_aligned(0x4000_0000).unwrap();
+        let pa = PhysAddr::new(0x20_0000);
+
+        tracker
+            .record_with_flags(root, va1, pa, true, false)
+            .unwrap();
+        assert_eq!(tracker.remove(root, va1), Some(pa));
+        // Even after unmapping the writable view, remapping the same frame EXEC must be denied.
+        assert!(tracker.conflicts_wx(pa, false, true));
+        // Only after zero-and-reclaim clears `ever_written` may the frame be mapped EXEC.
+        tracker.clear_ever_written(pa);
+        assert!(!tracker.conflicts_wx(pa, false, true));
+    }
+
+    #[test]
+    fn dma_pin_prevents_reclaim_until_unpinned() {
+        let mut tracker = FrameMappingTracker::<16>::new();
+        let pa = PhysAddr::new(0x30_0000);
+        assert!(!tracker.is_dma_pinned(pa));
+        tracker.pin_dma(pa).unwrap();
+        assert!(tracker.is_dma_pinned(pa));
+        assert!(tracker.unpin_dma(pa));
+        assert!(!tracker.is_dma_pinned(pa));
     }
 }

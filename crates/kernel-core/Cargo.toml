@@ -9,6 +9,7 @@ default = ["userspace", "smp", "elf-attestation", "acpi", "sched-priority-rr"]
 userspace = []
 smp = []
 elf-attestation = ["dep:newos-crypto"]
+elf-measurement = ["elf-attestation"]
 acpi = []
 # Pluggable EL1 scheduler policies (compile-time selection):
 sched-priority-rr = []

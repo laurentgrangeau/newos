@@ -206,12 +206,11 @@ impl KernelIpcState {
             11,
             Capability::new(CapObject::Endpoint { id: 1 }, Rights::ALL),
         )?;
-        let rw = Rights::READ.union(Rights::WRITE);
         let _ = self.root_cspace.insert_root_at(
             13,
             Capability {
                 object: CapObject::Endpoint { id: 2 },
-                rights: rw,
+                rights: Rights::WRITE,
                 badge: net_ipc::BADGE_SUPERVISOR,
             },
         )?;
@@ -293,6 +292,8 @@ impl KernelIpcState {
             34,
             Capability::new(CapObject::Notification { id: 3 }, Rights::WRITE),
         )?;
+        let _ =
+            cnode.insert_root_at(38, Capability::new(CapObject::IoSpace { domain_id: 0 }, rw))?;
         Ok(())
     }
 
@@ -349,6 +350,8 @@ impl KernelIpcState {
             34,
             Capability::new(CapObject::Notification { id: 3 }, Rights::WRITE),
         )?;
+        let _ =
+            cnode.insert_root_at(38, Capability::new(CapObject::IoSpace { domain_id: 0 }, rw))?;
         Ok(())
     }
 
@@ -385,7 +388,7 @@ impl KernelIpcState {
             13,
             Capability {
                 object: CapObject::Endpoint { id: 2 },
-                rights: rw,
+                rights: Rights::WRITE,
                 badge: net_ipc::BADGE_SSH,
             },
         )?;
@@ -393,7 +396,7 @@ impl KernelIpcState {
             14,
             Capability {
                 object: CapObject::Endpoint { id: 3 },
-                rights: rw,
+                rights: Rights::WRITE,
                 badge: key_ipc::BADGE_SSH,
             },
         )?;
@@ -447,7 +450,7 @@ impl KernelIpcState {
             2,
             Capability {
                 object: CapObject::Endpoint { id: 0 },
-                rights: rw,
+                rights: Rights::READ,
                 badge: 0x5E14,
             },
         )?;
@@ -480,7 +483,10 @@ impl KernelIpcState {
         let cnode = &mut self.domain_cspaces[pd_id - 1];
         let rw = Rights::READ.union(Rights::WRITE);
         let _ = cnode.insert_root_at(1, Capability::new(CapObject::Notification { id: 0 }, rw))?;
-        let _ = cnode.insert_root_at(2, Capability::new(CapObject::Endpoint { id: 0 }, rw))?;
+        let _ = cnode.insert_root_at(
+            2,
+            Capability::new(CapObject::Endpoint { id: 0 }, Rights::WRITE),
+        )?;
         let _ = cnode.insert_root_at(5, Capability::new(CapObject::Console, rw))?;
         let _ = cnode.insert_root_at(6, Capability::new(CapObject::PowerControl, Rights::READ))?;
         let _ = cnode.insert_root_at(
@@ -901,6 +907,19 @@ impl KernelIpcState {
         }
     }
 
+    /// Clear any buffered `IpcCall` whose sender was `sender_pd` (called on process teardown).
+    pub fn clear_buffered_calls_from(&mut self, sender_pd: usize) {
+        if sender_pd >= MAX_IPC_DOMAINS {
+            return;
+        }
+        let target = 2u8 + sender_pd as u8;
+        for slot in &mut self.endpoint_state {
+            if *slot == target {
+                *slot = 0;
+            }
+        }
+    }
+
     /// Send a register-only fastpath IPC payload to an `Endpoint` in `pd_id`'s `CSpace`.
     #[inline(always)]
     pub fn ipc_send_for(
@@ -921,19 +940,10 @@ impl KernelIpcState {
 
     /// Receive a pending register-only fastpath IPC message from an `Endpoint` in `pd_id`'s `CSpace`.
     ///
-    /// Refuses to consume a buffered `IpcCall` (`endpoint_state >= 2`) so a plain `IpcRecv` can
-    /// never swallow another task's synchronous call and hang the caller forever (`H3`).
+    /// Requires the server receive right (`Rights::READ`), which is never granted to pure clients.
     #[inline(always)]
     pub fn ipc_recv_for(&mut self, pd_id: usize, cap_id: CapId) -> Result<IpcMessage, SysError> {
         let (id, _) = self.lookup_endpoint_for(pd_id, cap_id, Rights::READ)?;
-        let idx = id as usize;
-        if idx >= MAX_ENDPOINTS {
-            return Err(SysError::InvalidArgument);
-        }
-        if self.endpoint_state[idx] >= 2 {
-            self.stats.would_blocks = self.stats.would_blocks.wrapping_add(1);
-            return Err(SysError::WouldBlock);
-        }
         self.ipc_recv_resolved(id).map(|(msg, _)| msg)
     }
 
@@ -944,6 +954,8 @@ impl KernelIpcState {
     }
 
     /// Synchronous direct call/reply fastpath on an `Endpoint` in `pd_id`'s `CSpace`.
+    ///
+    /// Requires `Rights::WRITE` only so clients never need receive authority (`H1`).
     #[inline]
     pub fn ipc_call_for(
         &mut self,
@@ -952,8 +964,7 @@ impl KernelIpcState {
         payload: u64,
         handler: impl FnOnce(IpcMessage) -> IpcMessage,
     ) -> Result<IpcMessage, SysError> {
-        let (id, badge) =
-            self.lookup_endpoint_for(pd_id, cap_id, Rights::READ.union(Rights::WRITE))?;
+        let (id, badge) = self.lookup_endpoint_for(pd_id, cap_id, Rights::WRITE)?;
         let idx = id as usize;
         if idx >= MAX_ENDPOINTS {
             return Err(SysError::InvalidArgument);
@@ -1077,8 +1088,9 @@ impl KernelIpcState {
         Ok(())
     }
 
-    /// Clear all capabilities held by an exited non-root process `pd_id` (`M4`), invoking
-    /// `on_frame(phys, can_reclaim)` for any `Frame` capabilities it held.
+    /// Clear all capabilities held by an exited non-root process `pd_id` (`M4`), reparenting
+    /// any external CDT descendants in other domains and invoking `on_frame(phys, can_reclaim)`
+    /// for any `Frame` capabilities it held.
     pub fn clear_domain_cspace(
         &mut self,
         pd_id: usize,
@@ -1087,6 +1099,31 @@ impl KernelIpcState {
         if pd_id == 0 || pd_id >= MAX_IPC_DOMAINS {
             return Err(SysError::InvalidArgument);
         }
+        // Reparent any cross-domain CDT children that pointed into `pd_id` before clearing.
+        let mut reparents: [(usize, Option<ExternalParent>); ROOT_CSPACE_SLOTS] =
+            [(0, None); ROOT_CSPACE_SLOTS];
+        let mut reparent_len = 0usize;
+        for slot in 1..ROOT_CSPACE_SLOTS {
+            if self.domain_cspaces[pd_id - 1].is_slot_occupied(slot) {
+                let replacement = self.domain_cspaces[pd_id - 1].root_external_parent_of_slot(slot);
+                reparents[reparent_len] = (slot, replacement);
+                reparent_len += 1;
+            }
+        }
+        for &(slot, replacement) in &reparents[..reparent_len] {
+            let old_ext = ExternalParent {
+                cnode_id: pd_id as u16,
+                slot: slot as u16,
+            };
+            for other in 0..MAX_IPC_DOMAINS {
+                if other != pd_id
+                    && let Ok(other_cn) = self.cspace_mut(other)
+                {
+                    other_cn.reparent_external_children(old_ext, replacement);
+                }
+            }
+        }
+
         let mut frames = [PhysAddr::new(0); ROOT_CSPACE_SLOTS];
         let mut frame_len = 0usize;
         self.domain_cspaces[pd_id - 1].clear_all(|cap| {
@@ -1103,6 +1140,50 @@ impl KernelIpcState {
             on_frame(phys, can_reclaim);
         }
         Ok(())
+    }
+
+    /// Retype an `IrqHandler` capability for `(irq, is_mip)` from a designated `Untyped`
+    /// capability in `pd_id`'s `CSpace`, rejecting duplicate live bindings for the same IRQ.
+    pub fn untyped_retype_irq_for(
+        &mut self,
+        pd_id: usize,
+        untyped_cap: CapId,
+        dst_slot: usize,
+        irq: u16,
+        is_mip: bool,
+    ) -> Result<CapId, SysError> {
+        if is_mip {
+            if irq >= 64 {
+                return Err(SysError::InvalidArgument);
+            }
+        } else if !(32..1020).contains(&irq) {
+            return Err(SysError::InvalidArgument);
+        }
+        if self.has_live_irq_cap(irq, is_mip) {
+            return Err(SysError::SlotOccupied);
+        }
+        let slot = if dst_slot == 0 {
+            self.cspace(pd_id)?.find_free_slot()?
+        } else {
+            dst_slot
+        };
+        self.cspace_mut(pd_id)?.insert_retyped_child(
+            untyped_cap,
+            slot,
+            CapObject::IrqHandler { irq, is_mip },
+        )
+    }
+
+    /// Return `true` if any active `CSpace` holds a live `CapObject::Endpoint { id }` with `Rights::READ`.
+    #[inline]
+    pub fn has_live_endpoint_server(&self, id: u32) -> bool {
+        let obj = CapObject::Endpoint { id };
+        self.root_cspace
+            .has_live_object_with_rights(obj, Rights::READ)
+            || self
+                .domain_cspaces
+                .iter()
+                .any(|cn| cn.has_live_object_with_rights(obj, Rights::READ))
     }
 
     /// Return `true` if any active `CSpace` holds a live `CapObject::Endpoint { id }` capability.
@@ -1153,6 +1234,21 @@ impl KernelIpcState {
                 .domain_cspaces
                 .iter()
                 .any(|cn| cn.has_live_frame_cap(phys))
+    }
+
+    /// Validate an `IoSpace` capability in `pd_id`'s `CSpace`, returning its domain ID.
+    #[inline]
+    pub fn validate_iospace_for(
+        &self,
+        pd_id: usize,
+        cap_id: CapId,
+        required: Rights,
+    ) -> Result<u16, SysError> {
+        let cap = self.cspace(pd_id)?.lookup(cap_id, required)?;
+        match cap.object {
+            CapObject::IoSpace { domain_id } => Ok(domain_id),
+            _ => Err(SysError::InvalidArgument),
+        }
     }
 
     /// Validate a `Frame` capability in `pd_id`'s `CSpace`, returning its physical base address.
@@ -1644,10 +1740,19 @@ mod tests {
             .root_cspace_mut()
             .mint(ep, wo_slot, Rights::WRITE, None)
             .unwrap();
+        // H1: `IpcCall` requires `Rights::WRITE` only; pure clients must NOT need `Rights::READ`
+        // and cannot hijack incoming calls via `IpcRecv`.
         assert_eq!(
-            ipc.ipc_call(wo_ep, 1, |m| m),
-            Err(SysError::InsufficientRights)
+            ipc.ipc_call(wo_ep, 1, |m| IpcMessage {
+                badge: m.badge,
+                payload: m.payload + 1,
+            }),
+            Ok(IpcMessage {
+                badge: 0x5E14,
+                payload: 2,
+            })
         );
+        assert_eq!(ipc.ipc_recv(wo_ep), Err(SysError::InsufficientRights));
 
         // Busy endpoint returns WouldBlock and increments would_blocks.
         ipc.reset_stats();

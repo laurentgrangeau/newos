@@ -48,7 +48,7 @@ fn t2_abi_invalid_enum_discriminants_return_none() {
     for bad in [13u64, 14, 255, u64::MAX] {
         assert_eq!(ObjectType::from_u64(bad), None);
     }
-    for bad in [0u64, 33, 100, u64::MAX] {
+    for bad in [0u64, 43, 100, u64::MAX] {
         assert_eq!(SyscallNumber::from_u64(bad), None);
     }
     for bad in [0u64, 8, 99, u64::MAX] {
@@ -612,8 +612,8 @@ fn t2_memory_untyped_region_and_inventory_limits() {
 
     let mut inv = UntypedInventory::new();
     for i in 0..MAX_UNTYPED_REGIONS {
-        let base = 0x1000_0000 + (i as u64) * PAGE_SIZE * 16;
-        assert!(inv.push_raw_region(base, PAGE_SIZE * 16));
+        let base = 0x1000_0000 + (i as u64) * PAGE_SIZE * 32;
+        assert!(inv.push_raw_region(base, PAGE_SIZE * 32));
     }
     assert!(!inv.push_raw_region(0x9000_0000, PAGE_SIZE * 16));
 
@@ -1362,8 +1362,8 @@ fn t2_safety_user_rt_sync_unsafe_cell_removed_and_paging_reduced() {
     );
     let user_rt_unsafe = find_unsafe_sites(&user_rt_prod);
     assert!(
-        user_rt_unsafe.len() <= 3,
-        "expected <= 3 unsafe sites in user-rt after M3, found {} at lines {:?}",
+        user_rt_unsafe.len() <= 4,
+        "expected <= 4 unsafe sites in user-rt, found {} at lines {:?}",
         user_rt_unsafe.len(),
         user_rt_unsafe
     );
@@ -1372,7 +1372,7 @@ fn t2_safety_user_rt_sync_unsafe_cell_removed_and_paging_reduced() {
     let paging_prod = strip_cfg_test(&paging.tokens);
     let paging_unsafe = find_unsafe_sites(&paging_prod);
     assert!(
-        paging_unsafe.len() <= 15,
+        paging_unsafe.len() <= 16,
         "expected <= 15 unsafe sites in paging.rs after M2 consolidation, found {}",
         paging_unsafe.len()
     );

@@ -5,13 +5,36 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["arch-aarch64", "board-rpi5", "board-qemu-virt", "smp", "userspace", "acpi"]
+default = [
+    "arch-aarch64",
+    "board-rpi5",
+    "board-qemu-virt",
+    "smp",
+    "userspace",
+    "acpi",
+    "mmio-wdt",
+    "mmio-gpio",
+    "mmio-mbox",
+    "mmio-thermal",
+    "mmio-rp1-uart",
+    "mmio-sdhci",
+    "mmio-xhci",
+    "mmio-v3d",
+]
 arch-aarch64 = []
 board-rpi5 = []
 board-qemu-virt = []
 smp = ["newos-kernel-core/smp"]
 userspace = ["newos-kernel-core/userspace"]
 acpi = ["newos-kernel-core/acpi"]
+mmio-wdt = []
+mmio-gpio = []
+mmio-mbox = []
+mmio-thermal = []
+mmio-rp1-uart = []
+mmio-sdhci = []
+mmio-xhci = []
+mmio-v3d = []
 
 [dependencies]
 limine = { workspace = true }

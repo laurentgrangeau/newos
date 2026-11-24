@@ -367,6 +367,27 @@ impl<const SLOTS: usize> CNode<SLOTS> {
         }
     }
 
+    /// Walk intra-`CNode` parent links starting at `slot` to find the nearest `ExternalParent`
+    /// ancestor outside this `CNode` (used to reparent external CDT children when a domain exits).
+    pub fn root_external_parent_of_slot(&self, mut slot: usize) -> Option<ExternalParent> {
+        for _ in 0..SLOTS {
+            if slot == 0 || slot >= SLOTS || self.slots[slot].cap.is_none() {
+                return None;
+            }
+            if let Some(ext) = self.slots[slot].external_parent() {
+                return Some(ext);
+            }
+            slot = self.slots[slot].parent_slot()?;
+        }
+        None
+    }
+
+    /// Return `true` if `slot` is currently occupied in this `CNode`.
+    #[inline]
+    pub fn is_slot_occupied(&self, slot: usize) -> bool {
+        slot > 0 && slot < SLOTS && self.slots[slot].cap.is_some()
+    }
+
     /// Insert a root capability (e.g. during bootstrap) into the first free slot.
     pub fn insert_root(&mut self, cap: Capability) -> Result<CapId, SysError> {
         let dst = self.find_free_slot()?;
@@ -978,6 +999,15 @@ impl<const SLOTS: usize> CNode<SLOTS> {
             Capability::new(object, cap.rights),
             Some(parent_idx),
         )
+    }
+
+    /// Return `true` if any occupied slot in this `CNode` holds `object` with at least `required` rights.
+    #[inline]
+    pub fn has_live_object_with_rights(&self, object: CapObject, required: Rights) -> bool {
+        self.slots.iter().skip(1).any(|s| {
+            s.cap
+                .is_some_and(|c| c.object == object && c.rights.contains(required))
+        })
     }
 
     /// Count currently occupied capability slots.

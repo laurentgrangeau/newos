@@ -3,7 +3,7 @@
 use limine::memmap::MEMMAP_USABLE;
 use limine::request::{
     ExecutableAddressRequest, ExecutableFileRequest, FramebufferRequest, HhdmRequest,
-    MemmapRequest, ModulesRequest, MpRequest, MpResponse, RsdpRequest,
+    MemmapRequest, ModulesRequest, MpRequest, MpResponse, RsdpRequest, StackSizeRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 use newos_kernel_core::memory::UntypedInventory;
@@ -60,6 +60,11 @@ static EXEC_ADDR_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::n
 #[used]
 #[cfg_attr(target_os = "none", unsafe(link_section = ".requests"))]
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+
+// SAFETY: Limine scans `.requests` in the bare-metal ELF image for `StackSizeRequest` (256 KiB boot stack).
+#[used]
+#[cfg_attr(target_os = "none", unsafe(link_section = ".requests"))]
+static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(256 * 1024);
 
 // SAFETY: Limine scans `.requests_end_marker` in the bare-metal ELF image.
 #[used]

@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const LIMINE_BRANCH: &str = "v9.x-binary";
+const LIMINE_BRANCH: &str = "v9.6.7-binary";
 const LIMINE_REPO: &str = "https://github.com/limine-bootloader/limine.git";
 // Soft-float target for EL1 kernel so LLVM never emits NEON/FP instructions on syscall/IRQ paths (`H2`).
 const KERNEL_TARGET_TRIPLE: &str = "aarch64-unknown-none-softfloat";
@@ -64,7 +64,9 @@ fn main() -> ExitCode {
             .and_then(|p| build_uefi_disk(&p, true, release).map(|_| ())),
         "run" => resolve_profile(&root, &args[1..], "qemu-virt")
             .and_then(|p| run_qemu(&p, true, release)),
-        "test" => run_tests(release),
+        "test" => {
+            resolve_profile(&root, &args[1..], "qemu-virt").and_then(|p| run_tests(&p, release))
+        }
         "host-test" => run_host_tests(release),
         "miri" => run_miri_tests(),
         "verify" => run_kani_verify(),
@@ -329,7 +331,15 @@ fn build_profile_modules(
         }
     }
     if profile.key {
-        let elf = build_user_elf(root, "newos-key-pd", "key-pd", &profile.cpu, None, release)?;
+        let key_feats = profile.key_pd_features();
+        let elf = build_user_elf(
+            root,
+            "newos-key-pd",
+            "key-pd",
+            &profile.cpu,
+            Some(&key_feats),
+            release,
+        )?;
         if include_domains {
             modules.push(("newos-key-pd", elf));
         }
@@ -351,7 +361,9 @@ fn build_uefi_disk(
 ) -> Result<PathBuf, String> {
     let root = workspace_root();
     let kernel_elf = build_kernel(&root, profile, release)?;
-    let modules = build_profile_modules(&root, profile, interactive, release)?;
+    // Always package all enabled profile PDs (including `net-pd`, `key-pd`, `ssh-pd`, `shell-pd`)
+    // so both interactive boots and automated `cargo xtask test` exercise the full protection-domain set.
+    let modules = build_profile_modules(&root, profile, true, release)?;
     let limine_dir = ensure_limine(&root)?;
 
     let stage = root.join("target/esp_root_aarch64");
@@ -862,10 +874,9 @@ fn run_bench(raw_args: &[String]) -> Result<(), String> {
     run_checked(&mut run_cmd, "newos-bench")
 }
 
-fn run_tests(release: bool) -> Result<(), String> {
+fn run_tests(profile: &BuildProfile, release: bool) -> Result<(), String> {
     run_host_tests(release)?;
-    let profile = BuildProfile::default_full("qemu-virt");
-    run_qemu(&profile, false, release)
+    run_qemu(profile, false, release)
 }
 
 fn find_firmware() -> Result<&'static str, String> {

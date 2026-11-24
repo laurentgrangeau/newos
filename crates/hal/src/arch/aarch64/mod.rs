@@ -405,6 +405,7 @@ pub fn guarded_el1_stack_top(cpu_id: usize) -> u64 {
 ///
 /// # Safety
 /// `new_sp` must be 16-byte aligned and point to the top of a valid, writable EL1 stack.
+// SAFETY: Caller guarantees `new_sp` is 16-byte aligned, writable, and `target` never returns.
 pub unsafe fn pivot_sp_and_jump(new_sp: u64, target: extern "C" fn() -> !) -> ! {
     // SAFETY: Caller guarantees `new_sp` is valid and `target` never returns.
     unsafe {
@@ -461,10 +462,12 @@ extern "C" fn aarch64_irq_el1_handler() {
 extern "C" fn aarch64_sync_el1_handler() {
     let esr: u64;
     let elr: u64;
-    // SAFETY: Reading `ESR_EL1` and `ELR_EL1` inside EL1 synchronous exception handler.
+    let far: u64;
+    // SAFETY: Reading `ESR_EL1`, `ELR_EL1`, and `FAR_EL1` inside EL1 synchronous exception handler.
     unsafe {
         asm!("mrs {}, esr_el1", out(reg) esr, options(nomem, nostack));
         asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack));
+        asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
     }
     let ec = (esr >> 26) & 0x3F;
     let iss = esr & 0xFFFF;
@@ -482,8 +485,8 @@ extern "C" fn aarch64_sync_el1_handler() {
     let mut s = serial::UnlockedPl011;
     let _ = writeln!(
         s,
-        "[newos-hal] FATAL AArch64 EL1 sync exception EC={:#x} ISS={:#x} ELR={:#018x}",
-        ec, iss, elr
+        "[newos-hal] FATAL AArch64 EL1 sync exception EC={:#x} ISS={:#x} ELR={:#018x} FAR={:#018x}",
+        ec, iss, elr, far
     );
     system_off(ShutdownStatus::Failed)
 }
@@ -853,6 +856,20 @@ impl Aarch64Platform {
         #[cfg(not(feature = "acpi"))]
         let acpi = AcpiHardware::default();
 
+        // Lock PT_GNU_RELRO (`.data.rel.ro`, `.got`, `.dynamic`) read-only in `TTBR1_EL1`
+        // after Limine has finished applying PIE relocations.
+        // SAFETY: `__relro_start` and `__relro_end` are linker-defined section boundary symbols
+        // in `crates/kernel/linker-aarch64.ld`; only their addresses are taken via `&raw const`.
+        unsafe extern "C" {
+            static __relro_start: u8;
+            static __relro_end: u8;
+        }
+        let relro_start = (&raw const __relro_start) as u64;
+        let relro_end = (&raw const __relro_end) as u64;
+        if relro_end > relro_start {
+            vspace.protect_ro_range(relro_start, relro_end);
+        }
+
         // Select PL011 MMIO physical base (ACPI SPCR -> board descriptor fallback):
         const UART_VIRT: u64 = 0xffff_b000_0000_0000;
         let uart_phys = acpi.spcr_uart_base.unwrap_or(board.uart.phys_base);
@@ -1043,25 +1060,30 @@ impl Aarch64Platform {
         PSCI_USE_SMC.store(use_smc, Ordering::Release);
 
         // Map capability-scoped Raspberry Pi 5 BCM2712 Hardware Watchdog MMIO (`0x10_7D20_0000`, `0x100` B):
-        const RPI5_PM_WDT_PHYS: u64 = 0x10_7D20_0000;
-        const RPI5_PM_WDT_LEN: u64 = 0x100;
-        const WDT_MMIO_VIRT: u64 = 0xffff_b006_0000_0000;
-        let wdt_mmio = if !info.qemu_virt
-            && let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
-            && let Ok(wdt_va) = VirtAddr::new_page_aligned(WDT_MMIO_VIRT)
-            && let Ok(wdt_fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_PM_WDT_PHYS))
-            && vspace
-                .map_4k(wdt_va, wdt_fr, mmio_flags, &mut info.untyped)
-                .is_ok()
-        {
-            Some((
-                PhysAddr::new(RPI5_PM_WDT_PHYS),
-                WDT_MMIO_VIRT,
-                RPI5_PM_WDT_LEN,
-            ))
-        } else {
-            None
+        #[cfg(feature = "mmio-wdt")]
+        let wdt_mmio = {
+            const RPI5_PM_WDT_PHYS: u64 = 0x10_7D20_0000;
+            const RPI5_PM_WDT_LEN: u64 = 0x100;
+            const WDT_MMIO_VIRT: u64 = 0xffff_b006_0000_0000;
+            if !info.qemu_virt
+                && let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
+                && let Ok(wdt_va) = VirtAddr::new_page_aligned(WDT_MMIO_VIRT)
+                && let Ok(wdt_fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_PM_WDT_PHYS))
+                && vspace
+                    .map_4k(wdt_va, wdt_fr, mmio_flags, &mut info.untyped)
+                    .is_ok()
+            {
+                Some((
+                    PhysAddr::new(RPI5_PM_WDT_PHYS),
+                    WDT_MMIO_VIRT,
+                    RPI5_PM_WDT_LEN,
+                ))
+            } else {
+                None
+            }
         };
+        #[cfg(not(feature = "mmio-wdt"))]
+        let wdt_mmio: Option<(PhysAddr, u64, u64)> = None;
 
         set_cpu_id(0);
         probe_and_enable_cpu_hardening();
@@ -1083,77 +1105,95 @@ impl Aarch64Platform {
         if !info.qemu_virt
             && let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
         {
-            const RP1_GPIO_PHYS: u64 = 0x1F_000D_0000;
-            const RP1_GPIO_LEN: u64 = 0x24000;
-            const RP1_GPIO_VIRT: u64 = 0xffff_b007_0000_0000;
-            let mut gpio_ok = true;
-            for block_off in [0x0_0000u64, 0x1_0000u64, 0x2_0000u64] {
-                let mut block_mapped = true;
-                for p in 0..4u64 {
-                    let off = block_off + p * 4096;
-                    let ok = VirtAddr::new_page_aligned(RP1_GPIO_VIRT + off)
-                        .and_then(|va| {
-                            PhysFrame::from_aligned(PhysAddr::new(RP1_GPIO_PHYS + off))
-                                .and_then(|fr| vspace.map_4k(va, fr, mmio_flags, &mut info.untyped))
-                        })
-                        .is_ok();
-                    if !ok {
-                        block_mapped = false;
-                        break;
+            #[cfg(feature = "mmio-gpio")]
+            {
+                const RP1_GPIO_PHYS: u64 = 0x1F_000D_0000;
+                const RP1_GPIO_LEN: u64 = 0x24000;
+                const RP1_GPIO_VIRT: u64 = 0xffff_b007_0000_0000;
+                let mut gpio_ok = true;
+                for block_off in [0x0_0000u64, 0x1_0000u64, 0x2_0000u64] {
+                    let mut block_mapped = true;
+                    for p in 0..4u64 {
+                        let off = block_off + p * 4096;
+                        let ok = VirtAddr::new_page_aligned(RP1_GPIO_VIRT + off)
+                            .and_then(|va| {
+                                PhysFrame::from_aligned(PhysAddr::new(RP1_GPIO_PHYS + off))
+                                    .and_then(|fr| {
+                                        vspace.map_4k(va, fr, mmio_flags, &mut info.untyped)
+                                    })
+                            })
+                            .is_ok();
+                        if !ok {
+                            block_mapped = false;
+                            break;
+                        }
+                    }
+                    if block_mapped {
+                        syscall::register_extra_mmio_mapping(
+                            PhysAddr::new(RP1_GPIO_PHYS + block_off),
+                            RP1_GPIO_VIRT + block_off,
+                            0x4000,
+                        );
+                    } else {
+                        gpio_ok = false;
                     }
                 }
-                if block_mapped {
-                    syscall::register_extra_mmio_mapping(
-                        PhysAddr::new(RP1_GPIO_PHYS + block_off),
-                        RP1_GPIO_VIRT + block_off,
-                        0x4000,
-                    );
-                } else {
-                    gpio_ok = false;
+                if gpio_ok {
+                    syscall::register_init_mmio_cap(19, PhysAddr::new(RP1_GPIO_PHYS), RP1_GPIO_LEN);
                 }
             }
-            if gpio_ok {
-                syscall::register_init_mmio_cap(19, PhysAddr::new(RP1_GPIO_PHYS), RP1_GPIO_LEN);
+
+            #[cfg(feature = "mmio-mbox")]
+            {
+                const MBOX_PHYS: u64 = 0x10_7C01_3000;
+                const MBOX_VIRT: u64 = 0xffff_b008_0000_0000;
+                if let Ok(va) = VirtAddr::new_page_aligned(MBOX_VIRT)
+                    && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(MBOX_PHYS))
+                    && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
+                {
+                    syscall::register_extra_mmio_mapping(
+                        PhysAddr::new(MBOX_PHYS),
+                        MBOX_VIRT,
+                        0x1000,
+                    );
+                    syscall::register_init_mmio_cap(20, PhysAddr::new(MBOX_PHYS), 0x1000);
+                }
             }
 
-            const MBOX_PHYS: u64 = 0x10_7C01_3000;
-            const MBOX_VIRT: u64 = 0xffff_b008_0000_0000;
-            if let Ok(va) = VirtAddr::new_page_aligned(MBOX_VIRT)
-                && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(MBOX_PHYS))
-                && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
+            #[cfg(feature = "mmio-thermal")]
             {
-                syscall::register_extra_mmio_mapping(PhysAddr::new(MBOX_PHYS), MBOX_VIRT, 0x1000);
-                syscall::register_init_mmio_cap(20, PhysAddr::new(MBOX_PHYS), 0x1000);
-            }
-
-            const THERMAL_PHYS: u64 = 0x10_7D5D_2000;
-            const THERMAL_VIRT: u64 = 0xffff_b009_0000_0000;
-            if let Ok(va) = VirtAddr::new_page_aligned(THERMAL_VIRT)
-                && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(THERMAL_PHYS))
-                && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
-            {
-                syscall::register_extra_mmio_mapping(
-                    PhysAddr::new(THERMAL_PHYS),
-                    THERMAL_VIRT,
-                    0x1000,
-                );
-                syscall::register_init_mmio_cap(21, PhysAddr::new(THERMAL_PHYS), 0x1000);
+                const THERMAL_PHYS: u64 = 0x10_7D5D_2000;
+                const THERMAL_VIRT: u64 = 0xffff_b009_0000_0000;
+                if let Ok(va) = VirtAddr::new_page_aligned(THERMAL_VIRT)
+                    && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(THERMAL_PHYS))
+                    && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
+                {
+                    syscall::register_extra_mmio_mapping(
+                        PhysAddr::new(THERMAL_PHYS),
+                        THERMAL_VIRT,
+                        0x1000,
+                    );
+                    syscall::register_init_mmio_cap(21, PhysAddr::new(THERMAL_PHYS), 0x1000);
+                }
             }
 
             // Narrow RP1 peripheral capability to the 4 KiB RP1 UART0 page (`P10`) instead of
             // spanning UART0, SPI0, I2C0, I2C1, and PWM0 in a single 420 KiB capability.
-            const RP1_UART0_PHYS: u64 = 0x1F_0003_0000;
-            const RP1_UART0_VIRT: u64 = 0xffff_b00a_0000_0000;
-            if let Ok(va) = VirtAddr::new_page_aligned(RP1_UART0_VIRT)
-                && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(RP1_UART0_PHYS))
-                && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
+            #[cfg(feature = "mmio-rp1-uart")]
             {
-                syscall::register_extra_mmio_mapping(
-                    PhysAddr::new(RP1_UART0_PHYS),
-                    RP1_UART0_VIRT,
-                    0x1000,
-                );
-                syscall::register_init_mmio_cap(22, PhysAddr::new(RP1_UART0_PHYS), 0x1000);
+                const RP1_UART0_PHYS: u64 = 0x1F_0003_0000;
+                const RP1_UART0_VIRT: u64 = 0xffff_b00a_0000_0000;
+                if let Ok(va) = VirtAddr::new_page_aligned(RP1_UART0_VIRT)
+                    && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(RP1_UART0_PHYS))
+                    && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
+                {
+                    syscall::register_extra_mmio_mapping(
+                        PhysAddr::new(RP1_UART0_PHYS),
+                        RP1_UART0_VIRT,
+                        0x1000,
+                    );
+                    syscall::register_init_mmio_cap(22, PhysAddr::new(RP1_UART0_PHYS), 0x1000);
+                }
             }
 
             // BCM2712 MIP MSI-X (`0x10_0013_0000`), microSD SDHCI (`0x10_00ff_f000`),
@@ -1167,20 +1207,24 @@ impl Aarch64Platform {
                 gic::init_bcm2712_mip(RPI5_MIP_VIRT);
             }
 
-            const RPI5_SDHCI_PHYS: u64 = 0x10_00ff_f000;
-            const RPI5_SDHCI_VIRT: u64 = 0xffff_b00c_0000_0000;
-            if let Ok(va) = VirtAddr::new_page_aligned(RPI5_SDHCI_VIRT)
-                && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_SDHCI_PHYS))
-                && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
+            #[cfg(feature = "mmio-sdhci")]
             {
-                syscall::register_extra_mmio_mapping(
-                    PhysAddr::new(RPI5_SDHCI_PHYS),
-                    RPI5_SDHCI_VIRT,
-                    0x1000,
-                );
-                syscall::register_init_mmio_cap(23, PhysAddr::new(RPI5_SDHCI_PHYS), 0x1000);
+                const RPI5_SDHCI_PHYS: u64 = 0x10_00ff_f000;
+                const RPI5_SDHCI_VIRT: u64 = 0xffff_b00c_0000_0000;
+                if let Ok(va) = VirtAddr::new_page_aligned(RPI5_SDHCI_VIRT)
+                    && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_SDHCI_PHYS))
+                    && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
+                {
+                    syscall::register_extra_mmio_mapping(
+                        PhysAddr::new(RPI5_SDHCI_PHYS),
+                        RPI5_SDHCI_VIRT,
+                        0x1000,
+                    );
+                    syscall::register_init_mmio_cap(23, PhysAddr::new(RPI5_SDHCI_PHYS), 0x1000);
+                }
             }
 
+            #[cfg(feature = "mmio-xhci")]
             for (slot, xhci_phys, xhci_virt) in [
                 (24usize, 0x1f_0020_0000u64, 0xffff_b00d_0000_0000u64),
                 (25usize, 0x1f_0030_0000u64, 0xffff_b00e_0000_0000u64),
@@ -1212,29 +1256,32 @@ impl Aarch64Platform {
             // PCIe ECAM and BCM2712 IOMMU are intentionally kept kernel-owned (`P4`):
             // never hand raw PCIe configuration space or IOMMU registers to EL0 `init`.
             // VideoCore VII V3D 7.1 (`0x10_0200_0000` Hub + `0x10_0200_8000` Core 0).
-            const RPI5_V3D_PHYS: u64 = 0x10_0200_0000;
-            const RPI5_V3D_LEN: u64 = 0x9000;
-            const RPI5_V3D_VIRT: u64 = 0xffff_b010_0000_0000;
-            let mut v3d_ok = true;
-            for off in [0x0000u64, 0x8000u64] {
-                let ok = VirtAddr::new_page_aligned(RPI5_V3D_VIRT + off)
-                    .and_then(|va| {
-                        PhysFrame::from_aligned(PhysAddr::new(RPI5_V3D_PHYS + off))
-                            .and_then(|fr| vspace.map_4k(va, fr, mmio_flags, &mut info.untyped))
-                    })
-                    .is_ok();
-                if ok {
-                    syscall::register_extra_mmio_mapping(
-                        PhysAddr::new(RPI5_V3D_PHYS + off),
-                        RPI5_V3D_VIRT + off,
-                        0x1000,
-                    );
-                } else {
-                    v3d_ok = false;
+            #[cfg(feature = "mmio-v3d")]
+            {
+                const RPI5_V3D_PHYS: u64 = 0x10_0200_0000;
+                const RPI5_V3D_LEN: u64 = 0x9000;
+                const RPI5_V3D_VIRT: u64 = 0xffff_b010_0000_0000;
+                let mut v3d_ok = true;
+                for off in [0x0000u64, 0x8000u64] {
+                    let ok = VirtAddr::new_page_aligned(RPI5_V3D_VIRT + off)
+                        .and_then(|va| {
+                            PhysFrame::from_aligned(PhysAddr::new(RPI5_V3D_PHYS + off))
+                                .and_then(|fr| vspace.map_4k(va, fr, mmio_flags, &mut info.untyped))
+                        })
+                        .is_ok();
+                    if ok {
+                        syscall::register_extra_mmio_mapping(
+                            PhysAddr::new(RPI5_V3D_PHYS + off),
+                            RPI5_V3D_VIRT + off,
+                            0x1000,
+                        );
+                    } else {
+                        v3d_ok = false;
+                    }
                 }
-            }
-            if v3d_ok {
-                syscall::register_init_mmio_cap(28, PhysAddr::new(RPI5_V3D_PHYS), RPI5_V3D_LEN);
+                if v3d_ok {
+                    syscall::register_init_mmio_cap(28, PhysAddr::new(RPI5_V3D_PHYS), RPI5_V3D_LEN);
+                }
             }
         }
 

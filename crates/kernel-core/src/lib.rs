@@ -29,7 +29,7 @@ const USER_STACK_BASE: u64 = 0x0000_7fff_f000_0000;
 pub const USER_STACK_PAGES: u64 = 16; // 64 KiB EL0 data stack
 /// 1 MiB EL0 data stack for protection domains (`newos-net-pd`, `newos-key-pd`, `newos-ssh-pd`)
 /// running NIST Level 5 ML-DSA-87 / ML-KEM-1024 lattice math.
-pub const USER_PQ_STACK_PAGES: u64 = 256;
+pub const USER_PQ_STACK_PAGES: u64 = 384;
 #[cfg(feature = "userspace")]
 const USER_SHADOW_STACK_BASE: u64 = 0x0000_7fff_e000_0000;
 #[cfg(feature = "userspace")]
@@ -312,15 +312,9 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
         let Some(supervisor_bytes) = info.supervisor_module else {
             let _ = writeln!(
                 platform,
-                "[newos] no EL0 supervisor-pd module supplied; pure EL1 kernel boot complete"
+                "[newos] FAIL: userspace feature enabled but no EL0 supervisor-pd module supplied"
             );
-            if info.qemu_virt {
-                platform.exit(ShutdownStatus::Success)
-            } else {
-                loop {
-                    platform.wait_for_interrupt();
-                }
-            }
+            platform.exit(ShutdownStatus::Failed);
         };
 
         platform.register_boot_module(DomainRole::Supervisor, supervisor_bytes);
@@ -421,9 +415,9 @@ fn spawn_isolated_domain<P: HalPlatform>(
     untyped: &mut UntypedInventory,
 ) -> Result<(), SysError> {
     #[cfg(feature = "elf-attestation")]
-    let sha_prefix = newos_crypto::sha3::digest_prefix_u64(elf_bytes);
+    let sha_prefix = Some(newos_crypto::sha3::digest_prefix_u64(elf_bytes));
     #[cfg(not(feature = "elf-attestation"))]
-    let sha_prefix: u64 = 0;
+    let sha_prefix: Option<u64> = None;
     let entropy = platform.random_u64();
     let stack_slide = (entropy & 0xFF) * PAGE_SIZE;
     let pie_base = 0x0040_0000u64 + (((entropy >> 8) & 0xFF) * PAGE_SIZE);
@@ -445,14 +439,25 @@ fn spawn_isolated_domain<P: HalPlatform>(
     )?;
     let root = user_vspace.root_phys();
     let pd_id = platform.register_domain(role, entry, user_sp, user_shadow_sp, root)?;
-    let _ = writeln!(
-        platform,
-        "[newos] spawned EL0 `{name}` (pd={pd_id}, role={role:?}, ttbr0={:#018x}, entry={:#018x}, sp={:#018x}, scs={:#018x}, segs={segs}, measured_sha3_512={sha_prefix:#018x})",
-        root.raw(),
-        entry.raw(),
-        user_sp.raw(),
-        user_shadow_sp.raw(),
-    );
+    if let Some(digest) = sha_prefix {
+        let _ = writeln!(
+            platform,
+            "[newos] spawned EL0 `{name}` (pd={pd_id}, role={role:?}, ttbr0={:#018x}, entry={:#018x}, sp={:#018x}, scs={:#018x}, segs={segs}, measured_sha3_512={digest:#018x})",
+            root.raw(),
+            entry.raw(),
+            user_sp.raw(),
+            user_shadow_sp.raw(),
+        );
+    } else {
+        let _ = writeln!(
+            platform,
+            "[newos] spawned EL0 `{name}` (pd={pd_id}, role={role:?}, ttbr0={:#018x}, entry={:#018x}, sp={:#018x}, scs={:#018x}, segs={segs})",
+            root.raw(),
+            entry.raw(),
+            user_sp.raw(),
+            user_shadow_sp.raw(),
+        );
+    }
     Ok(())
 }
 

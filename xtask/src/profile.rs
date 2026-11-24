@@ -103,6 +103,44 @@ impl BuildProfile {
         }
     }
 
+    /// Minimal empty profile used as the base for `parse_toml` so omitted keys never
+    /// silently enable SSH, networking, crypto, or hardware drivers (`M9`).
+    pub fn minimal_empty() -> Self {
+        Self {
+            arch: "aarch64".into(),
+            board: "rpi5".into(),
+            cpu: "cortex-a76".into(),
+            scheduler: "priority-rr".into(),
+            smp: false,
+            userspace: false,
+            elf_attestation: false,
+            acpi: false,
+            supervisor: false,
+            worker: false,
+            shell: false,
+            net: false,
+            key: false,
+            ssh: false,
+            net_enabled: false,
+            ipv4: false,
+            ipv6: false,
+            tcp: false,
+            udp: false,
+            icmp: false,
+            dns: false,
+            net_drivers: Vec::new(),
+            crypto_algorithms: Vec::new(),
+            storage_drivers: Vec::new(),
+            rng_drivers: Vec::new(),
+            gpu_drivers: Vec::new(),
+            ai_drivers: Vec::new(),
+            usb_drivers: Vec::new(),
+            gpio_drivers: Vec::new(),
+            wdt_drivers: Vec::new(),
+            board_drivers: Vec::new(),
+        }
+    }
+
     pub fn from_file(path: &Path) -> Result<Self, String> {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("failed to read profile {}: {e}", path.display()))?;
@@ -110,9 +148,13 @@ impl BuildProfile {
     }
 
     /// Parse a NewOS TOML build profile without external crate dependencies.
+    ///
+    /// Rejects duplicate keys, unknown sections/keys, and starts from [`Self::minimal_empty`]
+    /// so omitted keys never silently leave features enabled (`M9`).
     pub fn parse_toml(input: &str) -> Result<Self, String> {
-        let mut p = Self::default_full("rpi5");
+        let mut p = Self::minimal_empty();
         let mut section = String::new();
+        let mut seen_keys = std::collections::BTreeSet::new();
 
         for (line_idx, raw_line) in input.lines().enumerate() {
             let line_no = line_idx + 1;
@@ -131,6 +173,16 @@ impl BuildProfile {
             };
             let key = k.trim();
             let val = v.trim();
+            let canonical_key = if section == "kernel" && key == "elf_measurement" {
+                "elf_attestation"
+            } else {
+                key
+            };
+            if !seen_keys.insert((section.clone(), canonical_key.to_string())) {
+                return Err(format!(
+                    "duplicate config option `[{section}].{key}` on line {line_no}"
+                ));
+            }
             match (section.as_str(), key) {
                 ("target", "arch") => p.arch = parse_str(val, line_no)?,
                 ("target", "board") => p.board = parse_str(val, line_no)?,
@@ -139,7 +191,9 @@ impl BuildProfile {
                 ("kernel", "scheduler") => p.scheduler = parse_str(val, line_no)?,
                 ("kernel", "smp") => p.smp = parse_bool(val, line_no)?,
                 ("kernel", "userspace") => p.userspace = parse_bool(val, line_no)?,
-                ("kernel", "elf_attestation") => p.elf_attestation = parse_bool(val, line_no)?,
+                ("kernel", "elf_attestation" | "elf_measurement") => {
+                    p.elf_attestation = parse_bool(val, line_no)?
+                }
                 ("kernel", "acpi") => p.acpi = parse_bool(val, line_no)?,
 
                 ("domains", "supervisor") => p.supervisor = parse_bool(val, line_no)?,
@@ -180,10 +234,19 @@ impl BuildProfile {
     }
 
     /// Apply ergonomic CLI overrides on top of a loaded system composition profile.
+    ///
+    /// Rejects any unrecognized flag so typos like `--no-sshd` never silently leave SSH on (`M9`).
     pub fn apply_cli_overrides(&mut self, args: &[String]) -> Result<(), String> {
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
+                "--profile" => {
+                    i += 1;
+                    if args.get(i).is_none() {
+                        return Err("missing value for `--profile`".into());
+                    }
+                }
+                "--release" | "--debug" | "--list-options" => {}
                 "--board" => {
                     i += 1;
                     let b = args
@@ -217,6 +280,10 @@ impl BuildProfile {
                     self.net_enabled = false;
                     self.ipv4 = false;
                     self.ipv6 = false;
+                    self.tcp = false;
+                    self.udp = false;
+                    self.icmp = false;
+                    self.dns = false;
                     self.net = false;
                     self.ssh = false;
                 }
@@ -242,7 +309,11 @@ impl BuildProfile {
                     self.storage_drivers.retain(|d| d != "caos-snapshot");
                     self.rng_drivers.retain(|d| d != "csprng");
                 }
-                _ => {}
+                unknown => {
+                    return Err(format!(
+                        "unknown CLI option `{unknown}` (run `cargo xtask help` for valid options)"
+                    ));
+                }
             }
             i += 1;
         }
@@ -271,6 +342,55 @@ impl BuildProfile {
                 "unsupported scheduler `{}` (supported: `priority-rr`, `round-robin`, `fifo`)",
                 self.scheduler
             ));
+        }
+        if self.scheduler == "fifo" && self.userspace {
+            return Err(
+                "Profile error: cooperative scheduler `fifo` cannot be combined with `[kernel].userspace = true` (`M6`)"
+                    .into(),
+            );
+        }
+        for alg in &self.crypto_algorithms {
+            if !matches!(
+                alg.as_str(),
+                "sha3" | "chacha20-poly1305" | "ml-kem-1024" | "ml-dsa-87"
+            ) {
+                return Err(format!("Profile error: unknown crypto algorithm `{alg}`"));
+            }
+        }
+        for drv in &self.net_drivers {
+            if !matches!(drv.as_str(), "gem" | "virtio") {
+                return Err(format!("Profile error: unknown net driver `{drv}`"));
+            }
+        }
+        for (cat, list, allowed) in [
+            (
+                "storage",
+                &self.storage_drivers,
+                &["pcie", "sdhci", "nvme", "caos-snapshot"][..],
+            ),
+            (
+                "rng",
+                &self.rng_drivers,
+                &["bcm2712", "virtio", "csprng"][..],
+            ),
+            ("gpu", &self.gpu_drivers, &["v3d", "iommu"][..]),
+            ("ai", &self.ai_drivers, &["compute", "hailo"][..]),
+            ("usb", &self.usb_drivers, &["xhci"][..]),
+            ("gpio", &self.gpio_drivers, &["rp1"][..]),
+            ("wdt", &self.wdt_drivers, &["bcm2712"][..]),
+            (
+                "board",
+                &self.board_drivers,
+                &["mailbox", "thermal", "rtc", "rp1-bus"][..],
+            ),
+        ] {
+            for drv in list {
+                if !allowed.contains(&drv.as_str()) {
+                    return Err(format!(
+                        "Profile error: unknown `[drivers].{cat}` entry `{drv}`"
+                    ));
+                }
+            }
         }
         if !self.userspace
             && (self.supervisor || self.worker || self.shell || self.net || self.key || self.ssh)
@@ -353,10 +473,34 @@ impl BuildProfile {
             feats.push("userspace".into());
         }
         if self.elf_attestation {
-            feats.push("elf-attestation".into());
+            feats.push("elf-measurement".into());
         }
         if self.acpi {
             feats.push("acpi".into());
+        }
+        if !self.wdt_drivers.is_empty() {
+            feats.push("mmio-wdt".into());
+        }
+        if !self.gpio_drivers.is_empty() {
+            feats.push("mmio-gpio".into());
+        }
+        if self.board_drivers.iter().any(|d| d == "mailbox") {
+            feats.push("mmio-mbox".into());
+        }
+        if self.board_drivers.iter().any(|d| d == "thermal") {
+            feats.push("mmio-thermal".into());
+        }
+        if self.board_drivers.iter().any(|d| d == "rp1-bus") {
+            feats.push("mmio-rp1-uart".into());
+        }
+        if self.storage_drivers.iter().any(|d| d == "sdhci") {
+            feats.push("mmio-sdhci".into());
+        }
+        if !self.usb_drivers.is_empty() {
+            feats.push("mmio-xhci".into());
+        }
+        if self.gpu_drivers.iter().any(|d| d == "v3d") {
+            feats.push("mmio-v3d".into());
         }
         feats
     }
@@ -366,6 +510,9 @@ impl BuildProfile {
         let mut feats = Vec::new();
         if self.shell {
             feats.push("shell".into());
+            if self.has_crypto("sha3") {
+                feats.push("crypto-sha3".into());
+            }
         }
         if self.net_enabled && self.shell {
             feats.push("net".into());
@@ -374,6 +521,18 @@ impl BuildProfile {
             }
             if self.ipv6 {
                 feats.push("ipv6".into());
+            }
+            if self.tcp {
+                feats.push("tcp".into());
+            }
+            if self.udp {
+                feats.push("udp".into());
+            }
+            if self.icmp {
+                feats.push("icmp".into());
+            }
+            if self.dns {
+                feats.push("dns".into());
             }
         }
         if self.ssh {
@@ -397,8 +556,34 @@ impl BuildProfile {
         if self.ipv6 {
             feats.push("ipv6".into());
         }
+        if self.tcp {
+            feats.push("tcp".into());
+        }
+        if self.udp {
+            feats.push("udp".into());
+        }
+        if self.icmp {
+            feats.push("icmp".into());
+        }
+        if self.dns {
+            feats.push("dns".into());
+        }
         for drv in &self.net_drivers {
             feats.push(format!("driver-{drv}"));
+        }
+        feats
+    }
+
+    /// Resolve Cargo `--features` list for `newos-key-pd` (`--no-default-features`).
+    pub fn key_pd_features(&self) -> Vec<String> {
+        let mut feats = Vec::new();
+        for drv in &self.rng_drivers {
+            match drv.as_str() {
+                "bcm2712" => feats.push("driver-bcm2712".into()),
+                "virtio" => feats.push("driver-virtio".into()),
+                "csprng" => feats.push("csprng".into()),
+                _ => {}
+            }
         }
         feats
     }
@@ -638,5 +823,23 @@ mod tests {
         p3.apply_cli_overrides(&["--ipv6-only".into()]).unwrap();
         p3.validate().expect("--ipv6-only must be valid");
         assert!(!p3.ipv4 && p3.ipv6);
+
+        // M9: unknown CLI flags like `--no-sshd` must fail closed instead of leaving SSH enabled.
+        let mut p4 = BuildProfile::default_full("qemu-virt");
+        assert!(p4.apply_cli_overrides(&["--no-sshd".into()]).is_err());
+
+        // M6: cooperative `fifo` scheduler must be rejected when `userspace = true`.
+        let mut p5 = BuildProfile::default_full("qemu-virt");
+        p5.scheduler = "fifo".into();
+        assert!(p5.validate().is_err());
+
+        // M9: duplicate keys and unknown drivers/algorithms must be rejected.
+        assert!(BuildProfile::parse_toml("[kernel]\nsmp = true\nsmp = false\n").is_err());
+        let mut p6 = BuildProfile::default_full("rpi5");
+        p6.crypto_algorithms.push("md5".into());
+        assert!(p6.validate().is_err());
+        let mut p7 = BuildProfile::default_full("rpi5");
+        p7.net_drivers.push("e1000".into());
+        assert!(p7.validate().is_err());
     }
 }

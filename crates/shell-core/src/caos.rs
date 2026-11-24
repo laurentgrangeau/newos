@@ -32,7 +32,20 @@ impl ObjHash {
     pub const ZERO: Self = Self(0);
 
     pub const fn hash_bytes(bytes: &[u8]) -> Self {
+        #[cfg(feature = "sha3")]
         let mut h = newos_abi::sha3::digest_prefix_u64(bytes);
+        #[cfg(not(feature = "sha3"))]
+        let mut h = {
+            // Non-cryptographic FNV-1a 64-bit content hash for zero-crypto build profiles.
+            let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
+            let mut i = 0;
+            while i < bytes.len() {
+                acc ^= bytes[i] as u64;
+                acc = acc.wrapping_mul(0x0000_0100_0000_01b3);
+                i += 1;
+            }
+            acc
+        };
         if h == 0 {
             h = 1;
         }

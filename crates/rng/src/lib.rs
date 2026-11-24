@@ -251,4 +251,22 @@ mod tests {
         ];
         assert_eq!(&block[..16], &expected_first_16);
     }
+
+    #[test]
+    fn health_check_rejects_repeating_patterns() {
+        // 16-byte repeating pattern has 16 unique bytes and max count 4 (passes RCT/APT/delta),
+        // but must be rejected by the periodic pattern check.
+        let mut pat16 = [0u8; SEED_BLOCK_BYTES];
+        let base: [u8; 16] = [
+            0x13, 0x7A, 0x4C, 0xF1, 0x02, 0x99, 0xE5, 0x38, 0xB4, 0x6D, 0x20, 0x8F, 0xC7, 0x51,
+            0xA6, 0x0E,
+        ];
+        for (i, b) in pat16.iter_mut().enumerate() {
+            *b = base[i % 16];
+        }
+        assert_eq!(
+            verify_entropy_health(&pat16),
+            Err(RngError::HealthCheckFailed)
+        );
+    }
 }

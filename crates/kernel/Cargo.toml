@@ -11,9 +11,17 @@ default = [
     "board-qemu-virt",
     "smp",
     "userspace",
-    "elf-attestation",
+    "elf-measurement",
     "acpi",
     "sched-priority-rr",
+    "mmio-wdt",
+    "mmio-gpio",
+    "mmio-mbox",
+    "mmio-thermal",
+    "mmio-rp1-uart",
+    "mmio-sdhci",
+    "mmio-xhci",
+    "mmio-v3d",
 ]
 arch-aarch64 = ["newos-hal/arch-aarch64"]
 board-rpi5 = ["newos-hal/board-rpi5"]
@@ -21,10 +29,19 @@ board-qemu-virt = ["newos-hal/board-qemu-virt"]
 smp = ["newos-hal/smp", "newos-kernel-core/smp"]
 userspace = ["newos-hal/userspace", "newos-kernel-core/userspace"]
 elf-attestation = ["newos-kernel-core/elf-attestation"]
+elf-measurement = ["newos-kernel-core/elf-measurement"]
 acpi = ["newos-hal/acpi", "newos-kernel-core/acpi"]
 sched-priority-rr = ["newos-kernel-core/sched-priority-rr"]
 sched-round-robin = ["newos-kernel-core/sched-round-robin"]
 sched-fifo = ["newos-kernel-core/sched-fifo"]
+mmio-wdt = ["newos-hal/mmio-wdt"]
+mmio-gpio = ["newos-hal/mmio-gpio"]
+mmio-mbox = ["newos-hal/mmio-mbox"]
+mmio-thermal = ["newos-hal/mmio-thermal"]
+mmio-rp1-uart = ["newos-hal/mmio-rp1-uart"]
+mmio-sdhci = ["newos-hal/mmio-sdhci"]
+mmio-xhci = ["newos-hal/mmio-xhci"]
+mmio-v3d = ["newos-hal/mmio-v3d"]
 
 [dependencies]
 newos-hal = { workspace = true, default-features = false }

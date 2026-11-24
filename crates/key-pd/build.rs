@@ -89,6 +89,38 @@ fn main() {
     }
     generated.push_str("];\n");
 
+    // Optional build-time provisioned 32-byte host-key seed (`NEWOS_HOST_KEY_SEED` = 64 hex chars
+    // or `host_key.seed` file) so deployments can pin a persistent host fingerprint across reboots.
+    println!("cargo:rerun-if-env-changed=NEWOS_HOST_KEY_SEED");
+    let seed_path = workspace_root.join("host_key.seed");
+    println!("cargo:rerun-if-changed={}", seed_path.display());
+    let raw_seed = if let Ok(v) = env::var("NEWOS_HOST_KEY_SEED") {
+        Some(v)
+    } else if seed_path.exists() {
+        Some(fs::read_to_string(&seed_path).expect("failed to read host_key.seed"))
+    } else {
+        None
+    };
+    if let Some(hex_seed) = raw_seed.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        assert_eq!(
+            hex_seed.len(),
+            64,
+            "NEWOS_HOST_KEY_SEED must be exactly 64 hex chars (32 bytes)"
+        );
+        let bytes = hex_seed.as_bytes();
+        generated.push_str("pub const HOST_KEY_SEED: Option<[u8; 32]> = Some([\n    ");
+        for i in 0..32 {
+            let hi = (bytes[i * 2] as char).to_digit(16).expect("invalid hex") as u8;
+            let lo = (bytes[i * 2 + 1] as char)
+                .to_digit(16)
+                .expect("invalid hex") as u8;
+            generated.push_str(&format!("{:#04x}, ", (hi << 4) | lo));
+        }
+        generated.push_str("\n]);\n");
+    } else {
+        generated.push_str("pub const HOST_KEY_SEED: Option<[u8; 32]> = None;\n");
+    }
+
     fs::write(out_dir.join("authorized_keys.rs"), generated)
         .expect("failed to write authorized_keys.rs");
 }

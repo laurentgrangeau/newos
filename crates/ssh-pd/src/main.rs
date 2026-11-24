@@ -196,7 +196,7 @@ fn main() -> ! {
     let cycles_per_ms = (freq_hz / 1_000).max(1);
     const LOGIN_GRACE_MS: u64 = 30_000;
     const IDLE_TIMEOUT_MS: u64 = 600_000;
-    let mut shell_in = [0u8; 256];
+    let mut shell_in = [0u8; 1024];
 
     loop {
         let now_ms = newos_user_rt::read_cycles().unwrap_or(0) / cycles_per_ms;
@@ -269,7 +269,10 @@ fn main() -> ! {
             let chunk_len = server.pending_tx().len().min(net_ipc::MAX_CHUNK_BYTES);
             let req = net_ipc::encode_send_chunk(&server.pending_tx()[..chunk_len]);
             match ipc_call_retry(CapId::BOOTSTRAP_NET_EP, req) {
-                Ok(sent) if sent > 0 => server.consume_tx(sent as usize),
+                Ok(sent) if sent > 0 => {
+                    let clamped = (sent as usize).min(chunk_len);
+                    server.consume_tx(clamped);
+                }
                 _ => break,
             }
         }
@@ -299,7 +302,8 @@ fn main() -> ! {
                                 got_eof = true;
                                 break;
                             }
-                            let (bytes, n) = log_ipc::decode_chunk(word);
+                            let (bytes, raw_n) = log_ipc::decode_chunk(word);
+                            let n = raw_n.min(rx_batch.len().saturating_sub(rx_len));
                             if n == 0 {
                                 break;
                             }
@@ -361,7 +365,8 @@ fn main() -> ! {
             while sh_len + log_ipc::MAX_CHUNK_BYTES <= sh_out.len() {
                 match newos_user_rt::ipc_recv(CapId::BOOTSTRAP_SSH_OUT_EP) {
                     Ok((_badge, word)) => {
-                        let (bytes, n) = log_ipc::decode_chunk(word);
+                        let (bytes, raw_n) = log_ipc::decode_chunk(word);
+                        let n = raw_n.min(sh_out.len().saturating_sub(sh_len));
                         if n > 0 {
                             sh_out[sh_len..sh_len + n].copy_from_slice(&bytes[..n]);
                             sh_len += n;
@@ -388,6 +393,11 @@ fn main() -> ! {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
+    // Best-effort fail-closed auth-gate close before terminating (`M13`).
+    let _ = newos_user_rt::ipc_call(
+        CapId::BOOTSTRAP_KEY_EP,
+        key_ipc::encode_word_req(key_ipc::OP_CLOSE_SESSION, 0),
+    );
     let _ = newos_user_rt::ipc_log_write(CapId::BOOTSTRAP_LOG_EP, "[ssh-pd] PANIC in EL0\n");
     newos_user_rt::thread_exit()
 }

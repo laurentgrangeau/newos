@@ -900,6 +900,35 @@ pub fn domain_get_fault_info(pd_id: usize) -> Result<(DomainRoleId, u64, u64), S
     Ok((role, esr, elr))
 }
 
+/// Pin a caller-owned `Frame` capability in `iospace_cap` for hardware DMA (`H2`/`H4`),
+/// optionally mapping it as Normal Non-Cacheable (`DMA_FLAG_NON_CACHEABLE`) at `opt_nc_vaddr`.
+pub fn dma_map(
+    iospace_cap: CapId,
+    frame_cap: CapId,
+    flags: u64,
+    opt_nc_vaddr: u64,
+) -> Result<u64, SysError> {
+    raw_syscall(
+        SyscallNumber::DmaMap,
+        iospace_cap.raw(),
+        frame_cap.raw(),
+        flags,
+        opt_nc_vaddr,
+    )
+}
+
+/// Unpin a previously DMA-mapped `Frame` capability from `iospace_cap`.
+pub fn dma_unmap(iospace_cap: CapId, frame_cap: CapId) -> Result<(), SysError> {
+    raw_syscall(
+        SyscallNumber::DmaUnmap,
+        iospace_cap.raw(),
+        frame_cap.raw(),
+        0,
+        0,
+    )
+    .map(|_| ())
+}
+
 /// Read kernel physical memory stats (`BOOTSTRAP_POWER`, `Rights::READ`).
 ///
 /// Returns `(remaining_frames, reclaimed_cache_len)`.

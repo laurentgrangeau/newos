@@ -302,13 +302,100 @@ impl<'a, T: RngTransport> VirtioRngDevice<'a, T> {
             }
             core::hint::spin_loop();
         }
-        // Timeout: reset the device so the timed-out DMA descriptor is never left in flight (`N13`).
-        let _ = self.transport.write32(REG_STATUS, 0);
+        // Timeout: reset AND re-initialize the device so timed-out DMA descriptors are never
+        // left in flight and subsequent handshakes recover automatically (`M16`).
+        let _ = self.reinit_hardware();
+        Err(RngError::HardwareTimeout)
+    }
+
+    fn reinit_hardware(&mut self) -> Result<(), RngError> {
+        self.transport
+            .write32(REG_STATUS, 0)
+            .map_err(RngError::Sys)?;
+        self.dma.avail.flags.store(0, Ordering::Relaxed);
         self.dma.avail.idx.store(0, Ordering::Release);
+        self.dma.used.flags.store(0, Ordering::Relaxed);
         self.dma.used.idx.store(0, Ordering::Release);
         self.avail_idx = 0;
         self.last_used_idx = 0;
-        Err(RngError::HardwareTimeout)
+
+        let mut status = STATUS_ACKNOWLEDGE;
+        self.transport
+            .write32(REG_STATUS, status)
+            .map_err(RngError::Sys)?;
+        status |= STATUS_DRIVER;
+        self.transport
+            .write32(REG_STATUS, status)
+            .map_err(RngError::Sys)?;
+
+        self.transport
+            .write32(REG_DRIVER_FEATURES_SEL, 0)
+            .map_err(RngError::Sys)?;
+        self.transport
+            .write32(REG_DRIVER_FEATURES, 0)
+            .map_err(RngError::Sys)?;
+        self.transport
+            .write32(REG_DRIVER_FEATURES_SEL, 1)
+            .map_err(RngError::Sys)?;
+        self.transport
+            .write32(REG_DRIVER_FEATURES, 1)
+            .map_err(RngError::Sys)?;
+
+        status |= STATUS_FEATURES_OK;
+        self.transport
+            .write32(REG_STATUS, status)
+            .map_err(RngError::Sys)?;
+        if (self.transport.read32(REG_STATUS).map_err(RngError::Sys)? & STATUS_FEATURES_OK) == 0 {
+            return Err(RngError::HardwareFault);
+        }
+
+        self.transport
+            .write32(REG_QUEUE_SEL, 0)
+            .map_err(RngError::Sys)?;
+        self.transport
+            .write32(REG_QUEUE_NUM, QUEUE_SIZE as u32)
+            .map_err(RngError::Sys)?;
+
+        let desc_phys = self
+            .transport
+            .virt_to_phys(&self.dma.desc)
+            .map_err(RngError::Sys)?;
+        let avail_phys = self
+            .transport
+            .virt_to_phys(&self.dma.avail)
+            .map_err(RngError::Sys)?;
+        let used_phys = self
+            .transport
+            .virt_to_phys(&self.dma.used)
+            .map_err(RngError::Sys)?;
+
+        self.transport
+            .write32(REG_QUEUE_DESC_LOW, desc_phys as u32)
+            .map_err(RngError::Sys)?;
+        self.transport
+            .write32(REG_QUEUE_DESC_HIGH, (desc_phys >> 32) as u32)
+            .map_err(RngError::Sys)?;
+        self.transport
+            .write32(REG_QUEUE_DRIVER_LOW, avail_phys as u32)
+            .map_err(RngError::Sys)?;
+        self.transport
+            .write32(REG_QUEUE_DRIVER_HIGH, (avail_phys >> 32) as u32)
+            .map_err(RngError::Sys)?;
+        self.transport
+            .write32(REG_QUEUE_DEVICE_LOW, used_phys as u32)
+            .map_err(RngError::Sys)?;
+        self.transport
+            .write32(REG_QUEUE_DEVICE_HIGH, (used_phys >> 32) as u32)
+            .map_err(RngError::Sys)?;
+        self.transport
+            .write32(REG_QUEUE_READY, 1)
+            .map_err(RngError::Sys)?;
+
+        status |= STATUS_DRIVER_OK;
+        self.transport
+            .write32(REG_STATUS, status)
+            .map_err(RngError::Sys)?;
+        Ok(())
     }
 }
 

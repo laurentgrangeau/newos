@@ -442,14 +442,19 @@ impl<T: MmioDmaTransport> TxToken for VirtioTxToken<'_, T> {
         let tx_buf = &self.dma.tx_bufs[idx];
 
         // Wait (bounded) if all TX ring slots are still in flight so we never overwrite a
-        // buffer owned by the VirtIO device (`M9`).
+        // buffer owned by the VirtIO device (`M9`). Drop packet instead of corrupting DMA if still full.
         let avail_idx = self.dma.tx_avail.idx.load(Ordering::Acquire);
+        let mut slot_free = false;
         for _ in 0..100_000u32 {
             let used_idx = self.dma.tx_used.idx.load(Ordering::Acquire);
             if (avail_idx.wrapping_sub(used_idx) as usize) < QUEUE_SIZE {
+                slot_free = true;
                 break;
             }
             core::hint::spin_loop();
+        }
+        if !slot_free {
+            return res;
         }
 
         // Prepend 12-byte zeroed `virtio_net_hdr_v1` + Ethernet frame (64-bit word-stride)
@@ -540,6 +545,11 @@ impl<T: MmioDmaTransport> Device for VirtioNetDevice<'_, T> {
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         self.ack_interrupts();
+        let avail_idx = self.dma.tx_avail.idx.load(Ordering::Acquire);
+        let used_idx = self.dma.tx_used.idx.load(Ordering::Acquire);
+        if (avail_idx.wrapping_sub(used_idx) as usize) >= QUEUE_SIZE {
+            return None;
+        }
         let tx_desc = self.tx_next_desc;
         self.tx_next_desc = self.tx_next_desc.wrapping_add(1);
         Some(VirtioTxToken {

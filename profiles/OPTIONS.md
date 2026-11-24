@@ -27,7 +27,7 @@ cargo xtask config --profile profiles/tinykernel.toml
 | `scheduler` | `string` | `"priority-rr"`, `"round-robin"`, `"fifo"` | `"priority-rr"` | — | Compile-time scheduler policy: preemptive priority+RR (`priority-rr`), flat preemptive RR (`round-robin`), or cooperative non-preemptive FIFO (`fifo`, minimal overhead for tinykernel). |
 | `smp` | `bool` | `true`, `false` | `true` | — | Enables multi-core AP bring-up and `SmpScheduler` work-stealing (`false` = single-core uniprocessor). |
 | `userspace` | `bool` | `true`, `false` | `true` | Required by any `[domains].* = true` | Enables EL0 ELF64 loader and isolated EL0 protection domain spawning (`false` = pure EL1 kernel). |
-| `elf_attestation` | `bool` | `true`, `false` | `true` | Requires `"sha3"` in `[crypto].algorithms` | Measures loaded EL0 ELF binaries with FIPS 202 SHA3-512 at boot. |
+| `elf_measurement` (alias: `elf_attestation`) | `bool` | `true`, `false` | `false` | Requires `"sha3"` in `[crypto].algorithms` | Computes and logs a 64-bit FIPS 202 SHA3-512 measurement prefix for loaded EL0 ELFs at boot (omitted when `false`). |
 | `acpi` | `bool` | `true`, `false` | `true` | — | Enables ACPI RSDP/XSDT/FADT/SPCR/MADT/GTDT/MCFG hardware discovery (`false` = static `BoardDescriptor` only). |
 
 ---

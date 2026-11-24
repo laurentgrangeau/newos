@@ -20,9 +20,16 @@ use smoltcp::wire::Ipv4Address;
 use smoltcp::wire::Ipv6Address;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
-/// Static TCP socket buffer size (32 KiB each for RX and TX) to absorb ML-KEM-1024 (1568 B)
-/// and ML-DSA-87 (2592 B pk + 4627 B sig) SSH handshake packets without stalls.
-pub const TCP_BUF_SIZE: usize = 32_768;
+/// Static TCP socket buffer size per listener slot (16 KiB each for RX and TX, sized for
+/// ML-KEM-1024 + ML-DSA-87 post-quantum SSH handshakes across [`SSH_LISTEN_BACKLOG`] sockets).
+pub const TCP_BUF_SIZE: usize = 16_384;
+
+/// Number of concurrent listening TCP sockets on [`SSH_PORT`] (`H3`), ensuring a bare SYN
+/// flood or half-open connection cannot lock out legitimate SSH clients.
+pub const SSH_LISTEN_BACKLOG: usize = 4;
+
+/// Maximum time (5 s) a socket may remain in `SYN-RECEIVED` before being aborted and recycled.
+pub const SYN_TIMEOUT_MS: i64 = 5_000;
 
 /// Default SSH listening port.
 pub const SSH_PORT: u16 = 22;
@@ -41,8 +48,8 @@ pub const MAX_SOCKETS: usize = 8;
 /// Static backing buffers owned by the caller (e.g., `newos-net-pd` main/BSS)
 /// and borrowed by [`NetStack`].
 pub struct NetStackStorage<'a> {
-    pub tcp_rx_buf: [u8; TCP_BUF_SIZE],
-    pub tcp_tx_buf: [u8; TCP_BUF_SIZE],
+    pub tcp_rx_bufs: [[u8; TCP_BUF_SIZE]; SSH_LISTEN_BACKLOG],
+    pub tcp_tx_bufs: [[u8; TCP_BUF_SIZE]; SSH_LISTEN_BACKLOG],
     pub sockets: [SocketStorage<'a>; MAX_SOCKETS],
 }
 
@@ -55,21 +62,23 @@ impl Default for NetStackStorage<'_> {
 impl NetStackStorage<'_> {
     pub const fn new() -> Self {
         Self {
-            tcp_rx_buf: [0u8; TCP_BUF_SIZE],
-            tcp_tx_buf: [0u8; TCP_BUF_SIZE],
+            tcp_rx_bufs: [[0u8; TCP_BUF_SIZE]; SSH_LISTEN_BACKLOG],
+            tcp_tx_bufs: [[0u8; TCP_BUF_SIZE]; SSH_LISTEN_BACKLOG],
             sockets: [SocketStorage::EMPTY; MAX_SOCKETS],
         }
     }
 }
 
-/// Long-lived EL0 `smoltcp` IPv4/IPv6 dual-stack TCP listener.
+/// Long-lived EL0 `smoltcp` IPv4/IPv6 dual-stack multi-listener TCP stack.
 pub struct NetStack<'a, D: Device> {
     device: D,
     iface: Interface,
     sockets: SocketSet<'a>,
     #[cfg(feature = "ipv4")]
     dhcp_handle: SocketHandle,
-    tcp_handle: SocketHandle,
+    tcp_handles: [SocketHandle; SSH_LISTEN_BACKLOG],
+    syn_seen_ms: [Option<i64>; SSH_LISTEN_BACKLOG],
+    active_tcp: Option<usize>,
     #[cfg(feature = "ipv4")]
     initial_cfg: NetConfig,
     cfg: NetConfig,
@@ -81,24 +90,37 @@ pub struct NetStack<'a, D: Device> {
 
 impl<'a, D: Device> NetStack<'a, D> {
     /// Construct a persistent `NetStack` over an already-initialized `smoltcp` `Device`,
-    /// binding a TCP listener on `listen_port` (typically 22) and configuring IPv4/IPv6.
+    /// binding [`SSH_LISTEN_BACKLOG`] TCP listeners on `listen_port` (typically 22).
     pub fn new(
-        mut device: D,
+        device: D,
         mac: [u8; 6],
         initial_cfg: NetConfig,
         listen_port: u16,
         now_ms: i64,
         storage: &'a mut NetStackStorage<'a>,
     ) -> Self {
+        Self::new_with_seed(device, mac, initial_cfg, listen_port, now_ms, 0, storage)
+    }
+
+    /// Construct a persistent `NetStack` with an explicit caller-supplied 64-bit entropy seed
+    /// mixed into `smoltcp`'s ISN/port PRNG (`H3`).
+    pub fn new_with_seed(
+        mut device: D,
+        mac: [u8; 6],
+        initial_cfg: NetConfig,
+        listen_port: u16,
+        now_ms: i64,
+        entropy_seed: u64,
+        storage: &'a mut NetStackStorage<'a>,
+    ) -> Self {
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
-        // Derive a non-zero per-boot random seed from timestamp + MAC via SplitMix64 (`M8`)
-        // so TCP ISNs, ephemeral ports, and DNS transaction IDs do not repeat with seed=0.
-        let mut seed = (now_ms as u64)
+        let mut seed = entropy_seed
+            ^ (now_ms as u64).rotate_left(17)
             ^ u64::from_le_bytes([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0xA5, 0x5A])
             ^ 0x9E37_79B9_7F4A_7C15;
         seed = (seed ^ (seed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         seed = (seed ^ (seed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        config.random_seed = seed ^ (seed >> 31);
+        config.random_seed = (seed ^ (seed >> 31)).max(1);
         let mut iface = Interface::new(config, &mut device, Instant::from_millis(now_ms));
         #[cfg(feature = "ipv6")]
         let ipv6_cfg = Ipv6Config::from_mac(mac);
@@ -113,15 +135,21 @@ impl<'a, D: Device> NetStack<'a, D> {
         #[cfg(feature = "ipv4")]
         let dhcp_handle = sockets.add(dhcpv4::Socket::new());
 
-        let mut tcp_sock = tcp::Socket::new(
-            tcp::SocketBuffer::new(&mut storage.tcp_rx_buf[..]),
-            tcp::SocketBuffer::new(&mut storage.tcp_tx_buf[..]),
-        );
-        // Enforce TCP inactivity timeout and keep-alive so a stalled peer cannot lock out SSH (`N3`).
-        tcp_sock.set_timeout(Some(smoltcp::time::Duration::from_secs(60)));
-        tcp_sock.set_keep_alive(Some(smoltcp::time::Duration::from_secs(15)));
-        let _ = tcp_sock.listen(listen_port);
-        let tcp_handle = sockets.add(tcp_sock);
+        let [rx0, rx1, rx2, rx3] = &mut storage.tcp_rx_bufs;
+        let [tx0, tx1, tx2, tx3] = &mut storage.tcp_tx_bufs;
+        let make_sock = |rx: &'a mut [u8], tx: &'a mut [u8]| {
+            let mut s = tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
+            s.set_timeout(Some(smoltcp::time::Duration::from_secs(60)));
+            s.set_keep_alive(Some(smoltcp::time::Duration::from_secs(15)));
+            let _ = s.listen(listen_port);
+            s
+        };
+        let tcp_handles = [
+            sockets.add(make_sock(&mut rx0[..], &mut tx0[..])),
+            sockets.add(make_sock(&mut rx1[..], &mut tx1[..])),
+            sockets.add(make_sock(&mut rx2[..], &mut tx2[..])),
+            sockets.add(make_sock(&mut rx3[..], &mut tx3[..])),
+        ];
 
         Self {
             device,
@@ -129,7 +157,9 @@ impl<'a, D: Device> NetStack<'a, D> {
             sockets,
             #[cfg(feature = "ipv4")]
             dhcp_handle,
-            tcp_handle,
+            tcp_handles,
+            syn_seen_ms: [None; SSH_LISTEN_BACKLOG],
+            active_tcp: None,
             #[cfg(feature = "ipv4")]
             initial_cfg,
             cfg: initial_cfg,
@@ -253,12 +283,44 @@ impl<'a, D: Device> NetStack<'a, D> {
             }
         }
 
-        // Manage single-connection TCP listener lifecycle
-        let sock = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
-        if !sock.is_open() {
-            let _ = sock.listen(self.listen_port);
+        // Manage multi-socket TCP listener pool & abort half-open SYN-RECEIVED sockets (`H3`).
+        for i in 0..SSH_LISTEN_BACKLOG {
+            let sock = self.sockets.get_mut::<tcp::Socket>(self.tcp_handles[i]);
+            if !sock.is_open() {
+                let _ = sock.listen(self.listen_port);
+                self.syn_seen_ms[i] = None;
+                continue;
+            }
+            if sock.state() == tcp::State::SynReceived {
+                let first_seen = *self.syn_seen_ms[i].get_or_insert(now_ms);
+                if now_ms.saturating_sub(first_seen) >= SYN_TIMEOUT_MS {
+                    sock.abort();
+                    let _ = sock.listen(self.listen_port);
+                    self.syn_seen_ms[i] = None;
+                }
+            } else {
+                self.syn_seen_ms[i] = None;
+            }
         }
-        let connected = sock.is_active() && (sock.may_recv() || sock.may_send());
+
+        // Check active connection liveness or promote the next established socket.
+        if let Some(idx) = self.active_tcp {
+            let sock = self.sockets.get::<tcp::Socket>(self.tcp_handles[idx]);
+            if !(sock.is_active() && (sock.may_recv() || sock.may_send())) {
+                self.active_tcp = None;
+            }
+        }
+        if self.active_tcp.is_none() {
+            for i in 0..SSH_LISTEN_BACKLOG {
+                let sock = self.sockets.get::<tcp::Socket>(self.tcp_handles[i]);
+                if sock.is_active() && (sock.may_recv() || sock.may_send()) {
+                    self.active_tcp = Some(i);
+                    break;
+                }
+            }
+        }
+
+        let connected = self.active_tcp.is_some();
         let event = match (self.was_connected, connected) {
             (false, true) => TcpEvent::Connected,
             (true, false) => TcpEvent::Disconnected,
@@ -269,24 +331,37 @@ impl<'a, D: Device> NetStack<'a, D> {
     }
 
     #[inline]
+    fn active_handle(&self) -> SocketHandle {
+        self.tcp_handles[self.active_tcp.unwrap_or(0)]
+    }
+
+    #[inline]
     pub fn is_connected(&self) -> bool {
-        let sock = self.sockets.get::<tcp::Socket>(self.tcp_handle);
+        let Some(idx) = self.active_tcp else {
+            return false;
+        };
+        let sock = self.sockets.get::<tcp::Socket>(self.tcp_handles[idx]);
         sock.is_active() && (sock.may_recv() || sock.may_send())
     }
 
     #[inline]
     pub fn can_recv(&self) -> bool {
-        self.sockets.get::<tcp::Socket>(self.tcp_handle).can_recv()
+        self.sockets
+            .get::<tcp::Socket>(self.active_handle())
+            .can_recv()
     }
 
     #[inline]
     pub fn can_send(&self) -> bool {
-        self.sockets.get::<tcp::Socket>(self.tcp_handle).can_send()
+        self.sockets
+            .get::<tcp::Socket>(self.active_handle())
+            .can_send()
     }
 
     /// Non-blocking read from the active TCP stream; returns `0` if no bytes are ready.
     pub fn recv(&mut self, out: &mut [u8]) -> usize {
-        let sock = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        let handle = self.active_handle();
+        let sock = self.sockets.get_mut::<tcp::Socket>(handle);
         if !sock.can_recv() || out.is_empty() {
             return 0;
         }
@@ -295,7 +370,8 @@ impl<'a, D: Device> NetStack<'a, D> {
 
     /// Non-blocking write to the active TCP stream; returns bytes queued (`0..=data.len()`).
     pub fn send(&mut self, data: &[u8]) -> usize {
-        let sock = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        let handle = self.active_handle();
+        let sock = self.sockets.get_mut::<tcp::Socket>(handle);
         if !sock.can_send() || data.is_empty() {
             return 0;
         }
@@ -304,12 +380,20 @@ impl<'a, D: Device> NetStack<'a, D> {
 
     /// Gracefully close the active TCP connection (FIN).
     pub fn close(&mut self) {
-        self.sockets.get_mut::<tcp::Socket>(self.tcp_handle).close();
+        if let Some(idx) = self.active_tcp {
+            self.sockets
+                .get_mut::<tcp::Socket>(self.tcp_handles[idx])
+                .close();
+        }
     }
 
     /// Immediately abort the active TCP connection (RST — used on strict-KEX violations).
     pub fn abort(&mut self) {
-        self.sockets.get_mut::<tcp::Socket>(self.tcp_handle).abort();
+        if let Some(idx) = self.active_tcp {
+            self.sockets
+                .get_mut::<tcp::Socket>(self.tcp_handles[idx])
+                .abort();
+        }
     }
 
     #[inline]
@@ -636,5 +720,72 @@ mod tests {
 
         assert!(saw_connected, "IPv6 TCP client should connect");
         assert_eq!(&got[..got_len], msg);
+    }
+
+    #[test]
+    #[cfg(feature = "ipv4")]
+    fn multi_socket_listener_survives_bare_syn_and_recycles_after_timeout() {
+        let mut storage = NetStackStorage::new();
+        let server_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x31];
+        let mut server = NetStack::new_with_seed(
+            WireEnd::new(),
+            server_mac,
+            NetConfig::QEMU_DEFAULT,
+            SSH_PORT,
+            0,
+            0xDEAD_BEEF_CAFE_BABE,
+            &mut storage,
+        );
+
+        let mut attacker_dev = WireEnd::new();
+        let mut attacker_iface = Interface::new(
+            Config::new(HardwareAddress::Ethernet(EthernetAddress([
+                0x02, 0x00, 0x00, 0x00, 0x00, 0x32,
+            ]))),
+            &mut attacker_dev,
+            Instant::from_millis(0),
+        );
+        attacker_iface.update_ip_addrs(|a| {
+            let _ = a.push(IpCidr::new(
+                IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 99)),
+                24,
+            ));
+        });
+        let mut a_rx = [0u8; 1024];
+        let mut a_tx = [0u8; 1024];
+        let mut a_storage = [SocketStorage::EMPTY; 1];
+        let mut a_sockets = SocketSet::new(&mut a_storage[..]);
+        let a_handle = a_sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut a_rx[..]),
+            tcp::SocketBuffer::new(&mut a_tx[..]),
+        ));
+        a_sockets
+            .get_mut::<tcp::Socket>(a_handle)
+            .connect(
+                attacker_iface.context(),
+                (
+                    IpAddress::Ipv4(Ipv4Address::from(NetConfig::QEMU_DEFAULT.ip)),
+                    SSH_PORT,
+                ),
+                50_001,
+            )
+            .unwrap();
+
+        // Pump ONLY the attacker's initial SYN to server (dropping SYN-ACK so socket stays SynReceived).
+        for step in 0..10i64 {
+            let now = step * 10;
+            let _ =
+                attacker_iface.poll(Instant::from_millis(now), &mut attacker_dev, &mut a_sockets);
+            let mut frame = [0u8; FRAME_CAP];
+            while let Some(n) = attacker_dev.tx.pop(&mut frame) {
+                server.device.rx.push(&frame[..n]);
+            }
+            let _ = server.poll(now);
+        }
+
+        // Advance past SYN_TIMEOUT_MS (5000 ms): server must abort & recycle the half-open socket.
+        let _ = server.poll(SYN_TIMEOUT_MS + 1000);
+        assert!(!server.is_connected());
+        assert_eq!(server.syn_seen_ms, [None; SSH_LISTEN_BACKLOG]);
     }
 }

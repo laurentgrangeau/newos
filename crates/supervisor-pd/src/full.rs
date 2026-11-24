@@ -5,18 +5,23 @@
 use core::fmt::Write;
 use newos_abi::ring::SpscRing;
 use newos_abi::{CapId, ShutdownStatus, SysError};
+#[cfg(feature = "net")]
 use newos_net::{GemDma, MmioDmaTransport, NetConfig, NicKind, VirtioNetDma};
 use newos_shell_core::shell::{NullWriter, Record, RecordStream, Shell, ShellHost, SysInfo};
 use newos_user_rt::{BufferedConsole, IpcLogAssembler};
 
 /// Static EL0 DMA rings & packet buffers (`Sync` via atomics).
+#[cfg(feature = "net")]
 pub static VIRTIO_DMA: VirtioNetDma = VirtioNetDma::new();
 /// Static EL0 64-bit DMA rings & packet buffers for Raspberry Pi 5 RP1 Cadence GEM.
+#[cfg(feature = "net")]
 pub static GEM_DMA: GemDma = GemDma::new();
 
 /// Capability-scoped MMIO + `VirtToPhys` transport for EL0 NIC drivers.
+#[cfg(feature = "net")]
 pub struct CapMmioDmaTransport;
 
+#[cfg(feature = "net")]
 impl MmioDmaTransport for CapMmioDmaTransport {
     fn read32(&self, offset: u64) -> Result<u32, SysError> {
         newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, offset)
@@ -42,7 +47,9 @@ impl MmioDmaTransport for CapMmioDmaTransport {
 /// EL0 `ShellHost` adapter connecting `newos-shell-core` to `newos-user-rt`, `newos-net`,
 /// and the `newos-key-pd`-gated `newos-ssh-pd` interactive shell channel.
 struct SupervisorShellHost {
+    #[cfg(feature = "net")]
     net_cfg: Option<NetConfig>,
+    #[cfg(feature = "net")]
     cached_nic: Option<Option<NicKind>>,
     log_rx: IpcLogAssembler<256>,
     ssh_session_authorized: bool,
@@ -58,7 +65,9 @@ impl SupervisorShellHost {
 
     const fn with_log_rx(log_rx: IpcLogAssembler<256>) -> Self {
         Self {
+            #[cfg(feature = "net")]
             net_cfg: None,
+            #[cfg(feature = "net")]
             cached_nic: None,
             log_rx,
             ssh_session_authorized: false,
@@ -89,6 +98,7 @@ impl SupervisorShellHost {
         }
     }
 
+    #[cfg(feature = "net")]
     fn probe_nic_cached(&mut self) -> Option<NicKind> {
         if let Some(cached) = self.cached_nic {
             return cached;
@@ -99,6 +109,18 @@ impl SupervisorShellHost {
         nic
     }
 
+    #[cfg(not(feature = "net"))]
+    fn handle_net_with<W: Write>(
+        &mut self,
+        _subcmd: &str,
+        _arg: Option<&str>,
+        _stream: &mut RecordStream,
+        out: &mut W,
+    ) {
+        let _ = writeln!(out, "net: disabled in this build profile");
+    }
+
+    #[cfg(feature = "net")]
     fn handle_net_with<W: Write>(
         &mut self,
         subcmd: &str,
@@ -106,12 +128,14 @@ impl SupervisorShellHost {
         stream: &mut RecordStream,
         out: &mut W,
     ) {
+        let _ = arg;
         let nic = self.probe_nic_cached();
         let mac = nic
             .map(|n| n.mac())
             .unwrap_or([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
         if let Some(n) = nic {
             match subcmd {
+                #[cfg(feature = "ipv4")]
                 "dhcp" => {
                     match newos_net::live_dhcp_v4(CapMmioDmaTransport, n, &VIRTIO_DMA, &GEM_DMA) {
                         Ok(cfg) => {
@@ -147,6 +171,7 @@ impl SupervisorShellHost {
                         }
                     }
                 }
+                #[cfg(all(feature = "ipv4", feature = "icmp"))]
                 "ping" => {
                     let cfg = self.net_cfg.unwrap_or(NetConfig::QEMU_DEFAULT);
                     let target = match arg {
@@ -215,6 +240,7 @@ impl SupervisorShellHost {
                         }
                     }
                 }
+                #[cfg(all(feature = "ipv4", feature = "dns"))]
                 "resolve" => {
                     let Some(host) = arg else {
                         let _ = writeln!(out, "usage: net resolve <hostname>");
@@ -306,12 +332,15 @@ impl SupervisorShellHost {
                     }
                 }
             }
-        } else if let Ok(frame_len) = newos_net::verify_smoltcp_el0_stack(mac) {
-            stream.push(Record::Metric {
-                label: "smoltcp.tx.frame",
-                value: frame_len as u64,
-                unit: "bytes (EL0 IPv4)",
-            });
+        } else {
+            #[cfg(all(feature = "ipv4", feature = "udp"))]
+            if let Ok(frame_len) = newos_net::verify_smoltcp_el0_stack(mac) {
+                stream.push(Record::Metric {
+                    label: "smoltcp.tx.frame",
+                    value: frame_len as u64,
+                    unit: "bytes (EL0 IPv4)",
+                });
+            }
         }
     }
 }
@@ -726,93 +755,124 @@ pub fn main() -> ! {
         "[supervisor-pd] EL0 CAOS (dedup/rollback/seal) & typed `|` pipeline self-check: OK"
     );
 
-    // EL0 Networking: capability-scoped NIC (Pi 5 RP1 GEM or QEMU VirtIO-net) + live DHCPv4 + ICMP ping
-    let detected_nic =
-        newos_net::probe_nic(|off| newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, off));
-    let mac = detected_nic
-        .map(|n| n.mac())
-        .unwrap_or([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
-    if let Some(nic) = detected_nic {
-        let cfg = match newos_net::live_dhcp_v4(CapMmioDmaTransport, nic, &VIRTIO_DMA, &GEM_DMA) {
-            Ok(leased) => {
-                let gw = leased.gateway.unwrap_or([0; 4]);
-                let dns = leased.dns.unwrap_or([0; 4]);
-                let _ = writeln!(
-                    out,
-                    "[supervisor-pd] EL0 LIVE DHCPv4 ({}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}): ip={}.{}.{}.{}/{}, gw={}.{}.{}.{}, dns={}.{}.{}.{}",
-                    nic.driver_name(),
-                    mac[0],
-                    mac[1],
-                    mac[2],
-                    mac[3],
-                    mac[4],
-                    mac[5],
-                    leased.ip[0],
-                    leased.ip[1],
-                    leased.ip[2],
-                    leased.ip[3],
-                    leased.prefix_len,
-                    gw[0],
-                    gw[1],
-                    gw[2],
-                    gw[3],
-                    dns[0],
-                    dns[1],
-                    dns[2],
-                    dns[3],
-                );
-                leased
-            }
-            Err(msg) => {
-                let _ = writeln!(out, "[supervisor-pd] FAIL: live DHCPv4 lease: {msg}");
-                out.flush();
-                newos_user_rt::exit(ShutdownStatus::Failed);
-            }
-        };
+    // EL0 Networking: capability-scoped NIC (Pi 5 RP1 GEM or QEMU VirtIO-net) + live DHCPv4 / IPv6 check
+    #[cfg(feature = "net")]
+    {
+        let detected_nic =
+            newos_net::probe_nic(|off| newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, off));
+        let mac = detected_nic
+            .map(|n| n.mac())
+            .unwrap_or([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+        #[cfg(feature = "ipv4")]
+        if let Some(nic) = detected_nic {
+            let cfg = match newos_net::live_dhcp_v4(CapMmioDmaTransport, nic, &VIRTIO_DMA, &GEM_DMA)
+            {
+                Ok(leased) => {
+                    let gw = leased.gateway.unwrap_or([0; 4]);
+                    let dns = leased.dns.unwrap_or([0; 4]);
+                    let _ = writeln!(
+                        out,
+                        "[supervisor-pd] EL0 LIVE DHCPv4 ({}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}): ip={}.{}.{}.{}/{}, gw={}.{}.{}.{}, dns={}.{}.{}.{}",
+                        nic.driver_name(),
+                        mac[0],
+                        mac[1],
+                        mac[2],
+                        mac[3],
+                        mac[4],
+                        mac[5],
+                        leased.ip[0],
+                        leased.ip[1],
+                        leased.ip[2],
+                        leased.ip[3],
+                        leased.prefix_len,
+                        gw[0],
+                        gw[1],
+                        gw[2],
+                        gw[3],
+                        dns[0],
+                        dns[1],
+                        dns[2],
+                        dns[3],
+                    );
+                    leased
+                }
+                Err(msg) => {
+                    let _ = writeln!(out, "[supervisor-pd] FAIL: live DHCPv4 lease: {msg}");
+                    out.flush();
+                    newos_user_rt::exit(ShutdownStatus::Failed);
+                }
+            };
 
-        let target = cfg
-            .gateway
-            .unwrap_or(NetConfig::QEMU_DEFAULT.gateway.unwrap_or([10, 0, 2, 2]));
-        match newos_net::live_icmp_ping(
-            CapMmioDmaTransport,
-            nic,
-            &cfg,
-            target,
-            &VIRTIO_DMA,
-            &GEM_DMA,
-        ) {
-            Ok(res) => {
-                let _ = writeln!(
-                    out,
-                    "[supervisor-pd] EL0 LIVE ICMP ping {}.{}.{}.{} ({}): OK (seq={})",
-                    res.target[0],
-                    res.target[1],
-                    res.target[2],
-                    res.target[3],
-                    nic.driver_name(),
-                    res.seq,
-                );
+            #[cfg(feature = "icmp")]
+            {
+                let target = cfg
+                    .gateway
+                    .unwrap_or(NetConfig::QEMU_DEFAULT.gateway.unwrap_or([10, 0, 2, 2]));
+                match newos_net::live_icmp_ping(
+                    CapMmioDmaTransport,
+                    nic,
+                    &cfg,
+                    target,
+                    &VIRTIO_DMA,
+                    &GEM_DMA,
+                ) {
+                    Ok(res) => {
+                        let _ = writeln!(
+                            out,
+                            "[supervisor-pd] EL0 LIVE ICMP ping {}.{}.{}.{} ({}): OK (seq={})",
+                            res.target[0],
+                            res.target[1],
+                            res.target[2],
+                            res.target[3],
+                            nic.driver_name(),
+                            res.seq,
+                        );
+                    }
+                    Err(msg) => {
+                        let _ = writeln!(out, "[supervisor-pd] FAIL: live ICMP ping: {msg}");
+                        out.flush();
+                        newos_user_rt::exit(ShutdownStatus::Failed);
+                    }
+                }
             }
-            Err(msg) => {
-                let _ = writeln!(out, "[supervisor-pd] FAIL: live ICMP ping: {msg}");
-                out.flush();
-                newos_user_rt::exit(ShutdownStatus::Failed);
+        } else {
+            #[cfg(feature = "udp")]
+            match newos_net::verify_smoltcp_el0_stack(mac) {
+                Ok(frame_len) => {
+                    let _ = writeln!(
+                        out,
+                        "[supervisor-pd] EL0 smoltcp IPv4/UDP stack ({frame_len}B Ethernet frame): OK"
+                    );
+                }
+                Err(msg) => {
+                    let _ = writeln!(out, "[supervisor-pd] FAIL: EL0 smoltcp stack check: {msg}");
+                    out.flush();
+                    newos_user_rt::exit(ShutdownStatus::Failed);
+                }
             }
         }
-    } else {
-        match newos_net::verify_smoltcp_el0_stack(mac) {
-            Ok(frame_len) => {
-                let _ = writeln!(
-                    out,
-                    "[supervisor-pd] EL0 smoltcp IPv4/UDP stack ({frame_len}B Ethernet frame): OK"
-                );
-            }
-            Err(msg) => {
-                let _ = writeln!(out, "[supervisor-pd] FAIL: EL0 smoltcp stack check: {msg}");
-                out.flush();
-                newos_user_rt::exit(ShutdownStatus::Failed);
+        #[cfg(all(not(feature = "ipv4"), feature = "ipv6", feature = "udp"))]
+        {
+            let _ = detected_nic;
+            match newos_net::verify_smoltcp_ipv6_el0_stack(mac) {
+                Ok(frame_len) => {
+                    let _ = writeln!(
+                        out,
+                        "[supervisor-pd] EL0 smoltcp IPv6/UDP stack ({frame_len}B Ethernet frame): OK"
+                    );
+                }
+                Err(msg) => {
+                    let _ = writeln!(
+                        out,
+                        "[supervisor-pd] FAIL: EL0 smoltcp IPv6 stack check: {msg}"
+                    );
+                    out.flush();
+                    newos_user_rt::exit(ShutdownStatus::Failed);
+                }
             }
         }
+        #[cfg(not(any(feature = "ipv4", all(feature = "ipv6", feature = "udp"))))]
+        let _ = (detected_nic, mac);
     }
 
     // Unauthorized MMIO capability rejection
@@ -929,9 +989,19 @@ pub fn main() -> ! {
             out.flush();
             newos_user_rt::exit(ShutdownStatus::Failed);
         }
-        if newos_user_rt::notify_wait(CapId::BOOTSTRAP_FAULT_NOTIF, 1 << 1, 1_000_000_000)
-            != Ok((1 << 1, false))
-        {
+        let (fault_bits, timed_out) =
+            match newos_user_rt::notify_wait(CapId::BOOTSTRAP_FAULT_NOTIF, !0u64, 1_000_000_000) {
+                Ok(v) => v,
+                Err(_) => {
+                    let _ = writeln!(
+                        out,
+                        "[supervisor-pd] FAIL: Phase 2 fault NotifyWait (cycle={cycle})"
+                    );
+                    out.flush();
+                    newos_user_rt::exit(ShutdownStatus::Failed);
+                }
+            };
+        if timed_out || fault_bits == 0 {
             let _ = writeln!(
                 out,
                 "[supervisor-pd] FAIL: Phase 2 fault NotifyWait (cycle={cycle})"
@@ -939,7 +1009,8 @@ pub fn main() -> ! {
             out.flush();
             newos_user_rt::exit(ShutdownStatus::Failed);
         }
-        match newos_user_rt::domain_get_fault_info(1) {
+        let worker_pd = fault_bits.trailing_zeros() as usize;
+        match newos_user_rt::domain_get_fault_info(worker_pd) {
             Ok((newos_abi::DomainRoleId::Worker, esr, _elr)) if (esr >> 26) == 0 => {}
             other => {
                 let _ = writeln!(
@@ -967,7 +1038,7 @@ pub fn main() -> ! {
             newos_user_rt::exit(ShutdownStatus::Failed);
         }
         rem_after_cycle[cycle] = rem_frames;
-        if newos_user_rt::domain_respawn(newos_abi::DomainRoleId::Worker) != Ok(1) {
+        if newos_user_rt::domain_respawn(newos_abi::DomainRoleId::Worker) != Ok(worker_pd) {
             let _ = writeln!(
                 out,
                 "[supervisor-pd] FAIL: Phase 2 DomainRespawn(Worker) (cycle={cycle})"

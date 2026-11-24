@@ -71,6 +71,20 @@ pub fn verify_entropy_health(sample: &[u8; SEED_BLOCK_BYTES]) -> Result<(), RngE
         }
     }
 
+    // 4. Repeating-pattern / periodic cycle check (rejects repeating cycles of period 1..=32).
+    for period in 1..=32usize {
+        let mut all_match = true;
+        for i in period..sample.len() {
+            if sample[i] != sample[i - period] {
+                all_match = false;
+                break;
+            }
+        }
+        if all_match {
+            return Err(RngError::HealthCheckFailed);
+        }
+    }
+
     Ok(())
 }
 

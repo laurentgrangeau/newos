@@ -143,6 +143,12 @@ impl CapId {
     /// Well-known bootstrap shared-memory `Frame` capability for `ssh-pd` <-> `key-pd` `SpscRing` (slot 37, gen 1).
     pub const BOOTSTRAP_SSH_KEY_RING: Self = Self((1u64 << 32) | 37);
 
+    /// Well-known bootstrap `IoSpace` capability for DMA-pinned frame translation (slot 38, gen 1).
+    pub const BOOTSTRAP_IOSPACE: Self = Self((1u64 << 32) | 38);
+
+    /// Well-known bootstrap Normal-NC DMA descriptor ring `Frame` capability for `net-pd` (slot 39, gen 1).
+    pub const BOOTSTRAP_NET_DMA_RING: Self = Self((1u64 << 32) | 39);
+
     #[inline]
     pub const fn new(raw: u64) -> Self {
         Self(raw)
@@ -254,6 +260,10 @@ impl ObjectType {
     }
 }
 
+/// Flag bit in `a2` of `SyscallNumber::DmaMap` requesting a Normal Non-Cacheable (`MAIR 0x44`)
+/// EL0 mapping for coherent DMA descriptor rings (e.g., Raspberry Pi 5 RP1 Cadence GEM, `H4`).
+pub const DMA_FLAG_NON_CACHEABLE: u64 = 1 << 0;
+
 /// Flag bit in `a2` of `SyscallNumber::CapMint` / `CapGrant` indicating `a3` carries a new badge.
 pub const CAP_MINT_SET_BADGE: u64 = 1 << 8;
 
@@ -354,6 +364,12 @@ pub enum SyscallNumber {
     /// Read kernel physical memory reclamation statistics (`power_cap` `Rights::READ`):
     /// `(power_cap)` -> `(x0 = 0, x1 = remaining_frames, x2 = reclaimed_cache_len)`.
     MemStats = 40,
+    /// Pin a caller-owned `Frame` capability in an `IoSpace` for DMA (`H2`/`H4`):
+    /// `(iospace_cap, frame_cap, flags, optional_nc_vaddr)` -> `iova`.
+    DmaMap = 41,
+    /// Unpin a previously DMA-mapped `Frame` capability from an `IoSpace`:
+    /// `(iospace_cap, frame_cap)` -> `0`.
+    DmaUnmap = 42,
 }
 
 impl SyscallNumber {
@@ -400,6 +416,8 @@ impl SyscallNumber {
             38 => Some(Self::DomainDestroy),
             39 => Some(Self::DomainGetFaultInfo),
             40 => Some(Self::MemStats),
+            41 => Some(Self::DmaMap),
+            42 => Some(Self::DmaUnmap),
             _ => None,
         }
     }
@@ -936,13 +954,15 @@ mod tests {
             (38, SyscallNumber::DomainDestroy),
             (39, SyscallNumber::DomainGetFaultInfo),
             (40, SyscallNumber::MemStats),
+            (41, SyscallNumber::DmaMap),
+            (42, SyscallNumber::DmaUnmap),
         ];
         assert_eq!(SyscallNumber::from_u64(0), None);
         for (raw, variant) in expected_syscalls {
             assert_eq!(variant as u64, raw);
             assert_eq!(SyscallNumber::from_u64(raw), Some(variant));
         }
-        assert_eq!(SyscallNumber::from_u64(41), None);
+        assert_eq!(SyscallNumber::from_u64(43), None);
         assert_eq!(SyscallNumber::from_u64(99), None);
 
         for (raw, role) in [

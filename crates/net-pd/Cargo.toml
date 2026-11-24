@@ -5,15 +5,19 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["ipv4", "ipv6", "driver-gem", "driver-virtio"]
+default = ["ipv4", "ipv6", "tcp", "udp", "icmp", "dns", "driver-gem", "driver-virtio"]
 ipv4 = ["newos-net/ipv4"]
 ipv6 = ["newos-net/ipv6"]
+tcp = ["newos-net/tcp"]
+udp = ["newos-net/udp"]
+icmp = ["newos-net/icmp"]
+dns = ["newos-net/dns"]
 driver-gem = ["newos-net/driver-gem"]
 driver-virtio = ["newos-net/driver-virtio"]
 
 [dependencies]
 newos-abi = { workspace = true, default-features = false }
-newos-net = { workspace = true, default-features = false, features = ["tcp"] }
+newos-net = { workspace = true, default-features = false }
 newos-user-rt = { workspace = true }
 
 [lints]

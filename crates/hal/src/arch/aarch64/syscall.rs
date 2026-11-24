@@ -251,6 +251,7 @@ static BOOT_MODULES: IrqSpinLock<[Option<BootModuleSlice>; MAX_DOMAINS]> =
 /// Persistent 4 KiB physical addresses for inter-domain shared-memory `SpscRing` frames.
 static NET_SSH_RING_PHYS: AtomicU64 = AtomicU64::new(0);
 static SSH_KEY_RING_PHYS: AtomicU64 = AtomicU64::new(0);
+static NET_DMA_RING_PHYS: AtomicU64 = AtomicU64::new(0);
 
 /// Lazily allocate (and zero) a persistent shared-memory ring `Frame` from `RUNTIME_UNTYPED`.
 fn ensure_shared_ring_frame(slot: &AtomicU64) -> Option<PhysAddr> {
@@ -891,6 +892,9 @@ pub fn register_domain(
             if let Some(ring_pa) = ensure_shared_ring_frame(&NET_SSH_RING_PHYS) {
                 let _ = ipc.register_bootstrap_frame_cap(pd_id, 36, ring_pa);
             }
+            if let Some(dma_pa) = ensure_shared_ring_frame(&NET_DMA_RING_PHYS) {
+                let _ = ipc.register_bootstrap_frame_cap(pd_id, 39, dma_pa);
+            }
             let _ = ipc.register_child_caps_in_root(pd_id)?;
         }
         DomainRole::Key => {
@@ -1208,9 +1212,9 @@ pub fn dispatch_peripheral_spi(irq_id: u32) {
             let _ = ipc.notify_signal_id(b.notif_id, bit);
             wake_notif_waiter_locked(&mut table, &mut ipc, b.notif_id)
         } else {
-            let bit = 1u64 << (irq_id % 64);
-            let _ = ipc.notify_signal_id(0, bit);
-            wake_notif_waiter_locked(&mut table, &mut ipc, 0)
+            // Unbound peripheral SPI: keep masked at the GIC and drop it rather than
+            // injecting spurious bits into notification 0 (shared with worker-pd).
+            false
         }
     };
     if woke {
@@ -1341,6 +1345,7 @@ fn teardown_process_locked(table: &mut ProcTable, pd_id: usize) {
     }
 
     let ttbr0 = table.domains[pd_id].ttbr0;
+    let dying_role = table.domains[pd_id].role;
     let asid = ((pd_id + 1) as u16).max(1);
     table.domains[pd_id].active = false;
     table.domains[pd_id].running_on = None;
@@ -1355,6 +1360,8 @@ fn teardown_process_locked(table: &mut ProcTable, pd_id: usize) {
         let mut ipc = IPC_STATE.lock();
         let mut untyped = RUNTIME_UNTYPED.lock();
         let mut mappings = FRAME_MAPPINGS.lock();
+        // Clear any buffered `IpcCall` sent by this dying process so endpoints never jam.
+        ipc.clear_buffered_calls_from(pd_id);
         // Drain `FRAME_MAPPINGS` entries for `ttbr0` first so shared-frame checks stay accurate,
         // then walk the full EL0 page-table hierarchy (`L0[0..256]` -> `L1` -> `L2` -> `L3`) to
         // zero and reclaim every ELF, stack, shadow-stack, `MapPage`, and page-table frame.
@@ -1366,9 +1373,13 @@ fn teardown_process_locked(table: &mut ProcTable, pd_id: usize) {
                 let _ = untyped.reclaim_frame(frame);
             } else {
                 let pa = frame.start_addr();
-                if !ipc.has_live_frame_cap(pa) && !mappings.has_mapping_for_phys(pa) {
+                if !ipc.has_live_frame_cap(pa)
+                    && !mappings.has_mapping_for_phys(pa)
+                    && !mappings.is_dma_pinned(pa)
+                {
                     let zeroer = super::paging::Aarch64VSpace::from_root_phys(ttbr0, hhdm);
                     zeroer.zero_frame(&frame);
+                    mappings.clear_ever_written(pa);
                     let _ = untyped.reclaim_frame(frame);
                 }
             }
@@ -1376,13 +1387,52 @@ fn teardown_process_locked(table: &mut ProcTable, pd_id: usize) {
         let _ = ipc.clear_domain_cspace(pd_id, |phys, can_reclaim| {
             if can_reclaim
                 && !mappings.has_mapping_for_phys(phys)
+                && !mappings.is_dma_pinned(phys)
                 && let Ok(frame) = PhysFrame::from_aligned(phys)
             {
                 let vs = super::paging::Aarch64VSpace::from_root_phys(ttbr0, hhdm);
                 vs.zero_frame(&frame);
+                mappings.clear_ever_written(phys);
                 let _ = untyped.reclaim_frame(frame);
             }
         });
+        drop(mappings);
+        drop(untyped);
+        // Wake any peers blocked on endpoints/notifications that lost their server or last cap (`M19`).
+        for other in 0..MAX_DOMAINS {
+            if !table.domains[other].active {
+                continue;
+            }
+            let ep_dead = match table.domains[other].wait {
+                IpcWaitState::WaitingReply => {
+                    !ipc.has_live_endpoint_server(table.domains[other].wait_ep_id)
+                }
+                IpcWaitState::WaitingRecv => {
+                    !ipc.has_live_endpoint_cap(table.domains[other].wait_ep_id)
+                }
+                _ => false,
+            };
+            let notif_dead = table.domains[other].wait == IpcWaitState::WaitingNotif
+                && !ipc.has_live_notif_cap(table.domains[other].wait_notif_id);
+            if ep_dead || notif_dead {
+                table.domains[other].frame.x[0] = SysError::InvalidCapability as u64;
+                table.domains[other].frame.x[1] = 0;
+                table.domains[other].frame.x[2] = 0;
+                table.domains[other].wait_notif_id = 0;
+                table.domains[other].wait_notif_mask = 0;
+                table.domains[other].sleep_deadline_ticks = None;
+                table.set_wait_state(other, IpcWaitState::Runnable, 0);
+                let _ = table.sched.wake_slot(other);
+            }
+        }
+        // If `ssh-pd` died (panic or hardware fault), immediately notify `key-pd` and `net-pd`
+        // via `RING_PEER_RESET_BIT` so `key-pd` closes `BOOTSTRAP_AUTH_GATE_EP` fail-closed (`M13`).
+        if dying_role == DomainRole::Ssh {
+            let _ = ipc.notify_signal_id(4, RING_PEER_RESET_BIT);
+            let _ = wake_notif_waiter_locked(table, &mut ipc, 4);
+            let _ = ipc.notify_signal_id(2, RING_PEER_RESET_BIT);
+            let _ = wake_notif_waiter_locked(table, &mut ipc, 2);
+        }
         cleanup_orphaned_irqs(&ipc);
         super::paging::tlbi_asid(asid);
     }
@@ -1414,10 +1464,7 @@ fn park_cpu_until_runnable(frame: &mut TrapFrame) {
                 drop(t);
                 let interval = TIMER_TICK_INTERVAL.load(Ordering::Acquire);
                 arm_virtual_timer(interval);
-                // SAFETY: Re-enabling IRQs before returning to EL0.
-                unsafe {
-                    asm!("msr daifclr, #2", options(nomem, nostack));
-                }
+                // Keep IRQs masked until `eret` atomically restores `SPSR_EL1` (`M5`).
                 return;
             }
             let mut min_dl: Option<u64> = None;
@@ -1682,11 +1729,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         SyscallNumber::IpcCall => {
             let mut table = DOMAINS.lock();
             let mut ipc = IPC_STATE.lock();
-            match ipc.lookup_endpoint_for(
-                cur_pid,
-                CapId::new(a0),
-                Rights::WRITE.union(Rights::READ),
-            ) {
+            match ipc.lookup_endpoint_for(cur_pid, CapId::new(a0), Rights::WRITE) {
                 Err(e) => Err(e),
                 Ok((ep_id, badge)) => {
                     let cur = cur_pid;
@@ -1694,10 +1737,23 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                         && table.domains[server].running_on.is_none()
                     {
                         drop(ipc);
-                        // Mint single-use Reply capability on `server` pointing exclusively to `cur`.
+                        // Mint single-use Reply capability on `server` pointing exclusively to `cur`,
+                        // failing and waking any stranded previous caller (`M19`).
                         set_ipc_return(&mut table.domains[server].frame, a1, badge);
                         table.set_wait_state(server, IpcWaitState::Runnable, 0);
-                        table.domains[server].reply_target = Some(cur);
+                        if let Some(prev_client) = table.domains[server].reply_target.replace(cur)
+                            && prev_client != cur
+                            && prev_client < MAX_DOMAINS
+                            && table.domains[prev_client].active
+                            && table.domains[prev_client].wait == IpcWaitState::WaitingReply
+                        {
+                            table.domains[prev_client].frame.x[0] =
+                                SysError::InvalidCapability as u64;
+                            table.domains[prev_client].frame.x[1] = 0;
+                            table.domains[prev_client].frame.x[2] = 0;
+                            table.set_wait_state(prev_client, IpcWaitState::Runnable, 0);
+                            let _ = table.sched.wake_slot(prev_client);
+                        }
                         table.set_wait_state(cur, IpcWaitState::WaitingReply, ep_id);
                         let _ = table.sched.block_slot(cur);
                         let _ = table.sched.wake_slot(server);
@@ -1748,12 +1804,9 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             let mut table = DOMAINS.lock();
             let mut ipc = IPC_STATE.lock();
             let cur = cur_pid;
-            let required = if a2 != 0 {
-                Rights::WRITE.union(Rights::READ)
-            } else {
-                Rights::READ
-            };
-            match ipc.lookup_endpoint_for(cur_pid, CapId::new(a0), required) {
+            // Server receive right (`Rights::READ`) governs `IpcReplyRecv`; replying consumes
+            // the kernel-minted single-use `reply_target` capability rather than endpoint `WRITE`.
+            match ipc.lookup_endpoint_for(cur_pid, CapId::new(a0), Rights::READ) {
                 Err(e) => Err(e),
                 Ok((ep_id, badge)) => {
                     let mut fastpath_client = None;
@@ -2177,16 +2230,18 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                                 let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
                                 let mut vspace =
                                     super::paging::Aarch64VSpace::from_root_phys(root_phys, hhdm);
-                                match vspace.unmap_4k_asid(va, asid) {
+                                match vspace.unmap_4k_asid_reclaim(va, asid, &mut untyped) {
                                     Ok((frame, is_device)) => {
                                         if !is_device {
                                             let pa = frame.start_addr();
                                             let _ = mappings.remove(PhysAddr::new(root_phys), va);
                                             if !ipc.has_live_frame_cap(pa)
                                                 && !mappings.has_mapping_for_phys(pa)
+                                                && !mappings.is_dma_pinned(pa)
                                             {
                                                 // Zero exclusively reclaimed physical frame immediately (zero-on-free).
                                                 vspace.zero_frame(&frame);
+                                                mappings.clear_ever_written(pa);
                                                 let _ = untyped.reclaim_frame(frame);
                                             }
                                         }
@@ -2202,6 +2257,14 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         }
         SyscallNumber::UntypedRetype => match ObjectType::from_u64(a1) {
             None => Err(SysError::InvalidArgument),
+            Some(ObjectType::IrqHandler) => {
+                let irq = (a3 & 0xFFFF) as u16;
+                let is_mip = ((a3 >> 16) & 1) != 0;
+                IPC_STATE
+                    .lock()
+                    .untyped_retype_irq_for(cur_pid, CapId::new(a0), a2 as usize, irq, is_mip)
+                    .map(CapId::raw)
+            }
             Some(obj_type) => {
                 let cap_res = {
                     let mut ipc = IPC_STATE.lock();
@@ -2697,6 +2760,54 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                     let untyped = RUNTIME_UNTYPED.lock();
                     ipc_badge_out = untyped.reclaimed_count() as u64;
                     Ok(untyped.remaining_frames())
+                }
+            }
+        }
+        SyscallNumber::DmaMap => (|| -> Result<u64, SysError> {
+            let flags = a2;
+            let opt_vaddr = a3;
+            let ipc = IPC_STATE.lock();
+            let _iospace_id = ipc.validate_iospace_for(cur_pid, CapId::new(a0), Rights::WRITE)?;
+            let phys =
+                ipc.validate_frame_for(cur_pid, CapId::new(a1), Rights::READ.union(Rights::WRITE))?;
+            let mut untyped = RUNTIME_UNTYPED.lock();
+            let mut mappings = FRAME_MAPPINGS.lock();
+            if (flags & newos_abi::DMA_FLAG_NON_CACHEABLE) != 0 && opt_vaddr != 0 {
+                if opt_vaddr >= USER_ADDR_LIMIT {
+                    return Err(SysError::InvalidArgument);
+                }
+                let va = VirtAddr::new_page_aligned(opt_vaddr)?;
+                if mappings.conflicts_wx(phys, true, false) {
+                    return Err(SysError::InsufficientRights);
+                }
+                let frame_obj = PhysFrame::from_aligned(phys)?;
+                let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
+                let mut vspace = super::paging::Aarch64VSpace::from_root_phys(cur_ttbr0, hhdm);
+                if vspace.translate(va).is_some() {
+                    return Err(SysError::SlotOccupied);
+                }
+                let nc_flags = PageFlags::new_dma_nc(true, true);
+                vspace.map_4k(va, frame_obj, nc_flags, &mut untyped)?;
+                if let Err(e) =
+                    mappings.record_with_flags(PhysAddr::new(cur_ttbr0), va, phys, true, false)
+                {
+                    let _ = vspace.unmap_4k(va);
+                    return Err(e);
+                }
+            }
+            mappings.pin_dma(phys)?;
+            Ok(phys.raw())
+        })(),
+        SyscallNumber::DmaUnmap => {
+            let ipc = IPC_STATE.lock();
+            let res = ipc
+                .validate_iospace_for(cur_pid, CapId::new(a0), Rights::WRITE)
+                .and_then(|_| ipc.validate_frame_for(cur_pid, CapId::new(a1), Rights::READ));
+            match res {
+                Err(e) => Err(e),
+                Ok(phys) => {
+                    FRAME_MAPPINGS.lock().unpin_dma(phys);
+                    Ok(0)
                 }
             }
         }

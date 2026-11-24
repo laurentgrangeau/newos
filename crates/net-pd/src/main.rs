@@ -14,7 +14,12 @@
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
-use newos_abi::{CapId, SysError, net_ipc};
+#[cfg(feature = "tcp")]
+use newos_abi::net_ipc;
+use newos_abi::{CapId, SysError};
+#[cfg(not(feature = "tcp"))]
+use newos_net::{CycleClock, MmioDmaTransport, NetClock};
+#[cfg(feature = "tcp")]
 use newos_net::{
     CycleClock, MmioDmaTransport, NetClock, NetConfig, NetDevice, NetStack, NetStackStorage,
     NicKind, SSH_PORT, TcpEvent,
@@ -57,6 +62,7 @@ impl MmioDmaTransport for CapNetTransport {
     }
 }
 
+#[cfg(feature = "tcp")]
 fn serve_net_loop<D: NetDevice + newos_net::IrqAckDevice>(
     mut stack: NetStack<'_, D>,
     mut clock: CycleClock<fn() -> u64>,
@@ -198,6 +204,7 @@ fn serve_net_loop<D: NetDevice + newos_net::IrqAckDevice>(
     }
 }
 
+#[cfg(feature = "tcp")]
 fn handle_request<D: NetDevice>(
     stack: &mut NetStack<'_, D>,
     badge: u64,
@@ -238,6 +245,7 @@ fn handle_request<D: NetDevice>(
     }
 }
 
+#[cfg(feature = "tcp")]
 fn encode_status<D: NetDevice>(stack: &NetStack<'_, D>) -> u64 {
     let mut flags = 0u64;
     if stack.is_connected() {
@@ -264,6 +272,20 @@ fn main() -> ! {
     let cycles_per_ms = (freq_hz / 1_000).max(1);
     let mut clock = CycleClock::new(read_cycles_or_zero as fn() -> u64, cycles_per_ms);
 
+    const NET_DMA_RING_VADDR: u64 = 0x0000_6000_0002_0000;
+    if let Ok(iova) = newos_user_rt::dma_map(
+        CapId::BOOTSTRAP_IOSPACE,
+        CapId::BOOTSTRAP_NET_DMA_RING,
+        newos_abi::DMA_FLAG_NON_CACHEABLE,
+        NET_DMA_RING_VADDR,
+    ) {
+        let _ = writeln!(
+            out,
+            "[net-pd] IoSpace Normal-NC DMA ring pinned (iova={iova:#x})"
+        );
+        out.flush();
+    }
+
     let Some(nic) =
         newos_net::probe_nic(|off| newos_user_rt::mmio_read32(CapId::BOOTSTRAP_NET_MMIO, off))
     else {
@@ -276,66 +298,97 @@ fn main() -> ! {
     };
 
     let mac = nic.mac();
-    let _ = writeln!(
-        out,
-        "[net-pd] online ({}, ipv4={}, ipv6={}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, tcp=:{} cntfrq={}Hz)",
-        nic.driver_name(),
-        cfg!(feature = "ipv4"),
-        cfg!(feature = "ipv6"),
-        mac[0],
-        mac[1],
-        mac[2],
-        mac[3],
-        mac[4],
-        mac[5],
-        SSH_PORT,
-        freq_hz,
-    );
-    out.flush();
+    #[cfg(not(feature = "tcp"))]
+    {
+        let _ = (clock, mac);
+        let _ = writeln!(
+            out,
+            "[net-pd] online ({}, ipv4={}, ipv6={}, tcp=false; no TCP listener started)",
+            nic.driver_name(),
+            cfg!(feature = "ipv4"),
+            cfg!(feature = "ipv6"),
+        );
+        out.flush();
+        loop {
+            let _ = newos_user_rt::notify_wait(CapId::BOOTSTRAP_NET_NOTIF, u64::MAX, 100_000_000);
+        }
+    }
 
-    let mut storage = NetStackStorage::new();
-    let now_ms = clock.now_millis();
-    match nic {
-        #[cfg(feature = "driver-virtio")]
-        NicKind::Virtio(v) => match VirtioNetDevice::init(CapNetTransport, v.slot, &VIRTIO_DMA) {
-            Ok(dev) => {
-                let stack = NetStack::new(
-                    dev,
-                    mac,
-                    NetConfig::QEMU_DEFAULT,
-                    SSH_PORT,
-                    now_ms,
-                    &mut storage,
-                );
-                serve_net_loop(stack, clock, &mut out)
-            }
-            Err(e) => {
-                let _ = writeln!(out, "[net-pd] virtio-net init failed: {e}");
-                out.flush();
-                newos_user_rt::thread_exit();
-            }
-        },
-        #[cfg(feature = "driver-gem")]
-        NicKind::CadenceGem(g) => match GemNetDevice::init(CapNetTransport, g, &GEM_DMA) {
-            Ok(dev) => {
-                let stack = NetStack::new(
-                    dev,
-                    mac,
-                    NetConfig::QEMU_DEFAULT,
-                    SSH_PORT,
-                    now_ms,
-                    &mut storage,
-                );
-                serve_net_loop(stack, clock, &mut out)
-            }
-            Err(e) => {
-                let _ = writeln!(out, "[net-pd] rpi5-rp1-gem init failed: {e}");
-                out.flush();
-                newos_user_rt::thread_exit();
-            }
-        },
-        #[cfg(all(not(feature = "driver-virtio"), not(feature = "driver-gem")))]
-        _ => newos_user_rt::thread_exit(),
+    #[cfg(feature = "tcp")]
+    {
+        let _ = writeln!(
+            out,
+            "[net-pd] online ({}, ipv4={}, ipv6={}, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, tcp=:{} cntfrq={}Hz)",
+            nic.driver_name(),
+            cfg!(feature = "ipv4"),
+            cfg!(feature = "ipv6"),
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5],
+            SSH_PORT,
+            freq_hz,
+        );
+        out.flush();
+
+        let mut storage = NetStackStorage::new();
+        let now_ms = clock.now_millis();
+        let entropy_seed = newos_user_rt::read_cycles().unwrap_or(0) ^ (freq_hz.rotate_left(23));
+        match nic {
+            #[cfg(feature = "driver-virtio")]
+            NicKind::Virtio(v) => match VirtioNetDevice::init(CapNetTransport, v.slot, &VIRTIO_DMA)
+            {
+                Ok(dev) => {
+                    let stack = NetStack::new_with_seed(
+                        dev,
+                        mac,
+                        NetConfig::QEMU_DEFAULT,
+                        SSH_PORT,
+                        now_ms,
+                        entropy_seed,
+                        &mut storage,
+                    );
+                    serve_net_loop(stack, clock, &mut out)
+                }
+                Err(e) => {
+                    let _ = writeln!(out, "[net-pd] virtio-net init failed: {e}");
+                    out.flush();
+                    newos_user_rt::thread_exit();
+                }
+            },
+            #[cfg(feature = "driver-gem")]
+            NicKind::CadenceGem(g) => match GemNetDevice::init(CapNetTransport, g, &GEM_DMA) {
+                Ok(dev) => {
+                    // On real Raspberry Pi 5 hardware, start unconfigured (0.0.0.0) until DHCPv4
+                    // leases an address — never fall back to QEMU's 10.0.2.15/24 on a real LAN.
+                    let rpi5_init_cfg = NetConfig {
+                        ip: [0, 0, 0, 0],
+                        prefix_len: 0,
+                        gateway: None,
+                        dns: None,
+                    };
+                    let stack = NetStack::new_with_seed(
+                        dev,
+                        mac,
+                        rpi5_init_cfg,
+                        SSH_PORT,
+                        now_ms,
+                        entropy_seed,
+                        &mut storage,
+                    );
+                    serve_net_loop(stack, clock, &mut out)
+                }
+                Err(e) => {
+                    let _ = writeln!(out, "[net-pd] rpi5-rp1-gem init failed: {e}");
+                    out.flush();
+                    newos_user_rt::thread_exit();
+                }
+            },
+            #[cfg(all(not(feature = "driver-virtio"), not(feature = "driver-gem")))]
+            _ => newos_user_rt::thread_exit(),
+        }
     }
 }
 

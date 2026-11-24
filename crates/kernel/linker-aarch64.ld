@@ -9,6 +9,7 @@ PHDRS
     rodata          PT_LOAD FLAGS(4); /* PF_R */
     data            PT_LOAD FLAGS(6); /* PF_R | PF_W */
     dynamic         PT_DYNAMIC;
+    relro           PT_GNU_RELRO FLAGS(4); /* PF_R after early relocation */
 }
 
 SECTIONS
@@ -40,15 +41,22 @@ SECTIONS
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
-    .data : {
+    __relro_start = .;
+    .data.rel.ro : {
         *(.data.rel.ro .data.rel.ro.*)
         *(.got .got.*)
-        *(.data .data.*)
-    } :data
+    } :data :relro
 
     .dynamic : {
         *(.dynamic)
-    } :data :dynamic
+    } :data :dynamic :relro
+
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __relro_end = .;
+
+    .data : {
+        *(.data .data.*)
+    } :data
 
     .bss : {
         *(.bss .bss.*)

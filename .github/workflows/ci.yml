@@ -10,16 +10,70 @@ env:
 
 jobs:
   host-checks:
-    name: Format, Clippy & Host/E2E Tests
+    name: Format, Clippy, Audit & Host/E2E Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install pinned nightly toolchain
+        run: rustup show
       - name: Check formatting
         run: cargo fmt --all --check
-      - name: Run Clippy
+      - name: Run Clippy on default workspace members
         run: cargo clippy --all-targets -- -D warnings
       - name: Run all host unit and E2E tests
         run: cargo test
+      - name: Run cargo xtask feature-matrix
+        run: cargo xtask feature-matrix
+      - name: Run cargo-deny security & license check
+        uses: EmbarkStudios/cargo-deny-action@v2
+
+  target-lint-and-builds:
+    name: AArch64 Target Clippy (HAL, User-RT & PDs) + Variant Builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned nightly toolchain & targets
+        run: |
+          rustup show
+          rustup target add aarch64-unknown-none aarch64-unknown-none-softfloat
+      - name: Install mtools & dosfstools for UEFI image packaging
+        run: sudo apt-get update && sudo apt-get install -y mtools dosfstools
+      - name: Clippy AArch64 kernel & HAL (soft-float)
+        run: |
+          cargo clippy -p newos-hal -p newos-kernel --target aarch64-unknown-none-softfloat -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -- -D warnings
+      - name: Clippy AArch64 user-rt & EL0 protection domains
+        run: |
+          cargo clippy -p newos-user-rt -p newos-supervisor-pd -p newos-shell-pd -p newos-worker-pd -p newos-net-pd -p newos-key-pd -p newos-ssh-pd --target aarch64-unknown-none -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -- -D warnings
+      - name: Verify --ipv6-only & --no-net target builds
+        run: |
+          cargo xtask build --ipv6-only
+          cargo xtask build --no-net
+          if cargo xtask build --no-sshd; then echo "ERROR: unknown flag accepted"; exit 1; fi
+
+  qemu-boot-test:
+    name: 4-Core QEMU AArch64 Boot (Debug & Release, Full SSH PDs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned nightly toolchain & targets
+        run: |
+          rustup show
+          rustup target add aarch64-unknown-none aarch64-unknown-none-softfloat
+      - name: Install QEMU AArch64, AAVMF & FAT tools
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm qemu-efi-aarch64 mtools dosfstools
+      - name: Run 4-core QEMU debug boot test
+        run: cargo xtask test
+      - name: Run 4-core QEMU release boot test
+        run: cargo xtask test --release
+
+  kani-verification:
+    name: Kani Formal Verification Proofs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Kani model checker
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+      - name: Run Kani proofs on kernel-core & abi
+        run: cargo xtask verify

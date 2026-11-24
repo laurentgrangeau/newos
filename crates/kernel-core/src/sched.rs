@@ -31,17 +31,35 @@ impl SchedPolicyKind {
     }
 }
 
+#[cfg(all(
+    feature = "userspace",
+    feature = "sched-fifo",
+    not(feature = "sched-priority-rr"),
+    not(feature = "sched-round-robin")
+))]
+compile_error!(
+    "Profile error: cooperative `sched-fifo` cannot be combined with `userspace` (EL0 processes would hold CPUs indefinitely without timer preemption)"
+);
+
 /// Active compile-time scheduler policy selected by Cargo features.
-#[cfg(feature = "sched-priority-rr")]
-pub const ACTIVE_SCHED_POLICY: SchedPolicyKind = SchedPolicyKind::PriorityRoundRobin;
+/// Defaults safely to preemptive `PriorityRoundRobin` if no `sched-*` feature is explicitly set (`M6`).
+#[cfg(all(
+    feature = "sched-fifo",
+    not(feature = "sched-priority-rr"),
+    not(feature = "sched-round-robin")
+))]
+pub const ACTIVE_SCHED_POLICY: SchedPolicyKind = SchedPolicyKind::Fifo;
 
 /// Active compile-time scheduler policy selected by Cargo features.
 #[cfg(all(not(feature = "sched-priority-rr"), feature = "sched-round-robin"))]
 pub const ACTIVE_SCHED_POLICY: SchedPolicyKind = SchedPolicyKind::RoundRobin;
 
 /// Active compile-time scheduler policy selected by Cargo features.
-#[cfg(all(not(feature = "sched-priority-rr"), not(feature = "sched-round-robin")))]
-pub const ACTIVE_SCHED_POLICY: SchedPolicyKind = SchedPolicyKind::Fifo;
+#[cfg(any(
+    feature = "sched-priority-rr",
+    all(not(feature = "sched-round-robin"), not(feature = "sched-fifo"))
+))]
+pub const ACTIVE_SCHED_POLICY: SchedPolicyKind = SchedPolicyKind::PriorityRoundRobin;
 
 /// Unique kernel thread identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

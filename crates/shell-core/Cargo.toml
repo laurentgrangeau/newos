@@ -4,8 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["sha3"]
+sha3 = ["newos-abi/sha3"]
+
 [dependencies]
-newos-abi = { workspace = true }
+newos-abi = { workspace = true, default-features = false }
 
 [lints]
 workspace = true

@@ -51,7 +51,12 @@ fn serve_vault<E: EntropySource>(
     out: &mut IpcLogConsole<256>,
 ) -> ! {
     let personalization = start_cycles.to_le_bytes();
-    let vault = match KeyVault::new(source, &personalization, AUTHORIZED_KEYS) {
+    let vault = match KeyVault::new_with_optional_host_seed(
+        source,
+        &personalization,
+        AUTHORIZED_KEYS,
+        HOST_KEY_SEED,
+    ) {
         Ok(v) => v,
         Err(err) => {
             let _ = writeln!(
@@ -120,9 +125,30 @@ fn serve_vault<E: EntropySource>(
                     newos_user_rt::notify_wait(CapId::BOOTSTRAP_KEY_NOTIF, u64::MAX, 5_000_000)
                     && (bits & newos_abi::RING_PEER_RESET_BIT) != 0
                 {
+                    // Fail-closed: `ssh-pd` exited or faulted; immediately close the auth gate (`M13`).
+                    let _ = server.handle_ipc_word(
+                        newos_abi::key_ipc::BADGE_SSH,
+                        newos_abi::key_ipc::encode_word_req(
+                            newos_abi::key_ipc::OP_CLOSE_SESSION,
+                            0,
+                        ),
+                        0,
+                    );
+                    for _ in 0..256 {
+                        match newos_user_rt::ipc_send(
+                            CapId::BOOTSTRAP_AUTH_GATE_EP,
+                            newos_abi::auth_gate_ipc::SESSION_CLOSE,
+                        ) {
+                            Ok(()) => break,
+                            Err(SysError::WouldBlock) => {
+                                let _ = newos_user_rt::sleep_ms(1);
+                            }
+                            Err(_) => break,
+                        }
+                    }
                     let _ = writeln!(
                         out,
-                        "[key-pd] peer reset signal received; cleared ring state"
+                        "[key-pd] peer reset signal received; closed auth gate & cleared state"
                     );
                     out.flush();
                 }

@@ -4,10 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["driver-bcm2712", "driver-virtio", "csprng"]
+driver-bcm2712 = ["newos-rng/bcm2712"]
+driver-virtio = ["newos-rng/virtio"]
+csprng = ["newos-rng/csprng"]
+
 [dependencies]
-newos-abi = { workspace = true }
+newos-abi = { workspace = true, default-features = false }
 newos-key-vault = { workspace = true }
-newos-rng = { workspace = true }
+newos-rng = { workspace = true, default-features = false }
 newos-user-rt = { workspace = true }
 
 [lints]

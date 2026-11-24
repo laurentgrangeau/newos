@@ -210,6 +210,9 @@ impl GemDma {
 pub struct GemNetDevice<'a, T: MmioDmaTransport> {
     transport: T,
     dma: &'a GemDma,
+    /// When `true`, `rx_ring`/`tx_ring` live in Normal Non-Cacheable DMA memory (`DmaMap`
+    /// with `DMA_FLAG_NON_CACHEABLE`), so descriptor cache-line maintenance is skipped (`H4`).
+    coherent_rings: bool,
     rx_idx: usize,
     tx_idx: usize,
     pub rx_packets: u64,
@@ -218,6 +221,25 @@ pub struct GemNetDevice<'a, T: MmioDmaTransport> {
 
 impl<'a, T: MmioDmaTransport> GemNetDevice<'a, T> {
     pub fn init(transport: T, info: GemInfo, dma: &'a GemDma) -> Result<Self, &'static str> {
+        Self::init_inner(transport, info, dma, false)
+    }
+
+    /// Initialize Cadence GEM with hardware-coherent / Normal Non-Cacheable descriptor rings (`H4`),
+    /// eliminating shared-cache-line descriptor overwrite hazards on non-coherent ARM64 DMA.
+    pub fn init_coherent(
+        transport: T,
+        info: GemInfo,
+        dma: &'a GemDma,
+    ) -> Result<Self, &'static str> {
+        Self::init_inner(transport, info, dma, true)
+    }
+
+    fn init_inner(
+        transport: T,
+        info: GemInfo,
+        dma: &'a GemDma,
+        coherent_rings: bool,
+    ) -> Result<Self, &'static str> {
         // 1. Disable RX/TX & mask interrupts while configuring DMA rings
         transport
             .write32(REG_NCR, NCR_MPE)
@@ -326,6 +348,7 @@ impl<'a, T: MmioDmaTransport> GemNetDevice<'a, T> {
         let dev = Self {
             transport,
             dma,
+            coherent_rings,
             rx_idx: 0,
             tx_idx: 0,
             rx_packets: 0,
@@ -371,27 +394,32 @@ impl<'a, T: MmioDmaTransport> GemNetDevice<'a, T> {
         let slot = self.tx_idx;
         // Wait (bounded) until the hardware sets `TX_USED` on this descriptor so we never
         // overwrite a TX buffer while DMA still owns it (`M9`).
+        let mut ready = false;
         for _ in 0..100_000u32 {
-            let _ = self.transport.dma_invalidate(&self.dma.tx_ring.0[slot]);
+            if !self.coherent_rings {
+                let _ = self.transport.dma_invalidate(&self.dma.tx_ring.0[slot]);
+            }
             if (self.dma.tx_ring.0[slot].ctrl.load(Ordering::Acquire) & TX_USED) != 0 {
+                ready = true;
                 break;
             }
             core::hint::spin_loop();
         }
+        if !ready {
+            return;
+        }
         self.dma.tx_bufs[slot].write_bytes(&frame[..len]);
         let wrap = if slot + 1 == RING_SIZE { TX_WRAP } else { 0 };
         fence(Ordering::SeqCst);
-        if self.transport.dma_clean(&self.dma.tx_bufs[slot]).is_err() {
+        if !self.coherent_rings && self.transport.dma_clean(&self.dma.tx_bufs[slot]).is_err() {
             return;
         }
         // Clear TX_USED (bit 31) and set TX_LAST + length so GEM transmits the frame.
-        // Note (`P5`): 16-byte GEM descriptors share a 64B cache line; on non-coherent hardware
-        // the descriptor rings must be placed in non-cacheable DMA memory supplied by the kernel.
         self.dma.tx_ring.0[slot]
             .ctrl
             .store((len as u32) | TX_LAST | wrap, Ordering::Release);
         fence(Ordering::SeqCst);
-        if self.transport.dma_clean(&self.dma.tx_ring.0[slot]).is_err() {
+        if !self.coherent_rings && self.transport.dma_clean(&self.dma.tx_ring.0[slot]).is_err() {
             return;
         }
 
@@ -467,12 +495,16 @@ impl<'b, T: MmioDmaTransport> Device for GemNetDevice<'b, T> {
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let _ = self.transport.read32(REG_ISR);
         let prev_slot = (self.rx_idx + RING_SIZE - 1) % RING_SIZE;
-        let _ = self.transport.dma_clean(&self.dma.rx_ring.0[prev_slot]);
+        if !self.coherent_rings {
+            let _ = self.transport.dma_clean(&self.dma.rx_ring.0[prev_slot]);
+        }
 
         fence(Ordering::SeqCst);
         let slot = self.rx_idx;
         let desc = &self.dma.rx_ring.0[slot];
-        let _ = self.transport.dma_invalidate(desc);
+        if !self.coherent_rings {
+            let _ = self.transport.dma_invalidate(desc);
+        }
         let addr_lo = desc.addr_lo.load(Ordering::Acquire);
         if (addr_lo & RX_USED) == 0 {
             return None;
@@ -484,11 +516,15 @@ impl<'b, T: MmioDmaTransport> Device for GemNetDevice<'b, T> {
 
         if frame_len == 0 || frame_len > PKT_BUF_SIZE {
             desc.addr_lo.store(addr_lo & !RX_USED, Ordering::Release);
-            let _ = self.transport.dma_clean(desc);
+            if !self.coherent_rings {
+                let _ = self.transport.dma_clean(desc);
+            }
             return None;
         }
 
-        let _ = self.transport.dma_invalidate(&self.dma.rx_bufs[slot]);
+        if !self.coherent_rings {
+            let _ = self.transport.dma_invalidate(&self.dma.rx_bufs[slot]);
+        }
 
         let rx = GemRxToken {
             buf: &self.dma.rx_bufs[slot],

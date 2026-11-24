@@ -21,6 +21,7 @@ struct StandaloneShellHost {
     ssh_in_pos: usize,
     ssh_in_len: usize,
     ssh_session_authorized: bool,
+    last_input_from_ssh: bool,
 }
 
 impl StandaloneShellHost {
@@ -31,6 +32,7 @@ impl StandaloneShellHost {
             ssh_in_pos: 0,
             ssh_in_len: 0,
             ssh_session_authorized: false,
+            last_input_from_ssh: false,
         }
     }
 
@@ -43,6 +45,7 @@ impl StandaloneShellHost {
                 self.ssh_session_authorized = true;
             } else if payload == auth_gate_ipc::SESSION_CLOSE {
                 self.ssh_session_authorized = false;
+                self.last_input_from_ssh = false;
                 self.ssh_in_pos = 0;
                 self.ssh_in_len = 0;
             }
@@ -52,10 +55,8 @@ impl StandaloneShellHost {
 
 impl ShellHost for StandaloneShellHost {
     fn write_debug(&mut self, s: &str) {
-        let mut out = BufferedConsole::<256>::new();
-        let _ = out.write_str(s);
-        out.flush();
-        if self.ssh_session_authorized {
+        if self.ssh_session_authorized && self.last_input_from_ssh {
+            // Route SSH shell output exclusively to `ssh-pd` without leaking to serial console (`M14`).
             let bytes = s.as_bytes();
             let mut off = 0usize;
             while off < bytes.len() {
@@ -64,6 +65,10 @@ impl ShellHost for StandaloneShellHost {
                 let _ = newos_user_rt::ipc_send(CapId::BOOTSTRAP_SSH_OUT_EP, word);
                 off = end;
             }
+        } else {
+            let mut out = BufferedConsole::<256>::new();
+            let _ = out.write_str(s);
+            out.flush();
         }
     }
 
@@ -81,6 +86,7 @@ impl ShellHost for StandaloneShellHost {
         if self.ssh_in_pos < self.ssh_in_len {
             let b = self.ssh_in_buf[self.ssh_in_pos];
             self.ssh_in_pos += 1;
+            self.last_input_from_ssh = true;
             return Ok(b);
         }
         if self.ssh_session_authorized
@@ -91,10 +97,15 @@ impl ShellHost for StandaloneShellHost {
                 self.ssh_in_buf = chunk;
                 self.ssh_in_len = len;
                 self.ssh_in_pos = 1;
+                self.last_input_from_ssh = true;
                 return Ok(chunk[0]);
             }
         }
-        newos_user_rt::debug_read_byte()
+        let res = newos_user_rt::debug_read_byte();
+        if res.is_ok() {
+            self.last_input_from_ssh = false;
+        }
+        res
     }
 
     fn poll_background_log(&mut self, out: &mut [u8]) -> Option<(u64, usize)> {
@@ -122,6 +133,11 @@ impl ShellHost for StandaloneShellHost {
     }
 
     fn trigger_user_fault(&mut self) {
+        if self.last_input_from_ssh {
+            // Do not allow remote SSH users to deliberately fault the shell domain (`M14`).
+            self.write_debug("[ssh] fault/crash command is disabled over SSH\n");
+            return;
+        }
         newos_user_rt::trigger_user_fault()
     }
 
@@ -131,6 +147,16 @@ impl ShellHost for StandaloneShellHost {
 }
 
 fn main() -> ! {
+    if !newos_user_rt::sys_info().interactive_shell {
+        // In automated `cargo xtask test` mode, avoid competing with `supervisor-pd` on
+        // `BOOTSTRAP_LOG_EP` and PL011 RX while still verifying `shell-pd` spawns in EL0.
+        let mut out = BufferedConsole::<64>::new();
+        let _ = out.write_str("[shell-pd] online (test mode)\n");
+        out.flush();
+        loop {
+            let _ = newos_user_rt::yield_now();
+        }
+    }
     let mut sh = Shell::new(StandaloneShellHost::new());
     sh.run_interactive()
 }
