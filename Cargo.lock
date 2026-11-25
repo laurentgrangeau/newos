@@ -228,21 +228,21 @@ dependencies = [
 
 [[package]]
 name = "newos-abi"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-crypto",
 ]
 
 [[package]]
 name = "newos-ai"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
 ]
 
 [[package]]
 name = "newos-bench"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
  "newos-kernel-core",
@@ -251,14 +251,14 @@ dependencies = [
 
 [[package]]
 name = "newos-board"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
 ]
 
 [[package]]
 name = "newos-crypto"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "ml-dsa",
  "ml-kem",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "newos-e2e-tests"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "ml-dsa",
  "newos-abi",
@@ -285,21 +285,21 @@ dependencies = [
 
 [[package]]
 name = "newos-gpio"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
 ]
 
 [[package]]
 name = "newos-gpu"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
 ]
 
 [[package]]
 name = "newos-hal"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "limine",
  "newos-abi",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "newos-kernel"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-hal",
  "newos-kernel-core",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "newos-kernel-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
  "newos-crypto",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "newos-key-pd"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
  "newos-key-vault",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "newos-key-vault"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "ml-dsa",
  "newos-abi",
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "newos-net"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
  "smoltcp",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "newos-net-pd"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
  "newos-net",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "newos-rng"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
  "newos-crypto",
@@ -371,14 +371,14 @@ dependencies = [
 
 [[package]]
 name = "newos-shell-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
 ]
 
 [[package]]
 name = "newos-shell-pd"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
  "newos-shell-core",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "newos-ssh"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "ml-dsa",
  "newos-abi",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "newos-ssh-pd"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
  "newos-ssh-proto",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "newos-ssh-proto"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "ml-dsa",
  "ml-kem",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "newos-storage"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
  "newos-crypto",
@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "newos-supervisor-pd"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
  "newos-net",
@@ -438,28 +438,28 @@ dependencies = [
 
 [[package]]
 name = "newos-usb"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
 ]
 
 [[package]]
 name = "newos-user-rt"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
 ]
 
 [[package]]
 name = "newos-wdt"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
 ]
 
 [[package]]
 name = "newos-worker-pd"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "newos-abi",
  "newos-user-rt",
@@ -641,7 +641,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "xtask"
-version = "0.11.0"
+version = "0.12.0"
 
 [[package]]
 name = "zeroize"
