@@ -428,7 +428,7 @@ impl KernelIpcState {
         Ok(())
     }
 
-    /// Install least-privilege bootstrap capabilities for a non-root process (`pd_id >= 1`).
+    /// Install least-privilege bootstrap capabilities for an isolated protection domain (`pd_id >= 1`).
     ///
     /// Grants `BOOTSTRAP_NOTIF` (`READ | WRITE`), `BOOTSTRAP_EP` (`READ | WRITE`, badge `0x5E14`),
     /// `BOOTSTRAP_SELF_THREAD` (`READ | WRITE`), and write-only `BOOTSTRAP_LOG_EP` (`WRITE`,
@@ -472,8 +472,9 @@ impl KernelIpcState {
     /// Install designated `Thread` and `CNode` capabilities for `child_pd` into PD 0 (`supervisor-pd`).
     /// Install least-privilege capabilities for standalone EL0 `newos-shell-pd` (`DomainRole::Shell`).
     ///
-    /// Holds `BOOTSTRAP_NOTIF`, `BOOTSTRAP_EP`, `BOOTSTRAP_CONSOLE` (`R|W`), read-only
-    /// `BOOTSTRAP_POWER` (`SysInfo` only — cannot halt/reboot), `BOOTSTRAP_LOG_EP` (`R|W`),
+    /// Holds `BOOTSTRAP_NOTIF`, `BOOTSTRAP_EP`, write-only `BOOTSTRAP_FAULT_NOTIF` (for graceful
+    /// shutdown/reboot requests to PD 0), `BOOTSTRAP_CONSOLE` (`R|W`), read-only
+    /// `BOOTSTRAP_POWER` (`SysInfo` only — cannot halt/reboot directly), `BOOTSTRAP_LOG_EP` (`R|W`),
     /// `BOOTSTRAP_SSH_SHELL_EP` (`R`), `BOOTSTRAP_AUTH_GATE_EP` (`R`), `BOOTSTRAP_SSH_OUT_EP` (`W`),
     /// and read-only `BOOTSTRAP_SELF_THREAD`. Explicitly omits all MMIO and `Untyped` caps.
     pub fn init_shell_pd_bootstrap_caps(&mut self, pd_id: usize) -> Result<(), SysError> {
@@ -486,6 +487,10 @@ impl KernelIpcState {
         let _ = cnode.insert_root_at(
             2,
             Capability::new(CapObject::Endpoint { id: 0 }, Rights::WRITE),
+        )?;
+        let _ = cnode.insert_root_at(
+            3,
+            Capability::new(CapObject::Notification { id: 1 }, Rights::WRITE),
         )?;
         let _ = cnode.insert_root_at(5, Capability::new(CapObject::Console, rw))?;
         let _ = cnode.insert_root_at(6, Capability::new(CapObject::PowerControl, Rights::READ))?;
@@ -1088,7 +1093,7 @@ impl KernelIpcState {
         Ok(())
     }
 
-    /// Clear all capabilities held by an exited non-root process `pd_id` (`M4`), reparenting
+    /// Clear all capabilities held by an exited protection domain `pd_id` (`M4`), reparenting
     /// any external CDT descendants in other domains and invoking `on_frame(phys, can_reclaim)`
     /// for any `Frame` capabilities it held.
     pub fn clear_domain_cspace(
@@ -2589,6 +2594,43 @@ mod tests {
         assert_eq!(
             ipc.validate_irq_for(0, mip_cap, Rights::READ),
             Ok((5, true))
+        );
+    }
+
+    #[test]
+    fn shell_pd_can_request_shutdown_without_power_write_or_fault_read() {
+        let mut ipc = KernelIpcState::new();
+        ipc.init_bootstrap_caps(None).expect("root caps");
+        ipc.init_shell_pd_bootstrap_caps(1).expect("shell caps");
+
+        // `shell-pd` still holds only read-only `BOOTSTRAP_POWER` (cannot directly halt/reboot).
+        assert_eq!(
+            ipc.validate_power_for(1, CapId::BOOTSTRAP_POWER, Rights::READ),
+            Ok(())
+        );
+        assert_eq!(
+            ipc.validate_power_for(1, CapId::BOOTSTRAP_POWER, Rights::WRITE),
+            Err(SysError::InsufficientRights)
+        );
+
+        // `shell-pd` cannot read/consume PD 0's `BOOTSTRAP_FAULT_NOTIF`.
+        assert_eq!(
+            ipc.notify_poll_for(1, CapId::BOOTSTRAP_FAULT_NOTIF),
+            Err(SysError::InsufficientRights)
+        );
+
+        // `shell-pd` CAN signal a graceful shutdown request that PD 0 consumes via `WAIT_MASK`.
+        let bit = newos_abi::supervisor_notif::encode_shutdown(newos_abi::ShutdownStatus::Success);
+        assert_eq!(
+            ipc.notify_signal_for(1, CapId::BOOTSTRAP_FAULT_NOTIF, bit),
+            Ok(())
+        );
+        let consumed = ipc
+            .notify_consume_mask(1, newos_abi::supervisor_notif::WAIT_MASK)
+            .expect("consume supervisor notif");
+        assert_eq!(
+            newos_abi::supervisor_notif::decode_shutdown(consumed),
+            Some(newos_abi::ShutdownStatus::Success)
         );
     }
 }

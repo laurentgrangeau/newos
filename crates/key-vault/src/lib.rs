@@ -700,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn key_vault_server_enforces_sshd_badge_and_emits_auth_gate() {
+    fn key_vault_server_enforces_ssh_pd_badge_and_emits_auth_gate() {
         let (client_sk, client_pk) = make_client_keypair(0x99);
         let allowed_static: &'static [[u8; key_ipc::MLDSA87_PK_BYTES]] =
             std::boxed::Box::leak(std::boxed::Box::new([client_pk]));

@@ -211,7 +211,7 @@ pub fn ipc_log_write(ep: CapId, msg: &str) -> Result<usize, SysError> {
     Ok(bytes.len())
 }
 
-/// Buffered `core::fmt::Write` sink for non-root processes without a direct
+/// Buffered `core::fmt::Write` sink for isolated protection domains without a direct
 /// `Console` capability, routing output over `CapId::BOOTSTRAP_LOG_EP` to `supervisor-pd`.
 pub struct IpcLogConsole<const N: usize = 256> {
     ep: CapId,

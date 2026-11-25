@@ -12,13 +12,21 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::Device;
 #[cfg(feature = "ipv4")]
 use smoltcp::socket::dhcpv4;
+#[cfg(all(feature = "ipv4", feature = "dns"))]
+use smoltcp::socket::dns;
+#[cfg(all(feature = "ipv4", feature = "icmp"))]
+use smoltcp::socket::icmp;
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
+#[cfg(all(feature = "ipv4", feature = "dns"))]
+use smoltcp::wire::DnsQueryType;
 #[cfg(feature = "ipv4")]
 use smoltcp::wire::Ipv4Address;
 #[cfg(feature = "ipv6")]
 use smoltcp::wire::Ipv6Address;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
+#[cfg(all(feature = "ipv4", feature = "icmp"))]
+use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr};
 
 /// Static TCP socket buffer size per listener slot (16 KiB each for RX and TX, sized for
 /// ML-KEM-1024 + ML-DSA-87 post-quantum SSH handshakes across [`SSH_LISTEN_BACKLOG`] sockets).
@@ -42,7 +50,54 @@ pub enum TcpEvent {
     Disconnected,
 }
 
-/// Maximum concurrent sockets in `NetStackStorage` (DHCPv4 + multi-session TCP + DNS/ICMP).
+/// Non-blocking ICMPv4 Echo Request/Reply state tracked inside [`NetStack`].
+#[cfg(all(feature = "ipv4", feature = "icmp"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PingStatus {
+    Idle,
+    Pending,
+    Reply {
+        target: [u8; 4],
+        seq: u16,
+        rtt_ms: u32,
+    },
+    Timeout,
+}
+
+/// Non-blocking DNS A-record query state tracked inside [`NetStack`].
+#[cfg(all(feature = "ipv4", feature = "dns"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsStatus {
+    Idle,
+    Pending,
+    Resolved([u8; 4]),
+    Timeout,
+    Failed,
+}
+
+#[cfg(all(feature = "ipv4", feature = "icmp"))]
+const PING_IDENT: u16 = 0x5E14;
+#[cfg(all(feature = "ipv4", feature = "icmp"))]
+const PING_TIMEOUT_MS: i64 = 3_000;
+#[cfg(all(feature = "ipv4", feature = "icmp"))]
+const PING_RETRY_INTERVAL_MS: i64 = 500;
+#[cfg(all(feature = "ipv4", feature = "icmp"))]
+const PING_MAX_RETRIES: u8 = 3;
+
+#[cfg(all(feature = "ipv4", feature = "dns"))]
+const DNS_TIMEOUT_MS: i64 = 5_000;
+
+#[cfg(all(feature = "ipv4", feature = "icmp"))]
+#[derive(Debug, Clone, Copy)]
+struct PendingPing {
+    target: [u8; 4],
+    seq: u16,
+    start_ms: i64,
+    last_tx_ms: i64,
+    retries: u8,
+}
+
+/// Maximum concurrent sockets in `NetStackStorage` (DHCPv4 + multi-session TCP + DNS + ICMP).
 pub const MAX_SOCKETS: usize = 8;
 
 /// Static backing buffers owned by the caller (e.g., `newos-net-pd` main/BSS)
@@ -50,6 +105,16 @@ pub const MAX_SOCKETS: usize = 8;
 pub struct NetStackStorage<'a> {
     pub tcp_rx_bufs: [[u8; TCP_BUF_SIZE]; SSH_LISTEN_BACKLOG],
     pub tcp_tx_bufs: [[u8; TCP_BUF_SIZE]; SSH_LISTEN_BACKLOG],
+    #[cfg(all(feature = "ipv4", feature = "icmp"))]
+    pub icmp_rx_meta: [icmp::PacketMetadata; 4],
+    #[cfg(all(feature = "ipv4", feature = "icmp"))]
+    pub icmp_rx_data: [u8; 256],
+    #[cfg(all(feature = "ipv4", feature = "icmp"))]
+    pub icmp_tx_meta: [icmp::PacketMetadata; 4],
+    #[cfg(all(feature = "ipv4", feature = "icmp"))]
+    pub icmp_tx_data: [u8; 256],
+    #[cfg(all(feature = "ipv4", feature = "dns"))]
+    pub dns_queries: [Option<dns::DnsQuery>; 1],
     pub sockets: [SocketStorage<'a>; MAX_SOCKETS],
 }
 
@@ -64,6 +129,16 @@ impl NetStackStorage<'_> {
         Self {
             tcp_rx_bufs: [[0u8; TCP_BUF_SIZE]; SSH_LISTEN_BACKLOG],
             tcp_tx_bufs: [[0u8; TCP_BUF_SIZE]; SSH_LISTEN_BACKLOG],
+            #[cfg(all(feature = "ipv4", feature = "icmp"))]
+            icmp_rx_meta: [icmp::PacketMetadata::EMPTY; 4],
+            #[cfg(all(feature = "ipv4", feature = "icmp"))]
+            icmp_rx_data: [0u8; 256],
+            #[cfg(all(feature = "ipv4", feature = "icmp"))]
+            icmp_tx_meta: [icmp::PacketMetadata::EMPTY; 4],
+            #[cfg(all(feature = "ipv4", feature = "icmp"))]
+            icmp_tx_data: [0u8; 256],
+            #[cfg(all(feature = "ipv4", feature = "dns"))]
+            dns_queries: [const { None }; 1],
             sockets: [SocketStorage::EMPTY; MAX_SOCKETS],
         }
     }
@@ -72,10 +147,27 @@ impl NetStackStorage<'_> {
 /// Long-lived EL0 `smoltcp` IPv4/IPv6 dual-stack multi-listener TCP stack.
 pub struct NetStack<'a, D: Device> {
     device: D,
+    mac: [u8; 6],
     iface: Interface,
     sockets: SocketSet<'a>,
     #[cfg(feature = "ipv4")]
     dhcp_handle: SocketHandle,
+    #[cfg(all(feature = "ipv4", feature = "icmp"))]
+    icmp_handle: SocketHandle,
+    #[cfg(all(feature = "ipv4", feature = "icmp"))]
+    ping_seq: u16,
+    #[cfg(all(feature = "ipv4", feature = "icmp"))]
+    pending_ping: Option<PendingPing>,
+    #[cfg(all(feature = "ipv4", feature = "icmp"))]
+    ping_status: PingStatus,
+    #[cfg(all(feature = "ipv4", feature = "dns"))]
+    dns_handle: SocketHandle,
+    #[cfg(all(feature = "ipv4", feature = "dns"))]
+    dns_query: Option<dns::QueryHandle>,
+    #[cfg(all(feature = "ipv4", feature = "dns"))]
+    dns_start_ms: i64,
+    #[cfg(all(feature = "ipv4", feature = "dns"))]
+    dns_status: DnsStatus,
     tcp_handles: [SocketHandle; SSH_LISTEN_BACKLOG],
     syn_seen_ms: [Option<i64>; SSH_LISTEN_BACKLOG],
     active_tcp: Option<usize>,
@@ -134,6 +226,27 @@ impl<'a, D: Device> NetStack<'a, D> {
         let mut sockets = SocketSet::new(&mut storage.sockets[..]);
         #[cfg(feature = "ipv4")]
         let dhcp_handle = sockets.add(dhcpv4::Socket::new());
+        #[cfg(all(feature = "ipv4", feature = "icmp"))]
+        let icmp_handle = {
+            let mut s = icmp::Socket::new(
+                icmp::PacketBuffer::new(
+                    &mut storage.icmp_rx_meta[..],
+                    &mut storage.icmp_rx_data[..],
+                ),
+                icmp::PacketBuffer::new(
+                    &mut storage.icmp_tx_meta[..],
+                    &mut storage.icmp_tx_data[..],
+                ),
+            );
+            let _ = s.bind(icmp::Endpoint::Ident(PING_IDENT));
+            sockets.add(s)
+        };
+        #[cfg(all(feature = "ipv4", feature = "dns"))]
+        let dns_handle = {
+            let dns_ip = initial_cfg.dns.unwrap_or([1, 1, 1, 1]);
+            let servers = [IpAddress::Ipv4(Ipv4Address::from(dns_ip))];
+            sockets.add(dns::Socket::new(&servers, &mut storage.dns_queries[..]))
+        };
 
         let [rx0, rx1, rx2, rx3] = &mut storage.tcp_rx_bufs;
         let [tx0, tx1, tx2, tx3] = &mut storage.tcp_tx_bufs;
@@ -153,10 +266,27 @@ impl<'a, D: Device> NetStack<'a, D> {
 
         Self {
             device,
+            mac,
             iface,
             sockets,
             #[cfg(feature = "ipv4")]
             dhcp_handle,
+            #[cfg(all(feature = "ipv4", feature = "icmp"))]
+            icmp_handle,
+            #[cfg(all(feature = "ipv4", feature = "icmp"))]
+            ping_seq: 0,
+            #[cfg(all(feature = "ipv4", feature = "icmp"))]
+            pending_ping: None,
+            #[cfg(all(feature = "ipv4", feature = "icmp"))]
+            ping_status: PingStatus::Idle,
+            #[cfg(all(feature = "ipv4", feature = "dns"))]
+            dns_handle,
+            #[cfg(all(feature = "ipv4", feature = "dns"))]
+            dns_query: None,
+            #[cfg(all(feature = "ipv4", feature = "dns"))]
+            dns_start_ms: 0,
+            #[cfg(all(feature = "ipv4", feature = "dns"))]
+            dns_status: DnsStatus::Idle,
             tcp_handles,
             syn_seen_ms: [None; SSH_LISTEN_BACKLOG],
             active_tcp: None,
@@ -268,6 +398,8 @@ impl<'a, D: Device> NetStack<'a, D> {
                         #[cfg(feature = "ipv6")]
                         &self.ipv6_cfg,
                     );
+                    #[cfg(feature = "dns")]
+                    self.refresh_dns_servers();
                 }
                 dhcpv4::Event::Deconfigured => {
                     // Revert to the caller-supplied initial configuration (never hardcode QEMU's
@@ -279,9 +411,19 @@ impl<'a, D: Device> NetStack<'a, D> {
                         #[cfg(feature = "ipv6")]
                         &self.ipv6_cfg,
                     );
+                    #[cfg(feature = "dns")]
+                    self.refresh_dns_servers();
                 }
             }
         }
+
+        // Drive non-blocking ICMPv4 Echo Request/Reply state machine.
+        #[cfg(all(feature = "ipv4", feature = "icmp"))]
+        self.poll_ping(now_ms);
+
+        // Drive non-blocking DNS A-record resolution state machine.
+        #[cfg(all(feature = "ipv4", feature = "dns"))]
+        self.poll_dns(now_ms);
 
         // Manage multi-socket TCP listener pool & abort half-open SYN-RECEIVED sockets (`H3`).
         for i in 0..SSH_LISTEN_BACKLOG {
@@ -399,6 +541,207 @@ impl<'a, D: Device> NetStack<'a, D> {
     #[inline]
     pub fn config(&self) -> NetConfig {
         self.cfg
+    }
+
+    #[inline]
+    pub fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+
+    /// Trigger a fresh DHCPv4 lease discovery / renewal.
+    #[cfg(feature = "ipv4")]
+    pub fn dhcp_reset(&mut self) {
+        self.sockets
+            .get_mut::<dhcpv4::Socket>(self.dhcp_handle)
+            .reset();
+    }
+
+    /// Start a non-blocking ICMPv4 Echo Request to `target`.
+    /// Call [`NetStack::poll`] to drive TX/RX and [`NetStack::ping_status`] to inspect completion.
+    #[cfg(all(feature = "ipv4", feature = "icmp"))]
+    pub fn ping_start(&mut self, target: [u8; 4], now_ms: i64) -> Result<u16, &'static str> {
+        if self.cfg.ip == [0, 0, 0, 0] {
+            self.pending_ping = None;
+            self.ping_status = PingStatus::Idle;
+            return Err("no IPv4 address configured");
+        }
+        let next_seq = self.ping_seq.wrapping_add(1);
+        self.ping_seq = if next_seq == 0 { 1 } else { next_seq };
+        let seq = self.ping_seq;
+        self.pending_ping = Some(PendingPing {
+            target,
+            seq,
+            start_ms: now_ms,
+            last_tx_ms: now_ms,
+            retries: 0,
+        });
+        self.ping_status = PingStatus::Pending;
+        self.send_icmp_echo(target, seq);
+        Ok(seq)
+    }
+
+    /// Inspect the current non-blocking ICMPv4 ping status.
+    #[cfg(all(feature = "ipv4", feature = "icmp"))]
+    #[inline]
+    pub fn ping_status(&self) -> PingStatus {
+        self.ping_status
+    }
+
+    #[cfg(all(feature = "ipv4", feature = "icmp"))]
+    fn send_icmp_echo(&mut self, target: [u8; 4], seq: u16) {
+        let sock = self.sockets.get_mut::<icmp::Socket>(self.icmp_handle);
+        if !sock.can_send() {
+            return;
+        }
+        let dest = IpAddress::Ipv4(Ipv4Address::from(target));
+        let echo = Icmpv4Repr::EchoRequest {
+            ident: PING_IDENT,
+            seq_no: seq,
+            data: b"newos-el0",
+        };
+        if let Ok(buf) = sock.send(echo.buffer_len(), dest) {
+            let mut pkt = Icmpv4Packet::new_unchecked(buf);
+            echo.emit(&mut pkt, &smoltcp::phy::ChecksumCapabilities::default());
+        }
+    }
+
+    #[cfg(all(feature = "ipv4", feature = "icmp"))]
+    fn poll_ping(&mut self, now_ms: i64) {
+        let Some(mut pending) = self.pending_ping else {
+            // Drain any late/stale ICMP packets so the RX ring stays clear.
+            let sock = self.sockets.get_mut::<icmp::Socket>(self.icmp_handle);
+            while sock.can_recv() {
+                if sock.recv().is_err() {
+                    break;
+                }
+            }
+            return;
+        };
+
+        let sock = self.sockets.get_mut::<icmp::Socket>(self.icmp_handle);
+        while sock.can_recv() {
+            let Ok((data, _addr)) = sock.recv() else {
+                break;
+            };
+            if let Ok(pkt) = Icmpv4Packet::new_checked(data)
+                && let Ok(Icmpv4Repr::EchoReply { ident, seq_no, .. }) =
+                    Icmpv4Repr::parse(&pkt, &smoltcp::phy::ChecksumCapabilities::default())
+                && ident == PING_IDENT
+                && seq_no == pending.seq
+            {
+                let rtt_ms = now_ms.saturating_sub(pending.start_ms).max(0) as u32;
+                self.pending_ping = None;
+                self.ping_status = PingStatus::Reply {
+                    target: pending.target,
+                    seq: seq_no,
+                    rtt_ms,
+                };
+                return;
+            }
+        }
+
+        if now_ms.saturating_sub(pending.start_ms) >= PING_TIMEOUT_MS {
+            self.pending_ping = None;
+            self.ping_status = PingStatus::Timeout;
+            return;
+        }
+
+        if pending.retries < PING_MAX_RETRIES
+            && now_ms.saturating_sub(pending.last_tx_ms) >= PING_RETRY_INTERVAL_MS
+        {
+            pending.retries += 1;
+            pending.last_tx_ms = now_ms;
+            self.pending_ping = Some(pending);
+            self.send_icmp_echo(pending.target, pending.seq);
+        }
+    }
+
+    #[cfg(all(feature = "ipv4", feature = "dns"))]
+    fn refresh_dns_servers(&mut self) {
+        let dns_ip = self.cfg.dns.unwrap_or([1, 1, 1, 1]);
+        let servers = [IpAddress::Ipv4(Ipv4Address::from(dns_ip))];
+        self.sockets
+            .get_mut::<dns::Socket>(self.dns_handle)
+            .update_servers(&servers);
+    }
+
+    /// Start a non-blocking DNS A-record resolution for `hostname`.
+    /// Call [`NetStack::poll`] to drive TX/RX and [`NetStack::dns_status`] to inspect completion.
+    #[cfg(all(feature = "ipv4", feature = "dns"))]
+    pub fn dns_start(&mut self, hostname: &str, now_ms: i64) -> Result<(), &'static str> {
+        if self.cfg.ip == [0, 0, 0, 0] {
+            self.dns_status = DnsStatus::Failed;
+            return Err("no IPv4 address configured");
+        }
+        if let Some(prev) = self.dns_query.take() {
+            self.sockets
+                .get_mut::<dns::Socket>(self.dns_handle)
+                .cancel_query(prev);
+        }
+        self.refresh_dns_servers();
+        let sock = self.sockets.get_mut::<dns::Socket>(self.dns_handle);
+        match sock.start_query(self.iface.context(), hostname, DnsQueryType::A) {
+            Ok(qh) => {
+                self.dns_query = Some(qh);
+                self.dns_start_ms = now_ms;
+                self.dns_status = DnsStatus::Pending;
+                Ok(())
+            }
+            Err(_) => {
+                self.dns_status = DnsStatus::Failed;
+                Err("dns start_query failed")
+            }
+        }
+    }
+
+    /// Inspect the current non-blocking DNS A-record query status.
+    #[cfg(all(feature = "ipv4", feature = "dns"))]
+    #[inline]
+    pub fn dns_status(&self) -> DnsStatus {
+        self.dns_status
+    }
+
+    #[cfg(all(feature = "ipv4", feature = "dns"))]
+    fn poll_dns(&mut self, now_ms: i64) {
+        let Some(qh) = self.dns_query else {
+            return;
+        };
+        let sock = self.sockets.get_mut::<dns::Socket>(self.dns_handle);
+        match sock.get_query_result(qh) {
+            Ok(addrs) => {
+                self.dns_query = None;
+                if let Some(IpAddress::Ipv4(v4)) = addrs.first() {
+                    self.dns_status = DnsStatus::Resolved(v4.octets());
+                } else {
+                    self.dns_status = DnsStatus::Failed;
+                }
+            }
+            Err(dns::GetQueryResultError::Pending) => {
+                if now_ms.saturating_sub(self.dns_start_ms) >= DNS_TIMEOUT_MS {
+                    sock.cancel_query(qh);
+                    self.dns_query = None;
+                    self.dns_status = DnsStatus::Timeout;
+                }
+            }
+            Err(dns::GetQueryResultError::Failed) => {
+                self.dns_query = None;
+                self.dns_status = DnsStatus::Failed;
+            }
+        }
+    }
+
+    /// Returns `true` while an ICMP ping or DNS query is actively awaiting a reply.
+    #[inline]
+    pub fn has_pending_control_op(&self) -> bool {
+        #[cfg(all(feature = "ipv4", feature = "icmp"))]
+        if self.pending_ping.is_some() {
+            return true;
+        }
+        #[cfg(all(feature = "ipv4", feature = "dns"))]
+        if self.dns_query.is_some() {
+            return true;
+        }
+        false
     }
 
     /// Return the recommended milliseconds until the next `smoltcp` timer event,
@@ -787,5 +1130,108 @@ mod tests {
         let _ = server.poll(SYN_TIMEOUT_MS + 1000);
         assert!(!server.is_connected());
         assert_eq!(server.syn_seen_ms, [None; SSH_LISTEN_BACKLOG]);
+    }
+
+    #[test]
+    #[cfg(all(feature = "ipv4", feature = "icmp"))]
+    fn persistent_netstack_icmp_ping_roundtrip_and_timeout() {
+        let mut storage = NetStackStorage::new();
+        let mut stack = NetStack::new(
+            WireEnd::new(),
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0x41],
+            NetConfig {
+                ip: [10, 0, 2, 15],
+                prefix_len: 24,
+                gateway: Some([10, 0, 2, 2]),
+                dns: Some([10, 0, 2, 3]),
+            },
+            SSH_PORT,
+            0,
+            &mut storage,
+        );
+
+        // Peer interface (10.0.2.2) automatically responds to ARP + ICMP Echo Requests via smoltcp.
+        let mut peer_dev = WireEnd::new();
+        let mut peer_iface = Interface::new(
+            Config::new(HardwareAddress::Ethernet(EthernetAddress([
+                0x02, 0x00, 0x00, 0x00, 0x00, 0x42,
+            ]))),
+            &mut peer_dev,
+            Instant::from_millis(0),
+        );
+        peer_iface.update_ip_addrs(|a| {
+            let _ = a.push(IpCidr::new(IpAddress::v4(10, 0, 2, 2), 24));
+        });
+        let mut peer_storage = [SocketStorage::EMPTY; 1];
+        let mut peer_sockets = SocketSet::new(&mut peer_storage[..]);
+
+        let seq = stack.ping_start([10, 0, 2, 2], 100).unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(stack.ping_status(), PingStatus::Pending);
+        assert!(stack.has_pending_control_op());
+
+        for step in 0..200i64 {
+            let now = 100 + step * 10;
+            let _ = stack.poll(now);
+            pump_wire(&mut stack.device, &mut peer_dev);
+            let _ = peer_iface.poll(Instant::from_millis(now), &mut peer_dev, &mut peer_sockets);
+            pump_wire(&mut stack.device, &mut peer_dev);
+            if matches!(stack.ping_status(), PingStatus::Reply { .. }) {
+                break;
+            }
+        }
+        assert!(
+            matches!(
+                stack.ping_status(),
+                PingStatus::Reply {
+                    target: [10, 0, 2, 2],
+                    seq: 1,
+                    ..
+                }
+            ),
+            "expected ICMP EchoReply from peer, got {:?}",
+            stack.ping_status()
+        );
+        assert!(!stack.has_pending_control_op());
+
+        // Silent target must time out after PING_TIMEOUT_MS.
+        let seq2 = stack.ping_start([10, 0, 2, 99], 5_000).unwrap();
+        assert_eq!(seq2, 2);
+        let _ = stack.poll(5_000 + PING_TIMEOUT_MS + 10);
+        assert_eq!(stack.ping_status(), PingStatus::Timeout);
+        assert!(!stack.has_pending_control_op());
+    }
+
+    #[test]
+    #[cfg(all(feature = "ipv4", feature = "dns"))]
+    fn persistent_netstack_dns_query_and_timeout() {
+        let mut storage = NetStackStorage::new();
+        let mut stack = NetStack::new(
+            WireEnd::new(),
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0x51],
+            NetConfig {
+                ip: [10, 0, 2, 15],
+                prefix_len: 24,
+                gateway: Some([10, 0, 2, 2]),
+                dns: Some([10, 0, 2, 3]),
+            },
+            SSH_PORT,
+            0,
+            &mut storage,
+        );
+
+        assert_eq!(stack.dns_status(), DnsStatus::Idle);
+        stack.dns_start("example.com", 100).unwrap();
+        assert_eq!(stack.dns_status(), DnsStatus::Pending);
+        assert!(stack.has_pending_control_op());
+
+        // Poll once to verify TX frame (ARP for DNS server) is emitted and query stays Pending.
+        let _ = stack.poll(110);
+        assert_eq!(stack.dns_status(), DnsStatus::Pending);
+
+        // Advance past DNS_TIMEOUT_MS with no DNS server response -> Timeout.
+        let _ = stack.poll(100 + DNS_TIMEOUT_MS + 10);
+        assert_eq!(stack.dns_status(), DnsStatus::Timeout);
+        assert!(!stack.has_pending_control_op());
     }
 }

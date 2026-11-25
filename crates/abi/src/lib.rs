@@ -3,6 +3,7 @@
 //! Shared ABI contract between the microkernel (EL1) and EL0 protection domains.
 
 pub mod ring;
+pub mod timestamp;
 #[cfg(feature = "sha3")]
 pub use newos_crypto::sha3;
 
@@ -683,17 +684,55 @@ pub mod role_badge {
 /// Each 64-bit request word carries an opcode in bits `56..64` and up to 7 payload bytes in bits `0..56`:
 /// - `OP_POLL_STATUS (0x01)`: query connection/readiness bits + active IPv4 address
 /// - `OP_RECV_CHUNK  (0x02)`: pull up to 7 TCP RX bytes (reply: `0..=7` len in bits `56..64`, or `REPLY_EOF`)
-/// - `OP_SEND_BASE..=OP_SEND_BASE+7 (0x10..=0x17)`: push `len` (`0..=7`) TCP TX bytes; reply = bytes accepted
-/// - `OP_CLOSE       (0x0E)`: graceful TCP FIN close
-/// - `OP_ABORT       (0x0F)`: immediate TCP RST abort (e.g., strict-KEX violation)
+/// - `OP_GET_NET_INFO (0x03)`: supervisor-only query for gateway/prefix/driver, DNS server, or MAC
+/// - `OP_PING_START  (0x04)`: supervisor-only start non-blocking ICMPv4 echo request to IPv4 target
+/// - `OP_PING_POLL   (0x05)`: supervisor-only poll active ICMPv4 ping status/seq/rtt
+/// - `OP_DNS_START   (0x06)`: supervisor-only start non-blocking DNS A-record query for buffered hostname
+/// - `OP_DNS_POLL    (0x07)`: supervisor-only poll active DNS query status/IPv4
+/// - `OP_DHCP_RENEW  (0x08)`: supervisor-only trigger DHCPv4 lease renewal/discovery
+/// - `OP_CLOSE       (0x0E)`: graceful TCP FIN close (`ssh-pd` only)
+/// - `OP_ABORT       (0x0F)`: immediate TCP RST abort (`ssh-pd` only)
+/// - `OP_SEND_BASE..=OP_SEND_BASE+7 (0x10..=0x17)`: push `len` (`0..=7`) TCP TX bytes (`ssh-pd` only)
+/// - `OP_DNS_CHUNK_BASE..=OP_DNS_CHUNK_BASE+7 (0x20..=0x27)`: reset (`len=0`) or append DNS hostname bytes (`supervisor-pd` only)
 pub mod net_ipc {
     pub const MAX_CHUNK_BYTES: usize = 7;
 
     pub const OP_POLL_STATUS: u8 = 0x01;
     pub const OP_RECV_CHUNK: u8 = 0x02;
+    pub const OP_GET_NET_INFO: u8 = 0x03;
+    pub const OP_PING_START: u8 = 0x04;
+    pub const OP_PING_POLL: u8 = 0x05;
+    pub const OP_DNS_START: u8 = 0x06;
+    pub const OP_DNS_POLL: u8 = 0x07;
+    pub const OP_DHCP_RENEW: u8 = 0x08;
     pub const OP_CLOSE: u8 = 0x0E;
     pub const OP_ABORT: u8 = 0x0F;
     pub const OP_SEND_BASE: u8 = 0x10;
+    pub const OP_DNS_CHUNK_BASE: u8 = 0x20;
+
+    /// Sub-selectors for `OP_GET_NET_INFO`.
+    pub const INFO_GATEWAY_PREFIX: u8 = 0;
+    pub const INFO_DNS: u8 = 1;
+    pub const INFO_MAC: u8 = 2;
+
+    /// Driver IDs encoded in `INFO_GATEWAY_PREFIX` reply bits `8..16`.
+    pub const DRIVER_UNKNOWN: u8 = 0;
+    pub const DRIVER_VIRTIO: u8 = 1;
+    pub const DRIVER_GEM: u8 = 2;
+
+    /// Status tags in bits `56..64` for `OP_PING_START` / `OP_PING_POLL`.
+    pub const PING_IDLE: u8 = 0;
+    pub const PING_PENDING: u8 = 1;
+    pub const PING_OK: u8 = 2;
+    pub const PING_TIMEOUT: u8 = 3;
+    pub const PING_ERR: u8 = 4;
+
+    /// Status tags in bits `56..64` for `OP_DNS_START` / `OP_DNS_POLL`.
+    pub const DNS_IDLE: u8 = 0;
+    pub const DNS_PENDING: u8 = 1;
+    pub const DNS_OK: u8 = 2;
+    pub const DNS_TIMEOUT: u8 = 3;
+    pub const DNS_ERR: u8 = 4;
 
     /// Reply sentinel in bits `56..64` for `OP_RECV_CHUNK` when no active TCP connection exists.
     pub const REPLY_EOF: u8 = 0xFF;
@@ -716,6 +755,152 @@ pub mod net_ipc {
     #[inline]
     pub const fn encode_recv_chunk() -> u64 {
         (OP_RECV_CHUNK as u64) << 56
+    }
+
+    #[inline]
+    pub const fn encode_get_net_info(selector: u8) -> u64 {
+        ((OP_GET_NET_INFO as u64) << 56) | (selector as u64)
+    }
+
+    #[inline]
+    pub const fn decode_get_net_info_selector(word: u64) -> u8 {
+        (word & 0xFF) as u8
+    }
+
+    #[inline]
+    pub const fn encode_gateway_prefix_reply(
+        gateway: Option<[u8; 4]>,
+        prefix_len: u8,
+        driver_id: u8,
+    ) -> u64 {
+        let (gw_u32, has_gw) = match gateway {
+            Some(gw) => (u32::from_be_bytes(gw) as u64, 1u64),
+            None => (0u64, 0u64),
+        };
+        (gw_u32 << 32) | (has_gw << 16) | ((driver_id as u64) << 8) | (prefix_len as u64)
+    }
+
+    #[inline]
+    pub const fn decode_gateway_prefix_reply(word: u64) -> (Option<[u8; 4]>, u8, u8) {
+        let prefix_len = (word & 0xFF) as u8;
+        let driver_id = ((word >> 8) & 0xFF) as u8;
+        let has_gw = ((word >> 16) & 1) != 0;
+        let gw = if has_gw {
+            Some(((word >> 32) as u32).to_be_bytes())
+        } else {
+            None
+        };
+        (gw, prefix_len, driver_id)
+    }
+
+    #[inline]
+    pub const fn encode_dns_info_reply(dns: Option<[u8; 4]>) -> u64 {
+        match dns {
+            Some(ip) => ((u32::from_be_bytes(ip) as u64) << 32) | 1,
+            None => 0,
+        }
+    }
+
+    #[inline]
+    pub const fn decode_dns_info_reply(word: u64) -> Option<[u8; 4]> {
+        if (word & 1) != 0 {
+            Some(((word >> 32) as u32).to_be_bytes())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub const fn encode_mac_reply(mac: [u8; 6]) -> u64 {
+        (mac[0] as u64)
+            | ((mac[1] as u64) << 8)
+            | ((mac[2] as u64) << 16)
+            | ((mac[3] as u64) << 24)
+            | ((mac[4] as u64) << 32)
+            | ((mac[5] as u64) << 40)
+    }
+
+    #[inline]
+    pub const fn decode_mac_reply(word: u64) -> [u8; 6] {
+        [
+            (word & 0xFF) as u8,
+            ((word >> 8) & 0xFF) as u8,
+            ((word >> 16) & 0xFF) as u8,
+            ((word >> 24) & 0xFF) as u8,
+            ((word >> 32) & 0xFF) as u8,
+            ((word >> 40) & 0xFF) as u8,
+        ]
+    }
+
+    #[inline]
+    pub const fn encode_ping_start(target: [u8; 4]) -> u64 {
+        ((OP_PING_START as u64) << 56) | (u32::from_be_bytes(target) as u64)
+    }
+
+    #[inline]
+    pub const fn decode_ping_start(word: u64) -> [u8; 4] {
+        (word as u32).to_be_bytes()
+    }
+
+    #[inline]
+    pub const fn encode_ping_poll() -> u64 {
+        (OP_PING_POLL as u64) << 56
+    }
+
+    #[inline]
+    pub const fn encode_ping_reply(status: u8, seq: u16, rtt_ms: u32) -> u64 {
+        ((status as u64) << 56) | ((seq as u64) << 32) | (rtt_ms as u64)
+    }
+
+    #[inline]
+    pub const fn decode_ping_reply(word: u64) -> (u8, u16, u32) {
+        let status = (word >> 56) as u8;
+        let seq = ((word >> 32) & 0xFFFF) as u16;
+        let rtt_ms = (word & 0xFFFF_FFFF) as u32;
+        (status, seq, rtt_ms)
+    }
+
+    #[inline]
+    pub const fn encode_dns_chunk(bytes: &[u8]) -> u64 {
+        let len = if bytes.len() > MAX_CHUNK_BYTES {
+            MAX_CHUNK_BYTES
+        } else {
+            bytes.len()
+        };
+        let mut word = ((OP_DNS_CHUNK_BASE + len as u8) as u64) << 56;
+        let mut i = 0;
+        while i < len {
+            word |= (bytes[i] as u64) << (i * 8);
+            i += 1;
+        }
+        word
+    }
+
+    #[inline]
+    pub const fn encode_dns_start() -> u64 {
+        (OP_DNS_START as u64) << 56
+    }
+
+    #[inline]
+    pub const fn encode_dns_poll() -> u64 {
+        (OP_DNS_POLL as u64) << 56
+    }
+
+    #[inline]
+    pub const fn encode_dns_reply(status: u8, ipv4: [u8; 4]) -> u64 {
+        ((status as u64) << 56) | (u32::from_be_bytes(ipv4) as u64)
+    }
+
+    #[inline]
+    pub const fn decode_dns_reply(word: u64) -> (u8, [u8; 4]) {
+        let status = (word >> 56) as u8;
+        let ip = (word as u32).to_be_bytes();
+        (status, ip)
+    }
+
+    #[inline]
+    pub const fn encode_dhcp_renew() -> u64 {
+        (OP_DHCP_RENEW as u64) << 56
     }
 
     #[inline]
@@ -780,6 +965,15 @@ pub mod net_ipc {
                 i += 1;
             }
             (OP_SEND_BASE, buf, len)
+        } else if op >= OP_DNS_CHUNK_BASE && op <= OP_DNS_CHUNK_BASE + (MAX_CHUNK_BYTES as u8) {
+            let len = (op - OP_DNS_CHUNK_BASE) as usize;
+            let mut buf = [0u8; MAX_CHUNK_BYTES];
+            let mut i = 0;
+            while i < len {
+                buf[i] = ((word >> (i * 8)) & 0xFF) as u8;
+                i += 1;
+            }
+            (OP_DNS_CHUNK_BASE, buf, len)
         } else {
             (op, [0u8; MAX_CHUNK_BYTES], 0)
         }
@@ -795,6 +989,53 @@ pub mod auth_gate_ipc {
     pub const SESSION_OPEN: u64 = 0x5345_5353_4F50_454E;
     /// Signal `newos-supervisor-pd` to close `BOOTSTRAP_SSH_SHELL_EP` on disconnect.
     pub const SESSION_CLOSE: u64 = 0x5345_5353_434C_4F53;
+}
+
+/// Bitmask protocol on `CapId::BOOTSTRAP_FAULT_NOTIF` (`Notification { id: 1 }`)
+/// between the microkernel / `newos-shell-pd` and PD 0 (`newos-supervisor-pd`).
+///
+/// - Bits `0..=7` (`FAULT_PD_MASK`): isolated EL0 hardware fault notifications stamped by EL1.
+/// - Bits `8..=10` (`SHUTDOWN_MASK`): graceful shutdown/reboot requests signaled by `newos-shell-pd`
+///   via its write-only `CapId::BOOTSTRAP_FAULT_NOTIF` capability.
+pub mod supervisor_notif {
+    use crate::ShutdownStatus;
+
+    /// Bitmask covering isolated PD fault bits (`1 << pd_id` for `pd_id` in `0..8`).
+    pub const FAULT_PD_MASK: u64 = 0xFF;
+    /// Request clean system power-off (`ShutdownStatus::Success` -> PSCI `SYSTEM_OFF`).
+    pub const SHUTDOWN_OK: u64 = 1u64 << 8;
+    /// Request error system power-off (`ShutdownStatus::Failed` -> PSCI `SYSTEM_OFF`).
+    pub const SHUTDOWN_FAIL: u64 = 1u64 << 9;
+    /// Request clean system reboot (`ShutdownStatus::Reboot` -> PSCI `SYSTEM_RESET`).
+    pub const REBOOT: u64 = 1u64 << 10;
+    /// Bitmask covering all shutdown/reboot request bits.
+    pub const SHUTDOWN_MASK: u64 = SHUTDOWN_OK | SHUTDOWN_FAIL | REBOOT;
+    /// Combined wait mask used by `newos-supervisor-pd` in `run_root_supervisor`.
+    pub const WAIT_MASK: u64 = FAULT_PD_MASK | SHUTDOWN_MASK;
+
+    /// Encode a `ShutdownStatus` into its corresponding supervisor notification bit.
+    #[inline]
+    pub const fn encode_shutdown(status: ShutdownStatus) -> u64 {
+        match status {
+            ShutdownStatus::Success => SHUTDOWN_OK,
+            ShutdownStatus::Failed => SHUTDOWN_FAIL,
+            ShutdownStatus::Reboot => REBOOT,
+        }
+    }
+
+    /// Decode a shutdown/reboot request from a received notification bitmask.
+    #[inline]
+    pub const fn decode_shutdown(bits: u64) -> Option<ShutdownStatus> {
+        if (bits & REBOOT) != 0 {
+            Some(ShutdownStatus::Reboot)
+        } else if (bits & SHUTDOWN_FAIL) != 0 {
+            Some(ShutdownStatus::Failed)
+        } else if (bits & SHUTDOWN_OK) != 0 {
+            Some(ShutdownStatus::Success)
+        } else {
+            None
+        }
+    }
 }
 
 /// Narrow, register-only IPC RPC protocol for `CapId::BOOTSTRAP_KEY_EP`
@@ -1070,5 +1311,113 @@ mod tests {
         assert!(CapId::new(0).is_null());
         assert_eq!(CapId::new(u64::MAX).raw(), u64::MAX);
         assert!(!CapId::new(u64::MAX).is_null());
+    }
+
+    #[test]
+    fn supervisor_notif_shutdown_encoding_and_disjoint_masks() {
+        assert_eq!(
+            supervisor_notif::FAULT_PD_MASK & supervisor_notif::SHUTDOWN_MASK,
+            0
+        );
+        assert_eq!(
+            supervisor_notif::WAIT_MASK,
+            supervisor_notif::FAULT_PD_MASK | supervisor_notif::SHUTDOWN_MASK
+        );
+
+        assert_eq!(supervisor_notif::decode_shutdown(0), None);
+        assert_eq!(
+            supervisor_notif::decode_shutdown(supervisor_notif::FAULT_PD_MASK),
+            None
+        );
+
+        for status in [
+            ShutdownStatus::Success,
+            ShutdownStatus::Failed,
+            ShutdownStatus::Reboot,
+        ] {
+            let bit = supervisor_notif::encode_shutdown(status);
+            assert_ne!(bit & supervisor_notif::SHUTDOWN_MASK, 0);
+            assert_eq!(bit & supervisor_notif::FAULT_PD_MASK, 0);
+            assert_eq!(supervisor_notif::decode_shutdown(bit), Some(status));
+            // Fault bits alongside a shutdown request still decode the shutdown status.
+            assert_eq!(
+                supervisor_notif::decode_shutdown(bit | (1u64 << 2)),
+                Some(status)
+            );
+        }
+    }
+
+    #[test]
+    fn net_ipc_supervisor_control_roundtrips() {
+        let info_req = net_ipc::encode_get_net_info(net_ipc::INFO_GATEWAY_PREFIX);
+        assert_eq!(
+            net_ipc::decode_request(info_req).0,
+            net_ipc::OP_GET_NET_INFO
+        );
+        assert_eq!(
+            net_ipc::decode_get_net_info_selector(info_req),
+            net_ipc::INFO_GATEWAY_PREFIX
+        );
+
+        let gw_reply =
+            net_ipc::encode_gateway_prefix_reply(Some([192, 168, 1, 1]), 24, net_ipc::DRIVER_GEM);
+        assert_eq!(
+            net_ipc::decode_gateway_prefix_reply(gw_reply),
+            (Some([192, 168, 1, 1]), 24, net_ipc::DRIVER_GEM)
+        );
+        let no_gw_reply = net_ipc::encode_gateway_prefix_reply(None, 0, net_ipc::DRIVER_VIRTIO);
+        assert_eq!(
+            net_ipc::decode_gateway_prefix_reply(no_gw_reply),
+            (None, 0, net_ipc::DRIVER_VIRTIO)
+        );
+
+        assert_eq!(
+            net_ipc::decode_dns_info_reply(net_ipc::encode_dns_info_reply(Some([1, 1, 1, 1]))),
+            Some([1, 1, 1, 1])
+        );
+        assert_eq!(
+            net_ipc::decode_dns_info_reply(net_ipc::encode_dns_info_reply(None)),
+            None
+        );
+
+        let mac = [0xd8, 0x3a, 0xdd, 0x11, 0x22, 0x33];
+        assert_eq!(
+            net_ipc::decode_mac_reply(net_ipc::encode_mac_reply(mac)),
+            mac
+        );
+
+        let ping_req = net_ipc::encode_ping_start([8, 8, 8, 8]);
+        assert_eq!(net_ipc::decode_request(ping_req).0, net_ipc::OP_PING_START);
+        assert_eq!(net_ipc::decode_ping_start(ping_req), [8, 8, 8, 8]);
+
+        let ping_rep = net_ipc::encode_ping_reply(net_ipc::PING_OK, 7, 14);
+        assert_eq!(
+            net_ipc::decode_ping_reply(ping_rep),
+            (net_ipc::PING_OK, 7, 14)
+        );
+
+        let reset = net_ipc::encode_dns_chunk(b"");
+        let (op, buf, len) = net_ipc::decode_request(reset);
+        assert_eq!(op, net_ipc::OP_DNS_CHUNK_BASE);
+        assert_eq!(len, 0);
+        assert_eq!(&buf[..len], b"");
+
+        let chunk = net_ipc::encode_dns_chunk(b"google.");
+        let (op, buf, len) = net_ipc::decode_request(chunk);
+        assert_eq!(op, net_ipc::OP_DNS_CHUNK_BASE);
+        assert_eq!(len, 7);
+        assert_eq!(&buf[..len], b"google.");
+
+        assert_eq!(
+            net_ipc::decode_dns_reply(net_ipc::encode_dns_reply(
+                net_ipc::DNS_OK,
+                [142, 250, 74, 14]
+            )),
+            (net_ipc::DNS_OK, [142, 250, 74, 14])
+        );
+        assert_eq!(
+            net_ipc::decode_request(net_ipc::encode_dhcp_renew()).0,
+            net_ipc::OP_DHCP_RENEW
+        );
     }
 }

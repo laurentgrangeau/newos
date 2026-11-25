@@ -694,6 +694,11 @@ impl<H: ShellHost> Shell<H> {
                 continue;
             }
             self.record_history(line);
+            let mut cmd_log = AsciiLine::<{ LINE_BUF_SIZE + 8 }>::new();
+            cmd_log.push_str("[cmd] ");
+            cmd_log.push_str(line);
+            cmd_log.push_byte(b'\n');
+            self.host.write_debug(cmd_log.as_str());
             if let ExecOutcome::Exit(code) = self.exec_line(line) {
                 self.host.exit(code);
             }

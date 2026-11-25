@@ -141,7 +141,11 @@ impl ShellHost for StandaloneShellHost {
         newos_user_rt::trigger_user_fault()
     }
 
-    fn exit(&mut self, _code: ShutdownStatus) -> ! {
+    fn exit(&mut self, code: ShutdownStatus) -> ! {
+        let _ = newos_user_rt::notify_signal(
+            CapId::BOOTSTRAP_FAULT_NOTIF,
+            newos_abi::supervisor_notif::encode_shutdown(code),
+        );
         newos_user_rt::thread_exit()
     }
 }

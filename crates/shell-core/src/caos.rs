@@ -78,7 +78,7 @@ pub type CaosError = StoreError;
 
 const MOTD_BYTES: &[u8] = b"NewOS microkernel";
 const GUIDE_BYTES: &[u8] =
-    b"Try: `put \"hello\" | save @note`, `objects | where size > 20`, `procs | where pid == 1`";
+    b"Try: `put \"hello\" | save @note`, `objects | where size > 20`, `domains | where id == 1`";
 const MOTD_HASH: ObjHash = ObjHash::hash_bytes(MOTD_BYTES);
 const GUIDE_HASH: ObjHash = ObjHash::hash_bytes(GUIDE_BYTES);
 

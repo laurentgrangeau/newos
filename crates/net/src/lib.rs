@@ -18,6 +18,10 @@ pub mod virtio;
 #[cfg(feature = "driver-gem")]
 pub use gem::{GemDma, GemInfo, GemNetDevice, probe_cadence_gem};
 pub use smoltcp::phy::Device as NetDevice;
+#[cfg(all(feature = "tcp", feature = "ipv4", feature = "dns"))]
+pub use stack::DnsStatus;
+#[cfg(all(feature = "tcp", feature = "ipv4", feature = "icmp"))]
+pub use stack::PingStatus;
 #[cfg(all(feature = "tcp", any(feature = "ipv4", feature = "ipv6")))]
 pub use stack::{NetStack, NetStackStorage, SSH_PORT, TCP_BUF_SIZE, TcpEvent};
 #[cfg(feature = "driver-virtio")]

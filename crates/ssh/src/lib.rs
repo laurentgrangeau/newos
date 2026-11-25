@@ -1447,7 +1447,7 @@ mod tests {
         assert_eq!(client.host_fingerprint(), Some(expected_fp));
 
         // Bidirectional encrypted shell command & output exchange
-        client.send_shell_input(b"procs | count\n").unwrap();
+        client.send_shell_input(b"domains | count\n").unwrap();
         let c_len = client.pending_tx().len();
         let mut wire = [0u8; 1024];
         wire[..c_len].copy_from_slice(client.pending_tx());
@@ -1455,7 +1455,7 @@ mod tests {
         let n_in = server
             .feed_rx(&wire[..c_len], &mut vault, &mut s_shell_buf)
             .unwrap();
-        assert_eq!(&s_shell_buf[..n_in], b"procs | count\n");
+        assert_eq!(&s_shell_buf[..n_in], b"domains | count\n");
 
         server.send_shell_output(b"count: 5\n").unwrap();
         let s_len = server.pending_tx().len();

@@ -23,7 +23,7 @@ fn tier1_caos_boot_seeded_refs() {
     assert!(core::str::from_utf8(motd).unwrap().contains("NewOS"));
 
     let (_, guide) = store.get_any("@guide").unwrap();
-    assert_eq!(guide.len(), 86);
+    assert_eq!(guide.len(), 87);
 
     let mut refs = [None; MAX_REFS];
     let n = store.collect_refs(&mut refs);
@@ -161,7 +161,7 @@ fn tier1_shell_objects_and_refs_listing() {
     let out_obj = sh.host_mut().take_output();
     assert!(out_obj.contains("OBJECT HASH SIZE"));
     assert!(out_obj.contains("17B"));
-    assert!(out_obj.contains("86B"));
+    assert!(out_obj.contains("87B"));
 
     sh.exec_line("refs");
     let out_ref = sh.host_mut().take_output();
@@ -291,14 +291,14 @@ fn tier1_shell_buffered_and_null_writers() {
 #[test]
 fn tier1_pipe_where_u64_all_six_operators() {
     let mut sh = Shell::new(MockShellHost::default());
-    // Boot store has sizes 17 (@motd) and 86 (@guide).
+    // Boot store has sizes 17 (@motd) and 87 (@guide).
     assert_eq!(sh.eval_pipeline("objects | where size == 17").len(), 1);
     assert_eq!(sh.eval_pipeline("objects | where size == 0x11").len(), 1);
     assert_eq!(sh.eval_pipeline("objects | where size != 17").len(), 1);
     assert_eq!(sh.eval_pipeline("objects | where size > 17").len(), 1);
     assert_eq!(sh.eval_pipeline("objects | where size >= 17").len(), 2);
-    assert_eq!(sh.eval_pipeline("objects | where size < 86").len(), 1);
-    assert_eq!(sh.eval_pipeline("objects | where size <= 86").len(), 2);
+    assert_eq!(sh.eval_pipeline("objects | where size < 87").len(), 1);
+    assert_eq!(sh.eval_pipeline("objects | where size <= 87").len(), 2);
 }
 
 #[test]

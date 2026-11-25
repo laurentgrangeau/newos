@@ -598,7 +598,7 @@ impl DomainSlot {
     };
 }
 
-struct ProcTable {
+struct DomainTable {
     domains: [DomainSlot; MAX_DOMAINS],
     sched: Scheduler<MAX_DOMAINS>,
     recv_waiters: [u8; MAX_ENDPOINTS],
@@ -608,7 +608,7 @@ struct ProcTable {
     cpu_current: [Option<usize>; MAX_CPUS],
 }
 
-impl ProcTable {
+impl DomainTable {
     const fn new() -> Self {
         Self {
             domains: [DomainSlot::EMPTY; MAX_DOMAINS],
@@ -746,7 +746,7 @@ impl ProcTable {
     }
 }
 
-static DOMAINS: IrqSpinLock<ProcTable> = IrqSpinLock::new(ProcTable::new());
+static DOMAINS: IrqSpinLock<DomainTable> = IrqSpinLock::new(DomainTable::new());
 
 pub fn init(
     hhdm_offset: u64,
@@ -754,7 +754,7 @@ pub fn init(
     rng_mmio: Option<(PhysAddr, u64, u64)>,
     wdt_mmio: Option<(PhysAddr, u64, u64)>,
     qemu_virt: bool,
-    netd_present: bool,
+    net_pd_present: bool,
 ) {
     HHDM_OFFSET.store(hhdm_offset, Ordering::Release);
     IS_QEMU_VIRT.store(qemu_virt, Ordering::Release);
@@ -775,10 +775,15 @@ pub fn init(
         WDT_MMIO_LEN.store(len, Ordering::Release);
     }
     // When `newos-net-pd` (PD 2) is loaded, omit `BOOTSTRAP_NET_MMIO` from `supervisor-pd` (PD 0)
-    // so `net-pd` is the sole holder of NIC DMA authority.
-    let init_net_cap = if netd_present { None } else { cap_region };
+    // so `net-pd` is the sole holder of NIC DMA authority. Conversely, when `newos-net-pd` is
+    // absent, omit `BOOTSTRAP_NET_EP` from PD 0 so shell `net` commands never block on an
+    // unserved endpoint.
+    let init_net_cap = if net_pd_present { None } else { cap_region };
     let mut ipc = IPC_STATE.lock();
     let _ = ipc.init_bootstrap_caps(init_net_cap);
+    if !net_pd_present {
+        let _ = ipc.cap_delete_for(0, CapId::BOOTSTRAP_NET_EP);
+    }
     if let Some((phys, _, len)) = wdt_mmio {
         let _ = ipc.register_wdt_mmio_cap(phys, len);
     }
@@ -947,7 +952,7 @@ fn switch_ttbr0(ttbr0_phys: u64, pd_id: usize) {
 
 /// Save `from`'s GPR + `TPIDR_EL0` + NEON/FP state and switch `TTBR0_EL1` + registers to `to`.
 #[inline]
-fn context_switch(table: &mut ProcTable, from: usize, to: usize, frame: &mut TrapFrame) {
+fn context_switch(table: &mut DomainTable, from: usize, to: usize, frame: &mut TrapFrame) {
     let cpu = (super::get_cpu_id() as usize).min(MAX_CPUS - 1);
     table.domains[from].frame = *frame;
     table.domains[from].tpidr_el0 = read_tpidr_el0();
@@ -1017,7 +1022,7 @@ fn handle_dma_cache_op(
 }
 
 #[inline]
-fn read_cntfrq() -> u64 {
+pub(crate) fn read_cntfrq() -> u64 {
     let freq: u64;
     // SAFETY: Reading `CNTFRQ_EL0` in EL1 returns the architectural Generic Timer frequency in Hz.
     unsafe {
@@ -1115,7 +1120,7 @@ fn arm_virtual_timer_cval(deadline_ticks: u64) {
 
 /// Wake any `WaitingNotif` or `Sleeping` threads whose `sleep_deadline_ticks <= now`.
 /// Caller MUST hold `DOMAINS`.
-fn wake_expired_timers_locked(table: &mut ProcTable, now: u64) -> bool {
+fn wake_expired_timers_locked(table: &mut DomainTable, now: u64) -> bool {
     let mut woke_any = false;
     for pd_id in 0..table.count.min(MAX_DOMAINS) {
         if !table.domains[pd_id].active {
@@ -1170,7 +1175,7 @@ pub fn wake_expired_timers() {
 /// If any thread is blocked in `WaitingNotif` on `notif_id` with a mask intersecting the pending
 /// bits, consume the matched bits into its `TrapFrame` and wake it. Caller holds `DOMAINS -> IPC_STATE`.
 fn wake_notif_waiter_locked(
-    table: &mut ProcTable,
+    table: &mut DomainTable,
     ipc: &mut KernelIpcState,
     notif_id: u32,
 ) -> bool {
@@ -1326,7 +1331,7 @@ fn handle_debug_write(cur_ttbr0: u64, user_ptr: u64, user_len: u64) -> Result<u6
 /// Tear down an exiting or fatally faulting non-root process (`M4`):
 /// wake any waiting reply caller, unmap & reclaim its tracked mappings, clear its `CSpace`,
 /// and recycle its scheduler & process slot. Caller MUST hold `DOMAINS` lock.
-fn teardown_process_locked(table: &mut ProcTable, pd_id: usize) {
+fn teardown_domain_locked(table: &mut DomainTable, pd_id: usize) {
     let cpu = (super::get_cpu_id() as usize).min(MAX_CPUS - 1);
     table.domains[pd_id].wait_notif_id = 0;
     table.domains[pd_id].wait_notif_mask = 0;
@@ -1511,7 +1516,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
 
     if ec != 0x15 {
         // Hardware EL0 fault (e.g., `udf #0` illegal instruction EC=0x00, data/insn abort)
-        let (cur_pid, rec_pc, rec_sp, rec_shadow_sp) = {
+        let (cur_pd, rec_pc, rec_sp, rec_shadow_sp) = {
             let table = DOMAINS.lock();
             let Some(cur) = table.current_for_this_cpu() else {
                 super::system_off(ShutdownStatus::Failed);
@@ -1548,9 +1553,9 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             return;
         }
         // Non-root EL0 fault without self-handler: record fault diagnostics, tear down ONLY the
-        // faulting process (reclaiming all frames), signal `1 << cur_pid` on PD 0's
+        // faulting process (reclaiming all frames), signal `1 << cur_pd` on PD 0's
         // `BOOTSTRAP_FAULT_NOTIF` (`notif_id = 1`), and wake PD 0 if blocked in `NotifyWait`.
-        if cur_pid != 0 {
+        if cur_pd != 0 {
             let mut s = serial::Pl011::new();
             let far: u64;
             // SAFETY: Reading `FAR_EL1` in EL1 synchronous fault handler is architectural.
@@ -1559,21 +1564,21 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             }
             let _ = writeln!(
                 s,
-                "[newos-hal] isolated non-root EL0 fault (pd_id={cur_pid}, EC={:#x}, ELR={:#018x}, FAR={:#018x}) -> notifying supervisor",
+                "[newos-hal] isolated EL0 fault (pd={cur_pd}, EC={:#x}, ELR={:#018x}, FAR={:#018x}) -> notifying supervisor-pd",
                 ec, frame.elr_el1, far
             );
             let mut table = DOMAINS.lock();
-            let role = table.domains[cur_pid].role;
-            table.last_fault[cur_pid] = Some(FaultRecord {
+            let role = table.domains[cur_pd].role;
+            table.last_fault[cur_pd] = Some(FaultRecord {
                 role,
                 esr,
                 elr: frame.elr_el1,
                 _far: far,
             });
-            teardown_process_locked(&mut table, cur_pid);
+            teardown_domain_locked(&mut table, cur_pd);
             {
                 let mut ipc = IPC_STATE.lock();
-                let _ = ipc.notify_signal_id(1, 1u64 << (cur_pid & 63));
+                let _ = ipc.notify_signal_id(1, 1u64 << (cur_pd & 63));
                 let _ = wake_notif_waiter_locked(&mut table, &mut ipc, 1);
                 if table.sched.ready_count() == 0 {
                     ipc.drain_buffered_call_senders(|client| {
@@ -1591,8 +1596,8 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 }
             }
             super::smp::wake_idle_aps();
-            if let Some(next) = table.pick_next_runnable(cur_pid) {
-                context_switch(&mut table, cur_pid, next, frame);
+            if let Some(next) = table.pick_next_runnable(cur_pd) {
+                context_switch(&mut table, cur_pd, next, frame);
                 return;
             }
             if table.has_any_active() {
@@ -1622,7 +1627,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
     let a1 = frame.x[1];
     let a2 = frame.x[2];
     let a3 = frame.x[3];
-    let Some((cur_pid, cur_ttbr0)) = ({
+    let Some((cur_pd, cur_ttbr0)) = ({
         let table = DOMAINS.lock();
         table
             .current_for_this_cpu()
@@ -1642,7 +1647,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             let allowed =
                 IPC_STATE
                     .lock()
-                    .validate_console_for(cur_pid, CapId::new(a0), Rights::WRITE);
+                    .validate_console_for(cur_pd, CapId::new(a0), Rights::WRITE);
             allowed.and_then(|()| handle_debug_write(cur_ttbr0, a1, a2))
         }
         SyscallNumber::Yield => {
@@ -1652,15 +1657,15 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             PREEMPT_PENDING.store(false, Ordering::Release);
 
             let mut table = DOMAINS.lock();
-            if let Some(next) = table.pick_next_runnable(cur_pid) {
-                context_switch(&mut table, cur_pid, next, frame);
+            if let Some(next) = table.pick_next_runnable(cur_pd) {
+                context_switch(&mut table, cur_pd, next, frame);
             }
             return;
         }
         SyscallNumber::Exit => {
             match IPC_STATE
                 .lock()
-                .validate_power_for(cur_pid, CapId::new(a0), Rights::WRITE)
+                .validate_power_for(cur_pd, CapId::new(a0), Rights::WRITE)
             {
                 Ok(()) => {
                     let code = if a1 == ShutdownStatus::Success as u64 {
@@ -1681,7 +1686,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 // Lock order: DOMAINS -> IPC_STATE.
                 let mut table = DOMAINS.lock();
                 let mut ipc = IPC_STATE.lock();
-                match ipc.resolve_notify_signal_for(cur_pid, CapId::new(a0), a1) {
+                match ipc.resolve_notify_signal_for(cur_pd, CapId::new(a0), a1) {
                     Ok((notif_id, effective)) => match ipc.notify_signal_id(notif_id, effective) {
                         Ok(_) => {
                             woke_idle = wake_notif_waiter_locked(&mut table, &mut ipc, notif_id);
@@ -1697,14 +1702,14 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             }
             res
         }
-        SyscallNumber::NotifyPoll => IPC_STATE.lock().notify_poll_for(cur_pid, CapId::new(a0)),
+        SyscallNumber::NotifyPoll => IPC_STATE.lock().notify_poll_for(cur_pd, CapId::new(a0)),
         SyscallNumber::IpcSend => {
             let mut table = DOMAINS.lock();
             let mut ipc = IPC_STATE.lock();
-            match ipc.lookup_endpoint_for(cur_pid, CapId::new(a0), Rights::WRITE) {
+            match ipc.lookup_endpoint_for(cur_pd, CapId::new(a0), Rights::WRITE) {
                 Err(e) => Err(e),
                 Ok((ep_id, badge)) => {
-                    let cur = cur_pid;
+                    let cur = cur_pd;
                     // Strictly wake only `WaitingRecv` servers — NEVER hijack `WaitingReply` callers.
                     if let Some(peer) = table.find_waiter(IpcWaitState::WaitingRecv, ep_id, cur) {
                         set_ipc_return(&mut table.domains[peer].frame, a1, badge);
@@ -1720,7 +1725,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         SyscallNumber::IpcRecv => {
             IPC_STATE
                 .lock()
-                .ipc_recv_for(cur_pid, CapId::new(a0))
+                .ipc_recv_for(cur_pd, CapId::new(a0))
                 .map(|msg| {
                     ipc_badge_out = msg.badge;
                     msg.payload
@@ -1729,10 +1734,10 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         SyscallNumber::IpcCall => {
             let mut table = DOMAINS.lock();
             let mut ipc = IPC_STATE.lock();
-            match ipc.lookup_endpoint_for(cur_pid, CapId::new(a0), Rights::WRITE) {
+            match ipc.lookup_endpoint_for(cur_pd, CapId::new(a0), Rights::WRITE) {
                 Err(e) => Err(e),
                 Ok((ep_id, badge)) => {
-                    let cur = cur_pid;
+                    let cur = cur_pd;
                     if let Some(server) = table.find_waiter(IpcWaitState::WaitingRecv, ep_id, cur)
                         && table.domains[server].running_on.is_none()
                     {
@@ -1803,10 +1808,10 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         SyscallNumber::IpcReplyRecv => {
             let mut table = DOMAINS.lock();
             let mut ipc = IPC_STATE.lock();
-            let cur = cur_pid;
+            let cur = cur_pd;
             // Server receive right (`Rights::READ`) governs `IpcReplyRecv`; replying consumes
             // the kernel-minted single-use `reply_target` capability rather than endpoint `WRITE`.
-            match ipc.lookup_endpoint_for(cur_pid, CapId::new(a0), Rights::READ) {
+            match ipc.lookup_endpoint_for(cur_pd, CapId::new(a0), Rights::READ) {
                 Err(e) => Err(e),
                 Ok((ep_id, badge)) => {
                     let mut fastpath_client = None;
@@ -1887,14 +1892,14 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 Err(SysError::InvalidArgument)
             } else {
                 let mut table = DOMAINS.lock();
-                table.domains[cur_pid].fault_pc = a0;
-                table.domains[cur_pid].fault_sp = a1;
+                table.domains[cur_pd].fault_pc = a0;
+                table.domains[cur_pd].fault_sp = a1;
                 Ok(0)
             }
         }
         SyscallNumber::MmioRead32 => IPC_STATE
             .lock()
-            .validate_mmio_read32_for(cur_pid, CapId::new(a0), a1)
+            .validate_mmio_read32_for(cur_pd, CapId::new(a0), a1)
             .and_then(|phys| {
                 let virt = mmio_phys_to_virt(phys.raw()).ok_or(SysError::InvalidArgument)?;
                 let ptr = virt as *const u32;
@@ -1905,7 +1910,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             }),
         SyscallNumber::MmioWrite32 => IPC_STATE
             .lock()
-            .validate_mmio_write32_for(cur_pid, CapId::new(a0), a1)
+            .validate_mmio_write32_for(cur_pd, CapId::new(a0), a1)
             .and_then(|phys| {
                 let virt = mmio_phys_to_virt(phys.raw()).ok_or(SysError::InvalidArgument)?;
                 let ptr = virt as *mut u32;
@@ -1916,16 +1921,15 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             }),
         SyscallNumber::DebugRead => IPC_STATE
             .lock()
-            .validate_console_for(cur_pid, CapId::new(a0), Rights::READ)
+            .validate_console_for(cur_pd, CapId::new(a0), Rights::READ)
             .and_then(|()| match serial::try_read_byte() {
                 Some(b) => Ok(u64::from(b)),
                 None => Err(SysError::WouldBlock),
             }),
         SyscallNumber::SysInfo => {
-            let allowed =
-                IPC_STATE
-                    .lock()
-                    .validate_power_for(cur_pid, CapId::new(a0), Rights::READ);
+            let allowed = IPC_STATE
+                .lock()
+                .validate_power_for(cur_pd, CapId::new(a0), Rights::READ);
             allowed.map(|()| {
                 let domain_count = DOMAINS.lock().active_count() as u64;
                 let base = SYS_INFO_PACKED.load(Ordering::Acquire);
@@ -1938,7 +1942,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             } else {
                 IPC_STATE
                     .lock()
-                    .validate_vspace_for(cur_pid, CapId::new(a0), Rights::READ)
+                    .validate_vspace_for(cur_pd, CapId::new(a0), Rights::READ)
                     .and_then(|root| {
                         let root_phys = if root.raw() != 0 {
                             root.raw()
@@ -1961,24 +1965,24 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             parse_mint_rights_and_badge(a2, a3).and_then(|(rights, badge)| {
                 IPC_STATE
                     .lock()
-                    .cap_mint_for(cur_pid, CapId::new(a0), a1 as usize, rights, badge)
+                    .cap_mint_for(cur_pd, CapId::new(a0), a1 as usize, rights, badge)
                     .map(CapId::raw)
             })
         }
         SyscallNumber::CapCopy => IPC_STATE
             .lock()
-            .cap_copy_for(cur_pid, CapId::new(a0), a1 as usize)
+            .cap_copy_for(cur_pd, CapId::new(a0), a1 as usize)
             .map(CapId::raw),
         SyscallNumber::CapMove => IPC_STATE
             .lock()
-            .cap_move_for(cur_pid, CapId::new(a0), a1 as usize)
+            .cap_move_for(cur_pd, CapId::new(a0), a1 as usize)
             .map(CapId::raw),
         SyscallNumber::CapDelete => {
             let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
             let mut ipc = IPC_STATE.lock();
             let res = ipc
                 .cap_delete_for_with_frame_reclaim_cb(
-                    cur_pid,
+                    cur_pd,
                     CapId::new(a0),
                     |phys, can_reclaim| {
                         // Reclaim physical frame if this was the last Frame capability and no
@@ -2010,7 +2014,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             let mut ipc = IPC_STATE.lock();
             let res = ipc
                 .cap_revoke_for_with_frame_reclaim_cb(
-                    cur_pid,
+                    cur_pd,
                     CapId::new(a0),
                     |phys, can_reclaim| {
                         let mut reclaimed_frame = None;
@@ -2082,7 +2086,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 IPC_STATE
                     .lock()
                     .cap_grant_between_checked(
-                        cur_pid,
+                        cur_pd,
                         CapId::new(a0),
                         CapId::new(a1),
                         rights,
@@ -2099,7 +2103,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 let target =
                     IPC_STATE
                         .lock()
-                        .validate_thread_for(cur_pid, CapId::new(a0), Rights::WRITE);
+                        .validate_thread_for(cur_pd, CapId::new(a0), Rights::WRITE);
                 match target {
                     Err(e) => Err(e),
                     Ok(target_pd) => {
@@ -2107,10 +2111,10 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                         let mut table = DOMAINS.lock();
                         if target_pd >= table.count {
                             Err(SysError::InvalidArgument)
-                        } else if cur_pid != 0
+                        } else if cur_pd != 0
                             && table
                                 .sched
-                                .tcb(cur_pid)
+                                .tcb(cur_pd)
                                 .is_none_or(|tcb| new_prio > tcb.priority)
                         {
                             // Prevent unprivileged priority escalation above caller's MCP ceiling.
@@ -2129,7 +2133,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 let vspace_root =
                     IPC_STATE
                         .lock()
-                        .validate_vspace_for(cur_pid, CapId::new(a0), Rights::WRITE);
+                        .validate_vspace_for(cur_pd, CapId::new(a0), Rights::WRITE);
                 match vspace_root {
                     Err(e) => Err(e),
                     Ok(root) => parse_rights(a2).and_then(|rights| {
@@ -2210,7 +2214,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                         // Held across PTE mutation to serialize concurrent SMP `MapPage`/`UnmapPage`.
                         let table = DOMAINS.lock();
                         let ipc = IPC_STATE.lock();
-                        match ipc.validate_vspace_for(cur_pid, CapId::new(a0), Rights::WRITE) {
+                        match ipc.validate_vspace_for(cur_pd, CapId::new(a0), Rights::WRITE) {
                             Err(e) => Err(e),
                             Ok(root) => {
                                 let root_phys = if root.raw() != 0 {
@@ -2262,7 +2266,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 let is_mip = ((a3 >> 16) & 1) != 0;
                 IPC_STATE
                     .lock()
-                    .untyped_retype_irq_for(cur_pid, CapId::new(a0), a2 as usize, irq, is_mip)
+                    .untyped_retype_irq_for(cur_pd, CapId::new(a0), a2 as usize, irq, is_mip)
                     .map(CapId::raw)
             }
             Some(obj_type) => {
@@ -2270,7 +2274,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                     let mut ipc = IPC_STATE.lock();
                     let mut untyped = RUNTIME_UNTYPED.lock();
                     let res = ipc.untyped_retype_for(
-                        cur_pid,
+                        cur_pd,
                         CapId::new(a0),
                         obj_type,
                         a2 as usize,
@@ -2279,7 +2283,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                     // Zero newly retyped Frame before exposing it to EL0.
                     if let Ok(new_cap) = res
                         && obj_type == ObjectType::Frame
-                        && let Ok(phys) = ipc.validate_frame_for(cur_pid, new_cap, Rights::NONE)
+                        && let Ok(phys) = ipc.validate_frame_for(cur_pd, new_cap, Rights::NONE)
                         && let Ok(frame_obj) = PhysFrame::from_aligned(phys)
                     {
                         let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
@@ -2315,8 +2319,8 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                     // across capability validation, W^X anti-aliasing check, and PTE installation
                     // to eliminate the validate-then-map SMP race (`P8`) and W^X aliasing bypass (`M1`).
                     let ipc = IPC_STATE.lock();
-                    let root = ipc.validate_vspace_for(cur_pid, CapId::new(a0), Rights::WRITE)?;
-                    let phys = ipc.validate_frame_for(cur_pid, CapId::new(a1), frame_req)?;
+                    let root = ipc.validate_vspace_for(cur_pd, CapId::new(a0), Rights::WRITE)?;
+                    let phys = ipc.validate_frame_for(cur_pd, CapId::new(a1), frame_req)?;
                     let frame_obj = PhysFrame::from_aligned(phys)?;
                     let root_phys = if root.raw() != 0 {
                         root.raw()
@@ -2351,9 +2355,9 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         SyscallNumber::TimerFreq => Ok(read_cntfrq()),
         SyscallNumber::ThreadExit => {
             let mut table = DOMAINS.lock();
-            teardown_process_locked(&mut table, cur_pid);
-            if let Some(next) = table.pick_next_runnable(cur_pid) {
-                context_switch(&mut table, cur_pid, next, frame);
+            teardown_domain_locked(&mut table, cur_pd);
+            if let Some(next) = table.pick_next_runnable(cur_pd) {
+                context_switch(&mut table, cur_pd, next, frame);
                 return;
             }
             if table.has_any_active() {
@@ -2368,7 +2372,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         }
         SyscallNumber::IrqAck => IPC_STATE
             .lock()
-            .validate_irq_for(cur_pid, CapId::new(a0), Rights::WRITE)
+            .validate_irq_for(cur_pd, CapId::new(a0), Rights::WRITE)
             .map(|(irq, is_mip)| {
                 if is_mip {
                     super::gic::set_mip_vector_masked(irq as u8, false);
@@ -2380,7 +2384,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         SyscallNumber::DmaCacheOp => match DmaCacheOp::from_u64(a3) {
             Some(op) => IPC_STATE
                 .lock()
-                .validate_vspace_for(cur_pid, CapId::new(a0), Rights::READ)
+                .validate_vspace_for(cur_pd, CapId::new(a0), Rights::READ)
                 .and_then(|root| {
                     let target_ttbr0 = if root.raw() != 0 {
                         root.raw()
@@ -2393,7 +2397,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         },
         SyscallNumber::CpuFeatures => IPC_STATE
             .lock()
-            .validate_power_for(cur_pid, CapId::new(a0), Rights::READ)
+            .validate_power_for(cur_pd, CapId::new(a0), Rights::READ)
             .map(|()| super::cpu_isa_features()),
         SyscallNumber::NotifyWait => {
             let mask = a1;
@@ -2404,7 +2408,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 // Step 1 (fastpath): validate and consume matching bits under `IPC_STATE`.
                 let fast = {
                     let mut ipc = IPC_STATE.lock();
-                    ipc.validate_notification_id_for(cur_pid, CapId::new(a0), Rights::READ)
+                    ipc.validate_notification_id_for(cur_pd, CapId::new(a0), Rights::READ)
                         .and_then(|nid| ipc.notify_consume_mask(nid, mask).map(|m| (nid, m)))
                 };
                 match fast {
@@ -2431,20 +2435,20 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                             Err(e) => Err(e),
                             Ok(matched) if matched != 0 => Ok(matched),
                             Ok(_) => {
-                                table.domains[cur_pid].wait = IpcWaitState::WaitingNotif;
-                                table.domains[cur_pid].wait_notif_id = notif_id;
-                                table.domains[cur_pid].wait_notif_mask = mask;
-                                table.domains[cur_pid].sleep_deadline_ticks = deadline;
-                                let _ = table.sched.block_slot(cur_pid);
-                                if let Some(next) = table.pick_next_runnable(cur_pid) {
-                                    context_switch(&mut table, cur_pid, next, frame);
+                                table.domains[cur_pd].wait = IpcWaitState::WaitingNotif;
+                                table.domains[cur_pd].wait_notif_id = notif_id;
+                                table.domains[cur_pd].wait_notif_mask = mask;
+                                table.domains[cur_pd].sleep_deadline_ticks = deadline;
+                                let _ = table.sched.block_slot(cur_pd);
+                                if let Some(next) = table.pick_next_runnable(cur_pd) {
+                                    context_switch(&mut table, cur_pd, next, frame);
                                     return;
                                 }
                                 let cpu = (super::get_cpu_id() as usize).min(MAX_CPUS - 1);
-                                table.domains[cur_pid].frame = *frame;
-                                save_fp_state(&mut table.domains[cur_pid].fp);
-                                table.domains[cur_pid].tpidr_el0 = read_tpidr_el0();
-                                table.domains[cur_pid].running_on = None;
+                                table.domains[cur_pd].frame = *frame;
+                                save_fp_state(&mut table.domains[cur_pd].fp);
+                                table.domains[cur_pd].tpidr_el0 = read_tpidr_el0();
+                                table.domains[cur_pd].running_on = None;
                                 table.cpu_current[cpu] = None;
                                 drop(table);
                                 park_cpu_until_runnable(frame);
@@ -2465,10 +2469,10 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 let badge_bit = a2 as u8;
                 // Lock order: IPC_STATE -> IRQ_TABLE (leaf).
                 let ipc = IPC_STATE.lock();
-                match ipc.validate_irq_for(cur_pid, CapId::new(a0), Rights::WRITE) {
+                match ipc.validate_irq_for(cur_pd, CapId::new(a0), Rights::WRITE) {
                     Err(e) => Err(e),
                     Ok((irq, is_mip)) => match ipc.validate_notification_id_for(
-                        cur_pid,
+                        cur_pd,
                         CapId::new(a1),
                         Rights::WRITE,
                     ) {
@@ -2507,18 +2511,18 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 Ok(0)
             } else {
                 let mut table = DOMAINS.lock();
-                table.domains[cur_pid].wait = IpcWaitState::Sleeping;
-                table.domains[cur_pid].sleep_deadline_ticks = Some(deadline);
-                let _ = table.sched.block_slot(cur_pid);
-                if let Some(next) = table.pick_next_runnable(cur_pid) {
-                    context_switch(&mut table, cur_pid, next, frame);
+                table.domains[cur_pd].wait = IpcWaitState::Sleeping;
+                table.domains[cur_pd].sleep_deadline_ticks = Some(deadline);
+                let _ = table.sched.block_slot(cur_pd);
+                if let Some(next) = table.pick_next_runnable(cur_pd) {
+                    context_switch(&mut table, cur_pd, next, frame);
                     return;
                 }
                 let cpu = (super::get_cpu_id() as usize).min(MAX_CPUS - 1);
-                table.domains[cur_pid].frame = *frame;
-                save_fp_state(&mut table.domains[cur_pid].fp);
-                table.domains[cur_pid].tpidr_el0 = read_tpidr_el0();
-                table.domains[cur_pid].running_on = None;
+                table.domains[cur_pd].frame = *frame;
+                save_fp_state(&mut table.domains[cur_pd].fp);
+                table.domains[cur_pd].tpidr_el0 = read_tpidr_el0();
+                table.domains[cur_pd].running_on = None;
                 table.cpu_current[cpu] = None;
                 drop(table);
                 park_cpu_until_runnable(frame);
@@ -2533,9 +2537,9 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 // Lock order: IPC_STATE -> RUNTIME_UNTYPED.
                 let ipc = IPC_STATE.lock();
                 let mut untyped = RUNTIME_UNTYPED.lock();
-                match ipc.validate_vspace_for(cur_pid, CapId::new(a0), Rights::WRITE) {
+                match ipc.validate_vspace_for(cur_pd, CapId::new(a0), Rights::WRITE) {
                     Err(e) => Err(e),
-                    Ok(root) => match ipc.validate_mmio_region_for(cur_pid, CapId::new(a1)) {
+                    Ok(root) => match ipc.validate_mmio_region_for(cur_pd, CapId::new(a1)) {
                         Err(e) => Err(e),
                         Ok((phys, len, writable)) => {
                             if len == 0
@@ -2612,7 +2616,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 let auth =
                     IPC_STATE
                         .lock()
-                        .validate_power_for(cur_pid, CapId::new(a0), Rights::WRITE);
+                        .validate_power_for(cur_pd, CapId::new(a0), Rights::WRITE);
                 match auth {
                     Err(e) => Err(e),
                     Ok(()) => match DomainRoleId::from_u64(a1) {
@@ -2713,19 +2717,19 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             let target =
                 IPC_STATE
                     .lock()
-                    .validate_thread_for(cur_pid, CapId::new(a0), Rights::WRITE);
+                    .validate_thread_for(cur_pd, CapId::new(a0), Rights::WRITE);
             match target {
                 Err(e) => Err(e),
                 Ok(target_pd)
                     if target_pd == 0
                         || target_pd >= MAX_DOMAINS
-                        || target_pd == cur_pid
+                        || target_pd == cur_pd
                         || !table.domains[target_pd].active =>
                 {
                     Err(SysError::InvalidArgument)
                 }
                 Ok(target_pd) => {
-                    teardown_process_locked(&mut table, target_pd);
+                    teardown_domain_locked(&mut table, target_pd);
                     Ok(0)
                 }
             }
@@ -2735,7 +2739,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             let mut table = DOMAINS.lock();
             let auth = IPC_STATE
                 .lock()
-                .validate_power_for(cur_pid, CapId::new(a0), Rights::READ);
+                .validate_power_for(cur_pd, CapId::new(a0), Rights::READ);
             match auth {
                 Err(e) => Err(e),
                 Ok(()) if pd_id >= MAX_DOMAINS => Err(SysError::InvalidArgument),
@@ -2753,7 +2757,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         SyscallNumber::MemStats => {
             let auth = IPC_STATE
                 .lock()
-                .validate_power_for(cur_pid, CapId::new(a0), Rights::READ);
+                .validate_power_for(cur_pd, CapId::new(a0), Rights::READ);
             match auth {
                 Err(e) => Err(e),
                 Ok(()) => {
@@ -2767,9 +2771,9 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
             let flags = a2;
             let opt_vaddr = a3;
             let ipc = IPC_STATE.lock();
-            let _iospace_id = ipc.validate_iospace_for(cur_pid, CapId::new(a0), Rights::WRITE)?;
+            let _iospace_id = ipc.validate_iospace_for(cur_pd, CapId::new(a0), Rights::WRITE)?;
             let phys =
-                ipc.validate_frame_for(cur_pid, CapId::new(a1), Rights::READ.union(Rights::WRITE))?;
+                ipc.validate_frame_for(cur_pd, CapId::new(a1), Rights::READ.union(Rights::WRITE))?;
             let mut untyped = RUNTIME_UNTYPED.lock();
             let mut mappings = FRAME_MAPPINGS.lock();
             if (flags & newos_abi::DMA_FLAG_NON_CACHEABLE) != 0 && opt_vaddr != 0 {
@@ -2801,8 +2805,8 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         SyscallNumber::DmaUnmap => {
             let ipc = IPC_STATE.lock();
             let res = ipc
-                .validate_iospace_for(cur_pid, CapId::new(a0), Rights::WRITE)
-                .and_then(|_| ipc.validate_frame_for(cur_pid, CapId::new(a1), Rights::READ));
+                .validate_iospace_for(cur_pd, CapId::new(a0), Rights::WRITE)
+                .and_then(|_| ipc.validate_frame_for(cur_pd, CapId::new(a1), Rights::READ));
             match res {
                 Err(e) => Err(e),
                 Ok(phys) => {

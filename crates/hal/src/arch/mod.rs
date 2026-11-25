@@ -4,7 +4,9 @@ pub mod aarch64;
 
 pub use aarch64::Aarch64Platform as Platform;
 
-pub fn early_serial_init() {}
+pub fn early_serial_init() {
+    aarch64::serial::init_boot_clock();
+}
 
 pub fn early_serial() -> aarch64::serial::Pl011 {
     aarch64::serial::Pl011::new()

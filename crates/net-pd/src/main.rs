@@ -17,6 +17,10 @@ use core::panic::PanicInfo;
 #[cfg(feature = "tcp")]
 use newos_abi::net_ipc;
 use newos_abi::{CapId, SysError};
+#[cfg(all(feature = "tcp", feature = "ipv4", feature = "dns"))]
+use newos_net::DnsStatus;
+#[cfg(all(feature = "tcp", feature = "ipv4", feature = "icmp"))]
+use newos_net::PingStatus;
 #[cfg(not(feature = "tcp"))]
 use newos_net::{CycleClock, MmioDmaTransport, NetClock};
 #[cfg(feature = "tcp")]
@@ -63,14 +67,50 @@ impl MmioDmaTransport for CapNetTransport {
 }
 
 #[cfg(feature = "tcp")]
+struct SupervisorDnsBuf {
+    buf: [u8; 128],
+    len: usize,
+}
+
+#[cfg(feature = "tcp")]
+impl SupervisorDnsBuf {
+    const fn new() -> Self {
+        Self {
+            buf: [0u8; 128],
+            len: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.len = 0;
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> u64 {
+        if self.len.saturating_add(bytes.len()) > self.buf.len() {
+            return u64::MAX;
+        }
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        self.len as u64
+    }
+
+    #[cfg(all(feature = "ipv4", feature = "dns"))]
+    fn as_str(&self) -> Option<&str> {
+        core::str::from_utf8(&self.buf[..self.len]).ok()
+    }
+}
+
+#[cfg(feature = "tcp")]
 fn serve_net_loop<D: NetDevice + newos_net::IrqAckDevice>(
     mut stack: NetStack<'_, D>,
+    driver_id: u8,
     mut clock: CycleClock<fn() -> u64>,
     out: &mut IpcLogConsole<256>,
 ) -> ! {
     let mut has_reply = false;
     let mut reply_payload = 0u64;
     let mut last_ip = stack.config().ip;
+    let mut dns_buf = SupervisorDnsBuf::new();
 
     const NET_SSH_RING_VADDR: u64 = 0x0000_6000_0000_0000;
     let net_ssh_ring = newos_user_rt::map_shared_ring_pair(
@@ -168,12 +208,29 @@ fn serve_net_loop<D: NetDevice + newos_net::IrqAckDevice>(
         match newos_user_rt::ipc_reply_recv(CapId::BOOTSTRAP_NET_EP, reply_payload, has_reply) {
             Ok((badge, req)) => {
                 let (op, buf, len) = net_ipc::decode_request(req);
-                reply_payload = handle_request(&mut stack, badge, op, &buf[..len]);
+                reply_payload = handle_request(
+                    &mut stack,
+                    driver_id,
+                    &mut dns_buf,
+                    now_ms,
+                    badge,
+                    op,
+                    req,
+                    &buf[..len],
+                );
                 has_reply = true;
             }
             Err(SysError::WouldBlock) => {
                 has_reply = false;
-                let delay_ms = stack.poll_delay_ms(now_ms).unwrap_or(20).clamp(1, 50);
+                let max_delay = if stack.has_pending_control_op() {
+                    5
+                } else {
+                    50
+                };
+                let delay_ms = stack
+                    .poll_delay_ms(now_ms)
+                    .unwrap_or(20)
+                    .clamp(1, max_delay);
                 let mask = IRQ_BIT | TX_DOORBELL_BIT | newos_abi::RING_PEER_RESET_BIT;
                 if let Ok((bits, _timed_out)) = newos_user_rt::notify_wait(
                     CapId::BOOTSTRAP_NET_NOTIF,
@@ -205,18 +262,128 @@ fn serve_net_loop<D: NetDevice + newos_net::IrqAckDevice>(
 }
 
 #[cfg(feature = "tcp")]
+#[allow(clippy::too_many_arguments)]
 fn handle_request<D: NetDevice>(
     stack: &mut NetStack<'_, D>,
+    driver_id: u8,
+    dns_buf: &mut SupervisorDnsBuf,
+    now_ms: i64,
     badge: u64,
     op: u8,
+    raw_req: u64,
     payload: &[u8],
 ) -> u64 {
-    // Only `newos-supervisor-pd` (read-only status) and `newos-ssh-pd` (full TCP stream) are authorized.
+    // `newos-supervisor-pd`: diagnostic/control ops only (NEVER raw SSH TCP stream ops).
     if badge == net_ipc::BADGE_SUPERVISOR {
-        if op == net_ipc::OP_POLL_STATUS {
-            return encode_status(stack);
-        }
-        return 0;
+        let _ = now_ms;
+        return match op {
+            net_ipc::OP_POLL_STATUS => encode_status(stack),
+            net_ipc::OP_GET_NET_INFO => {
+                let cfg = stack.config();
+                match net_ipc::decode_get_net_info_selector(raw_req) {
+                    net_ipc::INFO_GATEWAY_PREFIX => {
+                        net_ipc::encode_gateway_prefix_reply(cfg.gateway, cfg.prefix_len, driver_id)
+                    }
+                    net_ipc::INFO_DNS => net_ipc::encode_dns_info_reply(cfg.dns),
+                    net_ipc::INFO_MAC => net_ipc::encode_mac_reply(stack.mac()),
+                    _ => 0,
+                }
+            }
+            net_ipc::OP_PING_START => {
+                #[cfg(all(feature = "ipv4", feature = "icmp"))]
+                {
+                    let target = net_ipc::decode_ping_start(raw_req);
+                    match stack.ping_start(target, now_ms) {
+                        Ok(seq) => net_ipc::encode_ping_reply(net_ipc::PING_PENDING, seq, 0),
+                        Err(_) => net_ipc::encode_ping_reply(net_ipc::PING_ERR, 0, 0),
+                    }
+                }
+                #[cfg(not(all(feature = "ipv4", feature = "icmp")))]
+                {
+                    net_ipc::encode_ping_reply(net_ipc::PING_ERR, 0, 0)
+                }
+            }
+            net_ipc::OP_PING_POLL => {
+                #[cfg(all(feature = "ipv4", feature = "icmp"))]
+                {
+                    match stack.ping_status() {
+                        PingStatus::Idle => net_ipc::encode_ping_reply(net_ipc::PING_IDLE, 0, 0),
+                        PingStatus::Pending => {
+                            net_ipc::encode_ping_reply(net_ipc::PING_PENDING, 0, 0)
+                        }
+                        PingStatus::Reply { seq, rtt_ms, .. } => {
+                            net_ipc::encode_ping_reply(net_ipc::PING_OK, seq, rtt_ms)
+                        }
+                        PingStatus::Timeout => {
+                            net_ipc::encode_ping_reply(net_ipc::PING_TIMEOUT, 0, 0)
+                        }
+                    }
+                }
+                #[cfg(not(all(feature = "ipv4", feature = "icmp")))]
+                {
+                    net_ipc::encode_ping_reply(net_ipc::PING_ERR, 0, 0)
+                }
+            }
+            net_ipc::OP_DNS_CHUNK_BASE => {
+                if payload.is_empty() {
+                    dns_buf.reset();
+                    0
+                } else {
+                    dns_buf.push(payload)
+                }
+            }
+            net_ipc::OP_DNS_START => {
+                #[cfg(all(feature = "ipv4", feature = "dns"))]
+                {
+                    let Some(host) = dns_buf.as_str() else {
+                        return net_ipc::encode_dns_reply(net_ipc::DNS_ERR, [0; 4]);
+                    };
+                    if host.is_empty() {
+                        return net_ipc::encode_dns_reply(net_ipc::DNS_ERR, [0; 4]);
+                    }
+                    match stack.dns_start(host, now_ms) {
+                        Ok(()) => net_ipc::encode_dns_reply(net_ipc::DNS_PENDING, [0; 4]),
+                        Err(_) => net_ipc::encode_dns_reply(net_ipc::DNS_ERR, [0; 4]),
+                    }
+                }
+                #[cfg(not(all(feature = "ipv4", feature = "dns")))]
+                {
+                    net_ipc::encode_dns_reply(net_ipc::DNS_ERR, [0; 4])
+                }
+            }
+            net_ipc::OP_DNS_POLL => {
+                #[cfg(all(feature = "ipv4", feature = "dns"))]
+                {
+                    match stack.dns_status() {
+                        DnsStatus::Idle => net_ipc::encode_dns_reply(net_ipc::DNS_IDLE, [0; 4]),
+                        DnsStatus::Pending => {
+                            net_ipc::encode_dns_reply(net_ipc::DNS_PENDING, [0; 4])
+                        }
+                        DnsStatus::Resolved(ip) => net_ipc::encode_dns_reply(net_ipc::DNS_OK, ip),
+                        DnsStatus::Timeout => {
+                            net_ipc::encode_dns_reply(net_ipc::DNS_TIMEOUT, [0; 4])
+                        }
+                        DnsStatus::Failed => net_ipc::encode_dns_reply(net_ipc::DNS_ERR, [0; 4]),
+                    }
+                }
+                #[cfg(not(all(feature = "ipv4", feature = "dns")))]
+                {
+                    net_ipc::encode_dns_reply(net_ipc::DNS_ERR, [0; 4])
+                }
+            }
+            net_ipc::OP_DHCP_RENEW => {
+                #[cfg(feature = "ipv4")]
+                {
+                    stack.dhcp_reset();
+                    1
+                }
+                #[cfg(not(feature = "ipv4"))]
+                {
+                    0
+                }
+            }
+            _ => 0,
+        };
     }
     if badge != net_ipc::BADGE_SSH {
         return 0;
@@ -350,7 +517,7 @@ fn main() -> ! {
                         entropy_seed,
                         &mut storage,
                     );
-                    serve_net_loop(stack, clock, &mut out)
+                    serve_net_loop(stack, net_ipc::DRIVER_VIRTIO, clock, &mut out)
                 }
                 Err(e) => {
                     let _ = writeln!(out, "[net-pd] virtio-net init failed: {e}");
@@ -378,7 +545,7 @@ fn main() -> ! {
                         entropy_seed,
                         &mut storage,
                     );
-                    serve_net_loop(stack, clock, &mut out)
+                    serve_net_loop(stack, net_ipc::DRIVER_GEM, clock, &mut out)
                 }
                 Err(e) => {
                     let _ = writeln!(out, "[net-pd] rpi5-rp1-gem init failed: {e}");

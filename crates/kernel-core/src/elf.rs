@@ -1,6 +1,6 @@
 //! 64-bit ELF64 parser for bootstrapping `init`.
 //!
-//! Only the single EL0 root task (`init`) is parsed by EL1; all subsequent
+//! Only bootstrap EL0 protection domains (starting with `supervisor-pd`) are parsed by EL1; all subsequent
 //! processes and ELF binaries are loaded by userspace services.
 
 use crate::memory::{PageFlags, VirtAddr};
