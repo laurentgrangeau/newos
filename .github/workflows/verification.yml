@@ -21,7 +21,9 @@ jobs:
       - name: Install pinned nightly toolchain
         run: rustup show
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2
+        with:
+          tool: cargo-llvm-cov
       - name: Enforce hard line-coverage floor
         run: |
           mkdir -p target/llvm-cov
@@ -91,7 +93,9 @@ jobs:
       - name: Install pinned nightly toolchain
         run: rustup show
       - name: Install cargo-mutants
-        uses: taiki-e/install-action@cargo-mutants
+        uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2
+        with:
+          tool: cargo-mutants
       - name: Run PR-diff mutation testing
         if: github.event_name == 'pull_request'
         run: |

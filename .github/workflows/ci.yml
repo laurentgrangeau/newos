@@ -25,7 +25,7 @@ jobs:
       - name: Run cargo xtask feature-matrix
         run: cargo xtask feature-matrix
       - name: Run cargo-deny security & license check
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # v2.1.4
 
   target-lint-and-builds:
     name: AArch64 Target Clippy (HAL, User-RT & PDs) + Variant Builds
