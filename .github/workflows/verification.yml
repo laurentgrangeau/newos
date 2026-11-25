@@ -1,0 +1,149 @@
+name: Verification, Coverage, Chaos, Fuzzing & Mutation Suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Nightly full mutation, extended fuzzing & soak verification at 03:00 UTC
+    - cron: "0 3 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage-gate:
+    name: Hard Line-Coverage Gate (cargo-llvm-cov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned nightly toolchain
+        run: rustup show
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Enforce hard line-coverage floor
+        run: |
+          mkdir -p target/llvm-cov
+          cargo xtask coverage --fail-under 75 --lcov
+      - name: Upload LCOV coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lcov-coverage-report
+          path: target/llvm-cov/lcov.info
+
+  extended-test-suites:
+    name: Property, Chaos, Security, Stress, Regression, Doc & Bench-Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned nightly toolchain
+        run: rustup show
+      - name: Run proptest, E2E SSH/Net, regression, chaos, and security/stress suites
+        run: |
+          cargo test -p newos-e2e-tests \
+            --test proptest_suite \
+            --test e2e_ssh_net \
+            --test regression \
+            --test chaos \
+            --test security_stress
+      - name: Run rustdoc tests across all host-testable crates
+        run: cargo test --doc
+      - name: Run benchmark sanity check
+        run: cargo xtask bench-check
+
+  miri-ub-checks:
+    name: Miri Undefined Behavior & Aliasing Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned nightly toolchain + Miri
+        run: |
+          rustup show
+          rustup component add miri
+      - name: Run Miri across host-testable OS crates
+        run: cargo xtask miri
+
+  elf-hardening-audit:
+    name: AArch64 ELF Binary Hardening Audit (PIE & W^X)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned nightly toolchain & AArch64 targets
+        run: |
+          rustup show
+          rustup target add aarch64-unknown-none aarch64-unknown-none-softfloat
+      - name: Audit debug and release AArch64 ELFs + Reproducible Build Check
+        run: |
+          cargo xtask audit-elf
+          cargo xtask audit-elf --release
+          cargo xtask repro-check
+
+  mutation-testing:
+    name: Mutation Testing (cargo-mutants)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install pinned nightly toolchain
+        run: rustup show
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@cargo-mutants
+      - name: Run PR-diff mutation testing
+        if: github.event_name == 'pull_request'
+        run: |
+          git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff
+          if [ -s pr.diff ]; then
+            cargo xtask mutants --in-diff pr.diff
+          else
+            echo "Empty diff; skipping PR mutation check."
+          fi
+      - name: Run scheduled/manual targeted mutation audit
+        if: github.event_name != 'pull_request'
+        run: |
+          cargo xtask mutants --package newos-abi
+          cargo xtask mutants --package newos-ssh-proto
+      - name: Upload mutants.out report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-report
+          path: mutants.out/
+
+  fuzz-smoke:
+    name: LibFuzzer Smoke Suite (cargo-fuzz)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned nightly toolchain
+        run: rustup show
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+      - name: Run libFuzzer across all 7 parser & crypto targets
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            cargo xtask fuzz --seconds 60
+          else
+            cargo xtask fuzz --seconds 10
+          fi
+
+  qemu-chaos-self-healing:
+    name: 4-Core QEMU AArch64 All-Domain Chaos & Self-Healing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned nightly toolchain & AArch64 targets
+        run: |
+          rustup show
+          rustup target add aarch64-unknown-none aarch64-unknown-none-softfloat
+      - name: Install QEMU AArch64, AAVMF & FAT tools
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm qemu-efi-aarch64 mtools dosfstools
+      - name: Run host + 4-core QEMU chaos self-healing suite & multi-profile matrix
+        run: |
+          cargo xtask chaos
+          cargo xtask qemu-matrix
+      - name: Run nightly endurance soak
+        if: github.event_name == 'schedule'
+        run: cargo xtask soak --cycles 5

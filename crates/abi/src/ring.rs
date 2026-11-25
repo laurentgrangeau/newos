@@ -2,6 +2,15 @@
 //!
 //! EL1 never parses ring buffers. Two EL0 processes share a mapped
 //! `Frame` containing an `SpscRing` and use a 64-bit kernel `Notification` capability for wakeups.
+//!
+//! ```
+//! use newos_abi::ring::SpscRing;
+//!
+//! let ring = SpscRing::<8>::new();
+//! assert!(ring.try_push(0x5E14).is_ok());
+//! assert_eq!(ring.try_pop(), Some(0x5E14));
+//! assert!(ring.is_empty());
+//! ```
 
 use crate::SysError;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -512,6 +521,69 @@ mod tests {
         let _ = ring.try_pop();
         let _ = ring.try_pop_slice(&mut []);
         let _ = ring.try_pop_slice(&mut out);
+    }
+
+    #[cfg(not(loom))]
+    #[test]
+    fn spsc_ring_concurrent_producer_consumer_10k_items() {
+        extern crate std;
+        use std::sync::Arc;
+        use std::thread;
+
+        const COUNT: u64 = 10_000;
+        let ring = Arc::new(SpscRing::<64>::new());
+        let prod_ring = Arc::clone(&ring);
+
+        let producer = thread::spawn(move || {
+            for i in 0..COUNT {
+                while prod_ring.try_push(i ^ 0x5E14_C0DE_0000_0000).is_err() {
+                    thread::yield_now();
+                }
+            }
+        });
+
+        for i in 0..COUNT {
+            loop {
+                if let Some(v) = ring.try_pop() {
+                    assert_eq!(v, i ^ 0x5E14_C0DE_0000_0000);
+                    break;
+                }
+                thread::yield_now();
+            }
+        }
+        assert!(producer.join().is_ok());
+        assert!(ring.is_empty());
+    }
+
+    #[cfg(loom)]
+    #[test]
+    fn loom_spsc_ring_acquire_release_interleavings() {
+        use loom::sync::Arc;
+        use loom::thread;
+
+        loom::model(|| {
+            let ring = Arc::new(SpscRing::<4>::new());
+            let prod = Arc::clone(&ring);
+            let t = thread::spawn(move || {
+                for v in 1u64..=3 {
+                    while prod.try_push(v).is_err() {
+                        thread::yield_now();
+                    }
+                }
+            });
+            let mut got = [0u64; 3];
+            for slot in &mut got {
+                loop {
+                    if let Some(v) = ring.try_pop() {
+                        *slot = v;
+                        break;
+                    }
+                    thread::yield_now();
+                }
+            }
+            assert!(t.join().is_ok());
+            assert_eq!(got, [1, 2, 3]);
+        });
     }
 }
 

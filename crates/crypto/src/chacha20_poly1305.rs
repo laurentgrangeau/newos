@@ -416,3 +416,20 @@ mod tests {
         assert_eq!(poly1305_mac(&otk, msg), expected_tag);
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn openssh_chacha20_poly1305_seal_open_roundtrip() {
+        let key: [u8; 64] = kani::any();
+        let seq: u64 = kani::any();
+        let mut pkt: [u8; 12] = kani::any();
+        let orig = pkt;
+        let cipher = OpenSshChaCha20Poly1305::new(&key);
+        let tag = cipher.seal_in_place(seq, &mut pkt);
+        assert!(cipher.open_in_place(seq, &mut pkt, &tag));
+        assert_eq!(&pkt[4..], &orig[4..]);
+    }
+}

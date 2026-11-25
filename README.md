@@ -1,6 +1,6 @@
 # NewOS
 
-> **Release:** [`v0.10.0`](https://github.com/laurentgrangeau/newos/releases/tag/v0.10.0) · `main` is on `0.11.0` development.
+> **Release:** [`v0.11.0`](https://github.com/laurentgrangeau/newos/releases/tag/v0.11.0) · Comprehensive 8-phase verification, chaos self-healing, fuzzing, mutation & hard CI coverage gate.
 
 A **64-bit capability microkernel** and **EL0 userspace environment** for the **Raspberry Pi 5 16 GB** (`aarch64` / ARMv8.2-A quad-core BCM2712 Cortex-A76, with QEMU `aarch64` `virt` as a local test harness). Features **static EL1 memory management**, **workspace-enforced `unsafe_code = "forbid"`** (with audited `unsafe` confined to `crates/hal` and `crates/user-rt`), **monotonic nanosecond boot & command/response log timestamps (`CNTVCT_EL0`/`CNTFRQ_EL0`)**, **Kernel PIE + Limine KASLR**, **Userspace PIE + full ASLR + KCFI + LLVM ShadowCallStack (`x18`)**, **quad-core SMP EL0 scheduling with GICv2 SGI wakeups & cross-core blocking IPC**, **isolated `TTBR0_EL1` address spaces (16-bit ASIDs + full NEON/FP save/restore)**, **EL0 crash isolation**, **live ACPI hardware discovery (`FADT`/`SPCR`/`MADT`/`GTDT`/`MCFG`)**, a **Raspberry Pi 5 (16 GB) EL0 hardware driver stack** (**BCM2712 Watchdog**, **RP1 40-pin GPIO**, **VideoCore Mailbox**, **AVS TMON Thermal & Active Cooler Fan**, **RTC**, **RP1 UART/I2C/SPI/PWM**, **BCM2712 MIP MSI-X**, **PCIe ECAM**, **microSD SDHCI**, **NVMe 1.4**, **RP1 Dual xHCI USB 3.0**, **UEFI GOP Framebuffer**, **`brcm,bcm2712-iommu`**, **VideoCore VII V3D 7.1**, **Cortex-A76 NEON/DotProd AI Compute**, and **Hailo-8/8L/10H PCIe NPU**), a **3-domain privilege-separated post-quantum SSHv2 service (`newos-net-pd` + `newos-key-pd` + `newos-ssh-pd`)** with **hardware TRNG (`BCM2712 iproc-rng200` / `VirtIO-RNG`)**, an **EL0 `smoltcp` IPv4/IPv6 TCP/IP stack + RP1 Cadence GEM Gigabit Ethernet driver** (plus VirtIO 1.0+ for QEMU testing), a **FIPS 202 `SHA3-512` Content-Addressed Object Store (CAOS)**, and a **UTF-8 Typed Pipeline Shell (`newos-shell-pd`)**.
 
@@ -16,7 +16,7 @@ A **64-bit capability microkernel** and **EL0 userspace environment** for the **
 - **Memory Safety & Formal Verification:**
   - `unsafe_code = "forbid"` is enforced at the workspace level in `Cargo.toml` across all 26 non-TCB crates (`newos-abi`, `newos-crypto`, `newos-kernel-core`, `newos-kernel`, `newos-net`, `newos-rng`, `newos-wdt`, `newos-gpio`, `newos-board`, `newos-storage`, `newos-usb`, `newos-gpu`, `newos-ai`, `newos-key-vault`, `newos-ssh-proto`, `newos-net-pd`, `newos-key-pd`, `newos-ssh-pd`, `newos-ssh`, `newos-shell-core`, `newos-supervisor-pd`, `newos-shell-pd`, `newos-worker-pd`, `newos-bench`, `xtask`, and `tests`).
   - Audited `unsafe` is strictly confined to hardware/paging/context-switch instructions in `crates/hal` (guarded by IRQ-disabling `IrqSpinLock`s, bounded descriptor helpers, and page-table-validated HHDM user copies) and the minimal `svc #0` / fault-recovery trampoline in `crates/user-rt` (with `set_fault_handler` implemented via `[AtomicU64; 8192]`), with documented `// SAFETY:` invariants on every site.
-  - **Miri, Kani & E2E Verification:** `cargo test` runs **448+** host tests (**153+** unit tests across 15 crates + **295** E2E tests in `tests/e2e` and `tests/teamwork_e2e`) and `cargo xtask miri` checks UB/aliasing/provenance across the core and hardware driver suites (excluding multi-minute PQ lattice crates); `#[cfg(kani)]` bounded model checking harnesses (`cargo xtask verify`) prove `SpscRing` FIFO & corrupted-peer safety, `CNode` monotonic rights attenuation & generational `CapId` safety, `notify_consume_mask` atomicity, `PageFlags` W^X exclusivity, and `UntypedInventory` disjointness.
+  - **Full 8-Phase Verification & Hard Coverage Gate:** `cargo test` runs **515+** host tests (unit, property-based `proptest`, full-stack PQ-SSH/KeyVault/Shell/Storage E2E, hardening-ID regression + fuzz-corpus replay, 150-round deterministic all-domain chaos self-healing, capability/crypto/OOM security & stress suites, 114-test `teamwork_e2e`, and rustdoc tests). Dedicated CI workflow (`.github/workflows/verification.yml`) enforces a **hard 75% line-coverage gate** (`cargo xtask coverage --fail-under 75`), **Miri** UB/aliasing checks (`cargo xtask miri`), **Kani** bounded model checking (`cargo xtask verify` across `abi`, `kernel-core`, `ssh`, and `crypto`), **8 libFuzzer targets** (`cargo xtask fuzz`), **mutation testing** (`cargo xtask mutants` with `.cargo/mutants.toml`), **AArch64 ELF binary hardening audit** (`cargo xtask audit-elf`: PIE, W^X 0 RWX, `PT_GNU_RELRO`, 0 EL1 FP arithmetic), **reproducible kernel build checks** (`cargo xtask repro-check`), **multi-profile QEMU matrix** (`cargo xtask qemu-matrix`: `tinykernel`, `--no-net`, `--ipv6-only`), and **nightly endurance soak** (`cargo xtask soak`).
   - **DMA Trust Boundary & Unintegrated Driver Libraries:** `newos-net-pd` holds a kernel-enforced `BOOTSTRAP_IOSPACE` (`DmaMap`/`DmaUnmap` with Normal Non-Cacheable `DMA_FLAG_NON_CACHEABLE` support) alongside NIC MMIO; because Raspberry Pi 5 RP1 Ethernet does not sit behind an ARM SMMUv3, `newos-net-pd` remains part of the DMA TCB on Pi 5. `newos-wdt` (`Bcm2712Watchdog`) is wired into PD 0's interactive Root Supervisor loop (feature-gated by `[drivers].wdt`); the remaining 6 Raspberry Pi 5 hardware driver crates (`newos-gpio`, `newos-board`, `newos-storage`, `newos-usb`, `newos-gpu`, `newos-ai`) are currently unintegrated EL0 driver libraries tested against unit mocks and not yet wired into the boot image.
   - **SSH Protocol & CAOS Hashing Notes:** The SSH server uses private post-quantum algorithm names (`mlkem1024-sha3-512`, `ssh-mldsa87`, `chacha20-poly1305@openssh.com`) with `newos-ssh` (requiring `--fingerprint` by default) and is not wire-compatible with stock OpenSSH clients. CAOS object hashes (`ObjHash`) use a 64-bit prefix of `SHA3-512`; boot module digests are logged as boot-time measurements.
 - **Defense-in-Depth AArch64 Security Hardening:**
@@ -157,7 +157,10 @@ sequenceDiagram
 ```text
 newos/
 ├── rust-toolchain.toml          # Nightly toolchain + rust-src, llvm-tools-preview, aarch64-unknown-none
-├── Cargo.toml                   # Workspace manifest (v0.11.0; v0.10.0 released)
+├── Cargo.toml                   # Workspace manifest (v0.11.0)
+├── .cargo/mutants.toml          # Mutation testing config (`cargo-mutants`) across all host-testable crates
+├── .github/workflows/           # CI (`ci.yml`) + Verification, Coverage Gate, Fuzzing, Mutation & Chaos (`verification.yml`)
+├── fuzz/                        # 8 libFuzzer targets + committed seed corpora (`cargo xtask fuzz`)
 ├── BENCHMARK_RESULTS.md         # Reproducible 28-metric before/after kernel, shell & IPC benchmarks
 ├── profiles/                    # Declarative TOML system composition & TCB profiles (inline-commented) & OPTIONS.md
 │   ├── OPTIONS.md               # Exhaustive reference of all 31 profile options, valid values & dependencies
@@ -197,7 +200,11 @@ newos/
 │   ├── shell-pd/                # Isolated EL0 Typed Pipeline Shell (`newos-shell-pd`), CAOS & SSH shell bridge
 │   └── worker-pd/               # Isolated EL0 worker protection domain (PD 1)
 ├── tests/
-│   ├── e2e/                     # Kernel, shell, crypto, and driver E2E test suites
+│   ├── e2e/                     # Kernel, shell, bench, and full-stack PQ-SSH/KeyVault/Storage E2E suites
+│   ├── proptest/                # Property-based testing suite (`proptest`)
+│   ├── regression/              # Hardening-ID regression suite + deterministic fuzz corpus replay
+│   ├── chaos/                   # 150-round deterministic all-domain chaos & self-healing simulator
+│   ├── security/                # Capability attenuation matrix, crypto KATs, ABI contracts & OOM stress
 │   └── teamwork_e2e/            # 5-tier opaque-box E2E & adversarial verification suite (114 tests)
 └── infra/
     └── startup.sh               # GCP Debian 13 + QEMU aarch64 + Rust nightly dev VM provisioning script
@@ -265,21 +272,31 @@ To boot on a Raspberry Pi 5 (16 GB):
 
 ## Build, Test & Local QEMU Harness
 
-### Host Unit Tests, Miri, Kani, Clippy & Formatting
+### Host Tests, Coverage Gate, Fuzzing, Mutation, Miri, Kani, Clippy & Formatting
 ```bash
-cargo xtask host-test
-cargo xtask miri            # Miri UB / aliasing / provenance checks (core + drivers)
-cargo xtask verify          # Kani bounded model checking proofs (optional)
-cargo fmt --check
+cargo test                         # All unit, E2E, proptest, regression, chaos, security & doc tests
+cargo test --doc                   # Rustdoc examples
+cargo xtask coverage --fail-under 75 # Hard line-coverage gate (cargo-llvm-cov)
+cargo xtask mutants                # Mutation testing (cargo-mutants + .cargo/mutants.toml)
+cargo xtask fuzz --seconds 15      # 8 libFuzzer targets under fuzz/
+cargo xtask miri                   # Miri UB / aliasing / provenance checks (core + drivers)
+cargo xtask verify                 # Kani bounded model checking proofs (abi, kernel-core, ssh)
+cargo xtask bench-check            # Benchmark JSON sanity & NaN/Inf check
+cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-### Automated AArch64 UEFI GPT + Limine + QEMU `virt` Test Suite
+### Automated AArch64 UEFI GPT + Limine + QEMU `virt` Test, Chaos & Hardening Suites
 Requires `qemu-system-aarch64`, `qemu-efi-aarch64` (or `AAVMF` / Homebrew QEMU EDK2), `dosfstools`, `mtools`, and Rust nightly (zero `xorriso` / ISO9660 dependency):
 
 ```bash
 cargo xtask test            # Debug build + QEMU aarch64 boot & 6-phase self-test
 cargo xtask test --release  # Release-optimized build + QEMU aarch64 verification
+cargo xtask chaos           # Host 150-round chaos simulator + QEMU all-domain self-healing
+cargo xtask qemu-matrix     # Boot & verify tinykernel, --no-net, and --ipv6-only profiles
+cargo xtask audit-elf       # Verify PIE, W^X (0 RWX), PT_GNU_RELRO & 0 EL1 FP arithmetic
+cargo xtask repro-check     # Verify deterministic reproducible kernel builds
+cargo xtask soak --cycles 5 # Multi-cycle QEMU endurance soak
 ```
 
 ### Interactive EL0 Shell (`newos-shell-pd`) & Pure Post-Quantum SSH in QEMU `virt`

@@ -569,3 +569,97 @@ impl<T: MmioDmaTransport> Device for VirtioNetDevice<'_, T> {
         caps
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use newos_abi::SysError;
+
+    struct MockVirtioTransport {
+        queue_max: u32,
+        status: AtomicU32,
+    }
+
+    impl MmioDmaTransport for MockVirtioTransport {
+        fn read32(&self, offset: u64) -> Result<u32, SysError> {
+            match offset & 0x1FF {
+                REG_QUEUE_NUM_MAX => Ok(self.queue_max),
+                REG_STATUS => Ok(self.status.load(Ordering::Relaxed)),
+                REG_INTERRUPT_STATUS => Ok(1),
+                _ => Ok(0),
+            }
+        }
+
+        fn write32(&self, offset: u64, val: u32) -> Result<(), SysError> {
+            if (offset & 0x1FF) == REG_STATUS {
+                self.status.store(val, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+
+        fn virt_to_phys<T>(&self, r: &T) -> Result<u64, SysError> {
+            Ok((r as *const T as usize) as u64)
+        }
+    }
+
+    #[test]
+    fn packet_buf_virtio_hdr_tx_rx_roundtrip_various_lengths() {
+        let buf = PacketBuf::new();
+        for len in [0usize, 1, 4, 7, 13, 60, 127, 512, 1514] {
+            let mut frame = [0u8; 1514];
+            for (i, b) in frame[..len].iter_mut().enumerate() {
+                *b = ((i * 31 + 17) & 0xFF) as u8;
+            }
+            buf.write_virtio_tx(&frame[..len]);
+            let mut out = [0u8; 1514];
+            buf.read_virtio_rx(&mut out[..len]);
+            assert_eq!(&out[..len], &frame[..len]);
+        }
+    }
+
+    #[test]
+    fn virtio_net_init_tx_queue_full_and_rx_recycle() {
+        // Queue too small must fail init cleanly
+        let dma = VirtioNetDma::new();
+        let bad_transport = MockVirtioTransport {
+            queue_max: 4,
+            status: AtomicU32::new(0),
+        };
+        assert!(VirtioNetDevice::init(bad_transport, 0, &dma).is_err());
+
+        // Valid init
+        let transport = MockVirtioTransport {
+            queue_max: QUEUE_SIZE as u32,
+            status: AtomicU32::new(0),
+        };
+        let mut dev = VirtioNetDevice::init(transport, 0, &dma).expect("virtio init");
+        assert_eq!(dev.capabilities().medium, Medium::Ethernet);
+        assert!(dev.receive(Instant::ZERO).is_none());
+
+        // Fill all QUEUE_SIZE TX descriptors -> next transmit returns None
+        for i in 0..QUEUE_SIZE {
+            let tx = dev.transmit(Instant::ZERO).expect("tx slot available");
+            tx.consume(64, |b| b.fill(i as u8));
+        }
+        assert!(dev.transmit(Instant::ZERO).is_none());
+
+        // Advance tx_used -> transmit becomes available again
+        dma.tx_used.idx.store(1, Ordering::Release);
+        assert!(dev.transmit(Instant::ZERO).is_some());
+
+        // Simulate device delivering an RX frame in descriptor 0
+        let payload = [0xC3u8; 42];
+        dma.rx_bufs[0].write_virtio_tx(&payload);
+        dma.rx_used.ring[0].id.store(0, Ordering::Relaxed);
+        dma.rx_used.ring[0].len.store(
+            (VIRTIO_NET_HDR_LEN + payload.len()) as u32,
+            Ordering::Relaxed,
+        );
+        dma.rx_used.idx.store(1, Ordering::Release);
+
+        let (rx, _tx) = dev.receive(Instant::ZERO).expect("rx frame delivered");
+        rx.consume(|bytes| {
+            assert_eq!(bytes, &payload[..]);
+        });
+    }
+}

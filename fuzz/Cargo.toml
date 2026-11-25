@@ -1,0 +1,58 @@
+[package]
+name = "newos-fuzz"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+newos-abi = { path = "../crates/abi" }
+newos-crypto = { path = "../crates/crypto" }
+newos-kernel-core = { path = "../crates/kernel-core" }
+newos-net = { path = "../crates/net" }
+newos-shell-core = { path = "../crates/shell-core" }
+newos-ssh-proto = { path = "../crates/ssh" }
+xtask = { path = "../xtask" }
+
+[[bin]]
+name = "fuzz_ssh_wire"
+path = "fuzz_targets/fuzz_ssh_wire.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_elf_loader"
+path = "fuzz_targets/fuzz_elf_loader.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_acpi_tables"
+path = "fuzz_targets/fuzz_acpi_tables.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_shell_parser"
+path = "fuzz_targets/fuzz_shell_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_net_packets"
+path = "fuzz_targets/fuzz_net_packets.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_abi_ipc"
+path = "fuzz_targets/fuzz_abi_ipc.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_aead_decrypt"
+path = "fuzz_targets/fuzz_aead_decrypt.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_gpt_profile"
+path = "fuzz_targets/fuzz_gpt_profile.rs"
+doc = false

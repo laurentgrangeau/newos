@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["fuzz"]
 members = [
     "xtask",
     "crates/crypto",
@@ -68,6 +69,7 @@ newos-net = { path = "crates/net" }
 newos-rng = { path = "crates/rng" }
 newos-shell-core = { path = "crates/shell-core" }
 newos-ssh-proto = { path = "crates/ssh" }
+newos-storage = { path = "crates/storage" }
 newos-user-rt = { path = "crates/user-rt" }
 
 [profile.dev.package.newos-crypto]
@@ -89,7 +91,7 @@ overflow-checks = true
 [workspace.lints.rust]
 unsafe_code = "forbid"
 unsafe_op_in_unsafe_fn = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)'] }
 
 [workspace.lints.clippy]
 all = "warn"

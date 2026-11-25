@@ -7,17 +7,21 @@ use core::fmt::Write;
 use core::ops::{Deref, DerefMut};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "userspace")]
+use newos_abi::DomainRoleId;
 use newos_abi::{
-    CAP_MINT_SET_BADGE, CapId, DmaCacheOp, DomainRoleId, IrqTriggerMode, NOTIFY_WAIT_TIMEOUT,
-    ObjectType, RING_PEER_RESET_BIT, Rights, ShutdownStatus, SysError, SyscallNumber,
+    CAP_MINT_SET_BADGE, CapId, DmaCacheOp, IrqTriggerMode, NOTIFY_WAIT_TIMEOUT, ObjectType,
+    RING_PEER_RESET_BIT, Rights, ShutdownStatus, SysError, SyscallNumber,
 };
+use newos_kernel_core::DomainRole;
 use newos_kernel_core::ipc::{KernelIpcState, MAX_ENDPOINTS, MAX_IPC_DOMAINS};
 use newos_kernel_core::memory::{
     FrameMappingTracker, PAGE_MASK, PAGE_SIZE, PageFlags, PhysAddr, PhysFrame, UntypedInventory,
     VSpaceMapper, VirtAddr,
 };
 use newos_kernel_core::sched::{DEFAULT_PRIORITY, Scheduler};
-use newos_kernel_core::{DomainRole, USER_PQ_STACK_PAGES, USER_STACK_PAGES};
+#[cfg(feature = "userspace")]
+use newos_kernel_core::{USER_PQ_STACK_PAGES, USER_STACK_PAGES};
 
 use super::serial;
 
@@ -558,6 +562,7 @@ struct FaultRecord {
 #[derive(Clone, Copy)]
 struct DomainSlot {
     active: bool,
+    pending_destroy: bool,
     role: DomainRole,
     ttbr0: u64,
     wait: IpcWaitState,
@@ -580,6 +585,7 @@ struct DomainSlot {
 impl DomainSlot {
     const EMPTY: Self = Self {
         active: false,
+        pending_destroy: false,
         role: DomainRole::Worker,
         ttbr0: 0,
         wait: IpcWaitState::Runnable,
@@ -847,6 +853,7 @@ pub fn register_domain(
     frame.spsr_el1 = 0; // EL0t, DAIF unmasked
     table.domains[pd_id] = DomainSlot {
         active: true,
+        pending_destroy: false,
         role,
         ttbr0,
         wait: IpcWaitState::Runnable,
@@ -879,10 +886,12 @@ pub fn register_domain(
         }
         DomainRole::Shell => {
             ipc.init_shell_pd_bootstrap_caps(pd_id)?;
+            let _ = ipc.register_child_thread_cap_in_root(40, pd_id)?;
             let _ = ipc.register_child_caps_in_root(pd_id)?;
         }
         DomainRole::Worker => {
             let _ = ipc.init_worker_pd_bootstrap_caps(pd_id)?;
+            let _ = ipc.register_child_thread_cap_in_root(41, pd_id)?;
             let _ = ipc.register_child_caps_in_root(pd_id)?;
         }
         DomainRole::Net => {
@@ -900,6 +909,7 @@ pub fn register_domain(
             if let Some(dma_pa) = ensure_shared_ring_frame(&NET_DMA_RING_PHYS) {
                 let _ = ipc.register_bootstrap_frame_cap(pd_id, 39, dma_pa);
             }
+            let _ = ipc.register_child_thread_cap_in_root(42, pd_id)?;
             let _ = ipc.register_child_caps_in_root(pd_id)?;
         }
         DomainRole::Key => {
@@ -917,6 +927,7 @@ pub fn register_domain(
             if let Some(ring_pa) = ensure_shared_ring_frame(&SSH_KEY_RING_PHYS) {
                 let _ = ipc.register_bootstrap_frame_cap(pd_id, 37, ring_pa);
             }
+            let _ = ipc.register_child_thread_cap_in_root(43, pd_id)?;
             let _ = ipc.register_child_caps_in_root(pd_id)?;
         }
         DomainRole::Ssh => {
@@ -927,6 +938,7 @@ pub fn register_domain(
             if let Some(ring_pa) = ensure_shared_ring_frame(&SSH_KEY_RING_PHYS) {
                 let _ = ipc.register_bootstrap_frame_cap(pd_id, 37, ring_pa);
             }
+            let _ = ipc.register_child_thread_cap_in_root(44, pd_id)?;
             let _ = ipc.register_child_caps_in_root(pd_id)?;
         }
     }
@@ -1262,6 +1274,45 @@ pub extern "C" fn irq_el0_dispatch(frame: &mut TrapFrame) {
     if let Some(id) = iar {
         super::gic::end_of_interrupt(id);
     }
+    // Cross-core SMP `DomainDestroy` handshake: if another core marked our currently running
+    // domain `pending_destroy`, immediately deschedule off this core so it can be torn down safely.
+    let mut should_park = false;
+    {
+        let mut table = DOMAINS.lock();
+        if let Some(cur) = table.current_for_this_cpu()
+            && table.domains[cur].pending_destroy
+        {
+            let cpu = (super::get_cpu_id() as usize).min(MAX_CPUS - 1);
+            table.domains[cur].frame = *frame;
+            save_fp_state(&mut table.domains[cur].fp);
+            table.domains[cur].tpidr_el0 = read_tpidr_el0();
+            table.domains[cur].running_on = None;
+            table.cpu_current[cpu] = None;
+            if let Some(next) = table.pick_next_runnable(cur) {
+                table.domains[next].running_on = Some(cpu);
+                table.cpu_current[cpu] = Some(next);
+                switch_ttbr0(table.domains[next].ttbr0, next);
+                restore_fp_state(&table.domains[next].fp);
+                write_tpidr_el0(table.domains[next].tpidr_el0);
+                *frame = table.domains[next].frame;
+            } else {
+                // SAFETY: Detach the dying domain's `TTBR0_EL1` (and ASID) from this CPU before
+                // releasing `DOMAINS.lock()` so `teardown_domain_locked` on another core can
+                // safely free/zero the page tables and invalidate the ASID without stale walks.
+                unsafe {
+                    asm!(
+                        "msr ttbr0_el1, xzr",
+                        "isb",
+                        options(nostack, preserves_flags)
+                    );
+                }
+                should_park = true;
+            }
+        }
+    }
+    if should_park {
+        park_cpu_until_runnable(frame);
+    }
 }
 
 /// Page-table-validated, PAN-safe copy from an EL0 buffer in `ttbr0` into an EL1 slice via HHDM.
@@ -1372,6 +1423,42 @@ fn teardown_domain_locked(table: &mut DomainTable, pd_id: usize) {
         // zero and reclaim every ELF, stack, shadow-stack, `MapPage`, and page-table frame.
         let mut batch = [None; 8];
         while mappings.drain_for_vspace(PhysAddr::new(ttbr0), &mut batch) > 0 {}
+        // Quiesce VirtIO-MMIO DMA engines (`REG_STATUS = 0`) BEFORE reclaiming the dying
+        // driver domain's physical frames so QEMU/hardware cannot DMA into freed page tables.
+        if IS_QEMU_VIRT.load(Ordering::Acquire) {
+            if dying_role == DomainRole::Net {
+                let net_virt = NET_MMIO_VIRT.load(Ordering::Acquire);
+                let net_len = NET_MMIO_LEN.load(Ordering::Acquire);
+                if net_virt != 0 && net_len >= 0x200 {
+                    let slots = (net_len / 0x200).min(32);
+                    for s in 0..slots {
+                        let base = net_virt + s * 0x200;
+                        // SAFETY: `NET_MMIO_VIRT..NET_MMIO_VIRT+NET_MMIO_LEN` is the kernel-mapped
+                        // VirtIO-MMIO window; resetting `REG_STATUS` (`0x70`) to 0 stops DMA.
+                        unsafe {
+                            let magic = core::ptr::read_volatile(base as *const u32);
+                            let dev_id = core::ptr::read_volatile((base + 0x008) as *const u32);
+                            if magic == 0x7472_6976 && dev_id == 1 {
+                                core::ptr::write_volatile((base + 0x070) as *mut u32, 0);
+                            }
+                        }
+                    }
+                }
+            } else if dying_role == DomainRole::Key {
+                let rng_virt = RNG_MMIO_VIRT.load(Ordering::Acquire);
+                let rng_len = RNG_MMIO_LEN.load(Ordering::Acquire);
+                if rng_virt != 0 && rng_len >= 0x100 {
+                    // SAFETY: `RNG_MMIO_VIRT` is the kernel-mapped VirtIO-RNG MMIO slot.
+                    unsafe {
+                        let magic = core::ptr::read_volatile(rng_virt as *const u32);
+                        let dev_id = core::ptr::read_volatile((rng_virt + 0x008) as *const u32);
+                        if magic == 0x7472_6976 && dev_id == 4 {
+                            core::ptr::write_volatile((rng_virt + 0x070) as *mut u32, 0);
+                        }
+                    }
+                }
+            }
+        }
         let mut vs = super::paging::Aarch64VSpace::from_root_phys(ttbr0, hhdm);
         vs.reclaim_all_user_frames(|frame, is_table| {
             if is_table {
@@ -1441,6 +1528,131 @@ fn teardown_domain_locked(table: &mut DomainTable, pd_id: usize) {
         cleanup_orphaned_irqs(&ipc);
         super::paging::tlbi_asid(asid);
     }
+}
+
+const MAX_SUPERVISOR_RESPAWNS: u64 = 5;
+static SUPERVISOR_RESPAWN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(not(feature = "userspace"))]
+fn respawn_supervisor_fresh_vspace(_frame: &mut TrapFrame) -> bool {
+    false
+}
+
+/// Reload PD 0 (`supervisor-pd`) from its immutable boot ELF into a brand-new `TTBR0_EL1` VSpace
+/// with fresh ASLR slides while preserving PD 0's `CSpace` (zero disruption to running child PDs),
+/// reclaiming all frames of the old PD 0 VSpace, and signaling `SUPERVISOR_RESPAWNED_BIT`.
+#[cfg(feature = "userspace")]
+fn respawn_supervisor_fresh_vspace(frame: &mut TrapFrame) -> bool {
+    let prev = SUPERVISOR_RESPAWN_COUNT.fetch_add(1, Ordering::AcqRel);
+    if prev >= MAX_SUPERVISOR_RESPAWNS {
+        let mut s = serial::Pl011::new();
+        let _ = writeln!(
+            s,
+            "[newos-hal] FATAL: supervisor-pd exceeded max fresh-VSpace respawns ({MAX_SUPERVISOR_RESPAWNS}); halting"
+        );
+        return false;
+    }
+    let Some(elf_bytes) = find_boot_module(DomainRole::Supervisor) else {
+        return false;
+    };
+    let entropy = super::next_aslr_entropy();
+    let stack_slide = (entropy & 0xFF) * PAGE_SIZE;
+    let pie_base = 0x0040_0000u64 + (((entropy >> 8) & 0xFF) * PAGE_SIZE);
+    let shadow_slide = ((entropy >> 16) & 0xFF) * PAGE_SIZE;
+    let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
+    let loaded = {
+        let mut untyped = RUNTIME_UNTYPED.lock();
+        let root_vs = super::paging::Aarch64VSpace::from_current_ttbr1(hhdm);
+        root_vs.new_user_vspace(&mut untyped).and_then(|mut vs| {
+            match newos_kernel_core::load_elf64_into_vspace(
+                &mut vs,
+                elf_bytes,
+                &mut untyped,
+                pie_base,
+                stack_slide,
+                shadow_slide,
+                USER_STACK_PAGES,
+            ) {
+                Ok((entry, user_sp, user_shadow_sp, _segs)) => {
+                    Ok((entry, user_sp, user_shadow_sp, vs.root_phys()))
+                }
+                Err(e) => {
+                    vs.reclaim_all_user_frames(|fr, _is_table| {
+                        let _ = untyped.reclaim_frame(fr);
+                    });
+                    Err(e)
+                }
+            }
+        })
+    };
+    let Ok((entry, user_sp, user_shadow_sp, new_root)) = loaded else {
+        return false;
+    };
+    let new_ttbr0 = new_root.raw();
+    let mut new_frame = TrapFrame::ZERO;
+    new_frame.x[18] = user_shadow_sp.raw();
+    new_frame.elr_el1 = entry.raw();
+    new_frame.sp_el0 = user_sp.raw();
+    new_frame.spsr_el1 = 0;
+
+    // Switch TTBR0_EL1 to the new VSpace before zeroing & reclaiming the old VSpace.
+    switch_ttbr0(new_ttbr0, 0);
+    super::paging::tlbi_asid(1);
+    restore_fp_state(&FpState::ZERO);
+    write_tpidr_el0(0);
+
+    {
+        // Lock order: DOMAINS -> IPC_STATE -> RUNTIME_UNTYPED -> FRAME_MAPPINGS.
+        let mut table = DOMAINS.lock();
+        let old_ttbr0 = table.domains[0].ttbr0;
+        table.domains[0].ttbr0 = new_ttbr0;
+        table.domains[0].fault_pc = 0;
+        table.domains[0].fault_sp = 0;
+        table.domains[0].shadow_sp = user_shadow_sp.raw();
+        table.domains[0].tpidr_el0 = 0;
+        table.domains[0].fp = FpState::ZERO;
+        table.domains[0].wait = IpcWaitState::Runnable;
+        table.domains[0].wait_ep_id = 0;
+        table.domains[0].wait_notif_id = 0;
+        table.domains[0].wait_notif_mask = 0;
+        table.domains[0].sleep_deadline_ticks = None;
+        table.domains[0].frame = new_frame;
+
+        let mut ipc = IPC_STATE.lock();
+        let _ = ipc.bind_bootstrap_vspace(0, new_root);
+        let _ = ipc.notify_signal_id(1, newos_abi::supervisor_notif::SUPERVISOR_RESPAWNED_BIT);
+
+        let mut untyped = RUNTIME_UNTYPED.lock();
+        let mut mappings = FRAME_MAPPINGS.lock();
+        let mut batch = [None; 8];
+        while mappings.drain_for_vspace(PhysAddr::new(old_ttbr0), &mut batch) > 0 {}
+        let mut old_vs = super::paging::Aarch64VSpace::from_root_phys(old_ttbr0, hhdm);
+        old_vs.reclaim_all_user_frames(|fr, is_table| {
+            if is_table {
+                let _ = untyped.reclaim_frame(fr);
+            } else {
+                let pa = fr.start_addr();
+                if !ipc.has_live_frame_cap(pa)
+                    && !mappings.has_mapping_for_phys(pa)
+                    && !mappings.is_dma_pinned(pa)
+                {
+                    let zeroer = super::paging::Aarch64VSpace::from_root_phys(old_ttbr0, hhdm);
+                    zeroer.zero_frame(&fr);
+                    mappings.clear_ever_written(pa);
+                    let _ = untyped.reclaim_frame(fr);
+                }
+            }
+        });
+    }
+
+    *frame = new_frame;
+    let mut s = serial::Pl011::new();
+    let _ = writeln!(
+        s,
+        "[newos-hal] respawned supervisor-pd (pd=0) into fresh TTBR0_EL1 (ttbr0={new_ttbr0:#018x}, attempt={})",
+        prev + 1
+    );
+    true
 }
 
 /// Park this CPU in low-power WFI until another runnable EL0 process can be claimed (`P2`/`P9`).
@@ -1605,6 +1817,9 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 park_cpu_until_runnable(frame);
                 return;
             }
+        }
+        if cur_pd == 0 && respawn_supervisor_fresh_vspace(frame) {
+            return;
         }
         let mut s = serial::Pl011::new();
         let _ = writeln!(
@@ -2354,6 +2569,12 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
         }
         SyscallNumber::TimerFreq => Ok(read_cntfrq()),
         SyscallNumber::ThreadExit => {
+            if cur_pd == 0 {
+                if respawn_supervisor_fresh_vspace(frame) {
+                    return;
+                }
+                super::system_off(ShutdownStatus::Failed);
+            }
             let mut table = DOMAINS.lock();
             teardown_domain_locked(&mut table, cur_pd);
             if let Some(next) = table.pick_next_runnable(cur_pd) {
@@ -2685,6 +2906,9 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                                         );
                                         match res {
                                             Ok(new_pd) => {
+                                                super::paging::tlbi_asid(
+                                                    ((new_pd + 1) as u16).max(1),
+                                                );
                                                 reset_shared_rings_for_role(role);
                                                 super::smp::wake_idle_aps();
                                                 Ok(new_pd as u64)
@@ -2729,8 +2953,18 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                     Err(SysError::InvalidArgument)
                 }
                 Ok(target_pd) => {
-                    teardown_domain_locked(&mut table, target_pd);
-                    Ok(0)
+                    if table.domains[target_pd].running_on.is_some() {
+                        // Mark `pending_destroy` + block in scheduler, then SGI remote cores so
+                        // `irq_el0_dispatch` immediately deschedules `target_pd` off its core.
+                        table.domains[target_pd].pending_destroy = true;
+                        let _ = table.sched.block_slot(target_pd);
+                        drop(table);
+                        super::smp::wake_idle_aps();
+                        Err(SysError::WouldBlock)
+                    } else {
+                        teardown_domain_locked(&mut table, target_pd);
+                        Ok(0)
+                    }
                 }
             }
         }

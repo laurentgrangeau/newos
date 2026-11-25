@@ -264,3 +264,126 @@ impl<E: EntropySource> ConditionedCsprng<E> {
         self.key
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct SplitMixEntropy(u64);
+    impl EntropySource for SplitMixEntropy {
+        fn fill_entropy(&mut self, dst: &mut [u8]) -> Result<(), RngError> {
+            for b in dst.iter_mut() {
+                self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                *b = (z ^ (z >> 31)) as u8;
+            }
+            Ok(())
+        }
+    }
+
+    struct FailingEntropy;
+    impl EntropySource for FailingEntropy {
+        fn fill_entropy(&mut self, _dst: &mut [u8]) -> Result<(), RngError> {
+            Err(RngError::HardwareFault)
+        }
+    }
+
+    fn good_sample(seed: u64) -> [u8; SEED_BLOCK_BYTES] {
+        let mut s = [0u8; SEED_BLOCK_BYTES];
+        SplitMixEntropy(seed).fill_entropy(&mut s).unwrap();
+        s
+    }
+
+    #[test]
+    fn health_check_rejects_rct_apt_low_diversity_linear_and_periodic() {
+        // Valid high-entropy sample passes
+        assert_eq!(verify_entropy_health(&good_sample(0x1234)), Ok(()));
+
+        // 1. All-zero & RCT (>= 6 consecutive identical bytes)
+        assert_eq!(
+            verify_entropy_health(&[0u8; SEED_BLOCK_BYTES]),
+            Err(RngError::HealthCheckFailed)
+        );
+        let mut rct = good_sample(0x2345);
+        rct[10..16].fill(0xAA);
+        assert_eq!(
+            verify_entropy_health(&rct),
+            Err(RngError::HealthCheckFailed)
+        );
+
+        // 2. APT (> 16 occurrences of one byte value, non-consecutive)
+        let mut apt = good_sample(0x3456);
+        for i in 0..17 {
+            apt[i * 3] = 0x55;
+        }
+        assert_eq!(
+            verify_entropy_health(&apt),
+            Err(RngError::HealthCheckFailed)
+        );
+
+        // 3. Low diversity (< 16 unique values, e.g. 8-byte non-repeating-period mix)
+        let mut low_div = [0u8; SEED_BLOCK_BYTES];
+        for (i, slot) in low_div.iter_mut().enumerate() {
+            *slot = ((i * 7 + (i / 8)) % 10) as u8;
+        }
+        assert_eq!(
+            verify_entropy_health(&low_div),
+            Err(RngError::HealthCheckFailed)
+        );
+
+        // 4. Linear monotonic counter (0, 1, 2, ..., 63)
+        let mut linear = [0u8; SEED_BLOCK_BYTES];
+        for (i, slot) in linear.iter_mut().enumerate() {
+            *slot = i as u8;
+        }
+        assert_eq!(
+            verify_entropy_health(&linear),
+            Err(RngError::HealthCheckFailed)
+        );
+
+        // 5. Periodic cycle (period = 32: second half equals first half)
+        let mut periodic = good_sample(0x4567);
+        for i in 0..32 {
+            periodic[32 + i] = periodic[i];
+        }
+        assert_eq!(
+            verify_entropy_health(&periodic),
+            Err(RngError::HealthCheckFailed)
+        );
+    }
+
+    #[test]
+    fn csprng_fast_key_erasure_empty_fill_reseed_and_hardware_fault() {
+        assert!(ConditionedCsprng::new(FailingEntropy, b"fail").is_err());
+
+        let mut rng = ConditionedCsprng::new(SplitMixEntropy(0xCAFE), b"csprng-unit").unwrap();
+        let k0 = rng.debug_key_snapshot();
+
+        // Empty fill is a no-op and preserves key
+        rng.fill_bytes(&mut []).unwrap();
+        assert_eq!(rng.debug_key_snapshot(), k0);
+
+        // Single fill mutates key (fast-key-erasure) and produces non-zero output
+        let mut out1 = [0u8; 48];
+        rng.fill_bytes(&mut out1).unwrap();
+        let k1 = rng.debug_key_snapshot();
+        assert_ne!(k0, k1);
+
+        let mut out2 = [0u8; 48];
+        rng.fill_bytes(&mut out2).unwrap();
+        assert_ne!(out1, out2);
+
+        // Explicit reseed advances key and resets byte counter
+        let k2 = rng.debug_key_snapshot();
+        rng.reseed().unwrap();
+        assert_ne!(rng.debug_key_snapshot(), k2);
+
+        // Crossing RESEED_INTERVAL_BYTES triggers automatic reseed cleanly
+        let mut big = [0u8; 1024];
+        for _ in 0..65 {
+            rng.fill_bytes(&mut big).unwrap();
+        }
+    }
+}

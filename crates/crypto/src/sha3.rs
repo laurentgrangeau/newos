@@ -195,6 +195,14 @@ fn absorb_shake256_block(state: &mut [u64; 25], block: &[u8; SHAKE256_RATE_BYTES
 
 /// Compute FIPS 202 **SHAKE256** XOF over `input`, writing arbitrary-length output into `out`
 /// without heap allocation.
+///
+/// ```
+/// use newos_crypto::sha3::shake256;
+///
+/// let mut out = [0u8; 32];
+/// shake256(b"abc", &mut out);
+/// assert_eq!(&out[..4], &[0x48, 0x33, 0x66, 0x60]);
+/// ```
 pub fn shake256(input: &[u8], out: &mut [u8]) {
     let mut state = [0u64; 25];
     let mut pos = 0;

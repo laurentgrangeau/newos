@@ -794,13 +794,12 @@ extern "C" fn supervisor_recover() -> ! {
             if info.interactive_shell {
                 let _ = writeln!(
                     out,
-                    "[supervisor-pd] recovered from EL0 fault (bits={:#x}) — restarting `newos-shell-pd`!",
+                    "[supervisor-pd] recovered from EL0 fault (bits={:#x}) — resuming root supervisor!",
                     bits
                 );
                 out.flush();
                 let _ = newos_user_rt::set_fault_handler(supervisor_recover);
-                let mut sh = Shell::new(SupervisorShellHost::new());
-                sh.run_interactive()
+                run_root_supervisor(&mut out)
             } else if bits == (1 << 6) {
                 let _ = writeln!(
                     out,
@@ -984,11 +983,50 @@ fn run_root_supervisor(out: &mut BufferedConsole<1024>) -> ! {
     }
 }
 
+fn destroy_domain_retry(thread_cap: CapId) -> Result<(), SysError> {
+    for attempt in 0..250usize {
+        match newos_user_rt::domain_destroy(thread_cap) {
+            Ok(()) => return Ok(()),
+            Err(SysError::WouldBlock) => {
+                if attempt < 16 {
+                    let _ = newos_user_rt::yield_now();
+                } else {
+                    let _ = newos_user_rt::sleep_ms(2);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(SysError::WouldBlock)
+}
+
 pub fn main() -> ! {
     let mut out = BufferedConsole::<1024>::new();
     let mut log_rx = IpcLogAssembler::<256>::new();
     let info = newos_user_rt::sys_info();
     let _ = newos_user_rt::set_fault_handler(supervisor_recover);
+
+    let boot_notif = newos_user_rt::notify_poll(CapId::BOOTSTRAP_FAULT_NOTIF).unwrap_or(0);
+    if (boot_notif & newos_abi::supervisor_notif::SUPERVISOR_RESPAWNED_BIT) != 0 {
+        if info.interactive_shell {
+            let _ = writeln!(
+                out,
+                "[supervisor-pd] resumed in fresh TTBR0_EL1 VSpace after PD 0 respawn"
+            );
+            out.flush();
+            run_root_supervisor(&mut out)
+        }
+        let _ = writeln!(
+            out,
+            "[supervisor-pd] Phase 2c PD 0 fresh-VSpace respawn: OK"
+        );
+        let _ = writeln!(
+            out,
+            "[supervisor-pd] triggering deliberate EL0 hardware fault (`udf #0`) to verify crash isolation..."
+        );
+        out.flush();
+        newos_user_rt::trigger_user_fault()
+    }
 
     if info.interactive_shell {
         // Standalone `newos-shell-pd` runs in its own isolated EL0 process; PD 0 serves as the
@@ -1335,9 +1373,19 @@ pub fn main() -> ! {
     );
 
     // Phase 2 Chaos Respawn & Zero-Leak Reclamation self-test:
+    // First confirm no child protection domain faulted unexpectedly during boot (e.g., stack overflow).
+    let pre_phase2_faults = newos_user_rt::notify_poll(CapId::BOOTSTRAP_FAULT_NOTIF).unwrap_or(0)
+        & newos_abi::supervisor_notif::FAULT_PD_MASK;
+    if pre_phase2_faults != 0 {
+        let _ = writeln!(
+            out,
+            "[supervisor-pd] FAIL: unexpected boot EL0 fault bits before Phase 2 ({pre_phase2_faults:#x})"
+        );
+        out.flush();
+        newos_user_rt::exit(ShutdownStatus::Failed);
+    }
     // Deliberately crash `worker` twice via `udf #0` (`0xDEAD_C0DE`), verify fault notification +
     // `DomainGetFaultInfo`, verify `DomainRespawn` restores IPC service, and prove exact 0-frame leak.
-    let _ = newos_user_rt::notify_poll(CapId::BOOTSTRAP_FAULT_NOTIF);
     let mut rem_after_cycle = [0u64; 2];
     for cycle in 0..2usize {
         if newos_user_rt::ipc_call(CapId::BOOTSTRAP_EP, 0xDEAD_C0DE)
@@ -1433,6 +1481,115 @@ pub fn main() -> ! {
         rem_after_cycle[1]
     );
 
+    // Phase 2b All-Server Chaos Respawn & Zero-Leak Verification:
+    // Destroy and respawn every isolated permanent server (Shell, Net, Key, Ssh) via its
+    // deterministic child `Thread` capability and verify frame reclamation + post-respawn liveness.
+    {
+        let servers = [
+            (
+                "Shell",
+                CapId::BOOTSTRAP_SHELL_THREAD,
+                newos_abi::DomainRoleId::Shell,
+            ),
+            (
+                "Net",
+                CapId::BOOTSTRAP_NET_THREAD,
+                newos_abi::DomainRoleId::Net,
+            ),
+            (
+                "Key",
+                CapId::BOOTSTRAP_KEY_THREAD,
+                newos_abi::DomainRoleId::Key,
+            ),
+            (
+                "Ssh",
+                CapId::BOOTSTRAP_SSH_THREAD,
+                newos_abi::DomainRoleId::Ssh,
+            ),
+        ];
+        let mut respawned_count = 0usize;
+        #[cfg(all(feature = "net", feature = "ipv4", feature = "icmp"))]
+        let mut net_respawned = false;
+        for (name, cap, role) in servers {
+            match destroy_domain_retry(cap) {
+                Ok(()) => {}
+                Err(SysError::InvalidCapability) => continue,
+                Err(e) => {
+                    let _ = writeln!(
+                        out,
+                        "[supervisor-pd] FAIL: Phase 2b DomainDestroy({name}) error: {e:?}"
+                    );
+                    out.flush();
+                    newos_user_rt::exit(ShutdownStatus::Failed);
+                }
+            }
+            let Ok((_rem, reclaimed)) = newos_user_rt::mem_stats() else {
+                let _ = writeln!(out, "[supervisor-pd] FAIL: Phase 2b MemStats({name})");
+                out.flush();
+                newos_user_rt::exit(ShutdownStatus::Failed);
+            };
+            if reclaimed == 0 {
+                let _ = writeln!(
+                    out,
+                    "[supervisor-pd] FAIL: Phase 2b expected reclaimed frames > 0 after destroying {name}"
+                );
+                out.flush();
+                newos_user_rt::exit(ShutdownStatus::Failed);
+            }
+            if let Err(e) = newos_user_rt::domain_respawn(role) {
+                let _ = writeln!(
+                    out,
+                    "[supervisor-pd] FAIL: Phase 2b DomainRespawn({name}) error: {e:?}"
+                );
+                out.flush();
+                newos_user_rt::exit(ShutdownStatus::Failed);
+            }
+            respawned_count += 1;
+            #[cfg(all(feature = "net", feature = "ipv4", feature = "icmp"))]
+            if role == newos_abi::DomainRoleId::Net {
+                net_respawned = true;
+            }
+        }
+        if respawned_count > 0 {
+            let _ = newos_user_rt::sleep_ms(30);
+            let post_faults = newos_user_rt::notify_poll(CapId::BOOTSTRAP_FAULT_NOTIF).unwrap_or(0)
+                & newos_abi::supervisor_notif::FAULT_PD_MASK;
+            if post_faults != 0 {
+                let _ = writeln!(
+                    out,
+                    "[supervisor-pd] FAIL: Phase 2b unexpected fault after server respawn ({post_faults:#x})"
+                );
+                out.flush();
+                newos_user_rt::exit(ShutdownStatus::Failed);
+            }
+        }
+        #[cfg(all(feature = "net", feature = "ipv4", feature = "icmp"))]
+        if net_respawned {
+            // Wait briefly for respawned `net-pd` to re-initialize VirtIO-Net and respond on BOOTSTRAP_NET_EP.
+            let mut ping_ok = false;
+            for _ in 0..20usize {
+                if net_pd_ping([10, 0, 2, 2]).is_ok() {
+                    ping_ok = true;
+                    break;
+                }
+                let _ = newos_user_rt::sleep_ms(25);
+            }
+            if !ping_ok {
+                let _ = writeln!(
+                    out,
+                    "[supervisor-pd] FAIL: Phase 2b respawned net-pd did not pass live ICMP ping"
+                );
+                out.flush();
+                newos_user_rt::exit(ShutdownStatus::Failed);
+            }
+        }
+        let _ = writeln!(
+            out,
+            "[supervisor-pd] Phase 2b multi-server chaos respawn (respawned={respawned_count}): OK"
+        );
+        out.flush();
+    }
+
     // Phase 3a On-Target AArch64 Cycle & Tail-Latency Benchmark Suite (256 samples each):
     // Measures real EL0<->EL1<->EL0 IpcCall round-trip, NotifySignal+NotifyWait fastpath,
     // and shared-memory SpscRing 4 KiB framed byte burst on AArch64 CNTVCT_EL0.
@@ -1488,11 +1645,13 @@ pub fn main() -> ! {
         );
     }
 
-    // Deliberate EL0 hardware fault (`udf #0`) -> supervisor recovery
+    // Phase 2c: Request a full fresh-VSpace PD 0 respawn via `ThreadExit`.
+    // On re-entry, `main()` observes `SUPERVISOR_RESPAWNED_BIT`, logs Phase 2c OK, and triggers
+    // the deliberate `udf #0` EL0 fault to verify in-place `supervisor_recover()` as well.
     let _ = writeln!(
         out,
-        "[supervisor-pd] triggering deliberate EL0 hardware fault (`udf #0`) to verify crash isolation..."
+        "[supervisor-pd] triggering fresh-VSpace PD 0 respawn (`ThreadExit`) to verify supervisor self-healing..."
     );
     out.flush();
-    newos_user_rt::trigger_user_fault()
+    newos_user_rt::thread_exit()
 }

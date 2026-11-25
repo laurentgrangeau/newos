@@ -417,6 +417,29 @@ impl<const SLOTS: usize> CNode<SLOTS> {
         }
     }
 
+    /// Install or rebind a root `CapObject::Thread { id }` capability at fixed `slot`
+    /// while preserving generation 1 across `DomainRespawn` cycles.
+    pub fn bind_thread_at(&mut self, slot: usize, thread_id: u32) -> Result<CapId, SysError> {
+        if slot == 0 || slot >= self.slots.len() {
+            return Err(SysError::InvalidArgument);
+        }
+        if let Some(cap) = self.slots[slot].cap.as_mut() {
+            match &mut cap.object {
+                CapObject::Thread { id } => {
+                    *id = thread_id;
+                    let generation = self.slots[slot].generation;
+                    Ok(CapId::new(((generation as u64) << 32) | (slot as u64)))
+                }
+                _ => Err(SysError::SlotOccupied),
+            }
+        } else {
+            self.insert_root_at(
+                slot,
+                Capability::new(CapObject::Thread { id: thread_id }, Rights::ALL),
+            )
+        }
+    }
+
     /// Bind the target `UntypedInventory` region index on an existing `CapObject::Untyped` cap during boot.
     pub fn bind_untyped_region(&mut self, id: CapId, region_index: u16) -> Result<(), SysError> {
         let (idx, _) = self.validate_cap(id)?;

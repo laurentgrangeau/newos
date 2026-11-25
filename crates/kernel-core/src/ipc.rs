@@ -545,6 +545,19 @@ impl KernelIpcState {
         Ok((thread_cap, cnode_cap))
     }
 
+    /// Install or refresh a deterministic child `Thread` capability at fixed `slot` (e.g., slots
+    /// `40..=44` for `BOOTSTRAP_{SHELL,WORKER,NET,KEY,SSH}_THREAD`) in PD 0's `CSpace`.
+    pub fn register_child_thread_cap_in_root(
+        &mut self,
+        slot: usize,
+        child_pd: usize,
+    ) -> Result<CapId, SysError> {
+        if child_pd == 0 || child_pd >= MAX_IPC_DOMAINS {
+            return Err(SysError::InvalidArgument);
+        }
+        self.root_cspace.bind_thread_at(slot, child_pd as u32)
+    }
+
     /// Validate a `Thread` capability in `pd_id`'s `CSpace`, returning the designated target `pd_id`.
     #[inline]
     pub fn validate_thread_for(
@@ -2631,6 +2644,41 @@ mod tests {
         assert_eq!(
             newos_abi::supervisor_notif::decode_shutdown(consumed),
             Some(newos_abi::ShutdownStatus::Success)
+        );
+    }
+
+    #[test]
+    fn register_child_thread_cap_in_root_rebinds_without_bumping_generation() {
+        let mut ipc = KernelIpcState::new();
+        let _ = ipc.init_bootstrap_caps(None).expect("bootstrap");
+
+        let cap1 = ipc
+            .register_child_thread_cap_in_root(42, 3)
+            .expect("initial net thread cap");
+        assert_eq!(cap1, CapId::BOOTSTRAP_NET_THREAD);
+        assert_eq!(
+            ipc.validate_thread_for(0, CapId::BOOTSTRAP_NET_THREAD, Rights::WRITE),
+            Ok(3)
+        );
+
+        // Respawn into a different PD slot rebinds in-place while preserving CapId generation 1.
+        let cap2 = ipc
+            .register_child_thread_cap_in_root(42, 5)
+            .expect("rebind net thread cap");
+        assert_eq!(cap2, CapId::BOOTSTRAP_NET_THREAD);
+        assert_eq!(
+            ipc.validate_thread_for(0, CapId::BOOTSTRAP_NET_THREAD, Rights::WRITE),
+            Ok(5)
+        );
+
+        // Reject PD 0 and out-of-range slots.
+        assert_eq!(
+            ipc.register_child_thread_cap_in_root(42, 0),
+            Err(SysError::InvalidArgument)
+        );
+        assert_eq!(
+            ipc.register_child_thread_cap_in_root(1, 3),
+            Err(SysError::SlotOccupied)
         );
     }
 }

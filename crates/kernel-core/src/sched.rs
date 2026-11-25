@@ -1020,3 +1020,20 @@ mod tests {
         assert_eq!(sched.pick_next_ready(0), Some(1));
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn scheduler_spawn_exit_reclaim_conserves_slot_capacity() {
+        let mut sched: Scheduler<4> = Scheduler::new();
+        let prio: u8 = kani::any();
+        let r0 = sched.spawn(prio);
+        assert!(r0.is_ok());
+        assert_eq!(sched.exit_slot(0), Ok(()));
+        sched.reclaim_slot(0);
+        // After reclaim, slot 0 is immediately reusable.
+        assert!(sched.spawn(prio).is_ok());
+    }
+}

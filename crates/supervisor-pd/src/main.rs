@@ -49,6 +49,12 @@ fn minimal_main() -> ! {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
+    if newos_user_rt::sys_info().interactive_shell {
+        let _ = newos_user_rt::debug_log(
+            "[supervisor-pd] PANIC in EL0 — requesting fresh-VSpace PD 0 respawn\n",
+        );
+        newos_user_rt::thread_exit()
+    }
     let _ = newos_user_rt::debug_log("[supervisor-pd] PANIC in EL0\n");
     newos_user_rt::exit(ShutdownStatus::Failed)
 }

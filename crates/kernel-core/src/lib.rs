@@ -27,9 +27,9 @@ use newos_abi::{Rights, ShutdownStatus, SysError};
 const USER_STACK_BASE: u64 = 0x0000_7fff_f000_0000;
 #[cfg(feature = "userspace")]
 pub const USER_STACK_PAGES: u64 = 16; // 64 KiB EL0 data stack
-/// 1 MiB EL0 data stack for protection domains (`newos-net-pd`, `newos-key-pd`, `newos-ssh-pd`)
-/// running NIST Level 5 ML-DSA-87 / ML-KEM-1024 lattice math.
-pub const USER_PQ_STACK_PAGES: u64 = 384;
+/// 2 MiB EL0 data stack for protection domains (`newos-net-pd`, `newos-key-pd`, `newos-ssh-pd`)
+/// running NIST Level 5 ML-DSA-87 / ML-KEM-1024 lattice math (gives headroom in unoptimized debug builds).
+pub const USER_PQ_STACK_PAGES: u64 = 512;
 #[cfg(feature = "userspace")]
 const USER_SHADOW_STACK_BASE: u64 = 0x0000_7fff_e000_0000;
 #[cfg(feature = "userspace")]

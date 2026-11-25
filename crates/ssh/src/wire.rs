@@ -1,4 +1,18 @@
 //! SSHv2 binary wire encoding/decoding helpers.
+//!
+//! ```
+//! use newos_ssh_proto::wire::{WireReader, WireWriter};
+//!
+//! let mut buf = [0u8; 32];
+//! let mut w = WireWriter::new(&mut buf);
+//! w.write_u32(42).unwrap();
+//! w.write_str("ssh-mldsa87").unwrap();
+//! let len = w.len();
+//!
+//! let mut r = WireReader::new(&buf[..len]);
+//! assert_eq!(r.read_u32(), Ok(42));
+//! assert_eq!(r.read_str(), Ok("ssh-mldsa87"));
+//! ```
 
 use crate::SshError;
 
@@ -119,5 +133,118 @@ impl<'a> WireWriter<'a> {
 
     pub fn write_str(&mut self, s: &str) -> Result<(), SshError> {
         self.write_string(s.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_roundtrip_primitives_and_strings() {
+        let mut buf = [0u8; 64];
+        let mut w = WireWriter::new(&mut buf);
+        assert!(w.is_empty());
+        w.write_u8(0xAB).unwrap();
+        w.write_bool(true).unwrap();
+        w.write_bool(false).unwrap();
+        w.write_u32(0x1234_5678).unwrap();
+        w.write_string(b"").unwrap();
+        w.write_str("mlkem1024-sha3-512").unwrap();
+        w.write_raw(&[1, 2, 3]).unwrap();
+        let written = w.len();
+        assert!(!w.is_empty());
+
+        let mut r = WireReader::new(&buf[..written]);
+        assert_eq!(r.remaining(), written);
+        assert_eq!(r.read_u8(), Ok(0xAB));
+        assert_eq!(r.read_bool(), Ok(true));
+        assert_eq!(r.read_bool(), Ok(false));
+        assert_eq!(r.read_u32(), Ok(0x1234_5678));
+        assert_eq!(r.read_string(), Ok(&[][..]));
+        assert_eq!(r.read_str(), Ok("mlkem1024-sha3-512"));
+        assert_eq!(r.read_exact(3), Ok(&[1, 2, 3][..]));
+        assert_eq!(r.remaining(), 0);
+        assert_eq!(r.read_u8(), Err(SshError::MalformedPacket));
+    }
+
+    #[test]
+    fn wire_reader_rejects_truncated_and_overflow_lengths() {
+        // Empty buffer rejects every read
+        let mut empty = WireReader::new(&[]);
+        assert_eq!(empty.read_u8(), Err(SshError::MalformedPacket));
+        assert_eq!(empty.read_bool(), Err(SshError::MalformedPacket));
+        assert_eq!(empty.read_u32(), Err(SshError::MalformedPacket));
+        assert_eq!(empty.read_string(), Err(SshError::MalformedPacket));
+        assert_eq!(empty.read_str(), Err(SshError::MalformedPacket));
+        assert_eq!(empty.read_exact(0), Ok(&[][..]));
+        assert_eq!(empty.read_exact(1), Err(SshError::MalformedPacket));
+
+        // Truncated u32 (only 3 bytes)
+        let mut short_u32 = WireReader::new(&[0, 0, 1]);
+        assert_eq!(short_u32.read_u32(), Err(SshError::MalformedPacket));
+
+        // Length prefix larger than remaining buffer
+        let mut overlong = WireReader::new(&[0, 0, 0, 10, b'a', b'b']);
+        assert_eq!(overlong.read_string(), Err(SshError::MalformedPacket));
+
+        // u32::MAX length prefix (must not wrap/panic)
+        let mut max_len = WireReader::new(&[0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        assert_eq!(max_len.read_string(), Err(SshError::MalformedPacket));
+
+        // read_exact(usize::MAX) after advancing 1 byte (checked_add overflow guard)
+        let mut overflow = WireReader::new(&[0x01, 0x02]);
+        assert_eq!(overflow.read_u8(), Ok(0x01));
+        assert_eq!(
+            overflow.read_exact(usize::MAX),
+            Err(SshError::MalformedPacket)
+        );
+    }
+
+    #[test]
+    fn wire_reader_rejects_invalid_utf8_and_non_zero_bool_is_true() {
+        // Non-zero byte decodes as true per RFC 4251 Section 5
+        let mut r = WireReader::new(&[0x42, 0x00]);
+        assert_eq!(r.read_bool(), Ok(true));
+        assert_eq!(r.read_bool(), Ok(false));
+
+        // Invalid UTF-8 string
+        let bad_utf8 = [0, 0, 0, 2, 0xFF, 0xFE];
+        let mut r2 = WireReader::new(&bad_utf8);
+        assert_eq!(r2.read_str(), Err(SshError::MalformedPacket));
+    }
+
+    #[test]
+    fn wire_writer_rejects_buffer_overflow_cleanly() {
+        let mut buf = [0u8; 4];
+        let mut w = WireWriter::new(&mut buf);
+        assert_eq!(w.write_raw(&[1, 2, 3, 4, 5]), Err(SshError::PacketTooLarge));
+        assert_eq!(w.len(), 0);
+
+        // String whose length prefix fits (4 bytes) but payload does not
+        assert_eq!(w.write_string(b"a"), Err(SshError::PacketTooLarge));
+
+        // Exact capacity fill succeeds, then next write fails
+        let mut buf2 = [0u8; 4];
+        let mut w2 = WireWriter::new(&mut buf2);
+        assert_eq!(w2.write_u32(0xDEAD_BEEF), Ok(()));
+        assert_eq!(w2.write_u8(1), Err(SshError::PacketTooLarge));
+        assert_eq!(w2.len(), 4);
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn wire_reader_never_panics_on_arbitrary_16_bytes() {
+        let data: [u8; 16] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= data.len());
+        let mut r = WireReader::new(&data[..len]);
+        let _ = r.read_u8();
+        let _ = r.read_u32();
+        let _ = r.read_string();
     }
 }

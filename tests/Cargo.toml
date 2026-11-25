@@ -6,9 +6,17 @@ license.workspace = true
 publish = false
 
 [dev-dependencies]
+ml-dsa = { version = "0.1", default-features = false, features = ["zeroize"] }
 newos-abi = { workspace = true }
+newos-crypto = { workspace = true }
 newos-kernel-core = { workspace = true }
+newos-key-vault = { workspace = true }
+newos-net = { workspace = true }
+newos-rng = { workspace = true }
 newos-shell-core = { workspace = true }
+newos-ssh-proto = { workspace = true }
+newos-storage = { workspace = true }
+proptest = { version = "1.6", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true
@@ -26,5 +34,25 @@ name = "e2e_bench"
 path = "e2e/e2e_bench.rs"
 
 [[test]]
+name = "e2e_ssh_net"
+path = "e2e/e2e_ssh_net.rs"
+
+[[test]]
 name = "teamwork_e2e"
 path = "teamwork_e2e/suite.rs"
+
+[[test]]
+name = "proptest_suite"
+path = "proptest/suite.rs"
+
+[[test]]
+name = "regression"
+path = "regression/suite.rs"
+
+[[test]]
+name = "chaos"
+path = "chaos/suite.rs"
+
+[[test]]
+name = "security_stress"
+path = "security/suite.rs"

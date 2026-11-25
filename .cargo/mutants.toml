@@ -1,0 +1,37 @@
+# NewOS Mutation Testing Configuration (`cargo-mutants`)
+#
+# Targets all host-testable library crates and `xtask` while excluding bare-metal
+# AArch64-only crates (`hal`, `kernel`, `user-rt`, `*-pd`) that cannot execute on the host.
+
+examine_globs = [
+    "crates/abi/src/**/*.rs",
+    "crates/crypto/src/**/*.rs",
+    "crates/kernel-core/src/**/*.rs",
+    "crates/key-vault/src/**/*.rs",
+    "crates/net/src/**/*.rs",
+    "crates/rng/src/**/*.rs",
+    "crates/shell-core/src/**/*.rs",
+    "crates/ssh/src/**/*.rs",
+    "crates/storage/src/**/*.rs",
+    "crates/board/src/**/*.rs",
+    "crates/gpio/src/**/*.rs",
+    "crates/gpu/src/**/*.rs",
+    "crates/ai/src/**/*.rs",
+    "crates/usb/src/**/*.rs",
+    "crates/wdt/src/**/*.rs",
+    "xtask/src/gpt.rs",
+    "xtask/src/profile.rs",
+]
+
+exclude_globs = [
+    "crates/hal/**",
+    "crates/kernel/**",
+    "crates/user-rt/**",
+    "crates/*-pd/**",
+    "crates/bench/**",
+    "fuzz/**",
+    "tests/**",
+]
+
+timeout_multiplier = 3.0
+minimum_test_timeout = 30

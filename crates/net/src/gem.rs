@@ -558,3 +558,106 @@ impl<'b, T: MmioDmaTransport> Device for GemNetDevice<'b, T> {
         caps
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockGemTransport {
+        mid: u32,
+        phy_bmsr: u16,
+    }
+
+    impl MmioDmaTransport for MockGemTransport {
+        fn read32(&self, offset: u64) -> Result<u32, SysError> {
+            match offset {
+                REG_MID => Ok(self.mid),
+                REG_NSR => Ok(NSR_IDLE),
+                REG_MAN => Ok(self.phy_bmsr as u32),
+                REG_ISR => Ok(ISR_RCOMP | ISR_TCOMP),
+                _ => Ok(0),
+            }
+        }
+
+        fn write32(&self, _offset: u64, _val: u32) -> Result<(), SysError> {
+            Ok(())
+        }
+
+        fn virt_to_phys<T>(&self, r: &T) -> Result<u64, SysError> {
+            Ok((r as *const T as usize) as u64)
+        }
+    }
+
+    #[test]
+    fn probe_cadence_gem_validates_module_id_and_fallback_mac() {
+        // Non-GEM module ID rejected
+        assert!(probe_cadence_gem(|_| Ok(0x1234_0000)).is_none());
+        // MMIO error rejected
+        assert!(probe_cadence_gem(|_| Err(SysError::InvalidCapability)).is_none());
+
+        // Valid GEM ID with all-zero SA1 uses locally-administered fallback MAC
+        let info = probe_cadence_gem(|off| match off {
+            REG_MID => Ok(0x0007_0109),
+            _ => Ok(0),
+        })
+        .expect("valid GEM");
+        assert_eq!(info.revision, 0x0109);
+        assert_eq!(info.mac, [0x02, 0x5E, 0x14, 0x00, 0x05, 0x16]);
+
+        // Valid GEM ID with programmed SA1 preserves MAC
+        let info2 = probe_cadence_gem(|off| match off {
+            REG_MID => Ok(0x0007_0109),
+            REG_SA1B => Ok(u32::from_le_bytes([0xDC, 0xA6, 0x32, 0x11])),
+            REG_SA1T => Ok(u32::from_le_bytes([0x22, 0x33, 0x00, 0x00])),
+            _ => Ok(0),
+        })
+        .expect("valid GEM with SA1");
+        assert_eq!(info2.mac, [0xDC, 0xA6, 0x32, 0x11, 0x22, 0x33]);
+    }
+
+    #[test]
+    fn gem_init_mdio_tx_rx_and_bad_length_drop() {
+        let dma = GemDma::new();
+        let info = GemInfo {
+            module_id: 0x0007_0109,
+            revision: 0x0109,
+            mac: [0x02, 0x5E, 0x14, 0x00, 0x05, 0x16],
+        };
+        let transport = MockGemTransport {
+            mid: 0x0007_0109,
+            phy_bmsr: BMSR_LSTATUS,
+        };
+        let mut dev = GemNetDevice::init(transport, info, &dma).expect("gem init");
+        assert_eq!(dev.capabilities().medium, Medium::Ethernet);
+        assert_eq!(dev.phy_link_up(RPI5_PHY_ADDR), Ok(true));
+
+        // No RX frame ready yet
+        assert!(dev.receive(Instant::ZERO).is_none());
+
+        // Transmit a 64-byte frame through TxToken
+        let tx = dev.transmit(Instant::ZERO).expect("tx slot ready");
+        tx.consume(64, |buf| buf.fill(0xAB));
+
+        // Inject a zero-length RX descriptor -> dropped cleanly without panic
+        let old_addr0 = dma.rx_ring.0[0].addr_lo.load(Ordering::Relaxed);
+        dma.rx_ring.0[0].ctrl.store(0, Ordering::Relaxed);
+        dma.rx_ring.0[0]
+            .addr_lo
+            .store(old_addr0 | RX_USED, Ordering::Release);
+        assert!(dev.receive(Instant::ZERO).is_none());
+
+        // Inject a valid 60-byte RX frame into slot 1 -> received cleanly
+        let sample = [0x5Au8; 60];
+        dma.rx_bufs[1].write_bytes(&sample);
+        let old_addr1 = dma.rx_ring.0[1].addr_lo.load(Ordering::Relaxed);
+        dma.rx_ring.0[1].ctrl.store(60, Ordering::Relaxed);
+        dma.rx_ring.0[1]
+            .addr_lo
+            .store(old_addr1 | RX_USED, Ordering::Release);
+        let (rx, _tx) = dev.receive(Instant::ZERO).expect("valid RX frame");
+        rx.consume(|bytes| {
+            assert_eq!(bytes.len(), 60);
+            assert!(bytes.iter().all(|&b| b == 0x5A));
+        });
+    }
+}

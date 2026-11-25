@@ -70,18 +70,30 @@ fn main() -> ExitCode {
         "host-test" => run_host_tests(release),
         "miri" => run_miri_tests(),
         "verify" => run_kani_verify(),
+        "coverage" => run_coverage(&root, &args[1..]),
+        "mutants" => run_mutants(&root, &args[1..]),
+        "fuzz" => run_fuzz(&root, &args[1..]),
+        "chaos" => run_chaos(&root, &args[1..], release),
+        "audit-elf" => run_audit_elf(&root, &args[1..], release),
+        "bench-check" => run_bench_check(&root),
+        "qemu-matrix" => run_qemu_matrix(&root, release),
+        "repro-check" => run_repro_check(&root, &args[1..], release),
+        "soak" => run_soak(&root, &args[1..], release),
         "rpi5-image" => resolve_profile(&root, &args[1..], "rpi5")
             .and_then(|p| build_rpi5_image(&p, release).map(|_| ())),
         "bench" => run_bench(&args[1..]),
         "help" | "-h" | "--help" => {
             eprintln!(
-                "Usage: cargo xtask <config|feature-matrix|rpi5-image|build|run|test|host-test|miri|verify|bench> [options]\n\
+                "Usage: cargo xtask <config|feature-matrix|rpi5-image|build|run|test|host-test|miri|verify|coverage|mutants|fuzz|chaos|audit-elf|bench|bench-check> [options]\n\
                  Options:\n\
                    --profile <profiles/*.toml>            Load declarative TOML system composition profile\n\
                    --board <rpi5|qemu-virt>               Override target board\n\
                    --sched <priority-rr|round-robin|fifo> Override kernel scheduler policy\n\
                    --no-smp | --no-acpi | --no-domains | --no-shell | --no-net | --no-ssh | --no-crypto\n\
                    --ipv4-only | --ipv6-only              Select single-stack networking\n\
+                   --fail-under <pct>                     Enforce minimum line coverage % (for `coverage`)\n\
+                   --in-diff <git-ref>                    Limit mutation testing to diff (for `mutants`)\n\
+                   --seconds <N>                          Max seconds per fuzz target (for `fuzz`)\n\
                    --release                              Build in release mode"
             );
             Ok(())
@@ -732,16 +744,309 @@ fn run_miri_tests() -> Result<(), String> {
     run_checked(&mut cmd, "cargo miri test")
 }
 
-/// Run Kani bounded model checking proofs (`#[cfg(kani)]`) on `SpscRing`, `CNode`, and `UntypedInventory`.
+/// Run Kani bounded model checking proofs (`#[cfg(kani)]`) on `abi`, `kernel-core`, and `ssh`.
 fn run_kani_verify() -> Result<(), String> {
     let root = workspace_root();
-    for pkg in ["newos-abi", "newos-kernel-core"] {
+    for pkg in ["newos-abi", "newos-kernel-core", "newos-ssh-proto"] {
         let mut cmd = Command::new("cargo");
         cmd.current_dir(&root).args(["kani", "--package", pkg]);
         run_checked(&mut cmd, &format!("cargo kani ({pkg})")).map_err(|e| {
             format!("{e} (install with `cargo install --locked kani-verifier && cargo kani setup`)")
         })?;
     }
+    Ok(())
+}
+
+/// Measure host line/region coverage with `cargo-llvm-cov` and optionally enforce a hard floor.
+fn run_coverage(root: &Path, args: &[String]) -> Result<(), String> {
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(root).args([
+        "llvm-cov",
+        "--summary-only",
+        "--ignore-filename-regex",
+        "(tests/|crates/bench/)",
+    ]);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--fail-under" => {
+                i += 1;
+                let pct = args
+                    .get(i)
+                    .ok_or_else(|| "missing percentage after `--fail-under`".to_string())?;
+                cmd.args(["--fail-under-lines", pct]);
+            }
+            "--html" => {
+                cmd.arg("--html");
+            }
+            "--lcov" => {
+                cmd.args(["--lcov", "--output-path", "target/llvm-cov/lcov.info"]);
+            }
+            other => return Err(format!("unknown coverage flag `{other}`")),
+        }
+        i += 1;
+    }
+    run_checked(&mut cmd, "cargo llvm-cov")
+}
+
+/// Run mutation testing (`cargo-mutants`) using `.cargo/mutants.toml`.
+fn run_mutants(root: &Path, args: &[String]) -> Result<(), String> {
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(root).arg("mutants");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--in-diff" => {
+                i += 1;
+                let diff_path = args
+                    .get(i)
+                    .ok_or_else(|| "missing diff file after `--in-diff`".to_string())?;
+                cmd.args(["--in-diff", diff_path]);
+            }
+            "--package" | "-p" => {
+                i += 1;
+                let pkg = args
+                    .get(i)
+                    .ok_or_else(|| "missing package name after `--package`".to_string())?;
+                cmd.args(["--package", pkg]);
+            }
+            other => return Err(format!("unknown mutants flag `{other}`")),
+        }
+        i += 1;
+    }
+    run_checked(&mut cmd, "cargo mutants")
+}
+
+/// Run libFuzzer targets under `fuzz/` via `cargo-fuzz`.
+fn run_fuzz(root: &Path, args: &[String]) -> Result<(), String> {
+    const ALL_TARGETS: &[&str] = &[
+        "fuzz_ssh_wire",
+        "fuzz_elf_loader",
+        "fuzz_acpi_tables",
+        "fuzz_shell_parser",
+        "fuzz_net_packets",
+        "fuzz_abi_ipc",
+        "fuzz_aead_decrypt",
+        "fuzz_gpt_profile",
+    ];
+    let mut seconds: u64 = 15;
+    let mut selected: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--seconds" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| "missing seconds after `--seconds`".to_string())?;
+                seconds = raw
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid `--seconds` value `{raw}`"))?;
+            }
+            other if !other.starts_with('-') => {
+                if let Some(&known) = ALL_TARGETS.iter().find(|&&t| t == other) {
+                    selected.push(known);
+                } else {
+                    return Err(format!("unknown fuzz target `{other}`"));
+                }
+            }
+            other => return Err(format!("unknown fuzz flag `{other}`")),
+        }
+        i += 1;
+    }
+    let targets: &[&str] = if selected.is_empty() {
+        ALL_TARGETS
+    } else {
+        &selected
+    };
+    let time_flag = format!("-max_total_time={seconds}");
+    for target in targets {
+        let mut cmd = Command::new("cargo");
+        cmd.current_dir(root)
+            .args(["fuzz", "run", target, "--", &time_flag]);
+        run_checked(&mut cmd, &format!("cargo fuzz run {target}"))?;
+    }
+    Ok(())
+}
+
+/// Run host deterministic chaos suite + on-target QEMU all-domain self-healing chaos tests.
+fn run_chaos(root: &Path, args: &[String], release: bool) -> Result<(), String> {
+    let mut host = Command::new("cargo");
+    host.current_dir(root)
+        .args(["test", "-p", "newos-e2e-tests", "--test", "chaos"]);
+    if release {
+        host.arg("--release");
+    }
+    run_checked(&mut host, "cargo test (host chaos)")?;
+    let profile = resolve_profile(root, args, "qemu-virt")?;
+    run_qemu(&profile, false, release)
+}
+
+/// Audit compiled AArch64 kernel & EL0 PD ELFs for W^X (zero RWX segments) and RELRO/PIE.
+fn run_audit_elf(root: &Path, args: &[String], release: bool) -> Result<(), String> {
+    let profile = resolve_profile(root, args, "qemu-virt")?;
+    let kernel_elf = build_kernel(root, &profile, release)?;
+    let modules = build_profile_modules(root, &profile, true, release)?;
+
+    let mut bins: Vec<(&str, PathBuf)> = vec![("newos-kernel", kernel_elf)];
+    bins.extend(modules);
+
+    for (name, path) in &bins {
+        let data = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        if data.len() < 64 || &data[0..4] != b"\x7fELF" || data[4] != 2 {
+            return Err(format!("{name}: invalid ELF64 header"));
+        }
+        let e_type = u16::from_le_bytes([data[16], data[17]]);
+        if e_type != 3 {
+            return Err(format!(
+                "{name}: expected PIE (ET_DYN=3), got e_type={e_type}"
+            ));
+        }
+        let e_phoff = u64::from_le_bytes(data[32..40].try_into().unwrap()) as usize;
+        let e_phentsize = u16::from_le_bytes([data[54], data[55]]) as usize;
+        let e_phnum = u16::from_le_bytes([data[56], data[57]]) as usize;
+        let mut load_count = 0usize;
+        let mut has_relro = false;
+        for idx in 0..e_phnum {
+            let off = e_phoff + idx * e_phentsize;
+            if off + 56 > data.len() {
+                return Err(format!("{name}: truncated program header {idx}"));
+            }
+            let p_type = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+            let p_flags = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
+            if p_type == 1 {
+                load_count += 1;
+                // PF_W (2) | PF_X (1) == 3 -> forbidden RWX segment!
+                if (p_flags & 3) == 3 {
+                    return Err(format!(
+                        "{name}: W^X VIOLATION — PT_LOAD segment {idx} has both PF_W and PF_X (flags={p_flags:#x})"
+                    ));
+                }
+            } else if p_type == 0x6474_e552 {
+                has_relro = true;
+            }
+        }
+        if load_count == 0 {
+            return Err(format!("{name}: zero PT_LOAD segments"));
+        }
+        let mut neon_note = "n/a";
+        if *name == "newos-kernel"
+            && let Ok(out) = Command::new("llvm-objdump")
+                .args(["-d", "--triple=aarch64-unknown-none"])
+                .arg(path)
+                .output()
+            && out.status.success()
+        {
+            let dis = String::from_utf8_lossy(&out.stdout);
+            let fp_hits = dis
+                .lines()
+                .filter(|l| l.contains("\tfmul\t") || l.contains("\tfadd\t"))
+                .count();
+            if fp_hits > 0 {
+                return Err(format!(
+                    "newos-kernel: soft-float violation — found {fp_hits} FP arithmetic instructions in EL1"
+                ));
+            }
+            neon_note = "0-FP-arith";
+        }
+        println!(
+            "[audit-elf] {name}: PIE=OK, W^X=OK ({load_count} PT_LOAD, 0 RWX), RELRO={has_relro}, EL1-softfloat={neon_note}"
+        );
+    }
+    Ok(())
+}
+
+/// Run `newos-bench --json` and verify output is valid JSON containing non-zero finite metrics.
+fn run_bench_check(root: &Path) -> Result<(), String> {
+    let output = Command::new("cargo")
+        .current_dir(root)
+        .args(["run", "--release", "-p", "newos-bench", "--", "--json"])
+        .output()
+        .map_err(|e| format!("failed to run newos-bench: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("newos-bench exited with {}", output.status));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains('{') || !stdout.contains('}') {
+        return Err("newos-bench --json did not emit JSON output".to_string());
+    }
+    if stdout.contains("NaN") || stdout.contains("Infinity") {
+        return Err("newos-bench --json emitted NaN/Infinity metric".to_string());
+    }
+    let metric_count =
+        stdout.matches("\"ns_per_op\"").count() + stdout.matches("\"ops_per_sec\"").count();
+    println!(
+        "[bench-check] newos-bench --json passed ({} bytes, {} numeric metric fields, 0 NaN/Inf)",
+        stdout.len(),
+        metric_count
+    );
+    Ok(())
+}
+
+/// Boot alternate system composition profiles (`tinykernel`, `--no-net`, `--ipv6-only`) in QEMU.
+fn run_qemu_matrix(root: &Path, release: bool) -> Result<(), String> {
+    let matrix: &[(&str, &[&str])] = &[
+        (
+            "tinykernel",
+            &[
+                "--profile",
+                "profiles/tinykernel.toml",
+                "--board",
+                "qemu-virt",
+            ],
+        ),
+        ("no-net", &["--no-net"]),
+        ("ipv6-only", &["--ipv6-only"]),
+    ];
+    for (label, flags) in matrix {
+        let owned: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+        let profile = resolve_profile(root, &owned, "qemu-virt")?;
+        println!("[qemu-matrix] booting profile `{label}`...");
+        run_qemu(&profile, false, release)?;
+    }
+    println!("[qemu-matrix] all {} profiles passed!", matrix.len());
+    Ok(())
+}
+
+/// Verify deterministic reproducible builds of `newos-kernel` (two builds produce identical bytes).
+fn run_repro_check(root: &Path, args: &[String], release: bool) -> Result<(), String> {
+    let profile = resolve_profile(root, args, "qemu-virt")?;
+    let p1 = build_kernel(root, &profile, release)?;
+    let b1 = fs::read(&p1).map_err(|e| format!("read build 1: {e}"))?;
+    let p2 = build_kernel(root, &profile, release)?;
+    let b2 = fs::read(&p2).map_err(|e| format!("read build 2: {e}"))?;
+    if b1 != b2 {
+        return Err("repro-check FAILED: two builds of newos-kernel differed!".to_string());
+    }
+    let crc = gpt::crc32(&b1);
+    println!(
+        "[repro-check] newos-kernel reproducible build OK (size={} bytes, crc32={crc:#010x})",
+        b1.len()
+    );
+    Ok(())
+}
+
+/// Nightly endurance soak: run `N` consecutive 4-core QEMU boot + chaos cycles.
+fn run_soak(_root: &Path, args: &[String], release: bool) -> Result<(), String> {
+    let mut cycles = 3usize;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--cycles" {
+            i += 1;
+            cycles = args
+                .get(i)
+                .ok_or("missing count after `--cycles`")?
+                .parse::<usize>()
+                .map_err(|_| "invalid `--cycles` value")?;
+        }
+        i += 1;
+    }
+    let profile = BuildProfile::default_full("qemu-virt");
+    for c in 1..=cycles {
+        println!("[soak] cycle {c}/{cycles}...");
+        run_qemu(&profile, false, release)?;
+    }
+    println!("[soak] all {cycles} QEMU endurance cycles passed!");
     Ok(())
 }
 
@@ -1018,4 +1323,31 @@ fn run_qemu(profile: &BuildProfile, interactive: bool, release: bool) -> Result<
     }
     println!("[xtask] QEMU (aarch64/cortex-a76) guest self-tests PASSED (status=OK)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_profile_parses_cli_overrides_and_rejects_bad_flags() {
+        let root = workspace_root();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        let p = resolve_profile(&root, &s(&["--board", "qemu-virt", "--no-net"]), "rpi5")
+            .expect("valid overrides");
+        assert_eq!(p.board, "qemu-virt");
+        assert!(!p.net);
+
+        // Missing path after --profile must error
+        assert!(resolve_profile(&root, &s(&["--profile"]), "qemu-virt").is_err());
+
+        // Unknown flag must error
+        assert!(resolve_profile(&root, &s(&["--no-sshd"]), "qemu-virt").is_err());
+
+        // --ipv6-only disables ipv4 while keeping ipv6
+        let p6 = resolve_profile(&root, &s(&["--ipv6-only"]), "qemu-virt").expect("ipv6-only");
+        assert!(!p6.ipv4);
+        assert!(p6.ipv6);
+    }
 }

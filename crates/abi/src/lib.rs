@@ -150,6 +150,21 @@ impl CapId {
     /// Well-known bootstrap Normal-NC DMA descriptor ring `Frame` capability for `net-pd` (slot 39, gen 1).
     pub const BOOTSTRAP_NET_DMA_RING: Self = Self((1u64 << 32) | 39);
 
+    /// Well-known bootstrap child `Thread` capability for `newos-shell-pd` in PD 0's `CSpace` (slot 40, gen 1).
+    pub const BOOTSTRAP_SHELL_THREAD: Self = Self((1u64 << 32) | 40);
+
+    /// Well-known bootstrap child `Thread` capability for `newos-worker-pd` in PD 0's `CSpace` (slot 41, gen 1).
+    pub const BOOTSTRAP_WORKER_THREAD: Self = Self((1u64 << 32) | 41);
+
+    /// Well-known bootstrap child `Thread` capability for `newos-net-pd` in PD 0's `CSpace` (slot 42, gen 1).
+    pub const BOOTSTRAP_NET_THREAD: Self = Self((1u64 << 32) | 42);
+
+    /// Well-known bootstrap child `Thread` capability for `newos-key-pd` in PD 0's `CSpace` (slot 43, gen 1).
+    pub const BOOTSTRAP_KEY_THREAD: Self = Self((1u64 << 32) | 43);
+
+    /// Well-known bootstrap child `Thread` capability for `newos-ssh-pd` in PD 0's `CSpace` (slot 44, gen 1).
+    pub const BOOTSTRAP_SSH_THREAD: Self = Self((1u64 << 32) | 44);
+
     #[inline]
     pub const fn new(raw: u64) -> Self {
         Self(raw)
@@ -1010,6 +1025,8 @@ pub mod supervisor_notif {
     pub const REBOOT: u64 = 1u64 << 10;
     /// Bitmask covering all shutdown/reboot request bits.
     pub const SHUTDOWN_MASK: u64 = SHUTDOWN_OK | SHUTDOWN_FAIL | REBOOT;
+    /// Stamped by EL1 on PD 0's `BOOTSTRAP_FAULT_NOTIF` after a fresh-VSpace `supervisor-pd` respawn.
+    pub const SUPERVISOR_RESPAWNED_BIT: u64 = 1u64 << 11;
     /// Combined wait mask used by `newos-supervisor-pd` in `run_root_supervisor`.
     pub const WAIT_MASK: u64 = FAULT_PD_MASK | SHUTDOWN_MASK;
 
@@ -1418,6 +1435,29 @@ mod tests {
         assert_eq!(
             net_ipc::decode_request(net_ipc::encode_dhcp_renew()).0,
             net_ipc::OP_DHCP_RENEW
+        );
+    }
+
+    #[test]
+    fn child_thread_caps_and_supervisor_respawned_bit_are_disjoint() {
+        let caps = [
+            CapId::BOOTSTRAP_SHELL_THREAD,
+            CapId::BOOTSTRAP_WORKER_THREAD,
+            CapId::BOOTSTRAP_NET_THREAD,
+            CapId::BOOTSTRAP_KEY_THREAD,
+            CapId::BOOTSTRAP_SSH_THREAD,
+        ];
+        for (i, c) in caps.iter().enumerate() {
+            assert_eq!(c.raw() >> 32, 1);
+            assert_eq!(c.raw() & 0xFFFF_FFFF, (40 + i) as u64);
+        }
+        assert_eq!(
+            supervisor_notif::SUPERVISOR_RESPAWNED_BIT & supervisor_notif::FAULT_PD_MASK,
+            0
+        );
+        assert_eq!(
+            supervisor_notif::SUPERVISOR_RESPAWNED_BIT & supervisor_notif::SHUTDOWN_MASK,
+            0
         );
     }
 }

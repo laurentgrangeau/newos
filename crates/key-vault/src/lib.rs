@@ -815,4 +815,144 @@ mod tests {
             (key_ipc::REPLY_OK, Some(auth_gate_ipc::SESSION_CLOSE))
         );
     }
+
+    #[test]
+    fn persistent_host_seed_produces_deterministic_host_key_and_fingerprint() {
+        let seed = [0x42u8; 32];
+        let v1 = KeyVault::new_with_optional_host_seed(
+            DeterministicTestEntropy(0x1001),
+            b"persist-1",
+            &[],
+            Some(seed),
+        )
+        .unwrap();
+        let v2 = KeyVault::new_with_optional_host_seed(
+            DeterministicTestEntropy(0x9999),
+            b"persist-2",
+            &[],
+            Some(seed),
+        )
+        .unwrap();
+        assert_eq!(v1.host_public_key(), v2.host_public_key());
+        assert_eq!(
+            v1.host_fingerprint_sha3_512(),
+            v2.host_fingerprint_sha3_512()
+        );
+    }
+
+    #[test]
+    fn userauth_rejects_unauthorized_key_short_data_wrong_sid_and_locks_after_3_attempts() {
+        let (_allowed_sk, allowed_pk) = make_client_keypair(0xA1);
+        let (other_sk, other_pk) = make_client_keypair(0xB2);
+        let allowed_static: &'static [[u8; key_ipc::MLDSA87_PK_BYTES]] =
+            std::boxed::Box::leak(std::boxed::Box::new([allowed_pk]));
+
+        let mut vault = KeyVault::new(
+            DeterministicTestEntropy(0x5555),
+            b"neg-auth",
+            allowed_static,
+        )
+        .unwrap();
+
+        // No pending session yet
+        let zero_sig = [0u8; key_ipc::MLDSA87_SIG_BYTES];
+        assert_eq!(
+            vault.verify_user_auth(&allowed_pk, &[0u8; 72], &zero_sig),
+            Err(VaultError::NoPendingSession)
+        );
+
+        let sid = sha3_512(b"session-neg-1");
+        let _ = vault.sign_kex_hash(&sid, 1_000).unwrap();
+
+        // Attempt 1: truncated signed_data
+        assert_eq!(
+            vault.verify_user_auth(&allowed_pk, &[0u8; 10], &zero_sig),
+            Err(VaultError::SessionIdMismatch)
+        );
+
+        // Attempt 2: mismatched session ID
+        let mut wrong_sid_data = [0u8; 72];
+        wrong_sid_data[0..4].copy_from_slice(&64u32.to_be_bytes());
+        wrong_sid_data[4..68].copy_from_slice(&sha3_512(b"wrong-sid"));
+        assert_eq!(
+            vault.verify_user_auth(&allowed_pk, &wrong_sid_data, &zero_sig),
+            Err(VaultError::SessionIdMismatch)
+        );
+
+        // Attempt 3: valid session ID but unauthorized key -> consumes pending session!
+        let mut valid_sid_data = [0u8; 72];
+        valid_sid_data[0..4].copy_from_slice(&64u32.to_be_bytes());
+        valid_sid_data[4..68].copy_from_slice(&sid);
+        let prefix = [0u8, CTX_USERAUTH.len() as u8];
+        let sig = other_sk
+            .expanded_key()
+            .sign_internal(&[&prefix, CTX_USERAUTH, &valid_sid_data], &B32::default());
+        let mut other_sig = [0u8; key_ipc::MLDSA87_SIG_BYTES];
+        other_sig.copy_from_slice(sig.encode().as_slice());
+        assert_eq!(
+            vault.verify_user_auth(&other_pk, &valid_sid_data, &other_sig),
+            Err(VaultError::UnauthorizedKey)
+        );
+
+        // Attempt 4: session must now be closed (NoPendingSession)
+        assert_eq!(
+            vault.verify_user_auth(&allowed_pk, &valid_sid_data, &zero_sig),
+            Err(VaultError::NoPendingSession)
+        );
+    }
+
+    #[test]
+    fn userauth_rejects_empty_authorized_keys_and_corrupted_signature() {
+        let (client_sk, client_pk) = make_client_keypair(0xC3);
+        let mut empty_vault =
+            KeyVault::new(DeterministicTestEntropy(0x6666), b"empty-ak", &[]).unwrap();
+        let sid = sha3_512(b"session-empty-ak");
+        let _ = empty_vault.sign_kex_hash(&sid, 1_000).unwrap();
+        let mut data = [0u8; 72];
+        data[0..4].copy_from_slice(&64u32.to_be_bytes());
+        data[4..68].copy_from_slice(&sid);
+        assert_eq!(
+            empty_vault.verify_user_auth(&client_pk, &data, &[0u8; key_ipc::MLDSA87_SIG_BYTES]),
+            Err(VaultError::UnauthorizedKey)
+        );
+
+        // Authorized key with 1-bit flipped signature must fail with InvalidSignature
+        let allowed_static: &'static [[u8; key_ipc::MLDSA87_PK_BYTES]] =
+            std::boxed::Box::leak(std::boxed::Box::new([client_pk]));
+        let mut vault = KeyVault::new(
+            DeterministicTestEntropy(0x7777),
+            b"tamper-sig",
+            allowed_static,
+        )
+        .unwrap();
+        let _ = vault.sign_kex_hash(&sid, 1_000).unwrap();
+        let prefix = [0u8, CTX_USERAUTH.len() as u8];
+        let sig = client_sk
+            .expanded_key()
+            .sign_internal(&[&prefix, CTX_USERAUTH, &data], &B32::default());
+        let mut sig_bytes = [0u8; key_ipc::MLDSA87_SIG_BYTES];
+        sig_bytes.copy_from_slice(sig.encode().as_slice());
+        sig_bytes[17] ^= 0x01;
+        assert_eq!(
+            vault.verify_user_auth(&client_pk, &data, &sig_bytes),
+            Err(VaultError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn random_u32_respects_window_budget_and_resets_after_kex_sign() {
+        let mut vault = KeyVault::new(DeterministicTestEntropy(0x8888), b"u32-cap", &[]).unwrap();
+        for _ in 0..(key_ipc::MAX_RANDOM_BYTES_PER_WINDOW / 4) {
+            assert!(vault.get_random_u32().is_ok());
+        }
+        assert_eq!(
+            vault.get_random_u32(),
+            Err(VaultError::RandomBudgetExceeded)
+        );
+
+        // Signing a fresh KEX hash resets the per-window random budget
+        let sid = sha3_512(b"reset-budget");
+        assert!(vault.sign_kex_hash(&sid, 1_000).is_ok());
+        assert!(vault.get_random_u32().is_ok());
+    }
 }

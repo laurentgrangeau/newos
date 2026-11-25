@@ -1514,4 +1514,158 @@ mod tests {
             Err(SshError::UnsupportedAlgorithm)
         );
     }
+
+    #[test]
+    fn banner_validation_rejects_non_ssh2_and_overlong_lines() {
+        let mut vault = MockVault::new([0u8; MLDSA87_PK_BYTES]);
+        let mut server = SshServer::new();
+        let mut shell = [0u8; 64];
+
+        // SSH-1.99 / SSH-1.5 rejected
+        assert!(
+            server
+                .feed_rx(b"SSH-1.5-legacy\r\n", &mut vault, &mut shell)
+                .is_err()
+        );
+
+        // Overlong banner (>255 bytes without CRLF)
+        server.reset();
+        let overlong = [b'A'; 260];
+        assert!(server.feed_rx(&overlong, &mut vault, &mut shell).is_err());
+    }
+
+    #[test]
+    fn client_rejects_mismatched_host_fingerprint() {
+        let mut user_seed = DsaB32::default();
+        user_seed.as_mut_slice().fill(0x55);
+        let user_sk = SigningKey::<MlDsa87>::from_seed(&user_seed);
+        let mut user_pk = [0u8; MLDSA87_PK_BYTES];
+        user_pk.copy_from_slice(user_sk.verifying_key().encode().as_slice());
+
+        let mut vault = MockVault::new(user_pk);
+        let wrong_fp = [0xAAu8; 64];
+        let mut server = SshServer::new();
+        let mut client = SshClient::new("newos", user_sk, Some(wrong_fp), [0x12u8; 64]);
+        let mut s_buf = [0u8; 64];
+        let mut c_buf = [0u8; 64];
+
+        let mut saw_fp_err = false;
+        for _ in 0..8 {
+            if !server.pending_tx().is_empty() {
+                let mut tmp = [0u8; MAX_PACKET_BODY + 64];
+                let n = server.pending_tx().len();
+                tmp[..n].copy_from_slice(server.pending_tx());
+                server.consume_tx(n);
+                match client.feed_rx(&tmp[..n], [0x33; 16], [0x44; 32], &mut c_buf) {
+                    Err(SshError::CryptoFailure | SshError::AuthFailed) => {
+                        saw_fp_err = true;
+                        break;
+                    }
+                    Err(other) => panic!("expected CryptoFailure/AuthFailed, got {other:?}"),
+                    Ok(_) => {}
+                }
+            }
+            if !client.pending_tx().is_empty() {
+                let mut tmp = [0u8; MAX_PACKET_BODY + 64];
+                let n = client.pending_tx().len();
+                tmp[..n].copy_from_slice(client.pending_tx());
+                client.consume_tx(n);
+                let _ = server.feed_rx(&tmp[..n], &mut vault, &mut s_buf).unwrap();
+            }
+        }
+        assert!(saw_fp_err, "client must reject mismatched host fingerprint");
+    }
+
+    #[test]
+    fn unauthorized_client_key_cannot_open_shell() {
+        let mut user_seed = DsaB32::default();
+        user_seed.as_mut_slice().fill(0x21);
+        let user_sk = SigningKey::<MlDsa87>::from_seed(&user_seed);
+
+        // Vault allows a DIFFERENT key than `user_sk`
+        let mut vault = MockVault::new([0xEEu8; MLDSA87_PK_BYTES]);
+        let expected_fp = sha3_512(&vault.host_pk);
+        let mut server = SshServer::new();
+        let mut client = SshClient::new("newos", user_sk, Some(expected_fp), [0x34u8; 64]);
+        let mut s_buf = [0u8; 64];
+        let mut c_buf = [0u8; 64];
+
+        for _ in 0..12 {
+            if !server.pending_tx().is_empty() {
+                let mut tmp = [0u8; MAX_PACKET_BODY + 64];
+                let n = server.pending_tx().len();
+                tmp[..n].copy_from_slice(server.pending_tx());
+                server.consume_tx(n);
+                let _ = client.feed_rx(&tmp[..n], [0x55; 16], [0x66; 32], &mut c_buf);
+            }
+            if !client.pending_tx().is_empty() {
+                let mut tmp = [0u8; MAX_PACKET_BODY + 64];
+                let n = client.pending_tx().len();
+                tmp[..n].copy_from_slice(client.pending_tx());
+                client.consume_tx(n);
+                let _ = server.feed_rx(&tmp[..n], &mut vault, &mut s_buf);
+            }
+        }
+        assert!(!server.is_shell_open());
+        assert_ne!(client.state(), ClientState::ShellOpen);
+
+        // Sending shell data before ShellOpen must emit zero wire bytes on both sides
+        let s_tx_before = server.pending_tx().len();
+        assert_eq!(server.send_shell_output(b"hi"), Ok(()));
+        assert_eq!(server.pending_tx().len(), s_tx_before);
+        let c_tx_before = client.pending_tx().len();
+        assert_eq!(client.send_shell_input(b"hi"), Ok(()));
+        assert_eq!(client.pending_tx().len(), c_tx_before);
+    }
+
+    #[test]
+    fn tampered_encrypted_shell_packet_fails_with_crypto_failure() {
+        let mut good_seed = DsaB32::default();
+        good_seed.as_mut_slice().fill(0x88);
+        let good_sk = SigningKey::<MlDsa87>::from_seed(&good_seed);
+        let mut good_pk = [0u8; MLDSA87_PK_BYTES];
+        good_pk.copy_from_slice(good_sk.verifying_key().encode().as_slice());
+        let mut good_vault = MockVault::new(good_pk);
+        let good_fp = sha3_512(&good_vault.host_pk);
+        let mut srv2 = SshServer::new();
+        let mut cli2 = SshClient::new("newos", good_sk, Some(good_fp), [0x78u8; 64]);
+        let mut s_buf = [0u8; 64];
+        let mut c_buf = [0u8; 64];
+
+        for _ in 0..12 {
+            if !srv2.pending_tx().is_empty() {
+                let mut tmp = [0u8; MAX_PACKET_BODY + 64];
+                let n = srv2.pending_tx().len();
+                tmp[..n].copy_from_slice(srv2.pending_tx());
+                srv2.consume_tx(n);
+                let _ = cli2
+                    .feed_rx(&tmp[..n], [0x11; 16], [0x22; 32], &mut c_buf)
+                    .unwrap();
+            }
+            if !cli2.pending_tx().is_empty() {
+                let mut tmp = [0u8; MAX_PACKET_BODY + 64];
+                let n = cli2.pending_tx().len();
+                tmp[..n].copy_from_slice(cli2.pending_tx());
+                cli2.consume_tx(n);
+                let _ = srv2
+                    .feed_rx(&tmp[..n], &mut good_vault, &mut s_buf)
+                    .unwrap();
+            }
+            if srv2.is_shell_open() && cli2.state() == ClientState::ShellOpen {
+                break;
+            }
+        }
+        assert!(srv2.is_shell_open());
+
+        cli2.send_shell_input(b"status\n").unwrap();
+        let n = cli2.pending_tx().len();
+        let mut tampered = [0u8; 1024];
+        tampered[..n].copy_from_slice(cli2.pending_tx());
+        cli2.consume_tx(n);
+        tampered[n - 1] ^= 0x01; // Flip 1 bit in Poly1305 tag
+        assert_eq!(
+            srv2.feed_rx(&tampered[..n], &mut good_vault, &mut s_buf),
+            Err(SshError::CryptoFailure)
+        );
+    }
 }

@@ -485,3 +485,16 @@ mod tests {
         );
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn parse_elf64_never_panics_on_arbitrary_64_byte_header() {
+        let data: [u8; 64] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= data.len());
+        let _ = parse_elf64(&data[..len]);
+    }
+}

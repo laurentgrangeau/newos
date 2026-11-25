@@ -206,16 +206,24 @@ mod tests {
             ms_to_ticks(MAX_TIMEOUT_MS + 1),
             Err(SysError::InvalidArgument)
         );
+        // Minimum boundary (1 ms -> >= 1 tick) and exact MAX_TIMEOUT_MS boundary
+        let t1 = ms_to_ticks(1).expect("1ms valid");
+        assert!(t1 >= 1);
         let t1000 = ms_to_ticks(1000).expect("1s valid");
         assert_eq!(t1000, 65_536);
         assert_eq!(ticks_to_ms(t1000), 1000);
         let tmax = ms_to_ticks(MAX_TIMEOUT_MS).expect("max valid");
         assert!(tmax <= PM_WDOG_TIME_MASK);
+        // Verify exact bitmask invariant for PM_RSTC_WRCFG_CLR
+        assert_eq!(PM_RSTC_WRCFG_CLR & PM_RSTC_WRCFG_MASK, 0);
+        assert_ne!(PM_RSTC_WRCFG_CLR, PM_RSTC_WRCFG_MASK);
     }
 
     #[test]
     fn arm_pet_remaining_and_disarm_sequence() {
         let mock = MockWdt::new();
+        // Pre-populate PM_RSTC with PM_RSTC_WRCFG_FULL_RESET already set so `|` vs `^` is caught!
+        *mock.rstc.borrow_mut() = PM_PASSWORD | PM_RSTC_WRCFG_FULL_RESET | 0x0102;
         let mut wdt = Bcm2712Watchdog::new(&mock);
         assert!(!wdt.is_armed());
         assert_eq!(wdt.pet(), Err(SysError::InvalidArgument));
@@ -226,30 +234,36 @@ mod tests {
             *mock.rstc.borrow() & PM_RSTC_WRCFG_MASK,
             PM_RSTC_WRCFG_FULL_RESET
         );
+        assert_eq!(*mock.rstc.borrow() & 0x0102, 0x0102);
         assert_eq!(wdt.remaining_ms().unwrap(), 5_000);
 
-        // Simulate countdown then pet
+        // Simulate countdown then pet (re-verify PM_PASSWORD and exact tick reload)
         *mock.wdog.borrow_mut() = 1000;
         assert!(wdt.remaining_ms().unwrap() < 20);
         wdt.pet().expect("pet reloads timeout");
         assert_eq!(wdt.remaining_ms().unwrap(), 5_000);
 
-        // Disarm
+        // Disarm (with PM_RSTC_RESET bits already present in mock.rstc to catch `|` vs `^`)
+        *mock.rstc.borrow_mut() = PM_RSTC_RESET;
         wdt.disarm().expect("disarm");
         assert!(!wdt.is_armed());
         assert_eq!(*mock.rstc.borrow(), PM_RSTC_RESET);
+        assert_eq!(wdt.pet(), Err(SysError::InvalidArgument));
         assert_eq!(wdt.reset_status().unwrap(), 0x0000_1000);
     }
 
     #[test]
     fn trigger_reset_programs_short_full_reset() {
         let mock = MockWdt::new();
+        *mock.rstc.borrow_mut() = PM_PASSWORD | PM_RSTC_WRCFG_FULL_RESET | 0x0005;
         let mut wdt = Bcm2712Watchdog::new(&mock);
         wdt.trigger_reset().expect("trigger reset");
+        assert!(wdt.is_armed());
         assert_eq!(*mock.wdog.borrow(), 10);
         assert_eq!(
             *mock.rstc.borrow() & PM_RSTC_WRCFG_MASK,
             PM_RSTC_WRCFG_FULL_RESET
         );
+        assert_eq!(*mock.rstc.borrow() & 0x0005, 0x0005);
     }
 }

@@ -301,3 +301,74 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_encode_and_decode_32_roundtrip_and_reject_invalid() {
+        let seed: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(3));
+        let hex = encode_hex(&seed);
+        assert_eq!(hex.len(), 64);
+        assert_eq!(decode_hex_32(&hex), Ok(seed));
+        assert_eq!(decode_hex_32(&format!("  {hex}\n")), Ok(seed));
+
+        // Wrong length
+        assert!(decode_hex_32("deadbeef").is_err());
+        assert!(decode_hex_32(&format!("{hex}00")).is_err());
+
+        // Non-hex character
+        let mut bad = hex.clone();
+        bad.replace_range(0..1, "z");
+        assert!(decode_hex_32(&bad).is_err());
+    }
+
+    #[test]
+    fn cmd_connect_validates_cli_flags_and_enforces_host_key_check() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        // Missing -i
+        assert!(cmd_connect(&s(&["newos@127.0.0.1"])).is_err());
+        // Missing target
+        assert!(cmd_connect(&s(&["-i", "id_mldsa87"])).is_err());
+        // Invalid port
+        assert!(cmd_connect(&s(&["-i", "id_mldsa87", "-p", "notaport", "u@h"])).is_err());
+        // Unknown flag
+        assert!(cmd_connect(&s(&["--bogus", "-i", "id_mldsa87", "u@h"])).is_err());
+        // Refuses unauthenticated connection without --fingerprint or --insecure-no-host-key-check
+        let err = cmd_connect(&s(&["-i", "id_mldsa87", "newos@127.0.0.1"])).unwrap_err();
+        assert!(err.contains("refusing unauthenticated connection"));
+    }
+
+    #[test]
+    fn cmd_keygen_creates_private_seed_0600_and_public_key() {
+        let tmp_dir = env::temp_dir().join(format!("newos_ssh_client_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let key_path = tmp_dir.join("test_id_mldsa87");
+        let pub_path = tmp_dir.join("test_id_mldsa87.pub");
+        let _ = fs::remove_file(&key_path);
+        let _ = fs::remove_file(&pub_path);
+
+        cmd_keygen(key_path.to_str()).expect("keygen should succeed");
+        let seed_hex = fs::read_to_string(&key_path).expect("read private seed");
+        assert!(decode_hex_32(&seed_hex).is_ok());
+
+        let pub_line = fs::read_to_string(&pub_path).expect("read public key");
+        assert!(pub_line.starts_with("ssh-mldsa87 "));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // Calling keygen again on existing path must fail (create_new atomic guard)
+        assert!(cmd_keygen(key_path.to_str()).is_err());
+
+        let _ = fs::remove_file(&key_path);
+        let _ = fs::remove_file(&pub_path);
+        let _ = fs::remove_dir(&tmp_dir);
+    }
+}
