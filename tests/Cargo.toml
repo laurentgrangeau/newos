@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[dependencies]
+newos-rng = { workspace = true }
+
 [dev-dependencies]
 ml-dsa = { version = "0.1", default-features = false, features = ["zeroize"] }
 newos-abi = { workspace = true }
@@ -12,7 +15,6 @@ newos-crypto = { workspace = true }
 newos-kernel-core = { workspace = true }
 newos-key-vault = { workspace = true }
 newos-net = { workspace = true }
-newos-rng = { workspace = true }
 newos-shell-core = { workspace = true }
 newos-ssh-proto = { workspace = true }
 newos-storage = { workspace = true }

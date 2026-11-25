@@ -686,14 +686,7 @@ impl ShellHost for SupervisorShellHost {
         }
     }
 
-    fn sys_info(&mut self) -> SysInfo {
-        let info = newos_user_rt::sys_info();
-        SysInfo {
-            online_cpus: info.online_cpus,
-            domain_count: info.domain_count,
-            interactive_shell: info.interactive_shell,
-        }
-    }
+    newos_user_rt::forward_shell_host_syscalls!();
 
     fn read_debug_byte(&mut self) -> Result<u8, SysError> {
         self.poll_ssh_auth_gate();
@@ -723,26 +716,6 @@ impl ShellHost for SupervisorShellHost {
             let _ = newos_user_rt::ipc_recv(CapId::BOOTSTRAP_SSH_SHELL_EP);
         }
         newos_user_rt::debug_read_byte()
-    }
-
-    fn ipc_send(&mut self, cap: CapId, payload: u64) -> Result<(), SysError> {
-        newos_user_rt::ipc_send(cap, payload)
-    }
-
-    fn ipc_recv(&mut self, cap: CapId) -> Result<(u64, u64), SysError> {
-        newos_user_rt::ipc_recv(cap)
-    }
-
-    fn ipc_call(&mut self, cap: CapId, payload: u64) -> Result<(u64, u64), SysError> {
-        newos_user_rt::ipc_call(cap, payload)
-    }
-
-    fn yield_now(&mut self) -> Result<u64, SysError> {
-        newos_user_rt::yield_now()
-    }
-
-    fn read_cycles(&mut self) -> Result<u64, SysError> {
-        newos_user_rt::read_cycles()
     }
 
     fn trigger_user_fault(&mut self) {

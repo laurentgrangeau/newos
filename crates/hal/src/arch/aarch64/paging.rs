@@ -257,14 +257,11 @@ impl Aarch64VSpace {
         ]
     }
 
-    /// Unmap a 4 KiB page using targeted `tlbi vae1is` when `asid` is provided (or `tlbi vaae1is`
-    /// otherwise), returning `(frame, is_device)` where `is_device` is `true` if the leaf PTE
-    /// carried the `Device` MAIR index (`MmioMap` pages must never be zeroed or reclaimed as RAM).
-    pub fn unmap_4k_asid(
+    fn unmap_4k_leaf(
         &mut self,
         virt: VirtAddr,
         asid: Option<u16>,
-    ) -> Result<(PhysFrame, bool), SysError> {
+    ) -> Result<(PhysFrame, bool, [u64; 3], [usize; 3]), SysError> {
         let [i0, i1, i2, i3] = Self::indices(virt);
         let l1 = self
             .next_table_existing(self.l0_phys, i0)
@@ -292,6 +289,36 @@ impl Aarch64VSpace {
             tlbi_va(virt);
         }
         let frame = PhysFrame::from_aligned(PhysAddr::new(pte & DESC_ADDR_MASK))?;
+        Ok((frame, is_device, [l1, l2, l3], [i0, i1, i2]))
+    }
+
+    fn try_reclaim_empty_table(
+        &mut self,
+        parent_phys: u64,
+        parent_idx: usize,
+        child_phys: u64,
+        untyped: &mut UntypedInventory,
+    ) -> bool {
+        if !self.is_table_empty(child_phys) {
+            return false;
+        }
+        let _ = self.write_desc(parent_phys, parent_idx, 0);
+        if let Ok(f) = PhysFrame::from_aligned(PhysAddr::new(child_phys)) {
+            self.zero_frame(&f);
+            let _ = untyped.reclaim_frame(f);
+        }
+        true
+    }
+
+    /// Unmap a 4 KiB page using targeted `tlbi vae1is` when `asid` is provided (or `tlbi vaae1is`
+    /// otherwise), returning `(frame, is_device)` where `is_device` is `true` if the leaf PTE
+    /// carried the `Device` MAIR index (`MmioMap` pages must never be zeroed or reclaimed as RAM).
+    pub fn unmap_4k_asid(
+        &mut self,
+        virt: VirtAddr,
+        asid: Option<u16>,
+    ) -> Result<(PhysFrame, bool), SysError> {
+        let (frame, is_device, _, _) = self.unmap_4k_leaf(virt, asid)?;
         Ok((frame, is_device))
     }
 
@@ -341,59 +368,15 @@ impl Aarch64VSpace {
         asid: Option<u16>,
         untyped: &mut UntypedInventory,
     ) -> Result<(PhysFrame, bool), SysError> {
-        let [i0, i1, i2, i3] = Self::indices(virt);
-        let l1 = self
-            .next_table_existing(self.l0_phys, i0)
-            .ok_or(SysError::InvalidArgument)?;
-        let l2 = self
-            .next_table_existing(l1, i1)
-            .ok_or(SysError::InvalidArgument)?;
-        let l3 = self
-            .next_table_existing(l2, i2)
-            .ok_or(SysError::InvalidArgument)?;
-
-        let pte = self.read_desc(l3, i3)?;
-        if (pte & DESC_VALID) == 0 {
-            return Err(SysError::InvalidArgument);
-        }
-
-        let dev_idx = device_mair_index();
-        let attr_idx = (pte >> 2) & 0x7;
-        let is_device = attr_idx == dev_idx && dev_idx != 0;
-
-        self.write_desc(l3, i3, 0)?;
-        if let Some(a) = asid {
-            tlbi_va_asid(virt, a);
-        } else {
-            tlbi_va(virt);
-        }
-
-        if self.is_table_empty(l3) {
-            let _ = self.write_desc(l2, i2, 0);
-            if let Ok(f) = PhysFrame::from_aligned(PhysAddr::new(l3)) {
-                self.zero_frame(&f);
-                let _ = untyped.reclaim_frame(f);
-            }
-            if self.is_table_empty(l2) {
-                let _ = self.write_desc(l1, i1, 0);
-                if let Ok(f) = PhysFrame::from_aligned(PhysAddr::new(l2)) {
-                    self.zero_frame(&f);
-                    let _ = untyped.reclaim_frame(f);
-                }
-                if self.is_table_empty(l1) {
-                    let _ = self.write_desc(self.l0_phys, i0, 0);
-                    if let Ok(f) = PhysFrame::from_aligned(PhysAddr::new(l1)) {
-                        self.zero_frame(&f);
-                        let _ = untyped.reclaim_frame(f);
-                    }
-                }
+        let (frame, is_device, [l1, l2, l3], [i0, i1, i2]) = self.unmap_4k_leaf(virt, asid)?;
+        if self.try_reclaim_empty_table(l2, i2, l3, untyped) {
+            if self.try_reclaim_empty_table(l1, i1, l2, untyped) {
+                let _ = self.try_reclaim_empty_table(self.l0_phys, i0, l1, untyped);
             }
             if let Some(a) = asid {
                 tlbi_asid(a);
             }
         }
-
-        let frame = PhysFrame::from_aligned(PhysAddr::new(pte & DESC_ADDR_MASK))?;
         Ok((frame, is_device))
     }
 
@@ -503,6 +486,52 @@ impl Aarch64VSpace {
         Ok(next_phys)
     }
 
+    fn encode_leaf_attrs(flags: PageFlags, allow_dma_nc: bool) -> u64 {
+        let mut bits = DESC_VALID | DESC_AF | DESC_SH_INNER;
+        if flags.no_cache {
+            bits |= device_mair_index() << 2;
+        } else if allow_dma_nc && flags.dma_nc {
+            bits |= normal_nc_mair_index() << 2;
+        }
+        match (flags.user, flags.writable) {
+            (false, true) => {} // AP=00: EL1 RW (Global)
+            (false, false) => bits |= DESC_AP_EL1_RO,
+            (true, true) => bits |= DESC_AP_EL0_RW | DESC_NG,
+            (true, false) => bits |= DESC_AP_EL0_RO | DESC_NG,
+        }
+        if !flags.executable {
+            bits |= DESC_PXN | DESC_UXN;
+        } else if flags.user {
+            // EL0 executable pages are NEVER executable by EL1 (hardware PXN)
+            bits |= DESC_PXN;
+        } else {
+            bits |= DESC_UXN;
+        }
+        bits
+    }
+
+    fn decode_leaf_flags(desc: u64, dev_idx: u64) -> PageFlags {
+        let ap = (desc >> 6) & 0b11;
+        let user = (ap & 0b01) != 0;
+        let writable = (ap & 0b10) == 0;
+        let executable = if user {
+            (desc & DESC_UXN) == 0
+        } else {
+            (desc & DESC_PXN) == 0
+        };
+        let attr_idx = (desc >> 2) & 0x7;
+        let no_cache = attr_idx == dev_idx && dev_idx != 0;
+        let nc_idx = normal_nc_mair_index();
+        let dma_nc = !no_cache && attr_idx == nc_idx && nc_idx != 0;
+        PageFlags {
+            writable,
+            executable,
+            user,
+            no_cache,
+            dma_nc,
+        }
+    }
+
     fn next_table_existing(&self, table_phys: u64, index: usize) -> Option<u64> {
         let entry = self.read_desc(table_phys, index).ok()?;
         if (entry & (DESC_VALID | DESC_TABLE_OR_PAGE)) != (DESC_VALID | DESC_TABLE_OR_PAGE) {
@@ -541,30 +570,9 @@ impl VSpaceMapper for Aarch64VSpace {
             return Err(SysError::SlotOccupied);
         }
 
-        let mut pte = (frame.start_addr().raw() & DESC_ADDR_MASK)
-            | DESC_VALID
+        let pte = (frame.start_addr().raw() & DESC_ADDR_MASK)
             | DESC_TABLE_OR_PAGE
-            | DESC_AF
-            | DESC_SH_INNER;
-        if flags.no_cache {
-            pte |= device_mair_index() << 2;
-        } else if flags.dma_nc {
-            pte |= normal_nc_mair_index() << 2;
-        }
-        match (flags.user, flags.writable) {
-            (false, true) => {} // AP=00: EL1 RW (Global)
-            (false, false) => pte |= DESC_AP_EL1_RO,
-            (true, true) => pte |= DESC_AP_EL0_RW | DESC_NG,
-            (true, false) => pte |= DESC_AP_EL0_RO | DESC_NG,
-        }
-        if !flags.executable {
-            pte |= DESC_PXN | DESC_UXN;
-        } else if flags.user {
-            // EL0 executable pages are NEVER executable by EL1 (hardware PXN)
-            pte |= DESC_PXN;
-        } else {
-            pte |= DESC_UXN;
-        }
+            | Self::encode_leaf_attrs(flags, true);
 
         self.write_desc(l3, i3, pte)?;
         tlbi_va(virt);
@@ -583,30 +591,9 @@ impl VSpaceMapper for Aarch64VSpace {
         let dev_idx = device_mair_index();
         if (l2_desc & DESC_TABLE_OR_PAGE) == 0 {
             // Level-2 2 MiB Block descriptor
-            let ap = (l2_desc >> 6) & 0b11;
-            let user = (ap & 0b01) != 0;
-            let writable = (ap & 0b10) == 0;
-            let executable = if user {
-                (l2_desc & DESC_UXN) == 0
-            } else {
-                (l2_desc & DESC_PXN) == 0
-            };
-            let attr_idx = (l2_desc >> 2) & 0x7;
-            let no_cache = attr_idx == dev_idx && dev_idx != 0;
-            let nc_idx = normal_nc_mair_index();
-            let dma_nc = !no_cache && attr_idx == nc_idx && nc_idx != 0;
             let phys =
                 PhysAddr::new((l2_desc & DESC_2M_ADDR_MASK) | (virt.raw() & HUGE_PAGE_MASK_2M));
-            return Some((
-                phys,
-                PageFlags {
-                    writable,
-                    executable,
-                    user,
-                    no_cache,
-                    dma_nc,
-                },
-            ));
+            return Some((phys, Self::decode_leaf_flags(l2_desc, dev_idx)));
         }
 
         let l3 = l2_desc & DESC_ADDR_MASK;
@@ -614,31 +601,8 @@ impl VSpaceMapper for Aarch64VSpace {
         if (pte & DESC_VALID) == 0 {
             return None;
         }
-
-        let ap = (pte >> 6) & 0b11;
-        let user = (ap & 0b01) != 0;
-        let writable = (ap & 0b10) == 0;
-        let executable = if user {
-            (pte & DESC_UXN) == 0
-        } else {
-            (pte & DESC_PXN) == 0
-        };
-        let attr_idx = (pte >> 2) & 0x7;
-        let no_cache = attr_idx == dev_idx && dev_idx != 0;
-        let nc_idx = normal_nc_mair_index();
-        let dma_nc = !no_cache && attr_idx == nc_idx && nc_idx != 0;
-
         let phys = PhysAddr::new((pte & DESC_ADDR_MASK) | (virt.raw() & 0xFFF));
-        Some((
-            phys,
-            PageFlags {
-                writable,
-                executable,
-                user,
-                no_cache,
-                dma_nc,
-            },
-        ))
+        Some((phys, Self::decode_leaf_flags(pte, dev_idx)))
     }
 
     fn unmap_4k(&mut self, virt: VirtAddr) -> Result<PhysFrame, SysError> {
@@ -669,24 +633,8 @@ impl VSpaceMapper for Aarch64VSpace {
         }
 
         // L2 Block descriptor: bit 0 = 1 (Valid), bit 1 = 0 (Block, not Table).
-        let mut desc =
-            (frame.start_addr().raw() & DESC_2M_ADDR_MASK) | DESC_VALID | DESC_AF | DESC_SH_INNER;
-        if flags.no_cache {
-            desc |= device_mair_index() << 2;
-        }
-        match (flags.user, flags.writable) {
-            (false, true) => {}
-            (false, false) => desc |= DESC_AP_EL1_RO,
-            (true, true) => desc |= DESC_AP_EL0_RW | DESC_NG,
-            (true, false) => desc |= DESC_AP_EL0_RO | DESC_NG,
-        }
-        if !flags.executable {
-            desc |= DESC_PXN | DESC_UXN;
-        } else if flags.user {
-            desc |= DESC_PXN;
-        } else {
-            desc |= DESC_UXN;
-        }
+        let desc =
+            (frame.start_addr().raw() & DESC_2M_ADDR_MASK) | Self::encode_leaf_attrs(flags, false);
 
         self.write_desc(l2, i2, desc)?;
         tlbi_va(virt);

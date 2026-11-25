@@ -5,26 +5,13 @@ use ml_dsa::{B32, Keypair, MlDsa87, SigningKey};
 use newos_abi::SysError;
 use newos_abi::key_ipc::{MLDSA87_PK_BYTES, MLDSA87_SIG_BYTES};
 use newos_abi::sha3::sha3_512;
+use newos_e2e_tests::DeterministicTestEntropy as SplitMixHwTrng;
 use newos_key_vault::KeyVault;
-use newos_rng::{EntropySource, RngError};
+use newos_rng::EntropySource;
 use newos_shell_core::shell::{Shell, ShellHost, SysInfo};
 use newos_ssh_proto::wire::MAX_PACKET_BODY;
 use newos_ssh_proto::{ClientState, KeyVaultClient, SshClient, SshError, SshServer};
 use newos_storage::{BlockDevice, SECTOR_SIZE, read_caos_snapshot, write_caos_snapshot};
-
-struct SplitMixHwTrng(u64);
-impl EntropySource for SplitMixHwTrng {
-    fn fill_entropy(&mut self, dst: &mut [u8]) -> Result<(), RngError> {
-        for b in dst.iter_mut() {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            *b = (z ^ (z >> 31)) as u8;
-        }
-        Ok(())
-    }
-}
 
 /// Bridges `newos-ssh-proto::KeyVaultClient` directly to the real `newos-key-vault::KeyVault`.
 struct RealKeyVaultAdapter<E: EntropySource> {

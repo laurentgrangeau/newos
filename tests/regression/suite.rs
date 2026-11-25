@@ -6,33 +6,20 @@
 
 use newos_abi::ring::SpscRing;
 use newos_abi::sha3::sha3_512;
+use newos_e2e_tests::DeterministicTestEntropy;
 use newos_kernel_core::acpi::{parse_gtdt, parse_madt, parse_mcfg, parse_rsdp, parse_spcr};
 use newos_kernel_core::elf::parse_elf64;
 use newos_key_vault::{KeyVault, VaultError};
+use newos_rng::RngError;
 use newos_rng::csprng::verify_entropy_health;
-use newos_rng::{EntropySource, RngError};
 use newos_ssh_proto::wire::WireReader;
 use std::path::Path;
-
-struct RegressionEntropy(u64);
-impl EntropySource for RegressionEntropy {
-    fn fill_entropy(&mut self, dst: &mut [u8]) -> Result<(), RngError> {
-        for b in dst.iter_mut() {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            *b = (z ^ (z >> 31)) as u8;
-        }
-        Ok(())
-    }
-}
 
 /// Regression H3 + N6 + M12: Token bucket burst allows 4 KEX signs, rate-limits the 5th,
 /// and unflushable 2048-bit Bloom filter rejects replayed exchange hashes even after 80+ KEXes.
 #[test]
 fn regression_h3_n6_m12_key_vault_rate_limit_and_unflushable_replay_guard() {
-    let mut vault = KeyVault::new(RegressionEntropy(0xCAFE_0001), b"reg-m12", &[]).unwrap();
+    let mut vault = KeyVault::new(DeterministicTestEntropy(0xCAFE_0001), b"reg-m12", &[]).unwrap();
     let first = sha3_512(b"reg-first-kex");
     assert!(vault.sign_kex_hash(&first, 1_000).is_ok());
     for i in 1u8..4 {

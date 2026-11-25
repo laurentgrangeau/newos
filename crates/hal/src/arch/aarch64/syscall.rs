@@ -673,6 +673,43 @@ impl DomainTable {
         }
     }
 
+    /// Mint single-use Reply capability on `server` pointing exclusively to `client`,
+    /// failing and waking any stranded previous caller (`H3`/`M19`).
+    #[inline]
+    fn replace_reply_target(&mut self, server: usize, client: usize) {
+        if let Some(prev_client) = self.domains[server].reply_target.replace(client)
+            && prev_client != client
+            && prev_client < MAX_DOMAINS
+            && self.domains[prev_client].active
+            && self.domains[prev_client].wait == IpcWaitState::WaitingReply
+        {
+            self.domains[prev_client].frame.x[0] = SysError::InvalidCapability as u64;
+            self.domains[prev_client].frame.x[1] = 0;
+            self.domains[prev_client].frame.x[2] = 0;
+            self.set_wait_state(prev_client, IpcWaitState::Runnable, 0);
+            let _ = self.sched.wake_slot(prev_client);
+        }
+    }
+
+    /// Block `cur_pd` in the scheduler and either context-switch to another runnable domain
+    /// (returning `true`) or save/detach `cur_pd` so the caller can drop `DOMAINS` and park
+    /// this CPU via `park_cpu_until_runnable(frame)` (returning `false`).
+    #[inline]
+    fn block_or_detach_current(&mut self, cur_pd: usize, frame: &mut TrapFrame) -> bool {
+        let _ = self.sched.block_slot(cur_pd);
+        if let Some(next) = self.pick_next_runnable(cur_pd) {
+            context_switch(self, cur_pd, next, frame);
+            return true;
+        }
+        let cpu = (super::get_cpu_id() as usize).min(MAX_CPUS - 1);
+        self.domains[cur_pd].frame = *frame;
+        save_fp_state(&mut self.domains[cur_pd].fp);
+        self.domains[cur_pd].tpidr_el0 = read_tpidr_el0();
+        self.domains[cur_pd].running_on = None;
+        self.cpu_current[cpu] = None;
+        false
+    }
+
     #[inline]
     fn pick_next_runnable(&mut self, from: usize) -> Option<usize> {
         if self.count <= 1 {
@@ -1961,19 +1998,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                         // failing and waking any stranded previous caller (`M19`).
                         set_ipc_return(&mut table.domains[server].frame, a1, badge);
                         table.set_wait_state(server, IpcWaitState::Runnable, 0);
-                        if let Some(prev_client) = table.domains[server].reply_target.replace(cur)
-                            && prev_client != cur
-                            && prev_client < MAX_DOMAINS
-                            && table.domains[prev_client].active
-                            && table.domains[prev_client].wait == IpcWaitState::WaitingReply
-                        {
-                            table.domains[prev_client].frame.x[0] =
-                                SysError::InvalidCapability as u64;
-                            table.domains[prev_client].frame.x[1] = 0;
-                            table.domains[prev_client].frame.x[2] = 0;
-                            table.set_wait_state(prev_client, IpcWaitState::Runnable, 0);
-                            let _ = table.sched.wake_slot(prev_client);
-                        }
+                        table.replace_reply_target(server, cur);
                         table.set_wait_state(cur, IpcWaitState::WaitingReply, ep_id);
                         let _ = table.sched.block_slot(cur);
                         let _ = table.sched.wake_slot(server);
@@ -2054,20 +2079,7 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                             {
                                 // Never silently overwrite an unanswered reply target (`H3`):
                                 // fail-and-wake any stranded previous caller first.
-                                if let Some(prev_client) =
-                                    table.domains[cur].reply_target.replace(caller)
-                                    && prev_client != caller
-                                    && prev_client < MAX_DOMAINS
-                                    && table.domains[prev_client].active
-                                    && table.domains[prev_client].wait == IpcWaitState::WaitingReply
-                                {
-                                    table.domains[prev_client].frame.x[0] =
-                                        SysError::InvalidCapability as u64;
-                                    table.domains[prev_client].frame.x[1] = 0;
-                                    table.domains[prev_client].frame.x[2] = 0;
-                                    table.set_wait_state(prev_client, IpcWaitState::Runnable, 0);
-                                    let _ = table.sched.wake_slot(prev_client);
-                                }
+                                table.replace_reply_target(cur, caller);
                             }
                             ipc_badge_out = msg.badge;
                             Ok(msg.payload)
@@ -2660,19 +2672,10 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                                 table.domains[cur_pd].wait_notif_id = notif_id;
                                 table.domains[cur_pd].wait_notif_mask = mask;
                                 table.domains[cur_pd].sleep_deadline_ticks = deadline;
-                                let _ = table.sched.block_slot(cur_pd);
-                                if let Some(next) = table.pick_next_runnable(cur_pd) {
-                                    context_switch(&mut table, cur_pd, next, frame);
-                                    return;
+                                if !table.block_or_detach_current(cur_pd, frame) {
+                                    drop(table);
+                                    park_cpu_until_runnable(frame);
                                 }
-                                let cpu = (super::get_cpu_id() as usize).min(MAX_CPUS - 1);
-                                table.domains[cur_pd].frame = *frame;
-                                save_fp_state(&mut table.domains[cur_pd].fp);
-                                table.domains[cur_pd].tpidr_el0 = read_tpidr_el0();
-                                table.domains[cur_pd].running_on = None;
-                                table.cpu_current[cpu] = None;
-                                drop(table);
-                                park_cpu_until_runnable(frame);
                                 return;
                             }
                         }
@@ -2734,19 +2737,10 @@ pub extern "C" fn sync_el0_dispatch(frame: &mut TrapFrame) {
                 let mut table = DOMAINS.lock();
                 table.domains[cur_pd].wait = IpcWaitState::Sleeping;
                 table.domains[cur_pd].sleep_deadline_ticks = Some(deadline);
-                let _ = table.sched.block_slot(cur_pd);
-                if let Some(next) = table.pick_next_runnable(cur_pd) {
-                    context_switch(&mut table, cur_pd, next, frame);
-                    return;
+                if !table.block_or_detach_current(cur_pd, frame) {
+                    drop(table);
+                    park_cpu_until_runnable(frame);
                 }
-                let cpu = (super::get_cpu_id() as usize).min(MAX_CPUS - 1);
-                table.domains[cur_pd].frame = *frame;
-                save_fp_state(&mut table.domains[cur_pd].fp);
-                table.domains[cur_pd].tpidr_el0 = read_tpidr_el0();
-                table.domains[cur_pd].running_on = None;
-                table.cpu_current[cpu] = None;
-                drop(table);
-                park_cpu_until_runnable(frame);
                 return;
             }
         }

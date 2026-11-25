@@ -72,14 +72,7 @@ impl ShellHost for StandaloneShellHost {
         }
     }
 
-    fn sys_info(&mut self) -> SysInfo {
-        let s = newos_user_rt::sys_info();
-        SysInfo {
-            online_cpus: s.online_cpus,
-            domain_count: s.domain_count,
-            interactive_shell: s.interactive_shell,
-        }
-    }
+    newos_user_rt::forward_shell_host_syscalls!();
 
     fn read_debug_byte(&mut self) -> Result<u8, SysError> {
         self.poll_auth_gate();
@@ -110,26 +103,6 @@ impl ShellHost for StandaloneShellHost {
 
     fn poll_background_log(&mut self, out: &mut [u8]) -> Option<(u64, usize)> {
         self.log_rx.poll_line(CapId::BOOTSTRAP_LOG_EP, out)
-    }
-
-    fn ipc_send(&mut self, cap: CapId, payload: u64) -> Result<(), SysError> {
-        newos_user_rt::ipc_send(cap, payload)
-    }
-
-    fn ipc_recv(&mut self, cap: CapId) -> Result<(u64, u64), SysError> {
-        newos_user_rt::ipc_recv(cap)
-    }
-
-    fn ipc_call(&mut self, cap: CapId, payload: u64) -> Result<(u64, u64), SysError> {
-        newos_user_rt::ipc_call(cap, payload)
-    }
-
-    fn yield_now(&mut self) -> Result<u64, SysError> {
-        newos_user_rt::yield_now()
-    }
-
-    fn read_cycles(&mut self) -> Result<u64, SysError> {
-        newos_user_rt::read_cycles()
     }
 
     fn trigger_user_fault(&mut self) {

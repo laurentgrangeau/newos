@@ -973,3 +973,47 @@ macro_rules! entry {
         }
     };
 }
+
+/// Forward standard EL0 `ShellHost` syscall methods (`sys_info`, `ipc_*`, `yield_now`,
+/// `read_cycles`) directly to `newos_user_rt`.
+#[macro_export]
+macro_rules! forward_shell_host_syscalls {
+    () => {
+        fn sys_info(&mut self) -> SysInfo {
+            let info = $crate::sys_info();
+            SysInfo {
+                online_cpus: info.online_cpus,
+                domain_count: info.domain_count,
+                interactive_shell: info.interactive_shell,
+            }
+        }
+
+        fn ipc_send(
+            &mut self,
+            cap: newos_abi::CapId,
+            payload: u64,
+        ) -> Result<(), newos_abi::SysError> {
+            $crate::ipc_send(cap, payload)
+        }
+
+        fn ipc_recv(&mut self, cap: newos_abi::CapId) -> Result<(u64, u64), newos_abi::SysError> {
+            $crate::ipc_recv(cap)
+        }
+
+        fn ipc_call(
+            &mut self,
+            cap: newos_abi::CapId,
+            payload: u64,
+        ) -> Result<(u64, u64), newos_abi::SysError> {
+            $crate::ipc_call(cap, payload)
+        }
+
+        fn yield_now(&mut self) -> Result<u64, newos_abi::SysError> {
+            $crate::yield_now()
+        }
+
+        fn read_cycles(&mut self) -> Result<u64, newos_abi::SysError> {
+            $crate::read_cycles()
+        }
+    };
+}

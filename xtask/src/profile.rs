@@ -505,6 +505,21 @@ impl BuildProfile {
         feats
     }
 
+    fn push_net_protocol_features(&self, feats: &mut Vec<String>) {
+        for (enabled, name) in [
+            (self.ipv4, "ipv4"),
+            (self.ipv6, "ipv6"),
+            (self.tcp, "tcp"),
+            (self.udp, "udp"),
+            (self.icmp, "icmp"),
+            (self.dns, "dns"),
+        ] {
+            if enabled {
+                feats.push(name.into());
+            }
+        }
+    }
+
     /// Resolve Cargo `--features` list for `newos-supervisor-pd` (`--no-default-features`).
     pub fn supervisor_features(&self) -> Vec<String> {
         let mut feats = Vec::new();
@@ -516,24 +531,7 @@ impl BuildProfile {
         }
         if self.net_enabled && self.shell {
             feats.push("net".into());
-            if self.ipv4 {
-                feats.push("ipv4".into());
-            }
-            if self.ipv6 {
-                feats.push("ipv6".into());
-            }
-            if self.tcp {
-                feats.push("tcp".into());
-            }
-            if self.udp {
-                feats.push("udp".into());
-            }
-            if self.icmp {
-                feats.push("icmp".into());
-            }
-            if self.dns {
-                feats.push("dns".into());
-            }
+            self.push_net_protocol_features(&mut feats);
         }
         if self.ssh {
             feats.push("ssh".into());
@@ -550,24 +548,7 @@ impl BuildProfile {
     /// Resolve Cargo `--features` list for `newos-net-pd` (`--no-default-features`).
     pub fn net_pd_features(&self) -> Vec<String> {
         let mut feats = Vec::new();
-        if self.ipv4 {
-            feats.push("ipv4".into());
-        }
-        if self.ipv6 {
-            feats.push("ipv6".into());
-        }
-        if self.tcp {
-            feats.push("tcp".into());
-        }
-        if self.udp {
-            feats.push("udp".into());
-        }
-        if self.icmp {
-            feats.push("icmp".into());
-        }
-        if self.dns {
-            feats.push("dns".into());
-        }
+        self.push_net_protocol_features(&mut feats);
         for drv in &self.net_drivers {
             feats.push(format!("driver-{drv}"));
         }
