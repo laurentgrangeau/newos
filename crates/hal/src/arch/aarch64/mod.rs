@@ -820,7 +820,7 @@ impl Aarch64Platform {
         const KERNEL_STACK_PAGES: u64 = 8;
         const KERNEL_STACK_STRIDE: u64 = KERNEL_GUARD_BYTES + KERNEL_STACK_PAGES * 4096;
         if let Ok(stack_flags) = PageFlags::new_wx(true, false, false, false) {
-            for cpu in 0..EL1_GUARDED_STACK_TOPS.len() {
+            for (cpu, stack_top) in EL1_GUARDED_STACK_TOPS.iter().enumerate() {
                 let base = KERNEL_STACK_BASE + (cpu as u64) * KERNEL_STACK_STRIDE;
                 let mut ok = true;
                 for p in 0..KERNEL_STACK_PAGES {
@@ -838,8 +838,7 @@ impl Aarch64Platform {
                     }
                 }
                 if ok {
-                    EL1_GUARDED_STACK_TOPS[cpu]
-                        .store(base + KERNEL_STACK_STRIDE, Ordering::Release);
+                    stack_top.store(base + KERNEL_STACK_STRIDE, Ordering::Release);
                 }
             }
         }

@@ -69,6 +69,7 @@ jobs:
   kani-verification:
     name: Kani Formal Verification Proofs
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Install Kani model checker

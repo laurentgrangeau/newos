@@ -1026,6 +1026,7 @@ mod kani_proofs {
     use super::*;
 
     #[kani::proof]
+    #[kani::unwind(8)]
     fn scheduler_spawn_exit_reclaim_conserves_slot_capacity() {
         let mut sched: Scheduler<4> = Scheduler::new();
         let prio: u8 = kani::any();

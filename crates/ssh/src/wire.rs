@@ -238,6 +238,7 @@ mod kani_proofs {
     use super::*;
 
     #[kani::proof]
+    #[kani::unwind(20)]
     fn wire_reader_never_panics_on_arbitrary_16_bytes() {
         let data: [u8; 16] = kani::any();
         let len: usize = kani::any();

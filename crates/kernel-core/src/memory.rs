@@ -1121,6 +1121,7 @@ mod kani_proofs {
     /// Prove `UntypedInventory::retype_frame` never yields overlapping frames or out-of-bounds
     /// addresses for any valid page-aligned physical region.
     #[kani::proof]
+    #[kani::unwind(4)]
     fn untyped_retype_frames_disjoint_and_in_bounds() {
         let base_pages: u64 = kani::any();
         let len_pages: u64 = kani::any();

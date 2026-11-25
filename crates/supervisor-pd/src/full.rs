@@ -1387,7 +1387,7 @@ pub fn main() -> ! {
     // Deliberately crash `worker` twice via `udf #0` (`0xDEAD_C0DE`), verify fault notification +
     // `DomainGetFaultInfo`, verify `DomainRespawn` restores IPC service, and prove exact 0-frame leak.
     let mut rem_after_cycle = [0u64; 2];
-    for cycle in 0..2usize {
+    for (cycle, rem_slot) in rem_after_cycle.iter_mut().enumerate() {
         if newos_user_rt::ipc_call(CapId::BOOTSTRAP_EP, 0xDEAD_C0DE)
             != Err(SysError::InvalidCapability)
         {
@@ -1446,7 +1446,7 @@ pub fn main() -> ! {
             out.flush();
             newos_user_rt::exit(ShutdownStatus::Failed);
         }
-        rem_after_cycle[cycle] = rem_frames;
+        *rem_slot = rem_frames;
         if newos_user_rt::domain_respawn(newos_abi::DomainRoleId::Worker) != Ok(worker_pd) {
             let _ = writeln!(
                 out,

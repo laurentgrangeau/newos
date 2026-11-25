@@ -491,6 +491,7 @@ mod kani_proofs {
     use super::*;
 
     #[kani::proof]
+    #[kani::unwind(8)]
     fn parse_elf64_never_panics_on_arbitrary_64_byte_header() {
         let data: [u8; 64] = kani::any();
         let len: usize = kani::any();

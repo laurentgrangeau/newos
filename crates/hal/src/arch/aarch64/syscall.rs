@@ -1685,9 +1685,9 @@ fn park_cpu_until_runnable(frame: &mut TrapFrame) {
                 return;
             }
             let mut min_dl: Option<u64> = None;
-            for p in 0..t.count.min(MAX_DOMAINS) {
-                if t.domains[p].active
-                    && let Some(dl) = t.domains[p].sleep_deadline_ticks
+            for dom in t.domains.iter().take(t.count.min(MAX_DOMAINS)) {
+                if dom.active
+                    && let Some(dl) = dom.sleep_deadline_ticks
                 {
                     min_dl = Some(match min_dl {
                         Some(cur) => cur.min(dl),
