@@ -3,6 +3,7 @@ name = "newos-user-rt"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 newos-abi = { workspace = true, default-features = false }

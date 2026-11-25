@@ -3,6 +3,7 @@ name = "newos-key-pd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [features]
 default = ["driver-bcm2712", "driver-virtio", "csprng"]

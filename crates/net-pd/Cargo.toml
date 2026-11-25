@@ -3,6 +3,7 @@ name = "newos-net-pd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [features]
 default = ["ipv4", "ipv6", "tcp", "udp", "icmp", "dns", "driver-gem", "driver-virtio"]

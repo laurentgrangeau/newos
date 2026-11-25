@@ -3,6 +3,7 @@ name = "newos-supervisor-pd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [features]
 default = ["shell", "crypto-sha3", "net", "ipv4", "ipv6", "tcp", "udp", "icmp", "dns", "ssh", "worker-supervisor", "wdt"]

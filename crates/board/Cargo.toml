@@ -3,6 +3,7 @@ name = "newos-board"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [features]
 default = ["mailbox", "thermal", "rtc", "rp1-bus"]

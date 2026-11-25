@@ -98,7 +98,7 @@ jobs:
           git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff
           if [ -s pr.diff ]; then
             set +e
-            cargo xtask mutants --in-diff pr.diff
+            cargo mutants --in-diff pr.diff
             rc=$?
             set -e
             # Exit code 2 = surviving mutants (uploaded as report); any other non-zero is a real failure
@@ -110,9 +110,10 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           set +e
-          cargo xtask mutants --package newos-wdt
+          cargo mutants --package newos-wdt
           rc=$?
           set -e
+          # Exit code 2 = surviving mutants (uploaded as report); any other non-zero is a real failure
           if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then exit "$rc"; fi
       - name: Upload mutants.out report
         uses: actions/upload-artifact@v4

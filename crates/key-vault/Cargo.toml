@@ -3,6 +3,7 @@ name = "newos-key-vault"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [features]
 default = ["ml-dsa-87", "sha3"]

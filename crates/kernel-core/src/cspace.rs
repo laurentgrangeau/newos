@@ -1457,11 +1457,14 @@ mod kani_proofs {
         assert_eq!(cap.badge, badge1);
 
         // Badge immutability: attempting to re-badge an already badged cap must fail
+        // (`Some(0)` is rejected as `InvalidArgument`; any non-zero badge as `InsufficientRights`).
         if cap.rights.contains(Rights::GRANT) {
-            assert_eq!(
-                cnode.mint(minted, 3, mask, Some(badge2)),
+            let expected = if badge2 == 0 {
+                Err(SysError::InvalidArgument)
+            } else {
                 Err(SysError::InsufficientRights)
-            );
+            };
+            assert_eq!(cnode.mint(minted, 3, mask, Some(badge2)), expected);
         }
     }
 
