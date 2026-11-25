@@ -1,8 +1,8 @@
 # NewOS
 
-> **Release:** [`v0.9.0`](https://github.com/laurentgrangeau/newos/releases/tag/v0.9.0) · `main` is on `0.10.0` development.
+> **Release:** [`v0.10.0`](https://github.com/laurentgrangeau/newos/releases/tag/v0.10.0)
 
-A **64-bit capability microkernel** and **EL0 userspace environment** for the **Raspberry Pi 5 16 GB** (`aarch64` / ARMv8.2-A quad-core BCM2712 Cortex-A76, with QEMU `aarch64` `virt` as a local test harness). Features **static EL1 memory management**, **workspace-enforced `unsafe_code = "forbid"`** (with audited `unsafe` confined to `crates/hal` and `crates/user-rt`), **Kernel PIE + Limine KASLR**, **Userspace PIE + full ASLR + KCFI + LLVM ShadowCallStack (`x18`)**, **quad-core SMP EL0 scheduling with GICv2 SGI wakeups & cross-core blocking IPC**, **isolated `TTBR0_EL1` address spaces (16-bit ASIDs + full NEON/FP save/restore)**, **EL0 crash isolation**, **live ACPI hardware discovery (`FADT`/`SPCR`/`MADT`/`GTDT`/`MCFG`)**, a **Raspberry Pi 5 (16 GB) EL0 hardware driver stack** (**BCM2712 Watchdog**, **RP1 40-pin GPIO**, **VideoCore Mailbox**, **AVS TMON Thermal & Active Cooler Fan**, **RTC**, **RP1 UART/I2C/SPI/PWM**, **BCM2712 MIP MSI-X**, **PCIe ECAM**, **microSD SDHCI**, **NVMe 1.4**, **RP1 Dual xHCI USB 3.0**, **UEFI GOP Framebuffer**, **`brcm,bcm2712-iommu`**, **VideoCore VII V3D 7.1**, **Cortex-A76 NEON/DotProd AI Compute**, and **Hailo-8/8L/10H PCIe NPU**), a **3-domain privilege-separated post-quantum SSHv2 service (`newos-net-pd` + `newos-key-pd` + `newos-ssh-pd`)** with **hardware TRNG (`BCM2712 iproc-rng200` / `VirtIO-RNG`)**, an **EL0 `smoltcp` IPv4/IPv6 TCP/IP stack + RP1 Cadence GEM Gigabit Ethernet driver** (plus VirtIO 1.0+ for QEMU testing), a **FIPS 202 `SHA3-512` Content-Addressed Object Store (CAOS)**, and a **UTF-8 Typed Pipeline Shell (`newos-shell-pd`)**.
+A **64-bit capability microkernel** and **EL0 userspace environment** for the **Raspberry Pi 5 16 GB** (`aarch64` / ARMv8.2-A quad-core BCM2712 Cortex-A76, with QEMU `aarch64` `virt` as a local test harness). Features **static EL1 memory management**, **workspace-enforced `unsafe_code = "forbid"`** (with audited `unsafe` confined to `crates/hal` and `crates/user-rt`), **monotonic nanosecond boot & command/response log timestamps (`CNTVCT_EL0`/`CNTFRQ_EL0`)**, **Kernel PIE + Limine KASLR**, **Userspace PIE + full ASLR + KCFI + LLVM ShadowCallStack (`x18`)**, **quad-core SMP EL0 scheduling with GICv2 SGI wakeups & cross-core blocking IPC**, **isolated `TTBR0_EL1` address spaces (16-bit ASIDs + full NEON/FP save/restore)**, **EL0 crash isolation**, **live ACPI hardware discovery (`FADT`/`SPCR`/`MADT`/`GTDT`/`MCFG`)**, a **Raspberry Pi 5 (16 GB) EL0 hardware driver stack** (**BCM2712 Watchdog**, **RP1 40-pin GPIO**, **VideoCore Mailbox**, **AVS TMON Thermal & Active Cooler Fan**, **RTC**, **RP1 UART/I2C/SPI/PWM**, **BCM2712 MIP MSI-X**, **PCIe ECAM**, **microSD SDHCI**, **NVMe 1.4**, **RP1 Dual xHCI USB 3.0**, **UEFI GOP Framebuffer**, **`brcm,bcm2712-iommu`**, **VideoCore VII V3D 7.1**, **Cortex-A76 NEON/DotProd AI Compute**, and **Hailo-8/8L/10H PCIe NPU**), a **3-domain privilege-separated post-quantum SSHv2 service (`newos-net-pd` + `newos-key-pd` + `newos-ssh-pd`)** with **hardware TRNG (`BCM2712 iproc-rng200` / `VirtIO-RNG`)**, an **EL0 `smoltcp` IPv4/IPv6 TCP/IP stack + RP1 Cadence GEM Gigabit Ethernet driver** (plus VirtIO 1.0+ for QEMU testing), a **FIPS 202 `SHA3-512` Content-Addressed Object Store (CAOS)**, and a **UTF-8 Typed Pipeline Shell (`newos-shell-pd`)**.
 
 ## Architecture Principles
 
@@ -29,7 +29,7 @@ A **64-bit capability microkernel** and **EL0 userspace environment** for the **
   - **Microarchitectural & Hardware Mitigations:** Probed ARMv8.2-A Cortex-A76 mitigations (`PAN`, `SSBS` / `SCTLR_EL1.DSSBS`, `CSV2`, `CSV3`); Cortex-A76 24-iteration Spectre-BHB clearing on EL0→EL1 entry; `csdb` Spectre v1 barriers; GPR/NEON scrubbing on fault redirect; zero-on-free frame reclaim; DMA cache maintenance (`dc cvac`/`dc civac`); capability-typed `IoSpace` placeholder reserved for BCM2712's `brcm,bcm2712-iommu` (BCM2712 does not include ARM SMMUv3).
 - **EL0 Storage & Typed Shell:**
   - **Content-Addressed Object Store (CAOS):** Immutable blobs addressed by `const fn` **FIPS 202 `SHA3-512`** `ObjHash` with automatic deduplication, collision rejection, lock-free reads, mark-and-sweep `gc()`, validated binary snapshots (`encode_snapshot`/`decode_snapshot`), capability-gated named Refs (`@name`), instant atomic `rollback`, and irreversible `seal` (read-only attenuation).
-  - **Typed Pipeline Shell (`newos-shell-pd`):** Full UTF-8 multi-byte input & scalar-aware backspace; stages pass typed `Record` values (`Proc`, `Object`, `Ref`, `Metric`, `Count`) directly through `|` (`put "hello" | save @note`, `objects | where size > 20`, `domains | where el == 0 | count`, `net dhcp`, `net ping`, `net resolve`).
+  - **Typed Pipeline Shell (`newos-shell-pd`):** Full UTF-8 multi-byte input & scalar-aware backspace; stages pass typed `Record` values (`Domain`, `Object`, `Ref`, `Metric`, `Count`) directly through `|` (`put "hello" | save @note`, `objects | where size > 20`, `domains | where el == 0 | count`, `net dhcp`, `net ping`, `net resolve`), with nanosecond-timestamped `[cmd]` execution and response logging on serial consoles.
 - **Raspberry Pi 5 (16 GB) Hardware Target:**
   - 64-bit `aarch64` compiled for `-C target-cpu=cortex-a76` (`+v8.2a,+neon,+crc,+lse,+dotprod,+fp16,+crypto`).
   - **Core SoC, SMP & Memory:** **UEFI GPT + FAT32 ESP** disk images (`xtask/src/gpt.rs`), Limine + UEFI GOP framebuffer discovery, live **ACPI** hardware discovery (`FADT` PSCI `SMC`/`HVC` `SYSTEM_OFF` + `SYSTEM_RESET`, `SPCR` PL011 UART, `MADT` GICv2/GIC-400 + CPUs, `GTDT` Generic Timer GSIV, `MCFG` PCIe ECAM), GIC-400 SPI routing/triggering + **BCM2712 MIP MSI-X** (`0x10_0013_0000`), quad-core SMP EL0 scheduling with cross-core blocking IPC, probed ARMv8.2-A ISA extensions (`CpuFeatures`), `PMUv3` (`PMCCNTR_EL0`), 4-level `TTBR0_EL1`/`TTBR1_EL1` with 16-bit ASIDs & validated ≥40-bit `TCR_EL1.IPS` for 16 GB RAM, PAN-safe `DmaCacheOp` (`dc cvac`/`dc civac`), and **BCM2712 Hardware Watchdog** (`0x10_7D20_0000`, `newos-wdt`).
@@ -134,7 +134,7 @@ sequenceDiagram
 
     alt Interactive Mode (default on Raspberry Pi 5 / cargo xtask run)
         Supervisor->>Supervisor: Arm Bcm2712Watchdog (8s) + NotifyWait(BOOTSTRAP_FAULT_NOTIF, 2s) supervision loop
-        Note over Boot,Init: Standalone `newos-shell-pd`, `net-pd`, `key-pd`, `ssh-pd` run in isolated EL0 VSpaces
+        Note over Boot,Supervisor: Standalone `newos-shell-pd`, `net-pd`, `key-pd`, `ssh-pd` run in isolated EL0 VSpaces
     else Automated Self-Test Mode (cargo xtask test)
         Supervisor->>HAL: ipc_send(BOOTSTRAP_EP, 0xA110_C0DE) + yield_now()
         HAL->>Worker: Switch TTBR0_EL1 -> enter newos-worker-pd::main()
@@ -157,7 +157,7 @@ sequenceDiagram
 ```text
 newos/
 ├── rust-toolchain.toml          # Nightly toolchain + rust-src, llvm-tools-preview, aarch64-unknown-none
-├── Cargo.toml                   # Workspace manifest (v0.10.0; v0.9.0 released)
+├── Cargo.toml                   # Workspace manifest (v0.10.0)
 ├── BENCHMARK_RESULTS.md         # Reproducible 28-metric before/after kernel, shell & IPC benchmarks
 ├── profiles/                    # Declarative TOML system composition & TCB profiles (inline-commented) & OPTIONS.md
 │   ├── OPTIONS.md               # Exhaustive reference of all 31 profile options, valid values & dependencies
@@ -171,7 +171,7 @@ newos/
 ├── xtask/                       # Build automation: system composition resolver, feature-matrix, UEFI GPT+FAT32 ESP images, QEMU, Miri, Kani & benchmarks
 ├── crates/                      # Workspace enforces `unsafe_code = "forbid"` everywhere except `hal` and `user-rt`; OS crates are `no_std`/`no_alloc`
 │   ├── crypto/                  # Modular crypto traits & feature-gated algorithms (SHA3, ChaCha20-Poly1305, ML-KEM-1024, ML-DSA-87)
-│   ├── abi/                     # Syscalls, CapId, Rights, DmaCacheOp, cpu_isa, SpscRing (optional `sha3`)
+│   ├── abi/                     # Syscalls, CapId, Rights, DmaCacheOp, cpu_isa, SpscRing, nanosecond timestamps (optional `sha3`)
 │   ├── hal/                     # Minimal audited unsafe TCB (aarch64, GIC-400, BCM2712 MIP, quad-core SMP, ACPI, PMUv3, MMIO)
 │   ├── kernel-core/             # Untyped, CSpace/CDT, ELF64 PIE, ACPI, IPC, Sched + Kani proofs
 │   ├── kernel/                  # Thin EL1 kernel binary
@@ -307,7 +307,6 @@ get @note
 objects | where size > 20
 refs | where writable == false
 domains | where el == 0 | count
-procs | where pid == 1 | count
 ref rollback @note
 ref seal @note
 net
