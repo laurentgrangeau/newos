@@ -11,6 +11,8 @@ description: >-
 Follow these procedures and conventions when working on Rust kernel and OS code
 in this repository.
 
+> **Architectural North Star**: NewOS is a **seL4-inspired capability microkernel** (NOT a Linux/monolithic kernel). Draw from seL4, L4, and modern Rust OS research (e.g., RedLeaf, Theseus, Hubris), keep the EL1 TCB strictly minimal, use modern capability-microkernel naming (no Unix/POSIX/`daemon` legacy), and continuously verify that every change is the **safest, fastest, most modern, memory-safe** implementation possible (see `.agents/rules/sel4-microkernel-principles.md`).
+
 ## 1. Toolchain & Cargo Configuration
 
 - Use the Rust **nightly** toolchain with `rust-src`, `llvm-tools-preview`,
@@ -65,10 +67,11 @@ in this repository.
 
 ## 4. Verification Checklist
 
-Before concluding a change, run the applicable checks:
-1. `cargo fmt --check`
-2. `cargo clippy --all-targets -- -D warnings` (or target-specific `--target ...`)
-3. `cargo build` / boot image build succeeds cleanly
-4. `cargo test` passes (both host unit tests and QEMU integration tests)
-5. Boot the image in QEMU with `-serial stdio -display none` and confirm
-   expected boot/serial output with no triple-faults or panics.
+Every time you add, modify, or delete any line of code, you MUST:
+1. Create or update tests covering the change (unit tests and/or E2E tests).
+2. Run local checks:
+   - `cargo fmt --check`
+   - `cargo clippy --all-targets -- -D warnings` (or target-specific `--target ...`)
+   - `cargo test` (host unit and E2E tests)
+3. Sync all modified/added/deleted files to `newos-dev` (`/home/laurentgrangeau/newos`) via IAP.
+4. Run `source /etc/profile.d/rust.sh && cd ~/newos && cargo xtask test` on `newos-dev` and confirm the AArch64 kernel + EL0 protection domains build cleanly and boot in QEMU with `PSCI SYSTEM_OFF (status=OK)` and no panics or failures.
