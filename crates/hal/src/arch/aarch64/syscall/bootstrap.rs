@@ -1,7 +1,7 @@
 //! Bootstrap capability provisioning, MMIO address translation, boot-module ELF registry,
 //! shared-memory ring allocation, and protection-domain registration.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "userspace")]
 use newos_abi::RING_PEER_RESET_BIT;
 use newos_abi::{CapId, SysError};
@@ -95,6 +95,8 @@ static BOOT_MODULES: IrqSpinLock<[Option<BootModuleSlice>; MAX_DOMAINS]> =
 static NET_SSH_RING_PHYS: AtomicU64 = AtomicU64::new(0);
 static SSH_KEY_RING_PHYS: AtomicU64 = AtomicU64::new(0);
 static NET_DMA_RING_PHYS: AtomicU64 = AtomicU64::new(0);
+/// Whether `newos-net-pd` is loaded in this boot image (controls `BOOTSTRAP_NET_EP` provisioning).
+static NET_PD_PRESENT: AtomicBool = AtomicBool::new(false);
 
 /// Initialize syscall globals and PD 0 (`supervisor-pd`) bootstrap capabilities.
 pub fn init(
@@ -127,6 +129,7 @@ pub fn init(
     // so `net-pd` is the sole holder of NIC DMA authority. Conversely, when `newos-net-pd` is
     // absent, omit `BOOTSTRAP_NET_EP` from PD 0 so shell `net` commands never block on an
     // unserved endpoint.
+    NET_PD_PRESENT.store(net_pd_present, Ordering::Release);
     let init_net_cap = if net_pd_present { None } else { cap_region };
     let mut ipc = IPC_STATE.lock();
     let _ = ipc.init_bootstrap_caps(init_net_cap);
@@ -301,7 +304,7 @@ fn provision_role_caps(
             }
         }
         DomainRole::Shell => {
-            ipc.init_shell_pd_bootstrap_caps(pd_id)?;
+            ipc.init_shell_pd_bootstrap_caps(pd_id, NET_PD_PRESENT.load(Ordering::Acquire))?;
             let _ = ipc.register_child_thread_cap_in_root(40, pd_id)?;
             let _ = ipc.register_child_caps_in_root(pd_id)?;
         }

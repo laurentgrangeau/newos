@@ -1073,6 +1073,8 @@ pub mod role_badge {
     pub const ROLE_KEY: u32 = 0x1003;
     /// Role tag for `newos-ssh-pd`.
     pub const ROLE_SSH: u32 = 0x1004;
+    /// Role tag for `newos-shell-pd`.
+    pub const ROLE_SHELL: u32 = 0x1005;
 
     /// Pack a `(role_tag, diagnostic_pd_id)` pair into a single 64-bit `BOOTSTRAP_LOG_EP` badge.
     #[inline]
@@ -1105,12 +1107,13 @@ pub mod role_badge {
             ROLE_NET => "net-pd",
             ROLE_KEY => "key-pd",
             ROLE_SSH => "ssh-pd",
+            ROLE_SHELL => "shell-pd",
             _ => "pd",
         }
     }
 }
 
-/// Register-only IPC wire protocol for `CapId::BOOTSTRAP_NET_EP` (`newos-net-pd` <-> `newos-ssh-pd`/`supervisor-pd`).
+/// Register-only IPC wire protocol for `CapId::BOOTSTRAP_NET_EP` (`newos-net-pd` <-> `newos-ssh-pd`/`supervisor-pd`/`shell-pd`).
 ///
 /// Each 64-bit request word carries an opcode in bits `56..64` and up to 7 payload bytes in bits `0..56`:
 /// - `OP_POLL_STATUS (0x01)`: query connection/readiness bits + active IPv4 address
@@ -1178,6 +1181,8 @@ pub mod net_ipc {
     pub const BADGE_SUPERVISOR: u64 = crate::role_badge::ROLE_SUPERVISOR as u64;
     /// Kernel-stamped IPC role badge for `newos-ssh-pd` owning the TCP :22 stream.
     pub const BADGE_SSH: u64 = crate::role_badge::ROLE_SSH as u64;
+    /// Kernel-stamped IPC role badge for `newos-shell-pd` issuing diagnostic/control network commands.
+    pub const BADGE_SHELL: u64 = crate::role_badge::ROLE_SHELL as u64;
 
     #[inline]
     #[must_use]

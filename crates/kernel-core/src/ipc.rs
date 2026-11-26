@@ -593,12 +593,18 @@ impl KernelIpcState {
     /// shutdown/reboot requests to PD 0), `BOOTSTRAP_CONSOLE` (`R|W`), read-only
     /// `BOOTSTRAP_POWER` (`SysInfo` only — cannot halt/reboot directly), `BOOTSTRAP_LOG_EP` (`R|W`),
     /// `BOOTSTRAP_SSH_SHELL_EP` (`R`), `BOOTSTRAP_AUTH_GATE_EP` (`R`), `BOOTSTRAP_SSH_OUT_EP` (`W`),
-    /// and read-only `BOOTSTRAP_SELF_THREAD`. Explicitly omits all MMIO and `Untyped` caps.
+    /// read-only `BOOTSTRAP_SELF_THREAD`, and — when `net_pd_present` is true — write-only
+    /// role-badged `BOOTSTRAP_NET_EP` (`net_ipc::BADGE_SHELL`) for diagnostic/control IPC to
+    /// `newos-net-pd`. Explicitly omits all MMIO and `Untyped` caps.
     ///
     /// # Errors
     /// - [`SysError::InvalidArgument`] if `pd_id == 0` or `pd_id >= MAX_IPC_DOMAINS`.
     /// - [`SysError::SlotOccupied`] if any target bootstrap slot is already occupied.
-    pub fn init_shell_pd_bootstrap_caps(&mut self, pd_id: usize) -> Result<(), SysError> {
+    pub fn init_shell_pd_bootstrap_caps(
+        &mut self,
+        pd_id: usize,
+        net_pd_present: bool,
+    ) -> Result<(), SysError> {
         let (cnode, pd_u32) = self.child_cspace_mut(pd_id)?;
         let rw = Rights::READ.union(Rights::WRITE);
         let _ = cnode.insert_root_at(1, Capability::new(CapObject::Notification { id: 0 }, rw))?;
@@ -617,6 +623,16 @@ impl KernelIpcState {
             Capability::new(CapObject::Thread { id: pd_u32 }, Rights::READ),
         )?;
         let _ = cnode.insert_root_at(11, Capability::new(CapObject::Endpoint { id: 1 }, rw))?;
+        if net_pd_present {
+            let _ = cnode.insert_root_at(
+                13,
+                Capability {
+                    object: CapObject::Endpoint { id: 2 },
+                    rights: Rights::WRITE,
+                    badge: net_ipc::BADGE_SHELL,
+                },
+            )?;
+        }
         let _ = cnode.insert_root_at(
             15,
             Capability::new(CapObject::Endpoint { id: 4 }, Rights::READ),
@@ -2895,7 +2911,14 @@ mod tests {
     fn shell_pd_can_request_shutdown_without_power_write_or_fault_read() {
         let mut ipc = KernelIpcState::new();
         ipc.init_bootstrap_caps(None).expect("root caps");
-        ipc.init_shell_pd_bootstrap_caps(1).expect("shell caps");
+        ipc.init_shell_pd_bootstrap_caps(1, false)
+            .expect("shell caps");
+
+        // When `net-pd` is absent, `shell-pd` has no `BOOTSTRAP_NET_EP` capability.
+        assert_eq!(
+            ipc.ipc_send_for(1, CapId::BOOTSTRAP_NET_EP, 0x1),
+            Err(SysError::InvalidCapability)
+        );
 
         // `shell-pd` still holds only read-only `BOOTSTRAP_POWER` (cannot directly halt/reboot).
         assert_eq!(
@@ -2925,6 +2948,39 @@ mod tests {
         assert_eq!(
             newos_abi::supervisor_notif::decode_shutdown(consumed),
             Some(newos_abi::ShutdownStatus::Success)
+        );
+    }
+
+    #[test]
+    fn shell_pd_net_ep_is_role_badged_and_write_only_when_net_pd_present() {
+        let mut ipc = KernelIpcState::new();
+        ipc.init_bootstrap_caps(None).expect("root caps");
+        ipc.init_shell_pd_bootstrap_caps(1, true)
+            .expect("shell caps");
+        ipc.init_net_pd_bootstrap_caps(2, Some((PhysAddr::new(0x0a00_0000), 0x200)))
+            .expect("net caps");
+
+        // `shell-pd` holds ZERO NIC MMIO authority.
+        assert_eq!(
+            ipc.validate_mmio_read32_for(1, CapId::BOOTSTRAP_NET_MMIO, 0),
+            Err(SysError::InvalidCapability)
+        );
+        // `shell-pd` cannot receive (impersonate server) on `BOOTSTRAP_NET_EP`.
+        assert_eq!(
+            ipc.ipc_recv_for(1, CapId::BOOTSTRAP_NET_EP),
+            Err(SysError::InsufficientRights)
+        );
+        // `shell-pd` CAN send diagnostic/control IPC stamped with `net_ipc::BADGE_SHELL`.
+        assert_eq!(
+            ipc.ipc_send_for(1, CapId::BOOTSTRAP_NET_EP, net_ipc::encode_poll_status()),
+            Ok(())
+        );
+        assert_eq!(
+            ipc.ipc_recv_for(2, CapId::BOOTSTRAP_NET_EP),
+            Ok(IpcMessage {
+                badge: net_ipc::BADGE_SHELL,
+                payload: net_ipc::encode_poll_status(),
+            })
         );
     }
 

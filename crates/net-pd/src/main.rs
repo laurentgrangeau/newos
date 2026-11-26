@@ -6,7 +6,7 @@
 //! Strict least-privilege capability set:
 //! - `CapId::BOOTSTRAP_NET_MMIO` (`R|W`) — RP1 Cadence GEM (Pi 5) or VirtIO-Net (QEMU)
 //! - `CapId::BOOTSTRAP_VSPACE` (`R` only) — `VirtToPhys` DMA translation only
-//! - `CapId::BOOTSTRAP_NET_EP` (`R|W`) — server endpoint for `newos-ssh-pd` (badge 4) & `supervisor-pd` (0x1000)
+//! - `CapId::BOOTSTRAP_NET_EP` (`R|W`) — server endpoint for `newos-ssh-pd` (`0x1004`), `supervisor-pd` (`0x1000`), and `shell-pd` (`0x1005`)
 //! - `CapId::BOOTSTRAP_LOG_EP` (`W`, badge 2) — write-only diagnostic log
 //!
 //! Explicitly holds ZERO access to `RNG_MMIO`, `KEY_EP`, `AUTH_GATE_EP`, `SSH_SHELL_EP`,
@@ -320,8 +320,8 @@ fn handle_request<D: NetDevice>(
     dns_buf: &mut SupervisorDnsBuf,
     req: &NetIpcRequest<'_>,
 ) -> u64 {
-    if req.badge == net_ipc::BADGE_SUPERVISOR {
-        handle_supervisor_request(stack, driver_id, dns_buf, req)
+    if matches!(req.badge, net_ipc::BADGE_SUPERVISOR | net_ipc::BADGE_SHELL) {
+        handle_control_request(stack, driver_id, dns_buf, req)
     } else if req.badge == net_ipc::BADGE_SSH {
         handle_ssh_request(stack, req)
     } else {
@@ -386,13 +386,14 @@ fn handle_supervisor_dns_request<D: NetDevice>(
 }
 
 #[cfg(feature = "tcp")]
-fn handle_supervisor_request<D: NetDevice>(
+fn handle_control_request<D: NetDevice>(
     stack: &mut NetStack<'_, D>,
     driver_id: u8,
     dns_buf: &mut SupervisorDnsBuf,
     req: &NetIpcRequest<'_>,
 ) -> u64 {
-    // `newos-supervisor-pd`: diagnostic/control ops only (NEVER raw SSH TCP stream ops).
+    // `newos-supervisor-pd` and `newos-shell-pd`: diagnostic/control ops only
+    // (NEVER raw SSH TCP stream ops).
     let _ = req.now_ms;
     match req.op {
         net_ipc::OP_POLL_STATUS => encode_status(stack),

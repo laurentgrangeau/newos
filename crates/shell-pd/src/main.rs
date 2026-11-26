@@ -10,8 +10,23 @@
 use core::fmt::Write;
 use core::panic::PanicInfo;
 use newos_abi::{CapId, ShutdownStatus, SysError, auth_gate_ipc, log_ipc};
-use newos_shell_core::shell::{Shell, ShellHost, SysInfo};
+use newos_shell_core::net_client::{
+    NetPdClient, StackStrWriter, handle_net_via_net_pd, poll_status,
+};
+use newos_shell_core::shell::{NullWriter, OutputMode, RecordStream, Shell, ShellHost, SysInfo};
 use newos_user_rt::{BufferedConsole, IpcLogAssembler};
+
+struct UserRtNetClient;
+
+impl NetPdClient for UserRtNetClient {
+    fn ipc_call(&mut self, req: u64) -> Result<u64, SysError> {
+        newos_user_rt::ipc_call(CapId::BOOTSTRAP_NET_EP, req).map(|(_badge, reply)| reply)
+    }
+
+    fn sleep_ms(&mut self, ms: u64) {
+        let _ = newos_user_rt::sleep_ms(ms);
+    }
+}
 
 newos_user_rt::entry!(main);
 
@@ -146,6 +161,35 @@ impl ShellHost for StandaloneShellHost {
             newos_abi::supervisor_notif::encode_shutdown(code),
         );
         newos_user_rt::thread_exit()
+    }
+
+    fn handle_net(
+        &mut self,
+        subcmd: &str,
+        arg: Option<&str>,
+        stream: &mut RecordStream,
+        mode: OutputMode,
+    ) {
+        let mut client = UserRtNetClient;
+        if mode.is_silent() {
+            let mut sink = NullWriter;
+            if let Ok(status_word) = poll_status(&mut client) {
+                handle_net_via_net_pd(&mut client, subcmd, arg, stream, &mut sink, status_word);
+            }
+        } else {
+            let mut out = StackStrWriter::<1024>::new();
+            if let Ok(status_word) = poll_status(&mut client) {
+                handle_net_via_net_pd(&mut client, subcmd, arg, stream, &mut out, status_word);
+            } else if subcmd.is_empty() {
+                let _ = writeln!(out, "net: no net-pd available");
+            } else {
+                let _ = writeln!(out, "net {subcmd}: no net-pd available");
+            }
+            let s = out.as_str();
+            if !s.is_empty() {
+                self.write_debug(s);
+            }
+        }
     }
 }
 

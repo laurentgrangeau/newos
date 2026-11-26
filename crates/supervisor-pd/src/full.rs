@@ -12,6 +12,8 @@ use newos_net::{GemDma, MmioDmaTransport, VirtioNetDma};
 #[cfg(feature = "net")]
 use newos_net::{NetConfig, NicKind};
 #[cfg(feature = "net")]
+use newos_shell_core::net_client::{self, NetPdClient, StackStrWriter};
+#[cfg(feature = "net")]
 use newos_shell_core::shell::{NullWriter, Record};
 use newos_shell_core::shell::{OutputMode, RecordStream, Shell, ShellHost, SysInfo};
 use newos_user_rt::{BufferedConsole, IpcLogAssembler};
@@ -50,194 +52,28 @@ impl MmioDmaTransport for CapMmioDmaTransport {
     }
 }
 
-/// Fixed-capacity UTF-8 buffer implementing `core::fmt::Write` so shell commands can
-/// format text and route it through `ShellHost::write_debug` (serial + SSH).
 #[cfg(feature = "net")]
-struct StackStrWriter<const N: usize> {
-    buf: [u8; N],
-    len: usize,
-}
+struct UserRtNetClient;
 
 #[cfg(feature = "net")]
-impl<const N: usize> StackStrWriter<N> {
-    const fn new() -> Self {
-        Self {
-            buf: [0u8; N],
-            len: 0,
-        }
+impl NetPdClient for UserRtNetClient {
+    fn ipc_call(&mut self, req: u64) -> Result<u64, SysError> {
+        newos_user_rt::ipc_call(CapId::BOOTSTRAP_NET_EP, req).map(|(_badge, reply)| reply)
     }
 
-    fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
-    }
-}
-
-#[cfg(feature = "net")]
-impl<const N: usize> Write for StackStrWriter<N> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let avail = N.saturating_sub(self.len);
-        let bytes = s.as_bytes();
-        let n = bytes.len().min(avail);
-        // Never split a multi-byte UTF-8 sequence.
-        let mut safe_n = n;
-        while safe_n > 0 && core::str::from_utf8(&bytes[..safe_n]).is_err() {
-            safe_n -= 1;
-        }
-        self.buf[self.len..self.len + safe_n].copy_from_slice(&bytes[..safe_n]);
-        self.len += safe_n;
-        Ok(())
+    fn sleep_ms(&mut self, ms: u64) {
+        let _ = newos_user_rt::sleep_ms(ms);
     }
 }
 
 #[cfg(feature = "net")]
 fn net_pd_call(req: u64) -> Result<u64, SysError> {
-    for _ in 0..500 {
-        match newos_user_rt::ipc_call(CapId::BOOTSTRAP_NET_EP, req) {
-            Ok((_badge, reply)) => return Ok(reply),
-            Err(SysError::WouldBlock) => {
-                let _ = newos_user_rt::sleep_ms(1);
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Err(SysError::WouldBlock)
-}
-
-#[cfg(feature = "net")]
-const fn net_pd_driver_name(driver_id: u8) -> &'static str {
-    match driver_id {
-        net_ipc::DRIVER_VIRTIO => "virtio-net",
-        net_ipc::DRIVER_GEM => "rpi5-rp1-gem",
-        _ => "net-pd",
-    }
-}
-
-#[cfg(all(
-    feature = "net",
-    feature = "ipv4",
-    any(feature = "dns", feature = "icmp")
-))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NetPdError {
-    Ipc(SysError),
-    #[cfg(feature = "dns")]
-    HostnameTooLong,
-    #[cfg(feature = "dns")]
-    DnsStartFailed,
-    #[cfg(feature = "dns")]
-    DnsTimeout,
-    #[cfg(feature = "dns")]
-    DnsFailed,
-    #[cfg(feature = "icmp")]
-    PingUnavailable,
-    #[cfg(feature = "icmp")]
-    PingTimeout,
-    #[cfg(feature = "icmp")]
-    PingFailed,
-}
-
-#[cfg(all(
-    feature = "net",
-    feature = "ipv4",
-    any(feature = "dns", feature = "icmp")
-))]
-impl core::fmt::Display for NetPdError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let msg = match self {
-            Self::Ipc(_) => "net-pd IPC error",
-            #[cfg(feature = "dns")]
-            Self::HostnameTooLong => "hostname too long",
-            #[cfg(feature = "dns")]
-            Self::DnsStartFailed => "dns query failed (no IPv4 or invalid hostname)",
-            #[cfg(feature = "dns")]
-            Self::DnsTimeout => "dns query timed out",
-            #[cfg(feature = "dns")]
-            Self::DnsFailed => "dns query failed",
-            #[cfg(feature = "icmp")]
-            Self::PingUnavailable => "no IPv4 address or ICMP unavailable",
-            #[cfg(feature = "icmp")]
-            Self::PingTimeout => "ICMP EchoReply timed out",
-            #[cfg(feature = "icmp")]
-            Self::PingFailed => "ping failed",
-        };
-        f.write_str(msg)
-    }
-}
-
-#[cfg(all(
-    feature = "net",
-    feature = "ipv4",
-    any(feature = "dns", feature = "icmp")
-))]
-impl core::error::Error for NetPdError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Ipc(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(all(
-    feature = "net",
-    feature = "ipv4",
-    any(feature = "dns", feature = "icmp")
-))]
-impl From<SysError> for NetPdError {
-    fn from(err: SysError) -> Self {
-        Self::Ipc(err)
-    }
-}
-
-#[cfg(all(feature = "net", feature = "ipv4", feature = "dns"))]
-fn net_pd_resolve(host: &str) -> Result<[u8; 4], NetPdError> {
-    net_pd_call(net_ipc::encode_dns_chunk(b""))?;
-    for chunk in host.as_bytes().chunks(net_ipc::MAX_CHUNK_BYTES) {
-        let res = net_pd_call(net_ipc::encode_dns_chunk(chunk))?;
-        if res == u64::MAX {
-            return Err(NetPdError::HostnameTooLong);
-        }
-    }
-    let start_rep = net_pd_call(net_ipc::encode_dns_start())?;
-    let (start_status, _) = net_ipc::decode_dns_reply(start_rep);
-    if start_status == net_ipc::DNS_ERR {
-        return Err(NetPdError::DnsStartFailed);
-    }
-    for _ in 0..550 {
-        let poll_rep = net_pd_call(net_ipc::encode_dns_poll())?;
-        let (status, ip) = net_ipc::decode_dns_reply(poll_rep);
-        match status {
-            net_ipc::DNS_OK => return Ok(ip),
-            net_ipc::DNS_TIMEOUT => return Err(NetPdError::DnsTimeout),
-            net_ipc::DNS_ERR => return Err(NetPdError::DnsFailed),
-            _ => {
-                let _ = newos_user_rt::sleep_ms(10);
-            }
-        }
-    }
-    Err(NetPdError::DnsTimeout)
+    net_client::call_with_retry(&mut UserRtNetClient, req)
 }
 
 #[cfg(all(feature = "net", feature = "ipv4", feature = "icmp"))]
-fn net_pd_ping(target: [u8; 4]) -> Result<(u16, u32), NetPdError> {
-    let start_rep = net_pd_call(net_ipc::encode_ping_start(target))?;
-    let (start_status, _, _) = net_ipc::decode_ping_reply(start_rep);
-    if start_status == net_ipc::PING_ERR {
-        return Err(NetPdError::PingUnavailable);
-    }
-    for _ in 0..350 {
-        let poll_rep = net_pd_call(net_ipc::encode_ping_poll())?;
-        let (status, seq, rtt_ms) = net_ipc::decode_ping_reply(poll_rep);
-        match status {
-            net_ipc::PING_OK => return Ok((seq, rtt_ms)),
-            net_ipc::PING_TIMEOUT => return Err(NetPdError::PingTimeout),
-            net_ipc::PING_ERR => return Err(NetPdError::PingFailed),
-            _ => {
-                let _ = newos_user_rt::sleep_ms(10);
-            }
-        }
-    }
-    Err(NetPdError::PingTimeout)
+fn net_pd_ping(target: [u8; 4]) -> Result<(u16, u32), net_client::NetPdError> {
+    net_client::ping_ipv4(&mut UserRtNetClient, target)
 }
 
 #[cfg(feature = "net")]
@@ -340,8 +176,15 @@ impl SupervisorShellHost {
                 "resolve" => self.handle_net_direct_resolve(n, arg, stream, out),
                 _ => self.handle_net_direct_info(n, mac, stream, out),
             }
-        } else if let Ok(status_word) = net_pd_call(net_ipc::encode_poll_status()) {
-            handle_net_via_net_pd(subcmd, arg, stream, out, status_word);
+        } else if let Ok(status_word) = net_client::poll_status(&mut UserRtNetClient) {
+            net_client::handle_net_via_net_pd(
+                &mut UserRtNetClient,
+                subcmd,
+                arg,
+                stream,
+                out,
+                status_word,
+            );
         } else {
             match subcmd {
                 "dhcp" | "ping" | "resolve" => {
@@ -584,212 +427,6 @@ impl SupervisorShellHost {
             }
         }
     }
-}
-
-#[cfg(feature = "net")]
-fn handle_net_via_net_pd<W: Write>(
-    subcmd: &str,
-    arg: Option<&str>,
-    stream: &mut RecordStream,
-    out: &mut W,
-    initial_status_word: u64,
-) {
-    let _ = arg;
-    match subcmd {
-        #[cfg(feature = "ipv4")]
-        "dhcp" => handle_net_pd_dhcp(stream, out),
-        #[cfg(all(feature = "ipv4", feature = "icmp"))]
-        "ping" => handle_net_pd_ping(arg, stream, out),
-        #[cfg(all(feature = "ipv4", feature = "dns"))]
-        "resolve" => handle_net_pd_resolve(arg, stream, out),
-        _ => handle_net_pd_info(stream, out, initial_status_word),
-    }
-}
-
-#[cfg(all(feature = "net", feature = "ipv4"))]
-fn handle_net_pd_dhcp<W: Write>(stream: &mut RecordStream, out: &mut W) {
-    if net_pd_call(net_ipc::encode_dhcp_renew()).is_err() {
-        let _ = writeln!(out, "net dhcp: net-pd IPC error");
-        return;
-    }
-    let mut ip = [0u8; 4];
-    let mut prefix_len = 0u8;
-    let mut gw = [0u8; 4];
-    let mut dns = [0u8; 4];
-    let mut driver_id = net_ipc::DRIVER_UNKNOWN;
-    for _ in 0..500 {
-        if let Ok(st) = net_pd_call(net_ipc::encode_poll_status()) {
-            let (_, cur_ip) = net_ipc::decode_status_reply(st);
-            if cur_ip != [0, 0, 0, 0] {
-                ip = cur_ip;
-                if let Ok(info) =
-                    net_pd_call(net_ipc::encode_get_net_info(net_ipc::INFO_GATEWAY_PREFIX))
-                {
-                    let (g, p, d) = net_ipc::decode_gateway_prefix_reply(info);
-                    gw = g.unwrap_or([0; 4]);
-                    prefix_len = p;
-                    driver_id = d;
-                }
-                if let Ok(dinfo) = net_pd_call(net_ipc::encode_get_net_info(net_ipc::INFO_DNS)) {
-                    dns = net_ipc::decode_dns_info_reply(dinfo).unwrap_or([0; 4]);
-                }
-                break;
-            }
-        }
-        let _ = newos_user_rt::sleep_ms(10);
-    }
-    if ip == [0, 0, 0, 0] {
-        let _ = writeln!(out, "net dhcp: DHCPv4 lease timed out");
-        return;
-    }
-    let _ = writeln!(
-        out,
-        "net dhcp ({}, via net-pd): ip={}.{}.{}.{}/{}, gw={}.{}.{}.{}, dns={}.{}.{}.{}",
-        net_pd_driver_name(driver_id),
-        ip[0],
-        ip[1],
-        ip[2],
-        ip[3],
-        prefix_len,
-        gw[0],
-        gw[1],
-        gw[2],
-        gw[3],
-        dns[0],
-        dns[1],
-        dns[2],
-        dns[3],
-    );
-    stream.push(Record::Metric {
-        label: "dhcp.prefix",
-        value: u64::from(prefix_len),
-        unit: "bits (IPv4 leased)",
-    });
-}
-
-#[cfg(all(feature = "net", feature = "ipv4", feature = "icmp"))]
-fn handle_net_pd_ping<W: Write>(arg: Option<&str>, stream: &mut RecordStream, out: &mut W) {
-    let target = match arg {
-        None => {
-            let gw = net_pd_call(net_ipc::encode_get_net_info(net_ipc::INFO_GATEWAY_PREFIX))
-                .ok()
-                .and_then(|w| net_ipc::decode_gateway_prefix_reply(w).0);
-            gw.unwrap_or([10, 0, 2, 2])
-        }
-        Some(raw) => {
-            if let Some(ip) = newos_net::parse_ipv4(raw) {
-                ip
-            } else if raw.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
-                let _ = writeln!(out, "net ping: invalid IPv4 address '{raw}'");
-                return;
-            } else {
-                #[cfg(feature = "dns")]
-                match net_pd_resolve(raw) {
-                    Ok(ip) => ip,
-                    Err(e) => {
-                        let _ = writeln!(out, "net ping: could not resolve '{raw}' ({e})");
-                        return;
-                    }
-                }
-                #[cfg(not(feature = "dns"))]
-                {
-                    let _ = writeln!(
-                        out,
-                        "net ping: DNS disabled; pass an IPv4 address instead of '{raw}'"
-                    );
-                    return;
-                }
-            }
-        }
-    };
-    match net_pd_ping(target) {
-        Ok((seq, rtt_ms)) => {
-            let _ = writeln!(
-                out,
-                "ICMP EchoReply from {}.{}.{}.{} (seq={seq}, rtt={rtt_ms}ms, via net-pd)",
-                target[0], target[1], target[2], target[3],
-            );
-            stream.push(Record::Metric {
-                label: "icmp.reply.seq",
-                value: u64::from(seq),
-                unit: "(ok)",
-            });
-        }
-        Err(e) => {
-            let _ = writeln!(out, "net ping: {e}");
-        }
-    }
-}
-
-#[cfg(all(feature = "net", feature = "ipv4", feature = "dns"))]
-fn handle_net_pd_resolve<W: Write>(arg: Option<&str>, stream: &mut RecordStream, out: &mut W) {
-    let Some(host) = arg else {
-        let _ = writeln!(out, "usage: net resolve <hostname>");
-        return;
-    };
-    match net_pd_resolve(host) {
-        Ok(ip) => {
-            let _ = writeln!(out, "{host} -> {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
-            stream.push(Record::Metric {
-                label: "dns.resolved",
-                value: u64::from(u32::from_be_bytes(ip)),
-                unit: "(ipv4 u32)",
-            });
-        }
-        Err(e) => {
-            let _ = writeln!(out, "net resolve: {e}");
-        }
-    }
-}
-
-#[cfg(feature = "net")]
-fn handle_net_pd_info<W: Write>(stream: &mut RecordStream, out: &mut W, initial_status_word: u64) {
-    let (_flags, ip) = net_ipc::decode_status_reply(initial_status_word);
-    let (gw_opt, prefix_len, driver_id) =
-        net_pd_call(net_ipc::encode_get_net_info(net_ipc::INFO_GATEWAY_PREFIX)).map_or(
-            (None, 0, net_ipc::DRIVER_UNKNOWN),
-            net_ipc::decode_gateway_prefix_reply,
-        );
-    let dns_opt = net_pd_call(net_ipc::encode_get_net_info(net_ipc::INFO_DNS))
-        .ok()
-        .and_then(net_ipc::decode_dns_info_reply);
-    let mac = net_pd_call(net_ipc::encode_get_net_info(net_ipc::INFO_MAC))
-        .map_or([0; 6], net_ipc::decode_mac_reply);
-    let gw = gw_opt.unwrap_or([0; 4]);
-    let dns = dns_opt.unwrap_or([0; 4]);
-    let _ = writeln!(
-        out,
-        "nic: driver={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (via net-pd)",
-        net_pd_driver_name(driver_id),
-        mac[0],
-        mac[1],
-        mac[2],
-        mac[3],
-        mac[4],
-        mac[5],
-    );
-    let _ = writeln!(
-        out,
-        "ipv4: {}.{}.{}.{}/{} gw={}.{}.{}.{} dns={}.{}.{}.{}",
-        ip[0],
-        ip[1],
-        ip[2],
-        ip[3],
-        prefix_len,
-        gw[0],
-        gw[1],
-        gw[2],
-        gw[3],
-        dns[0],
-        dns[1],
-        dns[2],
-        dns[3],
-    );
-    stream.push(Record::Metric {
-        label: "net.ipv4.prefix",
-        value: u64::from(prefix_len),
-        unit: "(via net-pd)",
-    });
 }
 
 impl ShellHost for SupervisorShellHost {
