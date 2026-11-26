@@ -1,6 +1,6 @@
 # NewOS
 
-> **Release:** [`v0.12.0`](https://github.com/laurentgrangeau/newos/releases/tag/v0.12.0)
+> **Release:** [`v0.12.0`](https://github.com/laurentgrangeau/newos/releases/tag/v0.12.0) · `main` is on `0.13.0` development.
 
 A **64-bit capability microkernel** and **EL0 userspace environment** for the **Raspberry Pi 5 16 GB** (`aarch64` / ARMv8.2-A quad-core BCM2712 Cortex-A76, with QEMU `aarch64` `virt` as a local test harness). Features **static EL1 memory management**, **workspace-enforced `unsafe_code = "forbid"`** (with audited `unsafe` confined to `crates/hal` and `crates/user-rt`), **monotonic nanosecond boot & command/response log timestamps (`CNTVCT_EL0`/`CNTFRQ_EL0`)**, **Kernel PIE + Limine KASLR**, **Userspace PIE + full ASLR + KCFI + LLVM ShadowCallStack (`x18`)**, **quad-core SMP EL0 scheduling with GICv2 SGI wakeups & cross-core blocking IPC**, **isolated `TTBR0_EL1` address spaces (16-bit ASIDs + full NEON/FP save/restore)**, **EL0 crash isolation**, **live ACPI hardware discovery (`FADT`/`SPCR`/`MADT`/`GTDT`/`MCFG`)**, a **Raspberry Pi 5 (16 GB) EL0 hardware driver stack** (**BCM2712 Watchdog**, **RP1 40-pin GPIO**, **VideoCore Mailbox**, **AVS TMON Thermal & Active Cooler Fan**, **RTC**, **RP1 UART/I2C/SPI/PWM**, **BCM2712 MIP MSI-X**, **PCIe ECAM**, **microSD SDHCI**, **NVMe 1.4**, **RP1 Dual xHCI USB 3.0**, **UEFI GOP Framebuffer**, **`brcm,bcm2712-iommu`**, **VideoCore VII V3D 7.1**, **Cortex-A76 NEON/DotProd AI Compute**, and **Hailo-8/8L/10H PCIe NPU**), a **3-domain privilege-separated post-quantum SSHv2 service (`newos-net-pd` + `newos-key-pd` + `newos-ssh-pd`)** with **hardware TRNG (`BCM2712 iproc-rng200` / `VirtIO-RNG`)**, an **EL0 `smoltcp` IPv4/IPv6 TCP/IP stack + RP1 Cadence GEM Gigabit Ethernet driver** (plus VirtIO 1.0+ for QEMU testing), a **FIPS 202 `SHA3-512` Content-Addressed Object Store (CAOS)**, and a **UTF-8 Typed Pipeline Shell (`newos-shell-pd`)**.
 
@@ -157,7 +157,7 @@ sequenceDiagram
 ```text
 newos/
 ├── rust-toolchain.toml          # Nightly toolchain + rust-src, llvm-tools-preview, aarch64-unknown-none
-├── Cargo.toml                   # Workspace manifest (v0.12.0)
+├── Cargo.toml                   # Workspace manifest (v0.13.0; v0.12.0 released)
 ├── .cargo/mutants.toml          # Mutation testing config (`cargo-mutants`) across all host-testable crates
 ├── .github/workflows/           # CI (`ci.yml`) + Verification, Coverage Gate, Fuzzing, Mutation & Chaos (`verification.yml`)
 ├── fuzz/                        # 8 libFuzzer targets + committed seed corpora (`cargo xtask fuzz`)
