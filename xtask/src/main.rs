@@ -1705,4 +1705,84 @@ mod tests {
         }
         assert!(!tmp.exists());
     }
+
+    #[test]
+    fn workspace_and_ci_enforce_clippy_pedantic_and_nursery() {
+        let root = workspace_root().expect("workspace root");
+
+        // 1. Root Cargo.toml enables all, pedantic, and nursery under [workspace.lints.clippy].
+        let root_manifest = fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
+        let clippy_section = root_manifest
+            .split("[workspace.lints.clippy]")
+            .nth(1)
+            .expect("missing [workspace.lints.clippy]");
+        assert!(
+            clippy_section.contains("pedantic ="),
+            "root Cargo.toml must enable clippy::pedantic"
+        );
+        assert!(
+            clippy_section.contains("nursery ="),
+            "root Cargo.toml must enable clippy::nursery"
+        );
+
+        // 2. Non-inheriting audited TCB & fuzz manifests mirror pedantic and nursery.
+        for rel in [
+            "crates/hal/Cargo.toml",
+            "crates/user-rt/Cargo.toml",
+            "fuzz/Cargo.toml",
+        ] {
+            let content = fs::read_to_string(root.join(rel)).expect("read manifest");
+            let section = content
+                .split("[lints.clippy]")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{rel} missing [lints.clippy]"));
+            assert!(
+                section.contains("pedantic ="),
+                "{rel} must enable clippy::pedantic"
+            );
+            assert!(
+                section.contains("nursery ="),
+                "{rel} must enable clippy::nursery"
+            );
+        }
+
+        // 3. Every other crate in crates/, xtask, and tests inherits workspace lints.
+        let mut checked_members = 0usize;
+        for entry in fs::read_dir(root.join("crates")).expect("read crates/") {
+            let path = entry.expect("dir entry").path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if matches!(name, "hal" | "user-rt") {
+                continue;
+            }
+            let manifest = fs::read_to_string(path.join("Cargo.toml"))
+                .unwrap_or_else(|_| panic!("missing Cargo.toml in {}", path.display()));
+            assert!(
+                manifest.contains("[lints]\nworkspace = true"),
+                "crates/{name}/Cargo.toml must inherit `[lints] workspace = true`"
+            );
+            checked_members += 1;
+        }
+        assert!(checked_members >= 20, "expected >= 20 inheriting crates");
+        for rel in ["xtask/Cargo.toml", "tests/Cargo.toml"] {
+            let manifest = fs::read_to_string(root.join(rel)).expect("read manifest");
+            assert!(
+                manifest.contains("[lints]\nworkspace = true"),
+                "{rel} must inherit `[lints] workspace = true`"
+            );
+        }
+
+        // 4. CI workflow enforces pedantic + nursery + -D warnings on all 3 Clippy jobs.
+        let ci_yml =
+            fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+        let clippy_gate_count = ci_yml
+            .matches("-W clippy::pedantic -W clippy::nursery -D warnings")
+            .count();
+        assert_eq!(
+            clippy_gate_count, 3,
+            "expected all 3 CI clippy invocations to enforce pedantic + nursery + -D warnings"
+        );
+    }
 }

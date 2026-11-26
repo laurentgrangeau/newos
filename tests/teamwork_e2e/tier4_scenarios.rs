@@ -636,7 +636,7 @@ fn fuzz_ring_1024(rng: &mut Xorshift64) {
                 if let Some(w) = spsc_ring.try_pop() {
                     assert_eq!(ring_shadow.pop_front(), Some(w));
                 } else {
-                    assert!(ring_shadow.is_empty());
+                    assert_eq!(ring_shadow, std::collections::VecDeque::new());
                 }
             }
             2 => {
@@ -662,7 +662,7 @@ fn fuzz_ring_1024(rng: &mut Xorshift64) {
     while let Some(w) = spsc_ring.try_pop() {
         assert_eq!(ring_shadow.pop_front(), Some(w));
     }
-    assert!(ring_shadow.is_empty());
+    assert_eq!(ring_shadow, std::collections::VecDeque::new());
 }
 
 #[test]

@@ -786,11 +786,7 @@ impl<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize>
     /// Account a timer tick on `cpu_id`; returns `true` if `cpu_id` should preempt immediately.
     #[inline]
     pub fn on_timer_tick(&mut self, cpu_id: usize) -> bool {
-        if cpu_id < self.online_cpus {
-            self.per_cpu[cpu_id].on_timer_tick()
-        } else {
-            false
-        }
+        cpu_id < self.online_cpus && self.per_cpu[cpu_id].on_timer_tick()
     }
 }
 

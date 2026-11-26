@@ -177,7 +177,7 @@ pub fn resolve_hostname<C: NetPdClient>(client: &mut C, host: &str) -> Result<[u
     Err(NetPdError::DnsTimeout)
 }
 
-/// Send an ICMPv4 echo request via `newos-net-pd` and wait for the reply.
+/// Send an `ICMPv4` echo request via `newos-net-pd` and wait for the reply.
 ///
 /// # Errors
 /// Returns [`NetPdError`] if ICMP is unavailable, times out, or fails.

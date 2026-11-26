@@ -18,8 +18,8 @@ jobs:
         run: rustup show
       - name: Check formatting
         run: cargo fmt --all --check
-      - name: Run Clippy on default workspace members
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Run Clippy (all, pedantic, nursery) on default workspace members
+        run: cargo clippy --all-targets -- -W clippy::pedantic -W clippy::nursery -D warnings
       - name: Run all host unit and E2E tests
         run: cargo test
       - name: Run cargo xtask feature-matrix
@@ -38,12 +38,12 @@ jobs:
           rustup target add aarch64-unknown-none aarch64-unknown-none-softfloat
       - name: Install mtools & dosfstools for UEFI image packaging
         run: sudo apt-get update && sudo apt-get install -y mtools dosfstools
-      - name: Clippy AArch64 kernel & HAL (soft-float)
+      - name: Clippy AArch64 kernel & HAL (soft-float, all + pedantic + nursery)
         run: |
-          cargo clippy -p newos-hal -p newos-kernel --target aarch64-unknown-none-softfloat -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -- -D warnings
-      - name: Clippy AArch64 user-rt & EL0 protection domains
+          cargo clippy -p newos-hal -p newos-kernel --target aarch64-unknown-none-softfloat -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -- -W clippy::pedantic -W clippy::nursery -D warnings
+      - name: Clippy AArch64 user-rt & EL0 protection domains (all + pedantic + nursery)
         run: |
-          cargo clippy -p newos-user-rt -p newos-supervisor-pd -p newos-shell-pd -p newos-worker-pd -p newos-net-pd -p newos-key-pd -p newos-ssh-pd --target aarch64-unknown-none -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -- -D warnings
+          cargo clippy -p newos-user-rt -p newos-supervisor-pd -p newos-shell-pd -p newos-worker-pd -p newos-net-pd -p newos-key-pd -p newos-ssh-pd --target aarch64-unknown-none -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -- -W clippy::pedantic -W clippy::nursery -D warnings
       - name: Verify --ipv6-only & --no-net target builds
         run: |
           cargo xtask build --ipv6-only
