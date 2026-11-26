@@ -27,6 +27,7 @@ const WARMUP_WORDS: usize = 4;
 const MAX_POLL_ITERS: u32 = 100_000;
 
 /// Capability-scoped EL0 driver for the Raspberry Pi 5 BCM2712 `iproc-rng200` hardware TRNG.
+#[derive(Debug)]
 pub struct Bcm2712Rng200<T: RngTransport> {
     transport: T,
 }
@@ -36,36 +37,31 @@ impl<T: RngTransport> Bcm2712Rng200<T> {
     ///
     /// Fails closed if the MMIO capability is missing, the hardware reports a lockout fault
     /// that does not clear on soft reset, or the FIFO stalls during warm-up.
+    ///
+    /// # Errors
+    /// Returns [`RngError::Sys`] if MMIO reads/writes fail, [`RngError::HardwareFault`] if the
+    /// lockout status persists after soft reset, or [`RngError::HardwareTimeout`] if the FIFO
+    /// stalls during warm-up.
     pub fn init(transport: T) -> Result<Self, RngError> {
-        let status = transport.read32(REG_INT_STATUS).map_err(RngError::Sys)?;
+        let status = transport.read32(REG_INT_STATUS)?;
         if (status & INT_MASTER_FAIL_LOCKOUT) != 0 {
             // Attempt one soft reset of the RBG/RNG pipeline per Broadcom iproc-rng200 spec.
-            transport
-                .write32(REG_RBG_SOFT_RESET, SOFT_RESET_BIT)
-                .map_err(RngError::Sys)?;
-            transport
-                .write32(REG_SOFT_RESET, SOFT_RESET_BIT)
-                .map_err(RngError::Sys)?;
-            transport
-                .write32(REG_RBG_SOFT_RESET, 0)
-                .map_err(RngError::Sys)?;
-            transport
-                .write32(REG_SOFT_RESET, 0)
-                .map_err(RngError::Sys)?;
-            let post_status = transport.read32(REG_INT_STATUS).map_err(RngError::Sys)?;
+            transport.write32(REG_RBG_SOFT_RESET, SOFT_RESET_BIT)?;
+            transport.write32(REG_SOFT_RESET, SOFT_RESET_BIT)?;
+            transport.write32(REG_RBG_SOFT_RESET, 0)?;
+            transport.write32(REG_SOFT_RESET, 0)?;
+            let post_status = transport.read32(REG_INT_STATUS)?;
             if (post_status & INT_MASTER_FAIL_LOCKOUT) != 0 {
                 return Err(RngError::HardwareFault);
             }
         }
 
-        let ctrl = transport.read32(REG_CTRL).map_err(RngError::Sys)?;
+        let ctrl = transport.read32(REG_CTRL)?;
         if (ctrl & CTRL_RBGEN) == 0 {
-            transport
-                .write32(REG_CTRL, ctrl | CTRL_RBGEN)
-                .map_err(RngError::Sys)?;
+            transport.write32(REG_CTRL, ctrl | CTRL_RBGEN)?;
         }
 
-        let mut dev = Self { transport };
+        let dev = Self { transport };
         // Discard initial warm-up words from the FIFO.
         for _ in 0..WARMUP_WORDS {
             let _ = dev.next_u32()?;
@@ -73,22 +69,15 @@ impl<T: RngTransport> Bcm2712Rng200<T> {
         Ok(dev)
     }
 
-    fn next_u32(&mut self) -> Result<u32, RngError> {
+    fn next_u32(&self) -> Result<u32, RngError> {
         for _ in 0..MAX_POLL_ITERS {
-            let status = self
-                .transport
-                .read32(REG_INT_STATUS)
-                .map_err(RngError::Sys)?;
+            let status = self.transport.read32(REG_INT_STATUS)?;
             if (status & INT_MASTER_FAIL_LOCKOUT) != 0 {
                 return Err(RngError::HardwareFault);
             }
-            let count = self
-                .transport
-                .read32(REG_FIFO_COUNT)
-                .map_err(RngError::Sys)?
-                & FIFO_COUNT_MASK;
+            let count = self.transport.read32(REG_FIFO_COUNT)? & FIFO_COUNT_MASK;
             if count > 0 {
-                return self.transport.read32(REG_FIFO_DATA).map_err(RngError::Sys);
+                return Ok(self.transport.read32(REG_FIFO_DATA)?);
             }
             core::hint::spin_loop();
         }

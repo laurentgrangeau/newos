@@ -1,5 +1,3 @@
-#![allow(clippy::assertions_on_constants)]
-
 //! Opaque-box E2E test suite for `newos-abi` and `newos-kernel-core`.
 //!
 //! Compile & run offline with:
@@ -20,6 +18,9 @@ pub(crate) mod test_helpers {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
 
+    const PAGE_SIZE_USIZE: usize = 4096;
+    const _: () = assert!(PAGE_SIZE_USIZE as u64 == PAGE_SIZE);
+
     /// Returns the ELF64 `e_machine` value expected by `newos_kernel_core::elf::parse_elf64`
     /// (`EM_AARCH64 = 183`, Raspberry Pi 5 16 GB).
     pub fn host_elf_machine() -> u16 {
@@ -32,7 +33,8 @@ pub(crate) mod test_helpers {
     }
 
     /// Specification for one ELF64 program header entry.
-    #[derive(Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[allow(clippy::struct_field_names)] // Intentional: mirrors ELF64 Elf64_Phdr spec field names.
     pub struct PhdrSpec {
         pub p_type: u32,
         pub p_flags: u32,
@@ -70,7 +72,8 @@ pub(crate) mod test_helpers {
         buf[32..40].copy_from_slice(&phoff.to_le_bytes());
         buf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
         buf[54..56].copy_from_slice(&phentsize.to_le_bytes());
-        buf[56..58].copy_from_slice(&(phdrs.len() as u16).to_le_bytes());
+        let phnum = u16::try_from(phdrs.len()).expect("phdr count fits u16");
+        buf[56..58].copy_from_slice(&phnum.to_le_bytes());
 
         for (idx, ph) in phdrs.iter().enumerate() {
             let base = 64 + idx * (phentsize as usize);
@@ -91,10 +94,11 @@ pub(crate) mod test_helpers {
 
     /// Host-side mock `VSpaceMapper` storing 4 KiB frame backing buffers in memory
     /// so ELF64 loading, W^X enforcement, and BSS zeroing can be verified end-to-end.
+    #[derive(Debug)]
     pub struct MockVSpaceMapper {
         root: PhysAddr,
         mappings: BTreeMap<u64, (PhysAddr, PageFlags)>,
-        frames: RefCell<BTreeMap<u64, [u8; PAGE_SIZE as usize]>>,
+        frames: RefCell<BTreeMap<u64, [u8; PAGE_SIZE_USIZE]>>,
     }
 
     impl MockVSpaceMapper {
@@ -144,7 +148,7 @@ pub(crate) mod test_helpers {
             self.frames
                 .borrow_mut()
                 .entry(phys.raw())
-                .or_insert([0xAAu8; PAGE_SIZE as usize]);
+                .or_insert([0xAAu8; PAGE_SIZE_USIZE]);
             self.mappings.insert(virt.raw(), (phys, flags));
             Ok(())
         }
@@ -168,7 +172,7 @@ pub(crate) mod test_helpers {
         fn zero_frame(&self, frame: &PhysFrame) {
             self.frames
                 .borrow_mut()
-                .insert(frame.start_addr().raw(), [0u8; PAGE_SIZE as usize]);
+                .insert(frame.start_addr().raw(), [0u8; PAGE_SIZE_USIZE]);
         }
 
         fn write_frame_bytes(
@@ -177,13 +181,13 @@ pub(crate) mod test_helpers {
             offset: usize,
             src: &[u8],
         ) -> Result<(), SysError> {
-            if offset + src.len() > PAGE_SIZE as usize {
+            if offset + src.len() > PAGE_SIZE_USIZE {
                 return Err(SysError::InvalidArgument);
             }
             let mut frames = self.frames.borrow_mut();
             let page = frames
                 .entry(frame.start_addr().raw())
-                .or_insert([0u8; PAGE_SIZE as usize]);
+                .or_insert([0u8; PAGE_SIZE_USIZE]);
             page[offset..offset + src.len()].copy_from_slice(src);
             Ok(())
         }

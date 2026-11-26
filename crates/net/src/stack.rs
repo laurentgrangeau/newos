@@ -1,6 +1,6 @@
 //! Persistent EL0 `smoltcp` Network Stack (`NetStack`).
 //!
-//! Designed for `newos-net-pd` (PD 2): initializes the NIC once, maintains an automatic DHCPv4
+//! Designed for `newos-net-pd` (PD 2): initializes the NIC once, maintains an automatic `DHCPv4`
 //! lease (with `NetConfig::QEMU_DEFAULT` fallback), and serves a persistent single-connection
 //! TCP listener (port 22) with 32 KiB RX/TX ring buffers sized for ML-KEM-1024 + ML-DSA-87
 //! post-quantum SSH handshakes.
@@ -8,6 +8,9 @@
 #[cfg(feature = "ipv6")]
 use crate::Ipv6Config;
 use crate::NetConfig;
+#[cfg(all(feature = "ipv4", any(feature = "icmp", feature = "dns")))]
+use crate::NetError;
+use crate::instant_from_millis_clamped;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::Device;
 #[cfg(feature = "ipv4")]
@@ -17,6 +20,7 @@ use smoltcp::socket::dns;
 #[cfg(all(feature = "ipv4", feature = "icmp"))]
 use smoltcp::socket::icmp;
 use smoltcp::socket::tcp;
+#[cfg(test)]
 use smoltcp::time::Instant;
 #[cfg(all(feature = "ipv4", feature = "dns"))]
 use smoltcp::wire::DnsQueryType;
@@ -43,17 +47,19 @@ pub const SYN_TIMEOUT_MS: i64 = 5_000;
 pub const SSH_PORT: u16 = 22;
 
 /// Edge-triggered TCP listener lifecycle events emitted by [`NetStack::poll`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TcpEvent {
+    #[default]
     None,
     Connected,
     Disconnected,
 }
 
-/// Non-blocking ICMPv4 Echo Request/Reply state tracked inside [`NetStack`].
+/// Non-blocking `ICMPv4` Echo Request/Reply state tracked inside [`NetStack`].
 #[cfg(all(feature = "ipv4", feature = "icmp"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PingStatus {
+    #[default]
     Idle,
     Pending,
     Reply {
@@ -66,8 +72,9 @@ pub enum PingStatus {
 
 /// Non-blocking DNS A-record query state tracked inside [`NetStack`].
 #[cfg(all(feature = "ipv4", feature = "dns"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DnsStatus {
+    #[default]
     Idle,
     Pending,
     Resolved([u8; 4]),
@@ -97,7 +104,76 @@ struct PendingPing {
     retries: u8,
 }
 
-/// Maximum concurrent sockets in `NetStackStorage` (DHCPv4 + multi-session TCP + DNS + ICMP).
+/// Unified internal `ICMPv4` ping state machine (eliminates split-field desynchronization).
+#[cfg(all(feature = "ipv4", feature = "icmp"))]
+#[derive(Debug, Clone, Copy)]
+enum PingState {
+    Idle,
+    Pending(PendingPing),
+    Reply {
+        target: [u8; 4],
+        seq: u16,
+        rtt_ms: u32,
+    },
+    Timeout,
+}
+
+#[cfg(all(feature = "ipv4", feature = "icmp"))]
+impl PingState {
+    const fn status(self) -> PingStatus {
+        match self {
+            Self::Idle => PingStatus::Idle,
+            Self::Pending(_) => PingStatus::Pending,
+            Self::Reply {
+                target,
+                seq,
+                rtt_ms,
+            } => PingStatus::Reply {
+                target,
+                seq,
+                rtt_ms,
+            },
+            Self::Timeout => PingStatus::Timeout,
+        }
+    }
+
+    const fn is_pending(self) -> bool {
+        matches!(self, Self::Pending(_))
+    }
+}
+
+/// Unified internal DNS query state machine (eliminates split-field desynchronization).
+#[cfg(all(feature = "ipv4", feature = "dns"))]
+#[derive(Clone, Copy)]
+enum DnsState {
+    Idle,
+    Pending {
+        handle: dns::QueryHandle,
+        start_ms: i64,
+    },
+    Resolved([u8; 4]),
+    Timeout,
+    Failed,
+}
+
+#[cfg(all(feature = "ipv4", feature = "dns"))]
+impl DnsState {
+    const fn status(self) -> DnsStatus {
+        match self {
+            Self::Idle => DnsStatus::Idle,
+            Self::Pending { .. } => DnsStatus::Pending,
+            Self::Resolved(ip) => DnsStatus::Resolved(ip),
+            Self::Timeout => DnsStatus::Timeout,
+            Self::Failed => DnsStatus::Failed,
+        }
+    }
+
+    const fn is_pending(self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
+}
+
+/// Maximum concurrent sockets in `NetStackStorage` (`DHCPv4` + multi-session TCP + DNS + ICMP).
 pub const MAX_SOCKETS: usize = 8;
 
 /// Static backing buffers owned by the caller (e.g., `newos-net-pd` main/BSS)
@@ -118,6 +194,16 @@ pub struct NetStackStorage<'a> {
     pub sockets: [SocketStorage<'a>; MAX_SOCKETS],
 }
 
+impl core::fmt::Debug for NetStackStorage<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NetStackStorage")
+            .field("tcp_backlog", &SSH_LISTEN_BACKLOG)
+            .field("tcp_buf_size", &TCP_BUF_SIZE)
+            .field("max_sockets", &MAX_SOCKETS)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for NetStackStorage<'_> {
     fn default() -> Self {
         Self::new()
@@ -125,6 +211,9 @@ impl Default for NetStackStorage<'_> {
 }
 
 impl NetStackStorage<'_> {
+    #[must_use]
+    // Intentional: `#![no_std]` zero-alloc socket backing storage owned by caller (`net-pd` `.bss`).
+    #[allow(clippy::large_stack_arrays)]
     pub const fn new() -> Self {
         Self {
             tcp_rx_bufs: [[0u8; TCP_BUF_SIZE]; SSH_LISTEN_BACKLOG],
@@ -157,17 +246,11 @@ pub struct NetStack<'a, D: Device> {
     #[cfg(all(feature = "ipv4", feature = "icmp"))]
     ping_seq: u16,
     #[cfg(all(feature = "ipv4", feature = "icmp"))]
-    pending_ping: Option<PendingPing>,
-    #[cfg(all(feature = "ipv4", feature = "icmp"))]
-    ping_status: PingStatus,
+    ping_state: PingState,
     #[cfg(all(feature = "ipv4", feature = "dns"))]
     dns_handle: SocketHandle,
     #[cfg(all(feature = "ipv4", feature = "dns"))]
-    dns_query: Option<dns::QueryHandle>,
-    #[cfg(all(feature = "ipv4", feature = "dns"))]
-    dns_start_ms: i64,
-    #[cfg(all(feature = "ipv4", feature = "dns"))]
-    dns_status: DnsStatus,
+    dns_state: DnsState,
     tcp_handles: [SocketHandle; SSH_LISTEN_BACKLOG],
     syn_seen_ms: [Option<i64>; SSH_LISTEN_BACKLOG],
     active_tcp: Option<usize>,
@@ -178,6 +261,18 @@ pub struct NetStack<'a, D: Device> {
     ipv6_cfg: Ipv6Config,
     listen_port: u16,
     was_connected: bool,
+}
+
+impl<D: Device> core::fmt::Debug for NetStack<'_, D> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NetStack")
+            .field("mac", &self.mac)
+            .field("cfg", &self.cfg)
+            .field("listen_port", &self.listen_port)
+            .field("active_tcp", &self.active_tcp)
+            .field("was_connected", &self.was_connected)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a, D: Device> NetStack<'a, D> {
@@ -207,13 +302,13 @@ impl<'a, D: Device> NetStack<'a, D> {
     ) -> Self {
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         let mut seed = entropy_seed
-            ^ (now_ms as u64).rotate_left(17)
+            ^ now_ms.cast_unsigned().rotate_left(17)
             ^ u64::from_le_bytes([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0xA5, 0x5A])
             ^ 0x9E37_79B9_7F4A_7C15;
         seed = (seed ^ (seed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         seed = (seed ^ (seed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         config.random_seed = (seed ^ (seed >> 31)).max(1);
-        let mut iface = Interface::new(config, &mut device, Instant::from_millis(now_ms));
+        let mut iface = Interface::new(config, &mut device, instant_from_millis_clamped(now_ms));
         #[cfg(feature = "ipv6")]
         let ipv6_cfg = Ipv6Config::from_mac(mac);
         Self::apply_ip_config(
@@ -276,17 +371,11 @@ impl<'a, D: Device> NetStack<'a, D> {
             #[cfg(all(feature = "ipv4", feature = "icmp"))]
             ping_seq: 0,
             #[cfg(all(feature = "ipv4", feature = "icmp"))]
-            pending_ping: None,
-            #[cfg(all(feature = "ipv4", feature = "icmp"))]
-            ping_status: PingStatus::Idle,
+            ping_state: PingState::Idle,
             #[cfg(all(feature = "ipv4", feature = "dns"))]
             dns_handle,
             #[cfg(all(feature = "ipv4", feature = "dns"))]
-            dns_query: None,
-            #[cfg(all(feature = "ipv4", feature = "dns"))]
-            dns_start_ms: 0,
-            #[cfg(all(feature = "ipv4", feature = "dns"))]
-            dns_status: DnsStatus::Idle,
+            dns_state: DnsState::Idle,
             tcp_handles,
             syn_seen_ms: [None; SSH_LISTEN_BACKLOG],
             active_tcp: None,
@@ -309,8 +398,9 @@ impl<'a, D: Device> NetStack<'a, D> {
     }
 
     #[cfg(feature = "ipv6")]
+    #[must_use]
     #[inline]
-    pub fn ipv6_config(&self) -> Ipv6Config {
+    pub const fn ipv6_config(&self) -> Ipv6Config {
         self.ipv6_cfg
     }
 
@@ -324,7 +414,7 @@ impl<'a, D: Device> NetStack<'a, D> {
         iface.update_ip_addrs(|addrs| {
             addrs.clear();
             #[cfg(feature = "ipv4")]
-            if cfg.ip != [0, 0, 0, 0] {
+            if cfg.is_configured() {
                 let _ = addrs.push(IpCidr::new(
                     IpAddress::Ipv4(Ipv4Address::from(cfg.ip)),
                     cfg.prefix_len,
@@ -365,14 +455,15 @@ impl<'a, D: Device> NetStack<'a, D> {
     }
 
     /// Access the underlying `NetDevice` (e.g. for hardware interrupt acknowledgement).
-    pub fn device(&self) -> &D {
+    #[must_use]
+    pub const fn device(&self) -> &D {
         &self.device
     }
 
-    /// Drive `smoltcp` RX/TX, DHCPv4 lease state (when `ipv4` is enabled), and automatic TCP re-listen.
+    /// Drive `smoltcp` RX/TX, `DHCPv4` lease state (when `ipv4` is enabled), and automatic TCP re-listen.
     pub fn poll(&mut self, now_ms: i64) -> TcpEvent {
         let _ = self.iface.poll(
-            Instant::from_millis(now_ms),
+            instant_from_millis_clamped(now_ms),
             &mut self.device,
             &mut self.sockets,
         );
@@ -389,8 +480,8 @@ impl<'a, D: Device> NetStack<'a, D> {
                     self.cfg = NetConfig {
                         ip: leased.address.address().octets(),
                         prefix_len: leased.address.prefix_len(),
-                        gateway: leased.router.map(|r| r.octets()),
-                        dns: leased.dns_servers.first().map(|d| d.octets()),
+                        gateway: leased.router.as_ref().map(Ipv4Address::octets),
+                        dns: leased.dns_servers.first().map(Ipv4Address::octets),
                     };
                     Self::apply_ip_config(
                         &mut self.iface,
@@ -473,36 +564,40 @@ impl<'a, D: Device> NetStack<'a, D> {
     }
 
     #[inline]
-    fn active_handle(&self) -> SocketHandle {
-        self.tcp_handles[self.active_tcp.unwrap_or(0)]
+    fn active_handle(&self) -> Option<SocketHandle> {
+        self.active_tcp.map(|idx| self.tcp_handles[idx])
     }
 
     #[inline]
     pub fn is_connected(&self) -> bool {
-        let Some(idx) = self.active_tcp else {
+        let Some(handle) = self.active_handle() else {
             return false;
         };
-        let sock = self.sockets.get::<tcp::Socket>(self.tcp_handles[idx]);
+        let sock = self.sockets.get::<tcp::Socket>(handle);
         sock.is_active() && (sock.may_recv() || sock.may_send())
     }
 
     #[inline]
     pub fn can_recv(&self) -> bool {
-        self.sockets
-            .get::<tcp::Socket>(self.active_handle())
-            .can_recv()
+        let Some(handle) = self.active_handle() else {
+            return false;
+        };
+        self.sockets.get::<tcp::Socket>(handle).can_recv()
     }
 
     #[inline]
     pub fn can_send(&self) -> bool {
-        self.sockets
-            .get::<tcp::Socket>(self.active_handle())
-            .can_send()
+        let Some(handle) = self.active_handle() else {
+            return false;
+        };
+        self.sockets.get::<tcp::Socket>(handle).can_send()
     }
 
     /// Non-blocking read from the active TCP stream; returns `0` if no bytes are ready.
     pub fn recv(&mut self, out: &mut [u8]) -> usize {
-        let handle = self.active_handle();
+        let Some(handle) = self.active_handle() else {
+            return 0;
+        };
         let sock = self.sockets.get_mut::<tcp::Socket>(handle);
         if !sock.can_recv() || out.is_empty() {
             return 0;
@@ -512,7 +607,9 @@ impl<'a, D: Device> NetStack<'a, D> {
 
     /// Non-blocking write to the active TCP stream; returns bytes queued (`0..=data.len()`).
     pub fn send(&mut self, data: &[u8]) -> usize {
-        let handle = self.active_handle();
+        let Some(handle) = self.active_handle() else {
+            return 0;
+        };
         let sock = self.sockets.get_mut::<tcp::Socket>(handle);
         if !sock.can_send() || data.is_empty() {
             return 0;
@@ -522,33 +619,31 @@ impl<'a, D: Device> NetStack<'a, D> {
 
     /// Gracefully close the active TCP connection (FIN).
     pub fn close(&mut self) {
-        if let Some(idx) = self.active_tcp {
-            self.sockets
-                .get_mut::<tcp::Socket>(self.tcp_handles[idx])
-                .close();
+        if let Some(handle) = self.active_handle() {
+            self.sockets.get_mut::<tcp::Socket>(handle).close();
         }
     }
 
     /// Immediately abort the active TCP connection (RST — used on strict-KEX violations).
     pub fn abort(&mut self) {
-        if let Some(idx) = self.active_tcp {
-            self.sockets
-                .get_mut::<tcp::Socket>(self.tcp_handles[idx])
-                .abort();
+        if let Some(handle) = self.active_handle() {
+            self.sockets.get_mut::<tcp::Socket>(handle).abort();
         }
     }
 
+    #[must_use]
     #[inline]
-    pub fn config(&self) -> NetConfig {
+    pub const fn config(&self) -> NetConfig {
         self.cfg
     }
 
+    #[must_use]
     #[inline]
-    pub fn mac(&self) -> [u8; 6] {
+    pub const fn mac(&self) -> [u8; 6] {
         self.mac
     }
 
-    /// Trigger a fresh DHCPv4 lease discovery / renewal.
+    /// Trigger a fresh `DHCPv4` lease discovery / renewal.
     #[cfg(feature = "ipv4")]
     pub fn dhcp_reset(&mut self) {
         self.sockets
@@ -556,35 +651,38 @@ impl<'a, D: Device> NetStack<'a, D> {
             .reset();
     }
 
-    /// Start a non-blocking ICMPv4 Echo Request to `target`.
+    /// Start a non-blocking `ICMPv4` Echo Request to `target`.
     /// Call [`NetStack::poll`] to drive TX/RX and [`NetStack::ping_status`] to inspect completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetError::NoIpv4Address`] if no IPv4 address is currently configured.
     #[cfg(all(feature = "ipv4", feature = "icmp"))]
-    pub fn ping_start(&mut self, target: [u8; 4], now_ms: i64) -> Result<u16, &'static str> {
-        if self.cfg.ip == [0, 0, 0, 0] {
-            self.pending_ping = None;
-            self.ping_status = PingStatus::Idle;
-            return Err("no IPv4 address configured");
+    pub fn ping_start(&mut self, target: [u8; 4], now_ms: i64) -> Result<u16, NetError> {
+        if !self.cfg.is_configured() {
+            self.ping_state = PingState::Idle;
+            return Err(NetError::NoIpv4Address);
         }
         let next_seq = self.ping_seq.wrapping_add(1);
         self.ping_seq = if next_seq == 0 { 1 } else { next_seq };
         let seq = self.ping_seq;
-        self.pending_ping = Some(PendingPing {
+        self.ping_state = PingState::Pending(PendingPing {
             target,
             seq,
             start_ms: now_ms,
             last_tx_ms: now_ms,
             retries: 0,
         });
-        self.ping_status = PingStatus::Pending;
         self.send_icmp_echo(target, seq);
         Ok(seq)
     }
 
-    /// Inspect the current non-blocking ICMPv4 ping status.
+    /// Inspect the current non-blocking `ICMPv4` ping status.
     #[cfg(all(feature = "ipv4", feature = "icmp"))]
+    #[must_use]
     #[inline]
-    pub fn ping_status(&self) -> PingStatus {
-        self.ping_status
+    pub const fn ping_status(&self) -> PingStatus {
+        self.ping_state.status()
     }
 
     #[cfg(all(feature = "ipv4", feature = "icmp"))]
@@ -607,7 +705,7 @@ impl<'a, D: Device> NetStack<'a, D> {
 
     #[cfg(all(feature = "ipv4", feature = "icmp"))]
     fn poll_ping(&mut self, now_ms: i64) {
-        let Some(mut pending) = self.pending_ping else {
+        let PingState::Pending(mut pending) = self.ping_state else {
             // Drain any late/stale ICMP packets so the RX ring stays clear.
             let sock = self.sockets.get_mut::<icmp::Socket>(self.icmp_handle);
             while sock.can_recv() {
@@ -629,9 +727,9 @@ impl<'a, D: Device> NetStack<'a, D> {
                 && ident == PING_IDENT
                 && seq_no == pending.seq
             {
-                let rtt_ms = now_ms.saturating_sub(pending.start_ms).max(0) as u32;
-                self.pending_ping = None;
-                self.ping_status = PingStatus::Reply {
+                let rtt_ms = u32::try_from(now_ms.saturating_sub(pending.start_ms).max(0))
+                    .unwrap_or(u32::MAX);
+                self.ping_state = PingState::Reply {
                     target: pending.target,
                     seq: seq_no,
                     rtt_ms,
@@ -641,8 +739,7 @@ impl<'a, D: Device> NetStack<'a, D> {
         }
 
         if now_ms.saturating_sub(pending.start_ms) >= PING_TIMEOUT_MS {
-            self.pending_ping = None;
-            self.ping_status = PingStatus::Timeout;
+            self.ping_state = PingState::Timeout;
             return;
         }
 
@@ -651,7 +748,7 @@ impl<'a, D: Device> NetStack<'a, D> {
         {
             pending.retries += 1;
             pending.last_tx_ms = now_ms;
-            self.pending_ping = Some(pending);
+            self.ping_state = PingState::Pending(pending);
             self.send_icmp_echo(pending.target, pending.seq);
         }
     }
@@ -667,93 +764,104 @@ impl<'a, D: Device> NetStack<'a, D> {
 
     /// Start a non-blocking DNS A-record resolution for `hostname`.
     /// Call [`NetStack::poll`] to drive TX/RX and [`NetStack::dns_status`] to inspect completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetError::NoIpv4Address`] if no IPv4 address is configured, or
+    /// [`NetError::DnsStartFailed`] if the DNS query could not be started.
     #[cfg(all(feature = "ipv4", feature = "dns"))]
-    pub fn dns_start(&mut self, hostname: &str, now_ms: i64) -> Result<(), &'static str> {
-        if self.cfg.ip == [0, 0, 0, 0] {
-            self.dns_status = DnsStatus::Failed;
-            return Err("no IPv4 address configured");
+    pub fn dns_start(&mut self, hostname: &str, now_ms: i64) -> Result<(), NetError> {
+        if !self.cfg.is_configured() {
+            self.dns_state = DnsState::Failed;
+            return Err(NetError::NoIpv4Address);
         }
-        if let Some(prev) = self.dns_query.take() {
+        if let DnsState::Pending { handle, .. } = self.dns_state {
             self.sockets
                 .get_mut::<dns::Socket>(self.dns_handle)
-                .cancel_query(prev);
+                .cancel_query(handle);
+            self.dns_state = DnsState::Idle;
         }
         self.refresh_dns_servers();
         let sock = self.sockets.get_mut::<dns::Socket>(self.dns_handle);
-        match sock.start_query(self.iface.context(), hostname, DnsQueryType::A) {
-            Ok(qh) => {
-                self.dns_query = Some(qh);
-                self.dns_start_ms = now_ms;
-                self.dns_status = DnsStatus::Pending;
-                Ok(())
-            }
-            Err(_) => {
-                self.dns_status = DnsStatus::Failed;
-                Err("dns start_query failed")
-            }
+        if let Ok(qh) = sock.start_query(self.iface.context(), hostname, DnsQueryType::A) {
+            self.dns_state = DnsState::Pending {
+                handle: qh,
+                start_ms: now_ms,
+            };
+            Ok(())
+        } else {
+            self.dns_state = DnsState::Failed;
+            Err(NetError::DnsStartFailed)
         }
     }
 
     /// Inspect the current non-blocking DNS A-record query status.
     #[cfg(all(feature = "ipv4", feature = "dns"))]
+    #[must_use]
     #[inline]
-    pub fn dns_status(&self) -> DnsStatus {
-        self.dns_status
+    pub const fn dns_status(&self) -> DnsStatus {
+        self.dns_state.status()
     }
 
     #[cfg(all(feature = "ipv4", feature = "dns"))]
     fn poll_dns(&mut self, now_ms: i64) {
-        let Some(qh) = self.dns_query else {
+        let DnsState::Pending {
+            handle: qh,
+            start_ms,
+        } = self.dns_state
+        else {
             return;
         };
         let sock = self.sockets.get_mut::<dns::Socket>(self.dns_handle);
         match sock.get_query_result(qh) {
             Ok(addrs) => {
-                self.dns_query = None;
                 if let Some(IpAddress::Ipv4(v4)) = addrs.first() {
-                    self.dns_status = DnsStatus::Resolved(v4.octets());
+                    self.dns_state = DnsState::Resolved(v4.octets());
                 } else {
-                    self.dns_status = DnsStatus::Failed;
+                    self.dns_state = DnsState::Failed;
                 }
             }
             Err(dns::GetQueryResultError::Pending) => {
-                if now_ms.saturating_sub(self.dns_start_ms) >= DNS_TIMEOUT_MS {
+                if now_ms.saturating_sub(start_ms) >= DNS_TIMEOUT_MS {
                     sock.cancel_query(qh);
-                    self.dns_query = None;
-                    self.dns_status = DnsStatus::Timeout;
+                    self.dns_state = DnsState::Timeout;
                 }
             }
             Err(dns::GetQueryResultError::Failed) => {
-                self.dns_query = None;
-                self.dns_status = DnsStatus::Failed;
+                self.dns_state = DnsState::Failed;
             }
         }
     }
 
     /// Returns `true` while an ICMP ping or DNS query is actively awaiting a reply.
+    #[must_use]
     #[inline]
-    pub fn has_pending_control_op(&self) -> bool {
+    pub const fn has_pending_control_op(&self) -> bool {
         #[cfg(all(feature = "ipv4", feature = "icmp"))]
-        if self.pending_ping.is_some() {
-            return true;
-        }
+        let ping_pending = self.ping_state.is_pending();
+        #[cfg(not(all(feature = "ipv4", feature = "icmp")))]
+        let ping_pending = false;
+
         #[cfg(all(feature = "ipv4", feature = "dns"))]
-        if self.dns_query.is_some() {
-            return true;
-        }
-        false
+        let dns_pending = self.dns_state.is_pending();
+        #[cfg(not(all(feature = "ipv4", feature = "dns")))]
+        let dns_pending = false;
+
+        ping_pending || dns_pending
     }
 
     /// Return the recommended milliseconds until the next `smoltcp` timer event,
     /// enabling `net-pd` to block in `NotifyWait` instead of busy-polling.
     pub fn poll_delay_ms(&mut self, now_ms: i64) -> Option<u64> {
         self.iface
-            .poll_delay(Instant::from_millis(now_ms), &self.sockets)
-            .map(|d| d.total_millis())
+            .poll_delay(instant_from_millis_clamped(now_ms), &self.sockets)
+            .as_ref()
+            .map(smoltcp::time::Duration::total_millis)
     }
 
+    #[must_use]
     #[inline]
-    pub fn listen_port(&self) -> u16 {
+    pub const fn listen_port(&self) -> u16 {
         self.listen_port
     }
 }
@@ -774,6 +882,8 @@ mod tests {
     }
 
     impl FrameQueue {
+        // Intentional: `#![no_std]` unit-test loopback queue allocated on test thread stack.
+        #[allow(clippy::large_stack_arrays)]
         const fn new() -> Self {
             Self {
                 frames: [[0u8; FRAME_CAP]; Q_SLOTS],
@@ -922,12 +1032,14 @@ mod tests {
                     (IpAddress::v4(10, 0, 2, 15), SSH_PORT),
                     40_000 + round,
                 )
-                .unwrap();
+                .expect("client connect");
 
             // 6 KiB payload simulates ML-KEM-1024 (1568 B) + ML-DSA-87 (4627 B) handshake
             let mut client_payload = [0u8; 6144];
             for (i, b) in client_payload.iter_mut().enumerate() {
-                *b = ((i as u8).wrapping_mul(31)).wrapping_add(round as u8);
+                *b = i.to_le_bytes()[0]
+                    .wrapping_mul(31)
+                    .wrapping_add(round.to_le_bytes()[0]);
             }
             let mut c_sent = 0usize;
             let mut s_recv = [0u8; 6144];
@@ -937,7 +1049,7 @@ mod tests {
             let mut closed = false;
 
             for step in 0..400i64 {
-                let now = (round as i64) * 5_000 + step * 10;
+                let now = i64::from(round) * 5_000 + step * 10;
                 let _ =
                     client_iface.poll(Instant::from_millis(now), &mut client_dev, &mut c_sockets);
                 pump_wire(&mut client_dev, &mut server.device);
@@ -1031,7 +1143,7 @@ mod tests {
                 (IpAddress::Ipv6(Ipv6Address::from(server_v6)), SSH_PORT),
                 41_000,
             )
-            .unwrap();
+            .expect("ipv6 client connect");
 
         let msg = b"hello-newos-ipv6-tcp!";
         let mut sent = false;
@@ -1050,7 +1162,7 @@ mod tests {
 
             let cs = c_sockets.get_mut::<tcp::Socket>(c_handle);
             if !sent && cs.can_send() {
-                assert_eq!(cs.send_slice(msg).unwrap(), msg.len());
+                assert_eq!(cs.send_slice(msg).expect("ipv6 client send"), msg.len());
                 sent = true;
             }
             if got_len < msg.len() {
@@ -1112,7 +1224,7 @@ mod tests {
                 ),
                 50_001,
             )
-            .unwrap();
+            .expect("attacker connect");
 
         // Pump ONLY the attacker's initial SYN to server (dropping SYN-ACK so socket stays SynReceived).
         for step in 0..10i64 {
@@ -1165,7 +1277,7 @@ mod tests {
         let mut peer_storage = [SocketStorage::EMPTY; 1];
         let mut peer_sockets = SocketSet::new(&mut peer_storage[..]);
 
-        let seq = stack.ping_start([10, 0, 2, 2], 100).unwrap();
+        let seq = stack.ping_start([10, 0, 2, 2], 100).expect("ping start");
         assert_eq!(seq, 1);
         assert_eq!(stack.ping_status(), PingStatus::Pending);
         assert!(stack.has_pending_control_op());
@@ -1195,7 +1307,9 @@ mod tests {
         assert!(!stack.has_pending_control_op());
 
         // Silent target must time out after PING_TIMEOUT_MS.
-        let seq2 = stack.ping_start([10, 0, 2, 99], 5_000).unwrap();
+        let seq2 = stack
+            .ping_start([10, 0, 2, 99], 5_000)
+            .expect("ping start 2");
         assert_eq!(seq2, 2);
         let _ = stack.poll(5_000 + PING_TIMEOUT_MS + 10);
         assert_eq!(stack.ping_status(), PingStatus::Timeout);
@@ -1221,7 +1335,7 @@ mod tests {
         );
 
         assert_eq!(stack.dns_status(), DnsStatus::Idle);
-        stack.dns_start("example.com", 100).unwrap();
+        stack.dns_start("example.com", 100).expect("dns start");
         assert_eq!(stack.dns_status(), DnsStatus::Pending);
         assert!(stack.has_pending_control_op());
 
@@ -1233,5 +1347,75 @@ mod tests {
         let _ = stack.poll(100 + DNS_TIMEOUT_MS + 10);
         assert_eq!(stack.dns_status(), DnsStatus::Timeout);
         assert!(!stack.has_pending_control_op());
+    }
+
+    #[test]
+    #[cfg(feature = "ipv4")]
+    fn netstack_unconfigured_ip_rejects_ping_and_dns_with_no_ipv4_address() {
+        extern crate std;
+        use std::format;
+
+        let mut storage = NetStackStorage::new();
+        let mut stack = NetStack::new(
+            WireEnd::new(),
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0x61],
+            NetConfig::UNCONFIGURED,
+            SSH_PORT,
+            0,
+            &mut storage,
+        );
+        assert!(format!("{stack:?}").contains("NetStack"));
+        assert!(!stack.is_connected());
+        assert!(!stack.can_recv());
+        assert!(!stack.can_send());
+        let mut buf = [0u8; 16];
+        assert_eq!(stack.recv(&mut buf), 0);
+        assert_eq!(stack.send(b"hello"), 0);
+
+        #[cfg(feature = "icmp")]
+        {
+            assert_eq!(
+                stack.ping_start([10, 0, 2, 2], 100),
+                Err(NetError::NoIpv4Address)
+            );
+            assert_eq!(stack.ping_status(), PingStatus::Idle);
+        }
+        #[cfg(feature = "dns")]
+        {
+            assert_eq!(
+                stack.dns_start("example.com", 100),
+                Err(NetError::NoIpv4Address)
+            );
+            assert_eq!(stack.dns_status(), DnsStatus::Failed);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "ipv4")]
+    fn netstack_extreme_timestamps_do_not_overflow() {
+        let mut storage = NetStackStorage::new();
+        let mut stack = NetStack::new(
+            WireEnd::new(),
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0x71],
+            NetConfig::QEMU_DEFAULT,
+            SSH_PORT,
+            i64::MIN,
+            &mut storage,
+        );
+
+        #[cfg(feature = "icmp")]
+        {
+            let _ = stack.ping_start([10, 0, 2, 2], i64::MIN);
+        }
+        #[cfg(feature = "dns")]
+        {
+            let _ = stack.dns_start("example.com", i64::MIN);
+        }
+
+        let _ = stack.poll(i64::MIN);
+        let _ = stack.poll(i64::MAX);
+        let _ = stack.poll(i64::MAX / 1_000);
+        let _ = stack.poll_delay_ms(i64::MAX);
+        let _ = stack.poll_delay_ms(i64::MIN);
     }
 }

@@ -27,11 +27,12 @@ fn tier2_caos_blob_size_boundaries_0_128_and_129() {
 #[test]
 fn tier2_caos_object_capacity_limit_and_dedup_when_full() {
     let mut store = ObjectStore::new();
-    let mut last_hash = ObjHash::ZERO;
+    let mut last_hash = None;
     for i in 0..(MAX_OBJECTS - 2) {
         let msg = format!("unique-object-{i}");
-        last_hash = store.put(msg.as_bytes()).unwrap();
+        last_hash = Some(store.put(msg.as_bytes()).unwrap());
     }
+    let last_hash = last_hash.expect("loop inserts at least one object");
     assert_eq!(store.object_count(), MAX_OBJECTS);
 
     // 25th distinct blob fails with NoSpace.

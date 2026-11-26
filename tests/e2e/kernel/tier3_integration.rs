@@ -197,9 +197,10 @@ fn tier3_elf64_untyped_and_mock_vspace_mapper_wx_and_bss() {
     assert!(data_flags.writable && !data_flags.executable);
     assert_eq!(mapper.read_frame_slice(data_phys, 0, 4), data_bytes);
     // BSS tail must be zeroed.
+    let page_len = usize::try_from(PAGE_SIZE).expect("PAGE_SIZE fits in usize");
     assert!(
         mapper
-            .read_frame_slice(data_phys, 4, (PAGE_SIZE as usize) - 4)
+            .read_frame_slice(data_phys, 4, page_len - 4)
             .iter()
             .all(|&b| b == 0)
     );

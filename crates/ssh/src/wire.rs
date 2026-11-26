@@ -1,4 +1,4 @@
-//! SSHv2 binary wire encoding/decoding helpers.
+//! `SSHv2` binary wire encoding/decoding helpers.
 //!
 //! ```
 //! use newos_ssh_proto::wire::{WireReader, WireWriter};
@@ -26,17 +26,33 @@ pub struct WireReader<'a> {
     pos: usize,
 }
 
+impl core::fmt::Debug for WireReader<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WireReader")
+            .field("pos", &self.pos)
+            .field("remaining", &self.remaining())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> WireReader<'a> {
+    #[must_use]
     pub const fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
+    #[must_use]
     #[inline]
     pub const fn remaining(&self) -> usize {
         self.buf.len().saturating_sub(self.pos)
     }
 
-    pub fn read_u8(&mut self) -> Result<u8, SshError> {
+    /// Read a single byte from the wire buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshError::MalformedPacket`] if no bytes remain.
+    pub const fn read_u8(&mut self) -> Result<u8, SshError> {
         if self.pos >= self.buf.len() {
             return Err(SshError::MalformedPacket);
         }
@@ -45,15 +61,30 @@ impl<'a> WireReader<'a> {
         Ok(v)
     }
 
+    /// Read an RFC 4251 boolean (`0` is `false`, any non-zero byte is `true`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshError::MalformedPacket`] if no bytes remain.
     pub fn read_bool(&mut self) -> Result<bool, SshError> {
         Ok(self.read_u8()? != 0)
     }
 
+    /// Read a big-endian `u32`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshError::MalformedPacket`] if fewer than 4 bytes remain.
     pub fn read_u32(&mut self) -> Result<u32, SshError> {
         let s = self.read_exact(4)?;
         Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
     }
 
+    /// Read an exact slice of `len` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshError::MalformedPacket`] if fewer than `len` bytes remain or `pos + len` overflows.
     pub fn read_exact(&mut self, len: usize) -> Result<&'a [u8], SshError> {
         let end = self.pos.checked_add(len).ok_or(SshError::MalformedPacket)?;
         if end > self.buf.len() {
@@ -64,11 +95,21 @@ impl<'a> WireReader<'a> {
         Ok(slice)
     }
 
+    /// Read an RFC 4251 length-prefixed byte string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshError::MalformedPacket`] if the length prefix or payload is truncated.
     pub fn read_string(&mut self) -> Result<&'a [u8], SshError> {
         let len = self.read_u32()? as usize;
         self.read_exact(len)
     }
 
+    /// Read an RFC 4251 length-prefixed UTF-8 string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshError::MalformedPacket`] if truncated or not valid UTF-8.
     pub fn read_str(&mut self) -> Result<&'a str, SshError> {
         let bytes = self.read_string()?;
         core::str::from_utf8(bytes).map_err(|_| SshError::MalformedPacket)
@@ -81,22 +122,39 @@ pub struct WireWriter<'a> {
     pos: usize,
 }
 
+impl core::fmt::Debug for WireWriter<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WireWriter")
+            .field("len", &self.pos)
+            .field("capacity", &self.buf.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> WireWriter<'a> {
-    pub fn new(buf: &'a mut [u8]) -> Self {
+    #[must_use]
+    pub const fn new(buf: &'a mut [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
+    #[must_use]
     #[inline]
     pub const fn len(&self) -> usize {
         self.pos
     }
 
+    #[must_use]
     #[inline]
     pub const fn is_empty(&self) -> bool {
         self.pos == 0
     }
 
-    pub fn write_u8(&mut self, v: u8) -> Result<(), SshError> {
+    /// Write a single byte to the buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshError::PacketTooLarge`] if the buffer is full.
+    pub const fn write_u8(&mut self, v: u8) -> Result<(), SshError> {
         if self.pos >= self.buf.len() {
             return Err(SshError::PacketTooLarge);
         }
@@ -105,14 +163,29 @@ impl<'a> WireWriter<'a> {
         Ok(())
     }
 
+    /// Write an RFC 4251 boolean (`0` or `1`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshError::PacketTooLarge`] if the buffer is full.
     pub fn write_bool(&mut self, v: bool) -> Result<(), SshError> {
         self.write_u8(u8::from(v))
     }
 
+    /// Write a big-endian `u32`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshError::PacketTooLarge`] if fewer than 4 bytes of space remain.
     pub fn write_u32(&mut self, v: u32) -> Result<(), SshError> {
         self.write_raw(&v.to_be_bytes())
     }
 
+    /// Write raw bytes without a length prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshError::PacketTooLarge`] if `bytes` does not fit in the remaining buffer.
     pub fn write_raw(&mut self, bytes: &[u8]) -> Result<(), SshError> {
         let end = self
             .pos
@@ -126,11 +199,32 @@ impl<'a> WireWriter<'a> {
         Ok(())
     }
 
+    /// Atomically write an RFC 4251 length-prefixed byte string.
+    ///
+    /// If the 4-byte prefix plus payload cannot fit, the writer position is left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshError::PacketTooLarge`] if `bytes.len()` exceeds `u32::MAX` or does not fit.
     pub fn write_string(&mut self, bytes: &[u8]) -> Result<(), SshError> {
-        self.write_u32(bytes.len() as u32)?;
+        let len_u32 = u32::try_from(bytes.len()).map_err(|_| SshError::PacketTooLarge)?;
+        let end = self
+            .pos
+            .checked_add(4)
+            .and_then(|p| p.checked_add(bytes.len()))
+            .ok_or(SshError::PacketTooLarge)?;
+        if end > self.buf.len() {
+            return Err(SshError::PacketTooLarge);
+        }
+        self.write_u32(len_u32)?;
         self.write_raw(bytes)
     }
 
+    /// Atomically write an RFC 4251 length-prefixed UTF-8 string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshError::PacketTooLarge`] if `s.len()` exceeds `u32::MAX` or does not fit.
     pub fn write_str(&mut self, s: &str) -> Result<(), SshError> {
         self.write_string(s.as_bytes())
     }
@@ -221,8 +315,9 @@ mod tests {
         assert_eq!(w.write_raw(&[1, 2, 3, 4, 5]), Err(SshError::PacketTooLarge));
         assert_eq!(w.len(), 0);
 
-        // String whose length prefix fits (4 bytes) but payload does not
+        // String whose length prefix fits (4 bytes) but payload does not — must remain atomic!
         assert_eq!(w.write_string(b"a"), Err(SshError::PacketTooLarge));
+        assert_eq!(w.len(), 0);
 
         // Exact capacity fill succeeds, then next write fails
         let mut buf2 = [0u8; 4];
@@ -230,6 +325,25 @@ mod tests {
         assert_eq!(w2.write_u32(0xDEAD_BEEF), Ok(()));
         assert_eq!(w2.write_u8(1), Err(SshError::PacketTooLarge));
         assert_eq!(w2.len(), 4);
+    }
+
+    #[test]
+    fn wire_reader_and_writer_debug_redact_raw_bytes() {
+        extern crate std;
+        use std::format;
+
+        let secret = b"TOP_SECRET_AUTH_PAYLOAD";
+        let r = WireReader::new(secret);
+        let r_dbg = format!("{r:?}");
+        assert!(r_dbg.contains("WireReader"));
+        assert!(!r_dbg.contains("TOP_SECRET"));
+        assert!(!r_dbg.contains("84, 79, 80"));
+
+        let mut buf = [0x5Au8; 32];
+        let w = WireWriter::new(&mut buf);
+        let w_dbg = format!("{w:?}");
+        assert!(w_dbg.contains("WireWriter"));
+        assert!(!w_dbg.contains("90, 90, 90"));
     }
 }
 

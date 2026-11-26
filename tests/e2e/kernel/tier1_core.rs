@@ -180,8 +180,8 @@ fn tier1_ring_power_of_two_sizes() {
 
 #[test]
 fn tier1_ring_concurrent_spsc_two_threads() {
-    let ring = SpscRing::<64>::new();
     const COUNT: u64 = 5_000;
+    let ring = SpscRing::<64>::new();
 
     thread::scope(|s| {
         s.spawn(|| {
@@ -603,9 +603,9 @@ fn tier1_mem_page_flags_wx_valid_combinations() {
     assert!(!rx.writable && rx.executable && rx.user);
     assert!(mmio.writable && mmio.no_cache && !mmio.user);
 
-    assert!(PageFlags::KERNEL_RW.writable && !PageFlags::KERNEL_RW.executable);
-    assert!(!PageFlags::KERNEL_RO.writable && !PageFlags::KERNEL_RO.executable);
-    assert!(!PageFlags::KERNEL_RX.writable && PageFlags::KERNEL_RX.executable);
+    const { assert!(PageFlags::KERNEL_RW.writable && !PageFlags::KERNEL_RW.executable) };
+    const { assert!(!PageFlags::KERNEL_RO.writable && !PageFlags::KERNEL_RO.executable) };
+    const { assert!(!PageFlags::KERNEL_RX.writable && PageFlags::KERNEL_RX.executable) };
 }
 
 #[test]

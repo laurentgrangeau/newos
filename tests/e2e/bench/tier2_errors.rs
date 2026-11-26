@@ -2,6 +2,7 @@
 //! 15 negative / boundary tests ensuring invalid outputs and regressions are strictly rejected.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use crate::bench_parser::{
     IPC_CONSUMPTION_KEYS, KERNEL_SPEED_KEYS, ParseError, SHELL_SPEED_KEYS, all_metric_keys,
@@ -131,9 +132,9 @@ fn tier2_bench_markdown_rejects_incomplete_post_opt_table() {
     let mut md = String::from("## Comparison\n| Metric | Baseline | Post-Opt |\n|---|---|---|\n");
     for (i, k) in all_metric_keys().into_iter().enumerate() {
         if i == 0 {
-            md.push_str(&format!("| `{k}` | 100 | 50 |\n"));
+            let _ = writeln!(md, "| `{k}` | 100 | 50 |");
         } else {
-            md.push_str(&format!("| `{k}` | 100 | TBD |\n"));
+            let _ = writeln!(md, "| `{k}` | 100 | TBD |");
         }
     }
     let err = parse_benchmark_results_md(&md).unwrap_err();
@@ -206,7 +207,7 @@ fn tier2_bench_verify_shell_faster_rejects_nan_and_inf() {
 
     let mut base_inf = base.clone();
     base_inf.insert("shell.session.full".to_string(), f64::INFINITY);
-    let mut post_ok = base.clone();
+    let mut post_ok = base;
     post_ok.insert("shell.session.full".to_string(), 500.0);
     assert!(verify_shell_faster(&base_inf, &post_ok).is_err());
 }
@@ -248,7 +249,7 @@ fn tier2_bench_verify_ipc_reduced_rejects_inconsistent_total_with_flat_component
     // Inconsistent baseline total must also be rejected.
     let mut bad_base = base.clone();
     bad_base.insert("ipc.total_consumption".to_string(), 999.0);
-    let mut valid_post = base.clone();
+    let mut valid_post = base;
     valid_post.insert("ipc.shell_session.debug_write_syscalls".to_string(), 25.0);
     valid_post.insert("ipc.total_consumption".to_string(), 225.0);
     assert!(verify_ipc_reduced(&bad_base, &valid_post).is_err());
@@ -266,7 +267,7 @@ fn tier2_bench_markdown_rejects_fractional_ipc_and_negative_or_nan_cells() {
         } else {
             "50"
         };
-        md_frac.push_str(&format!("| Cat | `{k}` | 100 | {post} |\n"));
+        let _ = writeln!(md_frac, "| Cat | `{k}` | 100 | {post} |");
     }
     assert!(matches!(
         parse_benchmark_results_md(&md_frac),
@@ -279,7 +280,7 @@ fn tier2_bench_markdown_rejects_fractional_ipc_and_negative_or_nan_cells() {
             "## Comparison\n| Category | Metric | M1 Baseline | M4 Post-Opt |\n|---|---|---|---|\n",
         );
         for k in all_metric_keys() {
-            md_bad.push_str(&format!("| Cat | `{k}` | 100 | {bad} |\n"));
+            let _ = writeln!(md_bad, "| Cat | `{k}` | 100 | {bad} |");
         }
         assert!(
             matches!(

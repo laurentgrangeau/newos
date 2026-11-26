@@ -19,21 +19,29 @@ pub const TMON_TEMP_MASK: u32 = 0x3FF;
 ///
 /// Formula from Broadcom `brcmstb_thermal` (BCM2712): `T(m°C) = 410_040 - (raw * 487)`.
 #[inline]
+#[must_use]
 pub const fn raw_to_millic(raw: u32) -> i32 {
-    410_040 - ((raw & TMON_TEMP_MASK) as i32) * 487
+    410_040 - (raw & TMON_TEMP_MASK).cast_signed() * 487
 }
 
-/// Capability-scoped EL0 driver for the BCM2712 AVS TMON SoC thermal sensor.
+/// Capability-scoped EL0 driver for the BCM2712 AVS TMON `SoC` thermal sensor.
+#[derive(Debug)]
 pub struct Bcm2712Thermal<T: MmioTransport> {
     transport: T,
 }
 
 impl<T: MmioTransport> Bcm2712Thermal<T> {
+    /// Construct a BCM2712 thermal sensor driver over `transport`.
+    #[must_use]
     pub const fn new(transport: T) -> Self {
         Self { transport }
     }
 
-    /// Read SoC junction temperature in milli-degrees Celsius (e.g. `52_340` = 52.34 °C).
+    /// Read `SoC` junction temperature in milli-degrees Celsius (e.g. `52_340` = 52.34 °C).
+    ///
+    /// # Errors
+    /// Returns [`SysError::WouldBlock`] if the measurement valid flag is not set, or a transport
+    /// [`SysError`] if the MMIO read fails.
     pub fn read_temp_millic(&self) -> Result<i32, SysError> {
         let reg = self.transport.read32(REG_TMON_TEMP_VALUE)?;
         if (reg & TMON_TEMP_VALID) == 0 {
@@ -56,15 +64,17 @@ impl Default for FanController {
 }
 
 impl FanController {
+    /// Create a new fan controller starting at 0% duty cycle.
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             current_duty_pct: 0,
         }
     }
 
-    /// Update PWM fan duty cycle (`0..=100`%) from SoC temperature in milli-degrees Celsius
+    /// Update PWM fan duty cycle (`0..=100`%) from `SoC` temperature in milli-degrees Celsius
     /// using Raspberry Pi 5's standard 4-stage trip points with 5 °C hysteresis.
-    pub fn update(&mut self, temp_millic: i32) -> u8 {
+    pub const fn update(&mut self, temp_millic: i32) -> u8 {
         let target = if temp_millic >= 75_000 {
             100
         } else if temp_millic >= 67_500 {
@@ -109,7 +119,9 @@ impl FanController {
         }
     }
 
+    /// Return the current PWM fan duty cycle percentage (`0..=100`).
     #[inline]
+    #[must_use]
     pub const fn duty_pct(&self) -> u8 {
         self.current_duty_pct
     }
@@ -138,8 +150,8 @@ mod tests {
         let invalid = Bcm2712Thermal::new(MockThermal(740));
         assert_eq!(invalid.read_temp_millic(), Err(SysError::WouldBlock));
 
-        // raw = 740 => 410_040 - 740*487 = 49_660 m°C (49.66 °C)
-        let valid = Bcm2712Thermal::new(MockThermal(TMON_TEMP_VALID | 740));
+        // raw = 0x02E4 (740) => 410_040 - 740*487 = 49_660 m°C (49.66 °C)
+        let valid = Bcm2712Thermal::new(MockThermal(TMON_TEMP_VALID | 0x02E4));
         assert_eq!(valid.read_temp_millic(), Ok(49_660));
     }
 
@@ -154,5 +166,21 @@ mod tests {
         assert_eq!(fan.update(76_000), 100);
         assert_eq!(fan.update(71_000), 100);
         assert_eq!(fan.update(69_000), 70);
+    }
+
+    #[test]
+    fn fan_controller_fails_safe_on_sensor_error_or_implausible_temp() {
+        let mut fan = FanController::default();
+        assert_eq!(fan.update_from_sensor(Err(SysError::WouldBlock)), 100);
+        assert_eq!(fan.duty_pct(), 100);
+
+        let mut fan2 = FanController::new();
+        assert_eq!(fan2.update_from_sensor(Ok(-50_000)), 100);
+
+        let mut fan3 = FanController::new();
+        assert_eq!(fan3.update_from_sensor(Ok(130_000)), 100);
+
+        let mut fan4 = FanController::new();
+        assert_eq!(fan4.update_from_sensor(Ok(61_000)), 50);
     }
 }

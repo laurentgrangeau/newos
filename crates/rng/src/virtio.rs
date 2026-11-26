@@ -1,4 +1,4 @@
-//! Modern VirtIO 1.0+ (v2) MMIO Entropy Device (`virtio-rng-device`, `device_id == 4`)
+//! Modern `VirtIO` 1.0+ (v2) MMIO Entropy Device (`virtio-rng-device`, `device_id == 4`)
 //! running in EL0 for QEMU `aarch64` `virt`.
 
 use crate::{EntropySource, RngError, RngTransport};
@@ -33,10 +33,25 @@ const STATUS_DRIVER_OK: u32 = 4;
 const STATUS_FEATURES_OK: u32 = 8;
 
 const VRING_DESC_F_WRITE: u16 = 2;
-const QUEUE_SIZE: usize = 4;
-const ENTROPY_BUF_LEN: usize = 64;
+const QUEUE_SIZE_U32: u32 = 4;
+const QUEUE_SIZE: usize = QUEUE_SIZE_U32 as usize;
+const ENTROPY_BUF_LEN_U32: u32 = 64;
+const ENTROPY_BUF_LEN: usize = ENTROPY_BUF_LEN_U32 as usize;
 const MAX_POLL_ITERS: u32 = 500_000;
 
+const _: () = assert!(QUEUE_SIZE == QUEUE_SIZE_U32 as usize);
+const _: () = assert!(ENTROPY_BUF_LEN == ENTROPY_BUF_LEN_U32 as usize);
+
+#[inline]
+const fn split_u64(val: u64) -> (u32, u32) {
+    let bytes = val.to_le_bytes();
+    (
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+    )
+}
+
+#[derive(Debug)]
 #[repr(C, align(16))]
 struct VirtqDesc {
     addr: AtomicU64,
@@ -56,6 +71,7 @@ impl VirtqDesc {
     }
 }
 
+#[derive(Debug)]
 #[repr(C, align(2))]
 struct VirtqAvail {
     flags: AtomicU16,
@@ -75,6 +91,7 @@ impl VirtqAvail {
     }
 }
 
+#[derive(Debug)]
 #[repr(C, align(4))]
 struct VirtqUsedElem {
     id: AtomicU32,
@@ -90,6 +107,7 @@ impl VirtqUsedElem {
     }
 }
 
+#[derive(Debug)]
 #[repr(C, align(4))]
 struct VirtqUsed {
     flags: AtomicU16,
@@ -118,6 +136,17 @@ pub struct VirtioRngDma {
     buf: [AtomicU8; ENTROPY_BUF_LEN],
 }
 
+impl core::fmt::Debug for VirtioRngDma {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VirtioRngDma")
+            .field("desc", &self.desc)
+            .field("avail", &self.avail)
+            .field("used", &self.used)
+            .field("buf", &"<redacted>")
+            .finish()
+    }
+}
+
 impl Default for VirtioRngDma {
     fn default() -> Self {
         Self::new()
@@ -125,6 +154,8 @@ impl Default for VirtioRngDma {
 }
 
 impl VirtioRngDma {
+    /// Create a zero-initialized static DMA region for `VirtioRngDevice`.
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             desc: [const { VirtqDesc::new() }; QUEUE_SIZE],
@@ -135,7 +166,8 @@ impl VirtioRngDma {
     }
 }
 
-/// Live EL0 VirtIO 1.0+ (v2) MMIO RNG driver (`device_id == 4`).
+/// Live EL0 `VirtIO` 1.0+ (v2) MMIO RNG driver (`device_id == 4`).
+#[derive(Debug)]
 pub struct VirtioRngDevice<'a, T: RngTransport> {
     transport: T,
     dma: &'a VirtioRngDma,
@@ -145,110 +177,78 @@ pub struct VirtioRngDevice<'a, T: RngTransport> {
 }
 
 impl<'a, T: RngTransport> VirtioRngDevice<'a, T> {
-    /// Initialize a scoped VirtIO-RNG v2 MMIO device (capability already scoped to the single slot).
+    /// Initialize a scoped `VirtIO`-RNG v2 MMIO device (capability already scoped to the single slot).
+    ///
+    /// # Errors
+    /// Returns [`RngError::Sys`] if MMIO or DMA translation fails, [`RngError::DeviceNotFound`]
+    /// if magic/version/device ID do not match, or [`RngError::HardwareFault`] if feature
+    /// negotiation or queue setup fails.
     pub fn init(transport: T, dma: &'a VirtioRngDma) -> Result<Self, RngError> {
-        let magic = transport.read32(REG_MAGIC).map_err(RngError::Sys)?;
-        let version = transport.read32(REG_VERSION).map_err(RngError::Sys)?;
-        let device_id = transport.read32(REG_DEVICE_ID).map_err(RngError::Sys)?;
+        let magic = transport.read32(REG_MAGIC)?;
+        let version = transport.read32(REG_VERSION)?;
+        let device_id = transport.read32(REG_DEVICE_ID)?;
         if magic != VIRTIO_MMIO_MAGIC || device_id != VIRTIO_DEVICE_RNG || version < 2 {
             return Err(RngError::DeviceNotFound);
         }
 
         // Reset -> ACKNOWLEDGE -> DRIVER
-        transport.write32(REG_STATUS, 0).map_err(RngError::Sys)?;
+        transport.write32(REG_STATUS, 0)?;
         let mut status = STATUS_ACKNOWLEDGE;
-        transport
-            .write32(REG_STATUS, status)
-            .map_err(RngError::Sys)?;
+        transport.write32(REG_STATUS, status)?;
         status |= STATUS_DRIVER;
-        transport
-            .write32(REG_STATUS, status)
-            .map_err(RngError::Sys)?;
+        transport.write32(REG_STATUS, status)?;
 
         // Negotiate VIRTIO_F_VERSION_1 (bit 32 -> word 1 bit 0)
-        transport
-            .write32(REG_DEVICE_FEATURES_SEL, 0)
-            .map_err(RngError::Sys)?;
-        let _ = transport
-            .read32(REG_DEVICE_FEATURES)
-            .map_err(RngError::Sys)?;
-        transport
-            .write32(REG_DEVICE_FEATURES_SEL, 1)
-            .map_err(RngError::Sys)?;
-        let dev_hi = transport
-            .read32(REG_DEVICE_FEATURES)
-            .map_err(RngError::Sys)?;
+        transport.write32(REG_DEVICE_FEATURES_SEL, 0)?;
+        let _ = transport.read32(REG_DEVICE_FEATURES)?;
+        transport.write32(REG_DEVICE_FEATURES_SEL, 1)?;
+        let dev_hi = transport.read32(REG_DEVICE_FEATURES)?;
         if (dev_hi & 1) == 0 {
             return Err(RngError::HardwareFault);
         }
-        transport
-            .write32(REG_DRIVER_FEATURES_SEL, 0)
-            .map_err(RngError::Sys)?;
-        transport
-            .write32(REG_DRIVER_FEATURES, 0)
-            .map_err(RngError::Sys)?;
-        transport
-            .write32(REG_DRIVER_FEATURES_SEL, 1)
-            .map_err(RngError::Sys)?;
-        transport
-            .write32(REG_DRIVER_FEATURES, 1)
-            .map_err(RngError::Sys)?;
+        transport.write32(REG_DRIVER_FEATURES_SEL, 0)?;
+        transport.write32(REG_DRIVER_FEATURES, 0)?;
+        transport.write32(REG_DRIVER_FEATURES_SEL, 1)?;
+        transport.write32(REG_DRIVER_FEATURES, 1)?;
 
         status |= STATUS_FEATURES_OK;
-        transport
-            .write32(REG_STATUS, status)
-            .map_err(RngError::Sys)?;
-        let post_status = transport.read32(REG_STATUS).map_err(RngError::Sys)?;
+        transport.write32(REG_STATUS, status)?;
+        let post_status = transport.read32(REG_STATUS)?;
         if (post_status & STATUS_FEATURES_OK) == 0 {
             return Err(RngError::HardwareFault);
         }
 
         // Configure single virtqueue 0 (`requestq`)
-        transport.write32(REG_QUEUE_SEL, 0).map_err(RngError::Sys)?;
-        let max_q = transport.read32(REG_QUEUE_NUM_MAX).map_err(RngError::Sys)?;
-        if (max_q as usize) < QUEUE_SIZE {
+        transport.write32(REG_QUEUE_SEL, 0)?;
+        let max_q = transport.read32(REG_QUEUE_NUM_MAX)?;
+        if max_q < QUEUE_SIZE_U32 {
             return Err(RngError::HardwareFault);
         }
-        transport
-            .write32(REG_QUEUE_NUM, QUEUE_SIZE as u32)
-            .map_err(RngError::Sys)?;
+        transport.write32(REG_QUEUE_NUM, QUEUE_SIZE_U32)?;
 
-        let desc_phys = transport.virt_to_phys(&dma.desc).map_err(RngError::Sys)?;
-        let avail_phys = transport.virt_to_phys(&dma.avail).map_err(RngError::Sys)?;
-        let used_phys = transport.virt_to_phys(&dma.used).map_err(RngError::Sys)?;
-        let buf_phys = transport.virt_to_phys(&dma.buf).map_err(RngError::Sys)?;
+        let desc_phys = transport.virt_to_phys(&dma.desc)?;
+        let avail_phys = transport.virt_to_phys(&dma.avail)?;
+        let used_phys = transport.virt_to_phys(&dma.used)?;
+        let buf_phys = transport.virt_to_phys(&dma.buf)?;
 
         dma.avail.flags.store(0, Ordering::Relaxed);
         dma.avail.idx.store(0, Ordering::Relaxed);
         dma.used.flags.store(0, Ordering::Relaxed);
         dma.used.idx.store(0, Ordering::Relaxed);
 
-        transport
-            .write32(REG_QUEUE_DESC_LOW, desc_phys as u32)
-            .map_err(RngError::Sys)?;
-        transport
-            .write32(REG_QUEUE_DESC_HIGH, (desc_phys >> 32) as u32)
-            .map_err(RngError::Sys)?;
-        transport
-            .write32(REG_QUEUE_DRIVER_LOW, avail_phys as u32)
-            .map_err(RngError::Sys)?;
-        transport
-            .write32(REG_QUEUE_DRIVER_HIGH, (avail_phys >> 32) as u32)
-            .map_err(RngError::Sys)?;
-        transport
-            .write32(REG_QUEUE_DEVICE_LOW, used_phys as u32)
-            .map_err(RngError::Sys)?;
-        transport
-            .write32(REG_QUEUE_DEVICE_HIGH, (used_phys >> 32) as u32)
-            .map_err(RngError::Sys)?;
-        transport
-            .write32(REG_QUEUE_READY, 1)
-            .map_err(RngError::Sys)?;
+        let (desc_lo, desc_hi) = split_u64(desc_phys);
+        let (avail_lo, avail_hi) = split_u64(avail_phys);
+        let (used_lo, used_hi) = split_u64(used_phys);
+        transport.write32(REG_QUEUE_DESC_LOW, desc_lo)?;
+        transport.write32(REG_QUEUE_DESC_HIGH, desc_hi)?;
+        transport.write32(REG_QUEUE_DRIVER_LOW, avail_lo)?;
+        transport.write32(REG_QUEUE_DRIVER_HIGH, avail_hi)?;
+        transport.write32(REG_QUEUE_DEVICE_LOW, used_lo)?;
+        transport.write32(REG_QUEUE_DEVICE_HIGH, used_hi)?;
+        transport.write32(REG_QUEUE_READY, 1)?;
 
         status |= STATUS_DRIVER_OK;
-        transport
-            .write32(REG_STATUS, status)
-            .map_err(RngError::Sys)?;
+        transport.write32(REG_STATUS, status)?;
 
         Ok(Self {
             transport,
@@ -269,9 +269,10 @@ impl<'a, T: RngTransport> VirtioRngDevice<'a, T> {
         self.dma.desc[0]
             .addr
             .store(self.buf_phys, Ordering::Relaxed);
-        self.dma.desc[0]
-            .len
-            .store(req_len as u32, Ordering::Relaxed);
+        self.dma.desc[0].len.store(
+            u32::try_from(req_len).unwrap_or(ENTROPY_BUF_LEN_U32),
+            Ordering::Relaxed,
+        );
         self.dma.desc[0]
             .flags
             .store(VRING_DESC_F_WRITE, Ordering::Relaxed);
@@ -284,9 +285,7 @@ impl<'a, T: RngTransport> VirtioRngDevice<'a, T> {
         self.dma.avail.idx.store(self.avail_idx, Ordering::Release);
         fence(Ordering::SeqCst);
 
-        self.transport
-            .write32(REG_QUEUE_NOTIFY, 0)
-            .map_err(RngError::Sys)?;
+        self.transport.write32(REG_QUEUE_NOTIFY, 0)?;
 
         for _ in 0..MAX_POLL_ITERS {
             let used_idx = self.dma.used.idx.load(Ordering::Acquire);
@@ -309,9 +308,7 @@ impl<'a, T: RngTransport> VirtioRngDevice<'a, T> {
     }
 
     fn reinit_hardware(&mut self) -> Result<(), RngError> {
-        self.transport
-            .write32(REG_STATUS, 0)
-            .map_err(RngError::Sys)?;
+        self.transport.write32(REG_STATUS, 0)?;
         self.dma.avail.flags.store(0, Ordering::Relaxed);
         self.dma.avail.idx.store(0, Ordering::Release);
         self.dma.used.flags.store(0, Ordering::Relaxed);
@@ -320,81 +317,41 @@ impl<'a, T: RngTransport> VirtioRngDevice<'a, T> {
         self.last_used_idx = 0;
 
         let mut status = STATUS_ACKNOWLEDGE;
-        self.transport
-            .write32(REG_STATUS, status)
-            .map_err(RngError::Sys)?;
+        self.transport.write32(REG_STATUS, status)?;
         status |= STATUS_DRIVER;
-        self.transport
-            .write32(REG_STATUS, status)
-            .map_err(RngError::Sys)?;
+        self.transport.write32(REG_STATUS, status)?;
 
-        self.transport
-            .write32(REG_DRIVER_FEATURES_SEL, 0)
-            .map_err(RngError::Sys)?;
-        self.transport
-            .write32(REG_DRIVER_FEATURES, 0)
-            .map_err(RngError::Sys)?;
-        self.transport
-            .write32(REG_DRIVER_FEATURES_SEL, 1)
-            .map_err(RngError::Sys)?;
-        self.transport
-            .write32(REG_DRIVER_FEATURES, 1)
-            .map_err(RngError::Sys)?;
+        self.transport.write32(REG_DRIVER_FEATURES_SEL, 0)?;
+        self.transport.write32(REG_DRIVER_FEATURES, 0)?;
+        self.transport.write32(REG_DRIVER_FEATURES_SEL, 1)?;
+        self.transport.write32(REG_DRIVER_FEATURES, 1)?;
 
         status |= STATUS_FEATURES_OK;
-        self.transport
-            .write32(REG_STATUS, status)
-            .map_err(RngError::Sys)?;
-        if (self.transport.read32(REG_STATUS).map_err(RngError::Sys)? & STATUS_FEATURES_OK) == 0 {
+        self.transport.write32(REG_STATUS, status)?;
+        if (self.transport.read32(REG_STATUS)? & STATUS_FEATURES_OK) == 0 {
             return Err(RngError::HardwareFault);
         }
 
-        self.transport
-            .write32(REG_QUEUE_SEL, 0)
-            .map_err(RngError::Sys)?;
-        self.transport
-            .write32(REG_QUEUE_NUM, QUEUE_SIZE as u32)
-            .map_err(RngError::Sys)?;
+        self.transport.write32(REG_QUEUE_SEL, 0)?;
+        self.transport.write32(REG_QUEUE_NUM, QUEUE_SIZE_U32)?;
 
-        let desc_phys = self
-            .transport
-            .virt_to_phys(&self.dma.desc)
-            .map_err(RngError::Sys)?;
-        let avail_phys = self
-            .transport
-            .virt_to_phys(&self.dma.avail)
-            .map_err(RngError::Sys)?;
-        let used_phys = self
-            .transport
-            .virt_to_phys(&self.dma.used)
-            .map_err(RngError::Sys)?;
+        let desc_phys = self.transport.virt_to_phys(&self.dma.desc)?;
+        let avail_phys = self.transport.virt_to_phys(&self.dma.avail)?;
+        let used_phys = self.transport.virt_to_phys(&self.dma.used)?;
 
-        self.transport
-            .write32(REG_QUEUE_DESC_LOW, desc_phys as u32)
-            .map_err(RngError::Sys)?;
-        self.transport
-            .write32(REG_QUEUE_DESC_HIGH, (desc_phys >> 32) as u32)
-            .map_err(RngError::Sys)?;
-        self.transport
-            .write32(REG_QUEUE_DRIVER_LOW, avail_phys as u32)
-            .map_err(RngError::Sys)?;
-        self.transport
-            .write32(REG_QUEUE_DRIVER_HIGH, (avail_phys >> 32) as u32)
-            .map_err(RngError::Sys)?;
-        self.transport
-            .write32(REG_QUEUE_DEVICE_LOW, used_phys as u32)
-            .map_err(RngError::Sys)?;
-        self.transport
-            .write32(REG_QUEUE_DEVICE_HIGH, (used_phys >> 32) as u32)
-            .map_err(RngError::Sys)?;
-        self.transport
-            .write32(REG_QUEUE_READY, 1)
-            .map_err(RngError::Sys)?;
+        let (desc_lo, desc_hi) = split_u64(desc_phys);
+        let (avail_lo, avail_hi) = split_u64(avail_phys);
+        let (used_lo, used_hi) = split_u64(used_phys);
+        self.transport.write32(REG_QUEUE_DESC_LOW, desc_lo)?;
+        self.transport.write32(REG_QUEUE_DESC_HIGH, desc_hi)?;
+        self.transport.write32(REG_QUEUE_DRIVER_LOW, avail_lo)?;
+        self.transport.write32(REG_QUEUE_DRIVER_HIGH, avail_hi)?;
+        self.transport.write32(REG_QUEUE_DEVICE_LOW, used_lo)?;
+        self.transport.write32(REG_QUEUE_DEVICE_HIGH, used_hi)?;
+        self.transport.write32(REG_QUEUE_READY, 1)?;
 
         status |= STATUS_DRIVER_OK;
-        self.transport
-            .write32(REG_STATUS, status)
-            .map_err(RngError::Sys)?;
+        self.transport.write32(REG_STATUS, status)?;
         Ok(())
     }
 }
@@ -453,14 +410,15 @@ mod tests {
                         .min(ENTROPY_BUF_LEN);
                     for (i, slot_b) in self.dma.buf.iter().enumerate().take(req_len) {
                         slot_b.store(
-                            ((i * 37 + used_idx as usize * 13 + 7) & 0xFF) as u8,
+                            (i * 37 + usize::from(used_idx) * 13 + 7).to_le_bytes()[0],
                             Ordering::Relaxed,
                         );
                     }
                     self.dma.used.ring[slot].id.store(0, Ordering::Relaxed);
-                    self.dma.used.ring[slot]
-                        .len
-                        .store(req_len as u32, Ordering::Relaxed);
+                    self.dma.used.ring[slot].len.store(
+                        u32::try_from(req_len).expect("req_len <= ENTROPY_BUF_LEN fits in u32"),
+                        Ordering::Relaxed,
+                    );
                     self.dma
                         .used
                         .idx
@@ -472,7 +430,7 @@ mod tests {
         }
 
         fn virt_to_phys<T>(&self, value: &T) -> Result<u64, SysError> {
-            Ok((value as *const T as usize) as u64)
+            Ok(core::ptr::from_ref::<T>(value).addr() as u64)
         }
     }
 
@@ -483,7 +441,7 @@ mod tests {
             magic: 0x1234,
             version: 2,
             device_id: VIRTIO_DEVICE_RNG,
-            queue_max: QUEUE_SIZE as u32,
+            queue_max: QUEUE_SIZE_U32,
             status: AtomicU32::new(0),
             dma: &dma,
             respond_on_notify: true,
@@ -497,7 +455,7 @@ mod tests {
             magic: VIRTIO_MMIO_MAGIC,
             version: 2,
             device_id: 1, // virtio-net, not rng
-            queue_max: QUEUE_SIZE as u32,
+            queue_max: QUEUE_SIZE_U32,
             status: AtomicU32::new(0),
             dma: &dma,
             respond_on_notify: true,
@@ -511,7 +469,7 @@ mod tests {
             magic: VIRTIO_MMIO_MAGIC,
             version: 1,
             device_id: VIRTIO_DEVICE_RNG,
-            queue_max: QUEUE_SIZE as u32,
+            queue_max: QUEUE_SIZE_U32,
             status: AtomicU32::new(0),
             dma: &dma,
             respond_on_notify: true,
@@ -529,7 +487,7 @@ mod tests {
             magic: VIRTIO_MMIO_MAGIC,
             version: 2,
             device_id: VIRTIO_DEVICE_RNG,
-            queue_max: QUEUE_SIZE as u32,
+            queue_max: QUEUE_SIZE_U32,
             status: AtomicU32::new(0),
             dma: &dma,
             respond_on_notify: true,

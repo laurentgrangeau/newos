@@ -16,11 +16,11 @@ pub mod sched;
 
 pub use ipc::{IpcMessage, IpcStats, KernelIpcState};
 
-use core::fmt::Write;
+use core::fmt::{self, Write};
 use cspace::{CNode, CapObject, Capability};
-#[cfg(feature = "userspace")]
-use memory::PAGE_SIZE;
 use memory::{CpuSecurityFeatures, PageFlags, PhysAddr, UntypedInventory, VSpaceMapper, VirtAddr};
+#[cfg(feature = "userspace")]
+use memory::{PAGE_SIZE, PageAccess, PageCachePolicy, PagePrivilege};
 use newos_abi::{Rights, ShutdownStatus, SysError};
 
 #[cfg(feature = "userspace")]
@@ -36,7 +36,7 @@ const USER_SHADOW_STACK_BASE: u64 = 0x0000_7fff_e000_0000;
 const USER_SHADOW_STACK_PAGES: u64 = 2; // 8 KiB EL0 Shadow Call Stack (`x18`, grows upward)
 
 /// Linear UEFI GOP / Limine framebuffer geometry discovered at boot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FramebufferInfo {
     pub phys_addr: u64,
     pub width: u32,
@@ -70,14 +70,15 @@ pub struct BootInfo {
 impl BootInfo {
     /// Usable memory rounded down to whole MiB for concise boot diagnostics.
     #[inline]
-    pub fn usable_mib(&self) -> u64 {
+    #[must_use]
+    pub const fn usable_mib(&self) -> u64 {
         self.untyped.total_bytes() / (1024 * 1024)
     }
 }
 
 /// Explicit bootstrap protection domain role used to assign least-privilege capabilities
 /// independently of spawn order / PD ID (`N5`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DomainRole {
     Supervisor,
     Shell,
@@ -89,6 +90,7 @@ pub enum DomainRole {
 
 impl DomainRole {
     #[inline]
+    #[must_use]
     pub const fn to_abi(self) -> newos_abi::DomainRoleId {
         match self {
             Self::Supervisor => newos_abi::DomainRoleId::Supervisor,
@@ -101,6 +103,7 @@ impl DomainRole {
     }
 
     #[inline]
+    #[must_use]
     pub const fn from_abi(id: newos_abi::DomainRoleId) -> Self {
         match id {
             newos_abi::DomainRoleId::Supervisor => Self::Supervisor,
@@ -113,13 +116,34 @@ impl DomainRole {
     }
 }
 
+impl fmt::Display for DomainRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.to_abi().fmt(f)
+    }
+}
+
+impl From<DomainRole> for newos_abi::DomainRoleId {
+    #[inline]
+    fn from(role: DomainRole) -> Self {
+        role.to_abi()
+    }
+}
+
+impl From<newos_abi::DomainRoleId> for DomainRole {
+    #[inline]
+    fn from(id: newos_abi::DomainRoleId) -> Self {
+        Self::from_abi(id)
+    }
+}
+
 /// Architecture-agnostic platform interface implemented by `newos-hal`.
 pub trait HalPlatform: Write {
     type VSpace: VSpaceMapper;
 
     fn arch_name(&self) -> &'static str;
-    fn board_name(&self) -> &'static str {
-        "generic"
+    /// Optional platform board identifier; returns `None` when not explicitly configured.
+    fn board_name(&self) -> Option<&'static str> {
+        None
     }
     fn security_features(&self) -> CpuSecurityFeatures;
     /// Return packed ARMv8.2-A ISA feature bitmask + PA width + D-cache line size (`newos_abi::cpu_isa`).
@@ -136,8 +160,24 @@ pub trait HalPlatform: Write {
     fn disable_interrupts(&mut self);
     fn wait_for_interrupt(&mut self);
     fn vspace_mut(&mut self) -> &mut Self::VSpace;
+
+    /// Allocate and initialize a fresh EL0 `VSpace` root from `untyped`.
+    ///
+    /// # Errors
+    /// Returns [`SysError::OutOfMemory`] if `untyped` lacks a free 4 KiB frame for the root table.
     fn create_user_vspace(&self, untyped: &mut UntypedInventory) -> Result<Self::VSpace, SysError>;
+
+    /// Write and read back `pattern` at mapped kernel virtual address `virt`.
+    ///
+    /// # Errors
+    /// Returns [`SysError::InvalidArgument`] if `virt` is not mapped or probe access fails.
     fn probe_mapped_u64(&self, virt: VirtAddr, pattern: u64) -> Result<u64, SysError>;
+
+    /// Register a newly constructed EL0 protection domain with the HAL scheduler and return its PD ID.
+    ///
+    /// # Errors
+    /// - [`SysError::OutOfMemory`] if the HAL domain table is full.
+    /// - [`SysError::InvalidArgument`] if entry, stack, or `vspace_root` parameters are invalid.
     fn register_domain(
         &mut self,
         role: DomainRole,
@@ -158,16 +198,14 @@ pub trait HalPlatform: Write {
     fn exit(&mut self, code: ShutdownStatus) -> !;
 }
 
-/// Microkernel boot entry: verify Phases 1–3 + SMP, then load isolated EL0 protection domains.
-pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
+fn log_boot_banner<P: HalPlatform>(platform: &mut P, info: &BootInfo) {
     let sec = platform.security_features();
-    let board = if platform.board_name() != "generic" {
-        platform.board_name()
-    } else if info.qemu_virt {
+    let fallback_board = if info.qemu_virt {
         "qemu-virt-test"
     } else {
         "rpi5-16gb"
     };
+    let board = platform.board_name().unwrap_or(fallback_board);
     let _ = writeln!(
         platform,
         "[newos] booting microkernel (arch={}, board={}, sched={}, smp={}, userspace={}, elf_attest={}, acpi={})",
@@ -230,7 +268,9 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
             fb.width, fb.height, fb.bpp, fb.pitch, fb.phys_addr,
         );
     }
+}
 
+fn verify_phase1_hal<P: HalPlatform>(platform: &mut P, info: &BootInfo) {
     #[cfg(feature = "smp")]
     if platform.online_cpus() != info.cpu_count {
         let _ = writeln!(
@@ -239,6 +279,8 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
         );
         platform.exit(ShutdownStatus::Failed);
     }
+    #[cfg(not(feature = "smp"))]
+    let _ = info;
 
     // VBAR_EL1 #BRK & ARM Generic Timer verification
     let before_bp = platform.breakpoint_count();
@@ -262,6 +304,79 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
         platform.breakpoint_count(),
         platform.timer_count(),
     );
+}
+
+#[cfg(feature = "userspace")]
+fn spawn_all_domains<P: HalPlatform>(
+    platform: &mut P,
+    supervisor_bytes: &'static [u8],
+    info: &mut BootInfo,
+) -> Result<(), SysError> {
+    spawn_isolated_domain(
+        platform,
+        DomainRole::Supervisor,
+        "newos-supervisor-pd",
+        supervisor_bytes,
+        &mut info.untyped,
+    )?;
+    let optional_domains = [
+        (DomainRole::Shell, "newos-shell-pd", info.shell_module),
+        (DomainRole::Worker, "newos-worker-pd", info.worker_module),
+        (DomainRole::Net, "newos-net-pd", info.net_module),
+        (DomainRole::Key, "newos-key-pd", info.key_module),
+        (DomainRole::Ssh, "newos-ssh-pd", info.ssh_module),
+    ];
+    for (role, name, module) in optional_domains {
+        if let Some(bytes) = module {
+            spawn_isolated_domain(platform, role, name, bytes, &mut info.untyped)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "userspace")]
+fn bootstrap_userspace<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
+    let Some(supervisor_bytes) = info.supervisor_module else {
+        let _ = writeln!(
+            platform,
+            "[newos] FAIL: userspace feature enabled but no EL0 supervisor-pd module supplied"
+        );
+        platform.exit(ShutdownStatus::Failed);
+    };
+
+    platform.register_boot_module(DomainRole::Supervisor, supervisor_bytes);
+    let optional_modules = [
+        (DomainRole::Shell, info.shell_module),
+        (DomainRole::Worker, info.worker_module),
+        (DomainRole::Net, info.net_module),
+        (DomainRole::Key, info.key_module),
+        (DomainRole::Ssh, info.ssh_module),
+    ];
+    for (role, module) in optional_modules {
+        if let Some(bytes) = module {
+            platform.register_boot_module(role, bytes);
+        }
+    }
+
+    match spawn_all_domains(platform, supervisor_bytes, &mut info) {
+        Ok(()) => {
+            platform.install_runtime_untyped(info.untyped);
+            platform.start_userspace()
+        }
+        Err(err) => {
+            let _ = writeln!(
+                platform,
+                "[newos] FAIL: failed to spawn EL0 protection domains: {err:?}"
+            );
+            platform.exit(ShutdownStatus::Failed);
+        }
+    }
+}
+
+/// Microkernel boot entry: verify Phases 1–3 + SMP, then load isolated EL0 protection domains.
+pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
+    log_boot_banner(platform, &info);
+    verify_phase1_hal(platform, &info);
 
     // Untyped retype + 4-level VSpace map / probe / unmap verification
     if let Err(err) = verify_phase2_memory(platform, &mut info.untyped) {
@@ -299,111 +414,15 @@ pub fn boot_early<P: HalPlatform>(platform: &mut P, mut info: BootInfo) -> ! {
             cfg!(feature = "smp"),
         );
         if info.qemu_virt {
-            platform.exit(ShutdownStatus::Success)
-        } else {
-            loop {
-                platform.wait_for_interrupt();
-            }
+            platform.exit(ShutdownStatus::Success);
+        }
+        loop {
+            platform.wait_for_interrupt();
         }
     }
 
     #[cfg(feature = "userspace")]
-    {
-        let Some(supervisor_bytes) = info.supervisor_module else {
-            let _ = writeln!(
-                platform,
-                "[newos] FAIL: userspace feature enabled but no EL0 supervisor-pd module supplied"
-            );
-            platform.exit(ShutdownStatus::Failed);
-        };
-
-        platform.register_boot_module(DomainRole::Supervisor, supervisor_bytes);
-        if let Some(shell_bytes) = info.shell_module {
-            platform.register_boot_module(DomainRole::Shell, shell_bytes);
-        }
-        if let Some(worker_bytes) = info.worker_module {
-            platform.register_boot_module(DomainRole::Worker, worker_bytes);
-        }
-        if let Some(net_bytes) = info.net_module {
-            platform.register_boot_module(DomainRole::Net, net_bytes);
-        }
-        if let Some(key_bytes) = info.key_module {
-            platform.register_boot_module(DomainRole::Key, key_bytes);
-        }
-        if let Some(ssh_bytes) = info.ssh_module {
-            platform.register_boot_module(DomainRole::Ssh, ssh_bytes);
-        }
-
-        let spawn_result = spawn_isolated_domain(
-            platform,
-            DomainRole::Supervisor,
-            "newos-supervisor-pd",
-            supervisor_bytes,
-            &mut info.untyped,
-        )
-        .and_then(|_| {
-            if let Some(shell_bytes) = info.shell_module {
-                spawn_isolated_domain(
-                    platform,
-                    DomainRole::Shell,
-                    "newos-shell-pd",
-                    shell_bytes,
-                    &mut info.untyped,
-                )?;
-            }
-            if let Some(worker_bytes) = info.worker_module {
-                spawn_isolated_domain(
-                    platform,
-                    DomainRole::Worker,
-                    "newos-worker-pd",
-                    worker_bytes,
-                    &mut info.untyped,
-                )?;
-            }
-            if let Some(net_bytes) = info.net_module {
-                spawn_isolated_domain(
-                    platform,
-                    DomainRole::Net,
-                    "newos-net-pd",
-                    net_bytes,
-                    &mut info.untyped,
-                )?;
-            }
-            if let Some(key_bytes) = info.key_module {
-                spawn_isolated_domain(
-                    platform,
-                    DomainRole::Key,
-                    "newos-key-pd",
-                    key_bytes,
-                    &mut info.untyped,
-                )?;
-            }
-            if let Some(ssh_bytes) = info.ssh_module {
-                spawn_isolated_domain(
-                    platform,
-                    DomainRole::Ssh,
-                    "newos-ssh-pd",
-                    ssh_bytes,
-                    &mut info.untyped,
-                )?;
-            }
-            Ok(())
-        });
-
-        match spawn_result {
-            Ok(()) => {
-                platform.install_runtime_untyped(info.untyped);
-                platform.start_userspace()
-            }
-            Err(err) => {
-                let _ = writeln!(
-                    platform,
-                    "[newos] FAIL: failed to spawn EL0 protection domains: {err:?}"
-                );
-                platform.exit(ShutdownStatus::Failed);
-            }
-        }
-    }
+    bootstrap_userspace(platform, info)
 }
 
 #[cfg(feature = "userspace")]
@@ -463,6 +482,13 @@ fn spawn_isolated_domain<P: HalPlatform>(
 
 /// ELF64 loader mapping an `ET_EXEC` or PIE `ET_DYN`
 /// binary into an isolated `VSpace` with ASLR code/stack/SCS slides and `R_AARCH64_RELATIVE` relocations.
+///
+/// # Errors
+/// - [`SysError::InvalidArgument`] if the ELF image, segment bounds, relocations, or canonical addresses are invalid.
+/// - [`SysError::Unsupported`] if the ELF image is not a 64-bit `AArch64` `ET_EXEC`/`ET_DYN` binary.
+/// - [`SysError::InsufficientRights`] if a PIE relocation targets a non-writable or non-user page.
+/// - [`SysError::SlotOccupied`] if the stack guard page is already mapped.
+/// - [`SysError::OutOfMemory`] if `untyped` cannot supply frames or page tables.
 #[cfg(feature = "userspace")]
 pub fn load_elf64_into_vspace<V: VSpaceMapper>(
     vspace: &mut V,
@@ -497,21 +523,31 @@ pub fn load_elf64_into_vspace<V: VSpaceMapper>(
             let copy_end = page_end.min(file_vaddr_end);
 
             if copy_end > copy_start {
-                let dst_off = (copy_start - page_vaddr) as usize;
-                let src_off = seg.file_offset + (copy_start - seg_start) as usize;
-                let copy_len = (copy_end - copy_start) as usize;
+                let dst_off = usize::try_from(copy_start - page_vaddr)
+                    .map_err(|_| SysError::InvalidArgument)?;
+                let src_delta = usize::try_from(copy_start - seg_start)
+                    .map_err(|_| SysError::InvalidArgument)?;
+                let src_off = seg
+                    .file_offset
+                    .checked_add(src_delta)
+                    .ok_or(SysError::InvalidArgument)?;
+                let copy_len = usize::try_from(copy_end - copy_start)
+                    .map_err(|_| SysError::InvalidArgument)?;
+                let src_end = src_off
+                    .checked_add(copy_len)
+                    .ok_or(SysError::InvalidArgument)?;
                 let src_slice = elf_bytes
-                    .get(src_off..src_off + copy_len)
+                    .get(src_off..src_end)
                     .ok_or(SysError::InvalidArgument)?;
                 vspace.write_frame_bytes(&frame, dst_off, src_slice)?;
             }
 
             let virt = VirtAddr::new_page_aligned(page_vaddr)?;
             vspace.map_4k(virt, frame, seg.flags, untyped)?;
-            match page_vaddr.checked_add(PAGE_SIZE) {
-                Some(next) => page_vaddr = next,
-                None => break,
-            }
+            let Some(next) = page_vaddr.checked_add(PAGE_SIZE) else {
+                break;
+            };
+            page_vaddr = next;
         }
     }
 
@@ -530,7 +566,7 @@ pub fn load_elf64_into_vspace<V: VSpaceMapper>(
             let page_pa = PhysAddr::new(pa.raw() & !memory::PAGE_MASK);
             let page_off = (pa.raw() & memory::PAGE_MASK) as usize;
             let frame = memory::PhysFrame::from_aligned(page_pa)?;
-            let relocated = (parsed.load_base as i64).wrapping_add(reloc.addend) as u64;
+            let relocated = parsed.load_base.wrapping_add_signed(reloc.addend);
             vspace.write_frame_bytes(&frame, page_off, &relocated.to_le_bytes())
         })?;
     }
@@ -542,7 +578,11 @@ pub fn load_elf64_into_vspace<V: VSpaceMapper>(
     if vspace.translate(guard_va).is_some() {
         return Err(SysError::SlotOccupied);
     }
-    let stack_flags = PageFlags::new_wx(true, false, true, false)?;
+    let stack_flags = PageFlags::new(
+        PageAccess::ReadWrite,
+        PagePrivilege::User,
+        PageCachePolicy::NormalCacheable,
+    );
     for page in 0..stack_pages {
         let frame = untyped.retype_frame()?;
         vspace.zero_frame(&frame);
@@ -673,5 +713,138 @@ mod tests {
             qemu_virt: false,
         };
         assert_eq!(info.usable_mib(), 256);
+    }
+
+    #[test]
+    fn domain_role_from_into_display_round_trips() {
+        struct Buf([u8; 32], usize);
+        impl Write for Buf {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                let bytes = s.as_bytes();
+                let n = bytes.len().min(self.0.len() - self.1);
+                self.0[self.1..self.1 + n].copy_from_slice(&bytes[..n]);
+                self.1 += n;
+                Ok(())
+            }
+        }
+
+        let roles = [
+            DomainRole::Supervisor,
+            DomainRole::Shell,
+            DomainRole::Worker,
+            DomainRole::Net,
+            DomainRole::Key,
+            DomainRole::Ssh,
+        ];
+        for role in roles {
+            let abi: newos_abi::DomainRoleId = role.into();
+            assert_eq!(abi, role.to_abi());
+            assert_eq!(DomainRole::from(abi), role);
+            assert_eq!(DomainRole::from_abi(abi), role);
+
+            let mut role_buf = Buf([0; 32], 0);
+            let mut abi_buf = Buf([0; 32], 0);
+            write!(&mut role_buf, "{role}").expect("format role");
+            write!(&mut abi_buf, "{abi}").expect("format abi");
+            assert_eq!(&role_buf.0[..role_buf.1], &abi_buf.0[..abi_buf.1]);
+        }
+    }
+
+    #[test]
+    fn hal_platform_default_board_name_is_none() {
+        struct DummyVSpace;
+        impl VSpaceMapper for DummyVSpace {
+            fn root_phys(&self) -> PhysAddr {
+                PhysAddr::new(0)
+            }
+            fn map_4k(
+                &mut self,
+                _virt: VirtAddr,
+                _frame: memory::PhysFrame,
+                _flags: PageFlags,
+                _untyped: &mut UntypedInventory,
+            ) -> Result<(), SysError> {
+                Ok(())
+            }
+            fn translate(&self, _virt: VirtAddr) -> Option<(PhysAddr, PageFlags)> {
+                None
+            }
+            fn unmap_4k(&mut self, _virt: VirtAddr) -> Result<memory::PhysFrame, SysError> {
+                Err(SysError::InvalidArgument)
+            }
+            fn zero_frame(&self, _frame: &memory::PhysFrame) {}
+            fn write_frame_bytes(
+                &self,
+                _frame: &memory::PhysFrame,
+                _offset: usize,
+                _src: &[u8],
+            ) -> Result<(), SysError> {
+                Ok(())
+            }
+        }
+
+        struct DummyPlatform(DummyVSpace);
+        impl Write for DummyPlatform {
+            fn write_str(&mut self, _s: &str) -> fmt::Result {
+                Ok(())
+            }
+        }
+        impl HalPlatform for DummyPlatform {
+            type VSpace = DummyVSpace;
+            fn arch_name(&self) -> &'static str {
+                "aarch64"
+            }
+            fn security_features(&self) -> CpuSecurityFeatures {
+                CpuSecurityFeatures::default()
+            }
+            fn current_cpu_id(&self) -> u32 {
+                0
+            }
+            fn online_cpus(&self) -> usize {
+                1
+            }
+            fn trigger_breakpoint(&mut self) {}
+            fn breakpoint_count(&self) -> u64 {
+                0
+            }
+            fn arm_oneshot_timer(&mut self, _ticks: u32) {}
+            fn timer_count(&self) -> u64 {
+                0
+            }
+            fn enable_interrupts(&mut self) {}
+            fn disable_interrupts(&mut self) {}
+            fn wait_for_interrupt(&mut self) {}
+            fn vspace_mut(&mut self) -> &mut Self::VSpace {
+                &mut self.0
+            }
+            fn create_user_vspace(
+                &self,
+                _untyped: &mut UntypedInventory,
+            ) -> Result<Self::VSpace, SysError> {
+                Ok(DummyVSpace)
+            }
+            fn probe_mapped_u64(&self, _virt: VirtAddr, _pattern: u64) -> Result<u64, SysError> {
+                Ok(0)
+            }
+            fn register_domain(
+                &mut self,
+                _role: DomainRole,
+                _entry: VirtAddr,
+                _user_sp: VirtAddr,
+                _user_shadow_sp: VirtAddr,
+                _vspace_root: PhysAddr,
+            ) -> Result<usize, SysError> {
+                Ok(0)
+            }
+            fn start_userspace(&mut self) -> ! {
+                unreachable!()
+            }
+            fn exit(&mut self, _code: ShutdownStatus) -> ! {
+                unreachable!()
+            }
+        }
+
+        let platform = DummyPlatform(DummyVSpace);
+        assert_eq!(platform.board_name(), None);
     }
 }

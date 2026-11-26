@@ -1,6 +1,7 @@
-//! Pure 64-bit `aarch64` HAL (ARMv8.2-A / Cortex-A76 / Raspberry Pi 5):
-//! `PL011` UART, `VBAR_EL1` vectors, `TPIDR_EL1` per-CPU, 4-level `TTBR0/TTBR1` paging,
-//! EL0 `svc #0` + `TTBR0_EL1` multi-process switching, SMP, and PSCI `SYSTEM_OFF`.
+//! Pure 64-bit `aarch64` HAL (`ARMv8.2-A` / `Cortex-A76` / Raspberry Pi 5).
+//!
+//! Provides `PL011` UART, `VBAR_EL1` vectors, `TPIDR_EL1` per-CPU, 4-level `TTBR0/TTBR1` paging,
+//! EL0 `svc #0` + `TTBR0_EL1` multi-domain switching, SMP, and PSCI `SYSTEM_OFF`.
 
 pub mod gic;
 pub mod paging;
@@ -10,13 +11,24 @@ pub mod syscall;
 
 use core::arch::{asm, global_asm};
 use core::fmt::{self, Write};
+use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use newos_abi::{ShutdownStatus, SysError, cpu_isa};
-use newos_kernel_core::memory::{CpuSecurityFeatures, PhysAddr, UntypedInventory, VirtAddr};
+use newos_kernel_core::memory::{
+    CpuSecurityFeatures, PageAccess, PageCachePolicy, PageFlags, PagePrivilege, PhysAddr,
+    PhysFrame, UntypedInventory, VSpaceMapper, VirtAddr,
+};
 use newos_kernel_core::{BootInfo, DomainRole, HalPlatform};
+
+use crate::board::PsciConduit;
 
 const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+const KERNEL_MMIO_FLAGS: PageFlags = PageFlags::new(
+    PageAccess::ReadWrite,
+    PagePrivilege::Kernel,
+    PageCachePolicy::DeviceNoCache,
+);
 
 static BREAKPOINT_COUNT: AtomicU64 = AtomicU64::new(0);
 static TIMER_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -29,21 +41,29 @@ static CPU_ISA_FEATURES: AtomicU64 = AtomicU64::new(0);
 static PSCI_USE_SMC: AtomicBool = AtomicBool::new(false);
 static ENTROPY_STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
 
+#[must_use]
 #[inline]
 pub fn cpu_isa_features() -> u64 {
     CPU_ISA_FEATURES.load(Ordering::Acquire)
 }
 
+#[must_use]
 #[inline]
 pub fn pmuv3_enabled() -> bool {
     PMUV3_ENABLED.load(Ordering::Acquire)
 }
 
-/// Probe ARMv8.2-A Cortex-A76 CPU security & ISA features (`PAN`, `SSBS`, `CSV2`, `CSV3`,
-/// `LSE`, `CRC32`, `AES`, `PMULL`, `SHA1`, `SHA256`, `DOTPROD`, `FP16`, `ASIMD`, `PMUv3`),
-/// cache line size (`CTR_EL0`), and physical address width (`ID_AA64MMFR0_EL1.PARange`).
-/// Enables hardware `PAN`, `SCTLR_EL1.DSSBS`, and `PMUv3` cycle counter when present.
-fn probe_and_enable_cpu_hardening() {
+struct CpuIdRegs {
+    mmfr0: u64,
+    mmfr1: u64,
+    pfr0: u64,
+    pfr1: u64,
+    isar0: u64,
+    dfr0: u64,
+    ctr: u64,
+}
+
+fn read_cpu_id_regs() -> CpuIdRegs {
     let mmfr0: u64;
     let mmfr1: u64;
     let pfr0: u64;
@@ -61,103 +81,133 @@ fn probe_and_enable_cpu_hardening() {
         asm!("mrs {}, id_aa64dfr0_el1", out(reg) dfr0, options(nomem, nostack));
         asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
     }
-    let has_pan = ((mmfr1 >> 20) & 0xF) != 0;
-    let has_csv2 = ((pfr0 >> 56) & 0xF) != 0;
-    let has_csv3 = ((pfr0 >> 60) & 0xF) != 0;
-    let has_ssbs = ((pfr1 >> 4) & 0xF) != 0;
+    CpuIdRegs {
+        mmfr0,
+        mmfr1,
+        pfr0,
+        pfr1,
+        isar0,
+        dfr0,
+        ctr,
+    }
+}
 
-    if has_pan || has_ssbs {
-        // SAFETY: CPU advertises PAN and/or SSBS; clearing `SCTLR_EL1.SPAN` (bit 23) forces
-        // `PSTATE.PAN = 1` on EL1 entry, and clearing `SCTLR_EL1.DSSBS` (bit 44 = 0) sets
-        // `PSTATE.SSBS = 0` on EL1 entry so Speculative Store Bypass is *prevented* (`M6`).
-        unsafe {
-            let mut sctlr: u64;
-            asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nomem, nostack));
-            if has_pan {
-                sctlr &= !(1u64 << 23);
-            }
-            if has_ssbs {
-                sctlr &= !(1u64 << 44);
-            }
-            asm!("msr sctlr_el1, {}", "isb", in(reg) sctlr, options(nomem, nostack));
-            if has_pan {
-                asm!("msr pan, #1", "isb", options(nomem, nostack));
-            }
-            if has_ssbs {
-                // Set `PSTATE.SSBS = 0` immediately via architectural `SSBS` system register (`s3_3_c4_c2_6`).
-                asm!("msr s3_3_c4_c2_6, xzr", "isb", options(nomem, nostack));
-            }
+fn enable_pan_ssbs(has_pan: bool, has_ssbs: bool) {
+    if !has_pan && !has_ssbs {
+        return;
+    }
+    // SAFETY: CPU advertises PAN and/or SSBS; clearing `SCTLR_EL1.SPAN` (bit 23) forces
+    // `PSTATE.PAN = 1` on EL1 entry, and clearing `SCTLR_EL1.DSSBS` (bit 44 = 0) sets
+    // `PSTATE.SSBS = 0` on EL1 entry so Speculative Store Bypass is *prevented* (`M6`).
+    unsafe {
+        let mut sctlr: u64;
+        asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nomem, nostack));
+        if has_pan {
+            sctlr &= !(1u64 << 23);
+        }
+        if has_ssbs {
+            sctlr &= !(1u64 << 44);
+        }
+        asm!("msr sctlr_el1, {}", "isb", in(reg) sctlr, options(nomem, nostack));
+        if has_pan {
+            asm!("msr pan, #1", "isb", options(nomem, nostack));
+        }
+        if has_ssbs {
+            // Set `PSTATE.SSBS = 0` immediately via architectural `SSBS` system register (`s3_3_c4_c2_6`).
+            asm!("msr s3_3_c4_c2_6, xzr", "isb", options(nomem, nostack));
         }
     }
+}
 
-    // Decode ARMv8.2-A Cortex-A76 ISA extensions & cache/PA geometry.
+const fn decode_isa_features(regs: &CpuIdRegs, has_pmuv3: bool) -> u64 {
     let mut isa = 0u64;
-    let aes_field = (isar0 >> 4) & 0xF;
+    let aes_field = (regs.isar0 >> 4) & 0xF;
     if aes_field >= 1 {
         isa |= cpu_isa::AES;
     }
     if aes_field >= 2 {
         isa |= cpu_isa::PMULL;
     }
-    if ((isar0 >> 8) & 0xF) >= 1 {
+    if ((regs.isar0 >> 8) & 0xF) >= 1 {
         isa |= cpu_isa::SHA1;
     }
-    if ((isar0 >> 12) & 0xF) >= 1 {
+    if ((regs.isar0 >> 12) & 0xF) >= 1 {
         isa |= cpu_isa::SHA256;
     }
-    if ((isar0 >> 16) & 0xF) >= 1 {
+    if ((regs.isar0 >> 16) & 0xF) >= 1 {
         isa |= cpu_isa::CRC32;
     }
-    if ((isar0 >> 20) & 0xF) >= 2 {
+    if ((regs.isar0 >> 20) & 0xF) >= 2 {
         isa |= cpu_isa::LSE;
     }
-    if ((isar0 >> 44) & 0xF) >= 1 {
+    if ((regs.isar0 >> 44) & 0xF) >= 1 {
         isa |= cpu_isa::DOTPROD;
     }
-    let asimd_field = (pfr0 >> 20) & 0xF;
-    let fp_field = (pfr0 >> 16) & 0xF;
+    let asimd_field = (regs.pfr0 >> 20) & 0xF;
+    let fp_field = (regs.pfr0 >> 16) & 0xF;
     if asimd_field != 0xF {
         isa |= cpu_isa::ASIMD;
     }
     if asimd_field == 1 || fp_field == 1 {
         isa |= cpu_isa::FP16;
     }
-    let pmu_ver = (dfr0 >> 8) & 0xF;
-    let has_pmuv3 = pmu_ver >= 1 && pmu_ver != 0xF;
     if has_pmuv3 {
         isa |= cpu_isa::PMUV3;
-        // SAFETY: CPU advertises PMUv3 (`ID_AA64DFR0_EL1.PMUVer`); enable the architectural
-        // 64-bit cycle counter (`PMCCNTR_EL0`) for EL1 only (`PMUSERENR_EL0 = 0` so unprivileged
-        // EL0 processes do not get a free high-resolution side-channel timer).
-        unsafe {
-            let pmcr: u64 = (1 << 0) | (1 << 2); // E (enable) | C (reset cycle counter)
-            let cntenset: u64 = 1 << 31; // Enable PMCCNTR_EL0
-            let userenr: u64 = 0; // Disallow direct EL0 PMU counter reads
-            asm!(
-                "msr pmuserenr_el0, {userenr}",
-                "msr pmcr_el0, {pmcr}",
-                "msr pmcntenset_el0, {cntenset}",
-                "isb",
-                userenr = in(reg) userenr,
-                pmcr = in(reg) pmcr,
-                cntenset = in(reg) cntenset,
-                options(nomem, nostack),
-            );
-        }
     }
+    isa
+}
 
-    let pa_bits: u8 = match mmfr0 & 0xF {
+fn enable_pmuv3() {
+    // SAFETY: CPU advertises PMUv3 (`ID_AA64DFR0_EL1.PMUVer`); enable the architectural
+    // 64-bit cycle counter (`PMCCNTR_EL0`) for EL1 only (`PMUSERENR_EL0 = 0` so unprivileged
+    // EL0 protection domains do not get a free high-resolution side-channel timer).
+    unsafe {
+        let pmcr: u64 = (1 << 0) | (1 << 2); // E (enable) | C (reset cycle counter)
+        let cntenset: u64 = 1 << 31; // Enable PMCCNTR_EL0
+        let userenr: u64 = 0; // Disallow direct EL0 PMU counter reads
+        asm!(
+            "msr pmuserenr_el0, {userenr}",
+            "msr pmcr_el0, {pmcr}",
+            "msr pmcntenset_el0, {cntenset}",
+            "isb",
+            userenr = in(reg) userenr,
+            pmcr = in(reg) pmcr,
+            cntenset = in(reg) cntenset,
+            options(nomem, nostack),
+        );
+    }
+}
+
+/// Probe `ARMv8.2-A` `Cortex-A76` CPU security & ISA features (`PAN`, `SSBS`, `CSV2`, `CSV3`,
+/// `LSE`, `CRC32`, `AES`, `PMULL`, `SHA1`, `SHA256`, `DOTPROD`, `FP16`, `ASIMD`, `PMUv3`),
+/// cache line size (`CTR_EL0`), and physical address width (`ID_AA64MMFR0_EL1.PARange`).
+/// Enables hardware `PAN`, `SCTLR_EL1.DSSBS`, and `PMUv3` cycle counter when present.
+fn probe_and_enable_cpu_hardening() {
+    let regs = read_cpu_id_regs();
+    let has_pan = ((regs.mmfr1 >> 20) & 0xF) != 0;
+    let has_csv2 = ((regs.pfr0 >> 56) & 0xF) != 0;
+    let has_csv3 = ((regs.pfr0 >> 60) & 0xF) != 0;
+    let has_ssbs = ((regs.pfr1 >> 4) & 0xF) != 0;
+    enable_pan_ssbs(has_pan, has_ssbs);
+
+    let pmu_ver = (regs.dfr0 >> 8) & 0xF;
+    let has_pmuv3 = pmu_ver >= 1 && pmu_ver != 0xF;
+    if has_pmuv3 {
+        enable_pmuv3();
+    }
+    let isa = decode_isa_features(&regs, has_pmuv3);
+
+    let pa_bits: u8 = match regs.mmfr0 & 0xF {
         0 => 32,
         1 => 36,
-        2 => 40,
         3 => 42,
         4 => 44,
         5 => 48,
         6 => 52,
         _ => 40,
     };
-    let dmin_line = (ctr >> 16) & 0xF;
-    let dcache_line_bytes = (4u16).checked_shl(dmin_line as u32).unwrap_or(64);
+    let dmin_line = u32::try_from((regs.ctr >> 16) & 0xF).unwrap_or(4);
+    let dcache_line_bytes = (4u16).checked_shl(dmin_line).unwrap_or(64);
     paging::set_dcache_line_bytes(u64::from(dcache_line_bytes));
 
     PAN_ENABLED.store(has_pan, Ordering::Release);
@@ -391,14 +441,12 @@ static EL1_GUARDED_STACK_TOPS: [AtomicU64; 4] = [
     AtomicU64::new(0),
 ];
 
-/// Return the top-of-stack VA for `cpu_id`'s guarded EL1 stack (or `0` if not mapped).
+/// Return the top-of-stack VA for `cpu_id`'s guarded EL1 stack, or `None` if not mapped.
+#[must_use]
 #[inline]
-pub fn guarded_el1_stack_top(cpu_id: usize) -> u64 {
-    if cpu_id < EL1_GUARDED_STACK_TOPS.len() {
-        EL1_GUARDED_STACK_TOPS[cpu_id].load(Ordering::Acquire)
-    } else {
-        0
-    }
+pub fn guarded_el1_stack_top(cpu_id: usize) -> Option<NonZeroU64> {
+    let slot = EL1_GUARDED_STACK_TOPS.get(cpu_id)?;
+    NonZeroU64::new(slot.load(Ordering::Acquire))
 }
 
 /// Pivot `SP_EL1` to `new_sp` and branch directly to diverging `target`.
@@ -425,12 +473,22 @@ unsafe extern "C" {
     static __newos_aarch64_vectors: u8;
 }
 
+// SAFETY: `__relro_start` and `__relro_end` are linker-defined section boundary symbols
+// in `crates/kernel/linker-aarch64.ld`; only their addresses are taken via `&raw const`.
+unsafe extern "C" {
+    static __relro_start: u8;
+    static __relro_end: u8;
+}
+
+extern "C" fn bsp_userspace_trampoline() -> ! {
+    syscall::start_userspace()
+}
+
 extern "C" fn aarch64_unhandled_el1_handler(esr: u64, elr: u64, far: u64, spsr: u64) -> ! {
     let mut s = serial::UnlockedPl011;
     let _ = writeln!(
         s,
-        "[newos-hal] FATAL unhandled EL1 exception ESR={:#018x} ELR={:#018x} FAR={:#018x} SPSR={:#018x}",
-        esr, elr, far, spsr
+        "[newos-hal] FATAL unhandled EL1 exception ESR={esr:#018x} ELR={elr:#018x} FAR={far:#018x} SPSR={spsr:#018x}"
     );
     system_off(ShutdownStatus::Failed)
 }
@@ -485,8 +543,7 @@ extern "C" fn aarch64_sync_el1_handler() {
     let mut s = serial::UnlockedPl011;
     let _ = writeln!(
         s,
-        "[newos-hal] FATAL AArch64 EL1 sync exception EC={:#x} ISS={:#x} ELR={:#018x} FAR={:#018x}",
-        ec, iss, elr, far
+        "[newos-hal] FATAL AArch64 EL1 sync exception EC={ec:#x} ISS={iss:#x} ELR={elr:#018x} FAR={far:#018x}"
     );
     system_off(ShutdownStatus::Failed)
 }
@@ -516,6 +573,7 @@ pub fn set_cpu_id(id: u64) {
     }
 }
 
+#[must_use]
 pub fn get_cpu_id() -> u64 {
     let id: u64;
     // SAFETY: Reading EL1-private `TPIDR_EL1`.
@@ -587,6 +645,7 @@ pub fn system_off(code: ShutdownStatus) -> ! {
     }
 }
 
+#[derive(Debug)]
 pub struct Aarch64Platform {
     board: &'static crate::board::BoardDescriptor,
     serial: serial::Pl011,
@@ -596,7 +655,7 @@ pub struct Aarch64Platform {
 
 #[derive(Default)]
 struct AcpiHardware {
-    psci_use_hvc: Option<bool>,
+    psci_conduit: Option<PsciConduit>,
     spcr_uart_base: Option<u64>,
     gicd_base: Option<u64>,
     gicc_base: Option<u64>,
@@ -604,6 +663,36 @@ struct AcpiHardware {
     madt_cpus: usize,
     virt_timer_irq: Option<u32>,
     ecam_base: Option<u64>,
+}
+
+/// RAII guard that unmaps `ACPI_SCRATCH_VIRT` on drop so temporary physical-memory reads
+/// can never leak a scratch mapping across early returns.
+#[cfg(feature = "acpi")]
+struct ScratchMappingGuard<'a> {
+    vspace: &'a mut paging::Aarch64VSpace,
+    scratch_va: VirtAddr,
+}
+
+#[cfg(feature = "acpi")]
+impl<'a> ScratchMappingGuard<'a> {
+    fn map(
+        vspace: &'a mut paging::Aarch64VSpace,
+        scratch_va: VirtAddr,
+        frame: PhysFrame,
+        untyped: &mut UntypedInventory,
+    ) -> Option<Self> {
+        vspace
+            .map_4k(scratch_va, frame, PageFlags::KERNEL_RO, untyped)
+            .ok()?;
+        Some(Self { vspace, scratch_va })
+    }
+}
+
+#[cfg(feature = "acpi")]
+impl Drop for ScratchMappingGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.vspace.unmap_4k(self.scratch_va);
+    }
 }
 
 /// Read `dst.len()` bytes from physical memory `phys_addr` using HHDM if already mapped,
@@ -616,12 +705,8 @@ fn read_phys_bytes(
     phys_addr: u64,
     dst: &mut [u8],
 ) -> bool {
-    use newos_kernel_core::memory::{PageFlags, PhysFrame, VSpaceMapper};
     const ACPI_SCRATCH_VIRT: u64 = 0xffff_b003_0000_0000;
 
-    let Ok(ro_flags) = PageFlags::new_wx(false, false, false, false) else {
-        return false;
-    };
     let Ok(scratch_va) = VirtAddr::new_page_aligned(ACPI_SCRATCH_VIRT) else {
         return false;
     };
@@ -632,6 +717,8 @@ fn read_phys_bytes(
             return false;
         };
         let page_phys = cur_phys & !0xFFF;
+        #[allow(clippy::cast_possible_truncation)]
+        // Masked to 12 bits (`0..4096`), always fits in `usize`.
         let page_off = (cur_phys & 0xFFF) as usize;
         let chunk = (4096 - page_off).min(dst.len() - copied);
 
@@ -649,10 +736,10 @@ fn read_phys_bytes(
             let Ok(frame) = PhysFrame::from_aligned(PhysAddr::new(page_phys)) else {
                 return false;
             };
-            if vspace.map_4k(scratch_va, frame, ro_flags, untyped).is_err() {
+            let Some(_guard) = ScratchMappingGuard::map(vspace, scratch_va, frame, untyped) else {
                 return false;
-            }
-            // SAFETY: `scratch_va` was just mapped read-only to `frame` in `TTBR1_EL1`.
+            };
+            // SAFETY: `_guard` mapped `scratch_va` read-only to `frame` in `TTBR1_EL1` and unmaps on drop.
             let src = unsafe {
                 core::slice::from_raw_parts(
                     (ACPI_SCRATCH_VIRT + page_off as u64) as *const u8,
@@ -660,11 +747,63 @@ fn read_phys_bytes(
                 )
             };
             dst[copied..copied + chunk].copy_from_slice(src);
-            let _ = vspace.unmap_4k(scratch_va);
         }
         copied += chunk;
     }
     true
+}
+
+#[cfg(feature = "acpi")]
+fn dispatch_acpi_table(sig: &[u8], tbl: &[u8], hw: &mut AcpiHardware) {
+    match sig {
+        b"FACP" => {
+            if let Some(arm) = newos_kernel_core::acpi::parse_fadt_arm_boot_arch(tbl)
+                && arm.psci_compliant
+            {
+                hw.psci_conduit = Some(if arm.psci_use_hvc {
+                    PsciConduit::Hvc
+                } else {
+                    PsciConduit::Smc
+                });
+            }
+        }
+        b"SPCR" => {
+            if let Some(spcr) = newos_kernel_core::acpi::parse_spcr(tbl)
+                && spcr.interface_type == newos_kernel_core::acpi::SPCR_INTERFACE_PL011
+                && spcr.base_address != 0
+                && spcr.base_address.trailing_zeros() >= 12
+            {
+                hw.spcr_uart_base = Some(spcr.base_address);
+            }
+        }
+        b"APIC" => {
+            if let Some(madt) = newos_kernel_core::acpi::parse_madt(tbl) {
+                if madt.gicd_base != 0 && madt.gicd_base.trailing_zeros() >= 12 {
+                    hw.gicd_base = Some(madt.gicd_base);
+                }
+                if madt.gicc_base != 0 && madt.gicc_base.trailing_zeros() >= 12 {
+                    hw.gicc_base = Some(madt.gicc_base);
+                }
+                hw.gic_version = madt.gic_version;
+                hw.madt_cpus = madt.cpu_count;
+            }
+        }
+        b"GTDT" => {
+            if let Some(gtdt) = newos_kernel_core::acpi::parse_gtdt(tbl)
+                && gtdt.el1_virt_timer_gsiv != 0
+            {
+                hw.virt_timer_irq = Some(gtdt.el1_virt_timer_gsiv);
+            }
+        }
+        b"MCFG" => {
+            if let Some(mcfg) = newos_kernel_core::acpi::parse_mcfg(tbl)
+                && mcfg.ecam_base != 0
+            {
+                hw.ecam_base = Some(mcfg.ecam_base);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Inspect ACPI RSDP -> XSDT -> FADT / SPCR / MADT / GTDT / MCFG from physical memory.
@@ -749,59 +888,462 @@ fn probe_acpi_hardware(
         ) {
             continue;
         }
-        let tbl = &tbl_buf[..tbl_len];
-        match &hdr_buf[0..4] {
-            b"FACP" => {
-                if let Some(arm) = newos_kernel_core::acpi::parse_fadt_arm_boot_arch(tbl)
-                    && arm.psci_compliant
-                {
-                    hw.psci_use_hvc = Some(arm.psci_use_hvc);
-                }
-            }
-            b"SPCR" => {
-                if let Some(spcr) = newos_kernel_core::acpi::parse_spcr(tbl)
-                    && spcr.interface_type == newos_kernel_core::acpi::SPCR_INTERFACE_PL011
-                    && spcr.base_address != 0
-                    && (spcr.base_address & 0xFFF) == 0
-                {
-                    hw.spcr_uart_base = Some(spcr.base_address);
-                }
-            }
-            b"APIC" => {
-                if let Some(madt) = newos_kernel_core::acpi::parse_madt(tbl) {
-                    if madt.gicd_base != 0 && (madt.gicd_base & 0xFFF) == 0 {
-                        hw.gicd_base = Some(madt.gicd_base);
-                    }
-                    if madt.gicc_base != 0 && (madt.gicc_base & 0xFFF) == 0 {
-                        hw.gicc_base = Some(madt.gicc_base);
-                    }
-                    hw.gic_version = madt.gic_version;
-                    hw.madt_cpus = madt.cpu_count;
-                }
-            }
-            b"GTDT" => {
-                if let Some(gtdt) = newos_kernel_core::acpi::parse_gtdt(tbl)
-                    && gtdt.el1_virt_timer_gsiv != 0
-                {
-                    hw.virt_timer_irq = Some(gtdt.el1_virt_timer_gsiv);
-                }
-            }
-            b"MCFG" => {
-                if let Some(mcfg) = newos_kernel_core::acpi::parse_mcfg(tbl)
-                    && mcfg.ecam_base != 0
-                {
-                    hw.ecam_base = Some(mcfg.ecam_base);
-                }
-            }
-            _ => {}
-        }
+        dispatch_acpi_table(&hdr_buf[0..4], &tbl_buf[..tbl_len], &mut hw);
     }
     hw
 }
 
+type MmioWindow = (PhysAddr, u64, u64);
+
+fn allocate_guarded_el1_stacks(vspace: &mut paging::Aarch64VSpace, untyped: &mut UntypedInventory) {
+    // Allocate per-CPU guarded 32 KiB EL1 kernel stacks in `TTBR1_EL1` with an unmapped
+    // 4 KiB guard page directly below each core's stack.
+    const KERNEL_STACK_BASE: u64 = 0xffff_b010_0000_0000;
+    const KERNEL_GUARD_BYTES: u64 = 4096;
+    const KERNEL_STACK_PAGES: u64 = 8;
+    const KERNEL_STACK_STRIDE: u64 = KERNEL_GUARD_BYTES + KERNEL_STACK_PAGES * 4096;
+    for (cpu, stack_top) in EL1_GUARDED_STACK_TOPS.iter().enumerate() {
+        let base = KERNEL_STACK_BASE + (cpu as u64) * KERNEL_STACK_STRIDE;
+        let mut ok = true;
+        for p in 0..KERNEL_STACK_PAGES {
+            let va = base + KERNEL_GUARD_BYTES + p * 4096;
+            let mapped = VirtAddr::new_page_aligned(va)
+                .and_then(|v| {
+                    untyped
+                        .retype_frame()
+                        .and_then(|fr| vspace.map_4k(v, fr, PageFlags::KERNEL_RW, untyped))
+                })
+                .is_ok();
+            if !mapped {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            stack_top.store(base + KERNEL_STACK_STRIDE, Ordering::Release);
+        }
+    }
+}
+
+fn lock_relro_pages(vspace: &mut paging::Aarch64VSpace) {
+    // Lock PT_GNU_RELRO (`.data.rel.ro`, `.got`, `.dynamic`) read-only in `TTBR1_EL1`
+    // after Limine has finished applying PIE relocations.
+    let relro_start = (&raw const __relro_start) as u64;
+    let relro_end = (&raw const __relro_end) as u64;
+    if relro_end > relro_start {
+        vspace.protect_ro_range(relro_start, relro_end);
+    }
+}
+
+fn map_boot_uart(
+    vspace: &mut paging::Aarch64VSpace,
+    untyped: &mut UntypedInventory,
+    hhdm_offset: u64,
+    uart_phys: u64,
+) {
+    const UART_VIRT: u64 = 0xffff_b000_0000_0000;
+    if let Ok(uart_virt) = VirtAddr::new_page_aligned(UART_VIRT)
+        && let Ok(frame) = PhysFrame::from_aligned(PhysAddr::new(uart_phys))
+        && vspace
+            .map_4k(uart_virt, frame, KERNEL_MMIO_FLAGS, untyped)
+            .is_ok()
+        && let Ok(uart_ptr) = usize::try_from(UART_VIRT)
+    {
+        // SAFETY: `UART_VIRT` was just mapped as a 4 KiB Device-nGnRnE page to `uart_phys`.
+        unsafe { serial::init_virt(uart_ptr) };
+    } else if let Ok(hhdm_ptr) = usize::try_from(hhdm_offset.wrapping_add(uart_phys)) {
+        // SAFETY: Fallback uses Limine's HHDM direct mapping of `uart_phys`.
+        unsafe { serial::init_virt(hhdm_ptr) };
+    }
+}
+
+fn probe_virtio_mmio_slot(
+    net_mmio_virt: u64,
+    net_mmio_phys: u64,
+    target_device_id: u32,
+) -> Option<(MmioWindow, Option<crate::board::IrqLine>)> {
+    const VIRTIO_MAGIC: u32 = 0x7472_6976;
+    const SLOT_STRIDE: u64 = 0x200;
+    for slot in 0..32u16 {
+        let off = u64::from(slot) * SLOT_STRIDE;
+        let base_va = net_mmio_virt + off;
+        // SAFETY: Caller verified `net_mmio_virt..net_mmio_virt + 16 KiB` is mapped Device-nGnRnE.
+        let (magic, dev_id) = unsafe {
+            (
+                core::ptr::read_volatile(base_va as *const u32),
+                core::ptr::read_volatile((base_va + 8) as *const u32),
+            )
+        };
+        if magic == VIRTIO_MAGIC && dev_id == target_device_id {
+            return Some((
+                (PhysAddr::new(net_mmio_phys + off), base_va, SLOT_STRIDE),
+                Some(crate::board::IrqLine::gic(48 + slot)),
+            ));
+        }
+    }
+    None
+}
+
+fn map_mmio_pages(
+    vspace: &mut paging::Aarch64VSpace,
+    untyped: &mut UntypedInventory,
+    virt_base: u64,
+    phys_base: u64,
+    pages: u64,
+) -> bool {
+    for p in 0..pages {
+        let off = p * 4096;
+        let mapped = VirtAddr::new_page_aligned(virt_base + off)
+            .and_then(|va| {
+                PhysFrame::from_aligned(PhysAddr::new(phys_base + off))
+                    .and_then(|fr| vspace.map_4k(va, fr, KERNEL_MMIO_FLAGS, untyped))
+            })
+            .is_ok();
+        if !mapped {
+            return false;
+        }
+    }
+    true
+}
+
+fn map_net_and_rng_mmio(
+    vspace: &mut paging::Aarch64VSpace,
+    untyped: &mut UntypedInventory,
+    board: &'static crate::board::BoardDescriptor,
+    qemu_virt: bool,
+) -> (
+    Option<MmioWindow>,
+    Option<crate::board::IrqLine>,
+    Option<MmioWindow>,
+    Option<crate::board::IrqLine>,
+) {
+    // Map capability-scoped Network Controller MMIO window (4 pages, Device-nGnRnE):
+    // - Default: Raspberry Pi 5 (BCM2712 + RP1 Cadence GEM Gigabit Ethernet): `0x1F_0010_0000`
+    // - Local test harness (`qemu` cmdline): QEMU `virt` VirtIO-MMIO slots 0..31: `0x0A00_0000`
+    const RPI5_RP1_GEM_PHYS: u64 = 0x1F_0010_0000;
+    const QEMU_NET_MMIO_PHYS: u64 = 0x0a00_0000;
+    const NET_MMIO_VIRT: u64 = 0xffff_b001_0000_0000;
+    const NET_MMIO_PAGES: u64 = 4;
+    const VIRTIO_DEV_NET: u32 = 1;
+    const VIRTIO_DEV_RNG: u32 = 4;
+    const RPI5_RNG200_PHYS: u64 = 0x10_7D20_8000;
+    const RPI5_RNG200_LEN: u64 = 0x28;
+    const RNG_MMIO_VIRT: u64 = 0xffff_b005_0000_0000;
+
+    let net_mmio_phys = if qemu_virt {
+        QEMU_NET_MMIO_PHYS
+    } else {
+        RPI5_RP1_GEM_PHYS
+    };
+    let net_mmio_mapped = map_mmio_pages(
+        vspace,
+        untyped,
+        NET_MMIO_VIRT,
+        net_mmio_phys,
+        NET_MMIO_PAGES,
+    );
+
+    let net_found = if !net_mmio_mapped {
+        None
+    } else if qemu_virt {
+        // Scope BOOTSTRAP_NET_MMIO strictly to the single 512-byte VirtIO-Net slot (`C-3`)
+        // rather than exposing all 32 VirtIO-MMIO devices on the bus.
+        probe_virtio_mmio_slot(NET_MMIO_VIRT, net_mmio_phys, VIRTIO_DEV_NET)
+    } else {
+        Some((
+            (
+                PhysAddr::new(net_mmio_phys),
+                NET_MMIO_VIRT,
+                NET_MMIO_PAGES * 4096,
+            ),
+            board.net_irq,
+        ))
+    };
+
+    // Map capability-scoped Hardware RNG MMIO window (Device-nGnRnE):
+    // - Raspberry Pi 5 (BCM2712 `iproc-rng200`): `0x10_7D20_8000` (scoped to `0x28` bytes)
+    // - QEMU `virt`: single 512-byte VirtIO-RNG slot (`device_id == 4`) on `0x0A00_0000`
+    let rng_found = if qemu_virt {
+        if net_mmio_mapped {
+            probe_virtio_mmio_slot(NET_MMIO_VIRT, net_mmio_phys, VIRTIO_DEV_RNG)
+        } else {
+            None
+        }
+    } else if let Ok(rng_va) = VirtAddr::new_page_aligned(RNG_MMIO_VIRT)
+        && let Ok(rng_fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_RNG200_PHYS))
+        && vspace
+            .map_4k(rng_va, rng_fr, KERNEL_MMIO_FLAGS, untyped)
+            .is_ok()
+    {
+        // Optionally mix 64 bits of hardware TRNG into `ENTROPY_STATE` for EL0 ASLR
+        // before handing `BOOTSTRAP_RNG_MMIO` exclusively to `newos-key-pd`.
+        // SAFETY: `RNG_MMIO_VIRT` was just mapped as Device-nGnRnE to BCM2712 `iproc-rng200`.
+        unsafe {
+            let ctrl = RNG_MMIO_VIRT as *mut u32;
+            let fifo_cnt = (RNG_MMIO_VIRT + 0x24) as *const u32;
+            let fifo_data = (RNG_MMIO_VIRT + 0x20) as *const u32;
+            let cur = core::ptr::read_volatile(ctrl);
+            core::ptr::write_volatile(ctrl, cur | 1);
+            for _ in 0..256u32 {
+                if (core::ptr::read_volatile(fifo_cnt) & 0xFF) >= 2 {
+                    let lo = u64::from(core::ptr::read_volatile(fifo_data));
+                    let hi = u64::from(core::ptr::read_volatile(fifo_data));
+                    ENTROPY_STATE.fetch_xor((hi << 32) | lo, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+        Some((
+            (
+                PhysAddr::new(RPI5_RNG200_PHYS),
+                RNG_MMIO_VIRT,
+                RPI5_RNG200_LEN,
+            ),
+            board.rng_irq,
+        ))
+    } else {
+        None
+    };
+
+    let (net_mmio, net_irq) = match net_found {
+        Some((win, irq)) => (Some(win), irq),
+        None => (None, None),
+    };
+    let (rng_mmio, rng_irq) = match rng_found {
+        Some((win, irq)) => (Some(win), irq),
+        None => (None, None),
+    };
+    (net_mmio, net_irq, rng_mmio, rng_irq)
+}
+
+fn map_gic(
+    vspace: &mut paging::Aarch64VSpace,
+    untyped: &mut UntypedInventory,
+    dist_phys: u64,
+    cpu_if_phys: u64,
+    virt_timer_irq: u32,
+) {
+    const GICD_VIRT: u64 = 0xffff_b002_0000_0000;
+    const GICC_VIRT: u64 = 0xffff_b002_0000_1000;
+    if let Ok(dist_va) = VirtAddr::new_page_aligned(GICD_VIRT)
+        && let Ok(cpu_if_va) = VirtAddr::new_page_aligned(GICC_VIRT)
+        && let Ok(dist_fr) = PhysFrame::from_aligned(PhysAddr::new(dist_phys))
+        && let Ok(cpu_if_fr) = PhysFrame::from_aligned(PhysAddr::new(cpu_if_phys))
+        && vspace
+            .map_4k(dist_va, dist_fr, KERNEL_MMIO_FLAGS, untyped)
+            .is_ok()
+        && vspace
+            .map_4k(cpu_if_va, cpu_if_fr, KERNEL_MMIO_FLAGS, untyped)
+            .is_ok()
+        && let Ok(dist_ptr) = usize::try_from(GICD_VIRT)
+        && let Ok(cpu_if_ptr) = usize::try_from(GICC_VIRT)
+    {
+        // SAFETY: `GICD_VIRT` and `GICC_VIRT` were just mapped as 4 KiB Device-nGnRnE pages.
+        unsafe { gic::init(dist_ptr, cpu_if_ptr, virt_timer_irq) };
+    }
+}
+
+#[cfg(feature = "mmio-wdt")]
+fn map_wdt_mmio(
+    vspace: &mut paging::Aarch64VSpace,
+    untyped: &mut UntypedInventory,
+    qemu_virt: bool,
+) -> Option<MmioWindow> {
+    const RPI5_PM_WDT_PHYS: u64 = 0x10_7D20_0000;
+    const RPI5_PM_WDT_LEN: u64 = 0x100;
+    const WDT_MMIO_VIRT: u64 = 0xffff_b006_0000_0000;
+    if !qemu_virt
+        && let Ok(wdt_va) = VirtAddr::new_page_aligned(WDT_MMIO_VIRT)
+        && let Ok(wdt_fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_PM_WDT_PHYS))
+        && vspace
+            .map_4k(wdt_va, wdt_fr, KERNEL_MMIO_FLAGS, untyped)
+            .is_ok()
+    {
+        return Some((
+            PhysAddr::new(RPI5_PM_WDT_PHYS),
+            WDT_MMIO_VIRT,
+            RPI5_PM_WDT_LEN,
+        ));
+    }
+    None
+}
+
+#[cfg(not(feature = "mmio-wdt"))]
+const fn map_wdt_mmio(
+    _vspace: &mut paging::Aarch64VSpace,
+    _untyped: &mut UntypedInventory,
+    _qemu_virt: bool,
+) -> Option<MmioWindow> {
+    None
+}
+
+#[cfg(any(
+    feature = "mmio-mbox",
+    feature = "mmio-thermal",
+    feature = "mmio-rp1-uart",
+    feature = "mmio-sdhci"
+))]
+fn map_single_init_mmio_page(
+    vspace: &mut paging::Aarch64VSpace,
+    untyped: &mut UntypedInventory,
+    slot: usize,
+    phys: u64,
+    virt: u64,
+) {
+    if let Ok(va) = VirtAddr::new_page_aligned(virt)
+        && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(phys))
+        && vspace.map_4k(va, fr, KERNEL_MMIO_FLAGS, untyped).is_ok()
+    {
+        syscall::register_extra_mmio_mapping(PhysAddr::new(phys), virt, 0x1000);
+        syscall::register_init_mmio_cap(slot, PhysAddr::new(phys), 0x1000);
+    }
+}
+
+fn map_rpi5_peripherals(vspace: &mut paging::Aarch64VSpace, untyped: &mut UntypedInventory) {
+    // Map Raspberry Pi 5 board peripherals (Device-nGnRnE) and grant capabilities to `init`:
+    // - Slot 19 (`BOOTSTRAP_GPIO_MMIO`): RP1 IO_BANK0 / RIO0 / PADS_BANK0 (40-pin GPIO 0..=27)
+    // - Slot 20 (`BOOTSTRAP_MBOX_MMIO`): BCM2712 VideoCore Property Mailbox (`0x10_7C01_3000`)
+    // - Slot 21 (`BOOTSTRAP_THERMAL_MMIO`): BCM2712 AVS TMON Thermal Sensor (`0x10_7D5D_2000`)
+    // - Slot 22 (`BOOTSTRAP_RP1_PERIPH_MMIO`): RP1 UART0
+    const RPI5_MIP_PHYS: u64 = 0x10_0013_0000;
+    const RPI5_MIP_VIRT: u64 = 0xffff_b00b_0000_0000;
+
+    #[cfg(feature = "mmio-gpio")]
+    {
+        const RP1_GPIO_PHYS: u64 = 0x1F_000D_0000;
+        const RP1_GPIO_LEN: u64 = 0x24000;
+        const RP1_GPIO_VIRT: u64 = 0xffff_b007_0000_0000;
+        let mut gpio_ok = true;
+        for block_off in [0x0_0000u64, 0x1_0000u64, 0x2_0000u64] {
+            if map_mmio_pages(
+                vspace,
+                untyped,
+                RP1_GPIO_VIRT + block_off,
+                RP1_GPIO_PHYS + block_off,
+                4,
+            ) {
+                syscall::register_extra_mmio_mapping(
+                    PhysAddr::new(RP1_GPIO_PHYS + block_off),
+                    RP1_GPIO_VIRT + block_off,
+                    0x4000,
+                );
+            } else {
+                gpio_ok = false;
+            }
+        }
+        if gpio_ok {
+            syscall::register_init_mmio_cap(19, PhysAddr::new(RP1_GPIO_PHYS), RP1_GPIO_LEN);
+        }
+    }
+
+    #[cfg(feature = "mmio-mbox")]
+    map_single_init_mmio_page(vspace, untyped, 20, 0x10_7C01_3000, 0xffff_b008_0000_0000);
+
+    #[cfg(feature = "mmio-thermal")]
+    map_single_init_mmio_page(vspace, untyped, 21, 0x10_7D5D_2000, 0xffff_b009_0000_0000);
+
+    // Narrow RP1 peripheral capability to the 4 KiB RP1 UART0 page (`P10`) instead of
+    // spanning UART0, SPI0, I2C0, I2C1, and PWM0 in a single 420 KiB capability.
+    #[cfg(feature = "mmio-rp1-uart")]
+    map_single_init_mmio_page(vspace, untyped, 22, 0x1F_0003_0000, 0xffff_b00a_0000_0000);
+
+    // BCM2712 MIP MSI-X (`0x10_0013_0000`), microSD SDHCI (`0x10_00ff_f000`),
+    // RP1 dual xHCI USB 3.0 (`0x1f_0020_0000` / `0x1f_0030_0000`), and PCIe ECAM.
+    if let Ok(va) = VirtAddr::new_page_aligned(RPI5_MIP_VIRT)
+        && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_MIP_PHYS))
+        && vspace.map_4k(va, fr, KERNEL_MMIO_FLAGS, untyped).is_ok()
+        && let Ok(mip_ptr) = usize::try_from(RPI5_MIP_VIRT)
+    {
+        // SAFETY: `RPI5_MIP_VIRT` was just mapped as a 4 KiB Device-nGnRnE page to `RPI5_MIP_PHYS`.
+        unsafe { gic::init_bcm2712_mip(mip_ptr) };
+    }
+
+    #[cfg(feature = "mmio-sdhci")]
+    map_single_init_mmio_page(vspace, untyped, 23, 0x10_00ff_f000, 0xffff_b00c_0000_0000);
+
+    #[cfg(feature = "mmio-xhci")]
+    for (slot, xhci_phys, xhci_virt) in [
+        (24usize, 0x1f_0020_0000u64, 0xffff_b00d_0000_0000u64),
+        (25usize, 0x1f_0030_0000u64, 0xffff_b00e_0000_0000u64),
+    ] {
+        if map_mmio_pages(vspace, untyped, xhci_virt, xhci_phys, 4) {
+            syscall::register_extra_mmio_mapping(PhysAddr::new(xhci_phys), xhci_virt, 0x4000);
+            syscall::register_init_mmio_cap(slot, PhysAddr::new(xhci_phys), 0x4000);
+        }
+    }
+
+    // PCIe ECAM and BCM2712 IOMMU are intentionally kept kernel-owned (`P4`):
+    // never hand raw PCIe configuration space or IOMMU registers to EL0 `init`.
+    // VideoCore VII V3D 7.1 (`0x10_0200_0000` Hub + `0x10_0200_8000` Core 0).
+    #[cfg(feature = "mmio-v3d")]
+    {
+        const RPI5_V3D_PHYS: u64 = 0x10_0200_0000;
+        const RPI5_V3D_LEN: u64 = 0x9000;
+        const RPI5_V3D_VIRT: u64 = 0xffff_b010_0000_0000;
+        let mut v3d_ok = true;
+        for off in [0x0000u64, 0x8000u64] {
+            let ok = VirtAddr::new_page_aligned(RPI5_V3D_VIRT + off)
+                .and_then(|va| {
+                    PhysFrame::from_aligned(PhysAddr::new(RPI5_V3D_PHYS + off))
+                        .and_then(|fr| vspace.map_4k(va, fr, KERNEL_MMIO_FLAGS, untyped))
+                })
+                .is_ok();
+            if ok {
+                syscall::register_extra_mmio_mapping(
+                    PhysAddr::new(RPI5_V3D_PHYS + off),
+                    RPI5_V3D_VIRT + off,
+                    0x1000,
+                );
+            } else {
+                v3d_ok = false;
+            }
+        }
+        if v3d_ok {
+            syscall::register_init_mmio_cap(28, PhysAddr::new(RPI5_V3D_PHYS), RPI5_V3D_LEN);
+        }
+    }
+}
+
+fn map_framebuffer(
+    vspace: &mut paging::Aarch64VSpace,
+    untyped: &mut UntypedInventory,
+    framebuffer: Option<newos_kernel_core::FramebufferInfo>,
+) {
+    // Map UEFI GOP / Limine linear framebuffer if present (capped at 4 MiB, slot 27).
+    const FB_VIRT: u64 = 0xffff_b012_0000_0000;
+    let Some(fb) = framebuffer else {
+        return;
+    };
+    if fb.phys_addr == 0 || (fb.phys_addr & 0xFFF) != 0 {
+        return;
+    }
+    let raw_bytes = u64::from(fb.height).saturating_mul(u64::from(fb.pitch));
+    let map_bytes = raw_bytes.min(4 * 1024 * 1024);
+    let pages = map_bytes.div_ceil(4096);
+    let mut mapped_pages = 0u64;
+    for p in 0..pages {
+        let off = p * 4096;
+        let ok = VirtAddr::new_page_aligned(FB_VIRT + off)
+            .and_then(|va| {
+                PhysFrame::from_aligned(PhysAddr::new(fb.phys_addr + off))
+                    .and_then(|fr| vspace.map_4k(va, fr, KERNEL_MMIO_FLAGS, untyped))
+            })
+            .is_ok();
+        if !ok {
+            break;
+        }
+        mapped_pages += 1;
+    }
+    if mapped_pages > 0 {
+        let len = mapped_pages * 4096;
+        syscall::register_extra_mmio_mapping(PhysAddr::new(fb.phys_addr), FB_VIRT, len);
+        syscall::register_init_mmio_cap(27, PhysAddr::new(fb.phys_addr), len);
+    }
+}
+
 impl Aarch64Platform {
+    #[must_use]
     pub fn init(info: &mut BootInfo) -> Self {
-        use newos_kernel_core::memory::{PageFlags, PhysFrame, VSpaceMapper};
         let board = crate::board::select_board(info.qemu_virt);
         if info.hhdm_offset == 0 {
             let mut s = serial::UnlockedPl011;
@@ -813,35 +1355,7 @@ impl Aarch64Platform {
         }
         let mut vspace = paging::Aarch64VSpace::from_current_ttbr1(info.hhdm_offset);
 
-        // Allocate per-CPU guarded 32 KiB EL1 kernel stacks in `TTBR1_EL1` with an unmapped
-        // 4 KiB guard page directly below each core's stack.
-        const KERNEL_STACK_BASE: u64 = 0xffff_b010_0000_0000;
-        const KERNEL_GUARD_BYTES: u64 = 4096;
-        const KERNEL_STACK_PAGES: u64 = 8;
-        const KERNEL_STACK_STRIDE: u64 = KERNEL_GUARD_BYTES + KERNEL_STACK_PAGES * 4096;
-        if let Ok(stack_flags) = PageFlags::new_wx(true, false, false, false) {
-            for (cpu, stack_top) in EL1_GUARDED_STACK_TOPS.iter().enumerate() {
-                let base = KERNEL_STACK_BASE + (cpu as u64) * KERNEL_STACK_STRIDE;
-                let mut ok = true;
-                for p in 0..KERNEL_STACK_PAGES {
-                    let va = base + KERNEL_GUARD_BYTES + p * 4096;
-                    let mapped = VirtAddr::new_page_aligned(va)
-                        .and_then(|v| {
-                            info.untyped
-                                .retype_frame()
-                                .and_then(|fr| vspace.map_4k(v, fr, stack_flags, &mut info.untyped))
-                        })
-                        .is_ok();
-                    if !mapped {
-                        ok = false;
-                        break;
-                    }
-                }
-                if ok {
-                    stack_top.store(base + KERNEL_STACK_STRIDE, Ordering::Release);
-                }
-            }
-        }
+        allocate_guarded_el1_stacks(&mut vspace, &mut info.untyped);
 
         // Discover hardware dynamically from ACPI (FADT/SPCR/MADT/GTDT/MCFG) when enabled,
         // falling back to the active `BoardDescriptor`.
@@ -855,234 +1369,34 @@ impl Aarch64Platform {
         #[cfg(not(feature = "acpi"))]
         let acpi = AcpiHardware::default();
 
-        // Lock PT_GNU_RELRO (`.data.rel.ro`, `.got`, `.dynamic`) read-only in `TTBR1_EL1`
-        // after Limine has finished applying PIE relocations.
-        // SAFETY: `__relro_start` and `__relro_end` are linker-defined section boundary symbols
-        // in `crates/kernel/linker-aarch64.ld`; only their addresses are taken via `&raw const`.
-        unsafe extern "C" {
-            static __relro_start: u8;
-            static __relro_end: u8;
-        }
-        let relro_start = (&raw const __relro_start) as u64;
-        let relro_end = (&raw const __relro_end) as u64;
-        if relro_end > relro_start {
-            vspace.protect_ro_range(relro_start, relro_end);
-        }
+        lock_relro_pages(&mut vspace);
 
         // Select PL011 MMIO physical base (ACPI SPCR -> board descriptor fallback):
-        const UART_VIRT: u64 = 0xffff_b000_0000_0000;
         let uart_phys = acpi.spcr_uart_base.unwrap_or(board.uart.phys_base);
-        if let Ok(uart_virt) = VirtAddr::new_page_aligned(UART_VIRT)
-            && let Ok(frame) = PhysFrame::from_aligned(PhysAddr::new(uart_phys))
-            && let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
-            && vspace
-                .map_4k(uart_virt, frame, mmio_flags, &mut info.untyped)
-                .is_ok()
-        {
-            serial::init_virt(UART_VIRT);
-        } else {
-            serial::init_virt(info.hhdm_offset.wrapping_add(uart_phys));
-        }
+        map_boot_uart(&mut vspace, &mut info.untyped, info.hhdm_offset, uart_phys);
 
-        // Map capability-scoped Network Controller MMIO window (4 pages, Device-nGnRnE):
-        // - Default: Raspberry Pi 5 (BCM2712 + RP1 Cadence GEM Gigabit Ethernet): `0x1F_0010_0000`
-        // - Local test harness (`qemu` cmdline): QEMU `virt` VirtIO-MMIO slots 0..31: `0x0A00_0000`
-        const RPI5_RP1_GEM_PHYS: u64 = 0x1F_0010_0000;
-        const QEMU_NET_MMIO_PHYS: u64 = 0x0a00_0000;
-        const NET_MMIO_VIRT: u64 = 0xffff_b001_0000_0000;
-        const NET_MMIO_PAGES: u64 = 4;
-        let net_mmio_phys = if info.qemu_virt {
-            QEMU_NET_MMIO_PHYS
-        } else {
-            RPI5_RP1_GEM_PHYS
-        };
-        let mut net_mmio_mapped = false;
-        if let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true) {
-            net_mmio_mapped = true;
-            for p in 0..NET_MMIO_PAGES {
-                let off = p * 4096;
-                let mapped = VirtAddr::new_page_aligned(NET_MMIO_VIRT + off)
-                    .and_then(|va| {
-                        PhysFrame::from_aligned(PhysAddr::new(net_mmio_phys + off)).and_then(
-                            |frame| vspace.map_4k(va, frame, mmio_flags, &mut info.untyped),
-                        )
-                    })
-                    .is_ok();
-                if !mapped {
-                    net_mmio_mapped = false;
-                    break;
-                }
-            }
-        }
-        let net_mmio = if !net_mmio_mapped {
-            None
-        } else if info.qemu_virt {
-            // Scope BOOTSTRAP_NET_MMIO strictly to the single 512-byte VirtIO-Net slot (`C-3`)
-            // rather than exposing all 32 VirtIO-MMIO devices on the bus.
-            const VIRTIO_MAGIC: u32 = 0x7472_6976;
-            const VIRTIO_DEV_NET: u32 = 1;
-            const SLOT_STRIDE: u64 = 0x200;
-            let mut found = None;
-            for slot in 0..32u64 {
-                let off = slot * SLOT_STRIDE;
-                let base_va = NET_MMIO_VIRT + off;
-                // SAFETY: All `NET_MMIO_PAGES` pages of `NET_MMIO_VIRT..NET_MMIO_VIRT + 16 KiB`
-                // were verified mapped above as Device-nGnRnE.
-                let (magic, dev_id) = unsafe {
-                    (
-                        core::ptr::read_volatile(base_va as *const u32),
-                        core::ptr::read_volatile((base_va + 8) as *const u32),
-                    )
-                };
-                if magic == VIRTIO_MAGIC && dev_id == VIRTIO_DEV_NET {
-                    found = Some((
-                        PhysAddr::new(net_mmio_phys + off),
-                        base_va,
-                        SLOT_STRIDE,
-                        Some(crate::board::IrqLine::gic(48 + slot as u16)),
-                    ));
-                    break;
-                }
-            }
-            found
-        } else {
-            Some((
-                PhysAddr::new(net_mmio_phys),
-                NET_MMIO_VIRT,
-                NET_MMIO_PAGES * 4096,
-                board.net_irq,
-            ))
-        };
-        let net_irq = net_mmio.and_then(|(_, _, _, irq)| irq);
-        let net_mmio = net_mmio.map(|(pa, va, len, _)| (pa, va, len));
-
-        // Map capability-scoped Hardware RNG MMIO window (Device-nGnRnE):
-        // - Raspberry Pi 5 (BCM2712 `iproc-rng200`): `0x10_7D20_8000` (scoped to `0x28` bytes)
-        // - QEMU `virt`: single 512-byte VirtIO-RNG slot (`device_id == 4`) on `0x0A00_0000`
-        const RPI5_RNG200_PHYS: u64 = 0x10_7D20_8000;
-        const RPI5_RNG200_LEN: u64 = 0x28;
-        const RNG_MMIO_VIRT: u64 = 0xffff_b005_0000_0000;
-        let rng_mmio = if info.qemu_virt {
-            if !net_mmio_mapped {
-                None
-            } else {
-                const VIRTIO_MAGIC: u32 = 0x7472_6976;
-                const VIRTIO_DEV_RNG: u32 = 4;
-                const SLOT_STRIDE: u64 = 0x200;
-                let mut found = None;
-                for slot in 0..32u64 {
-                    let off = slot * SLOT_STRIDE;
-                    let base_va = NET_MMIO_VIRT + off;
-                    // SAFETY: `NET_MMIO_VIRT..+16 KiB` was verified mapped as Device-nGnRnE.
-                    let (magic, dev_id) = unsafe {
-                        (
-                            core::ptr::read_volatile(base_va as *const u32),
-                            core::ptr::read_volatile((base_va + 8) as *const u32),
-                        )
-                    };
-                    if magic == VIRTIO_MAGIC && dev_id == VIRTIO_DEV_RNG {
-                        found = Some((
-                            PhysAddr::new(net_mmio_phys + off),
-                            base_va,
-                            SLOT_STRIDE,
-                            Some(crate::board::IrqLine::gic(48 + slot as u16)),
-                        ));
-                        break;
-                    }
-                }
-                found
-            }
-        } else if let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
-            && let Ok(rng_va) = VirtAddr::new_page_aligned(RNG_MMIO_VIRT)
-            && let Ok(rng_fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_RNG200_PHYS))
-            && vspace
-                .map_4k(rng_va, rng_fr, mmio_flags, &mut info.untyped)
-                .is_ok()
-        {
-            // Optionally mix 64 bits of hardware TRNG into `ENTROPY_STATE` for EL0 ASLR
-            // before handing `BOOTSTRAP_RNG_MMIO` exclusively to `newos-key-pd`.
-            // SAFETY: `RNG_MMIO_VIRT` was just mapped as Device-nGnRnE to BCM2712 `iproc-rng200`.
-            unsafe {
-                let ctrl = RNG_MMIO_VIRT as *mut u32;
-                let fifo_cnt = (RNG_MMIO_VIRT + 0x24) as *const u32;
-                let fifo_data = (RNG_MMIO_VIRT + 0x20) as *const u32;
-                let cur = core::ptr::read_volatile(ctrl);
-                core::ptr::write_volatile(ctrl, cur | 1);
-                for _ in 0..256u32 {
-                    if (core::ptr::read_volatile(fifo_cnt) & 0xFF) >= 2 {
-                        let lo = u64::from(core::ptr::read_volatile(fifo_data));
-                        let hi = u64::from(core::ptr::read_volatile(fifo_data));
-                        ENTROPY_STATE.fetch_xor((hi << 32) | lo, Ordering::Relaxed);
-                        break;
-                    }
-                }
-            }
-            Some((
-                PhysAddr::new(RPI5_RNG200_PHYS),
-                RNG_MMIO_VIRT,
-                RPI5_RNG200_LEN,
-                board.rng_irq,
-            ))
-        } else {
-            None
-        };
-        let rng_irq = rng_mmio.and_then(|(_, _, _, irq)| irq);
-        let rng_mmio = rng_mmio.map(|(pa, va, len, _)| (pa, va, len));
+        let (net_mmio, net_irq, rng_mmio, rng_irq) =
+            map_net_and_rng_mmio(&mut vspace, &mut info.untyped, board, info.qemu_virt);
         syscall::register_board_irqs(net_irq, rng_irq, board.uart_irq);
 
         // Map GICv2 / GIC-400 Distributor & CPU Interface (ACPI MADT -> board descriptor fallback):
-        const GICD_VIRT: u64 = 0xffff_b002_0000_0000;
-        const GICC_VIRT: u64 = 0xffff_b002_0000_1000;
-        let gicd_phys = acpi.gicd_base.unwrap_or(board.gicd.phys_base);
-        let gicc_phys = acpi.gicc_base.unwrap_or(board.gicc.phys_base);
+        let dist_phys = acpi.gicd_base.unwrap_or(board.gicd.phys_base);
+        let cpu_if_phys = acpi.gicc_base.unwrap_or(board.gicc.phys_base);
         let virt_timer_irq = acpi.virt_timer_irq.unwrap_or(gic::IRQ_VIRTUAL_TIMER);
-        if let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
-            && let Ok(gicd_va) = VirtAddr::new_page_aligned(GICD_VIRT)
-            && let Ok(gicc_va) = VirtAddr::new_page_aligned(GICC_VIRT)
-            && let Ok(gicd_fr) = PhysFrame::from_aligned(PhysAddr::new(gicd_phys))
-            && let Ok(gicc_fr) = PhysFrame::from_aligned(PhysAddr::new(gicc_phys))
-            && vspace
-                .map_4k(gicd_va, gicd_fr, mmio_flags, &mut info.untyped)
-                .is_ok()
-            && vspace
-                .map_4k(gicc_va, gicc_fr, mmio_flags, &mut info.untyped)
-                .is_ok()
-        {
-            gic::init(GICD_VIRT, GICC_VIRT, virt_timer_irq);
-        }
+        map_gic(
+            &mut vspace,
+            &mut info.untyped,
+            dist_phys,
+            cpu_if_phys,
+            virt_timer_irq,
+        );
 
         // Select PSCI conduit from ACPI FADT `ARM_BOOT_ARCH` when available; fallback to board descriptor.
-        let use_smc = match acpi.psci_use_hvc {
-            Some(use_hvc) => !use_hvc,
-            None => board.psci_use_smc,
-        };
-        PSCI_USE_SMC.store(use_smc, Ordering::Release);
+        let psci_conduit = acpi.psci_conduit.unwrap_or(board.psci_conduit);
+        PSCI_USE_SMC.store(psci_conduit == PsciConduit::Smc, Ordering::Release);
 
         // Map capability-scoped Raspberry Pi 5 BCM2712 Hardware Watchdog MMIO (`0x10_7D20_0000`, `0x100` B):
-        #[cfg(feature = "mmio-wdt")]
-        let wdt_mmio = {
-            const RPI5_PM_WDT_PHYS: u64 = 0x10_7D20_0000;
-            const RPI5_PM_WDT_LEN: u64 = 0x100;
-            const WDT_MMIO_VIRT: u64 = 0xffff_b006_0000_0000;
-            if !info.qemu_virt
-                && let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
-                && let Ok(wdt_va) = VirtAddr::new_page_aligned(WDT_MMIO_VIRT)
-                && let Ok(wdt_fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_PM_WDT_PHYS))
-                && vspace
-                    .map_4k(wdt_va, wdt_fr, mmio_flags, &mut info.untyped)
-                    .is_ok()
-            {
-                Some((
-                    PhysAddr::new(RPI5_PM_WDT_PHYS),
-                    WDT_MMIO_VIRT,
-                    RPI5_PM_WDT_LEN,
-                ))
-            } else {
-                None
-            }
-        };
-        #[cfg(not(feature = "mmio-wdt"))]
-        let wdt_mmio: Option<(PhysAddr, u64, u64)> = None;
+        let wdt_mmio = map_wdt_mmio(&mut vspace, &mut info.untyped, info.qemu_virt);
 
         set_cpu_id(0);
         probe_and_enable_cpu_hardening();
@@ -1096,242 +1410,28 @@ impl Aarch64Platform {
             info.net_module.is_some(),
         );
 
-        // Map Raspberry Pi 5 board peripherals (Device-nGnRnE) and grant capabilities to `init`:
-        // - Slot 19 (`BOOTSTRAP_GPIO_MMIO`): RP1 IO_BANK0 / RIO0 / PADS_BANK0 (40-pin GPIO 0..=27)
-        // - Slot 20 (`BOOTSTRAP_MBOX_MMIO`): BCM2712 VideoCore Property Mailbox (`0x10_7C01_3000`)
-        // - Slot 21 (`BOOTSTRAP_THERMAL_MMIO`): BCM2712 AVS TMON Thermal Sensor (`0x10_7D5D_2000`)
-        // - Slot 22 (`BOOTSTRAP_RP1_PERIPH_MMIO`): RP1 UART0, SPI0, I2C0, I2C1, PWM0
-        if !info.qemu_virt
-            && let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
-        {
-            #[cfg(feature = "mmio-gpio")]
-            {
-                const RP1_GPIO_PHYS: u64 = 0x1F_000D_0000;
-                const RP1_GPIO_LEN: u64 = 0x24000;
-                const RP1_GPIO_VIRT: u64 = 0xffff_b007_0000_0000;
-                let mut gpio_ok = true;
-                for block_off in [0x0_0000u64, 0x1_0000u64, 0x2_0000u64] {
-                    let mut block_mapped = true;
-                    for p in 0..4u64 {
-                        let off = block_off + p * 4096;
-                        let ok = VirtAddr::new_page_aligned(RP1_GPIO_VIRT + off)
-                            .and_then(|va| {
-                                PhysFrame::from_aligned(PhysAddr::new(RP1_GPIO_PHYS + off))
-                                    .and_then(|fr| {
-                                        vspace.map_4k(va, fr, mmio_flags, &mut info.untyped)
-                                    })
-                            })
-                            .is_ok();
-                        if !ok {
-                            block_mapped = false;
-                            break;
-                        }
-                    }
-                    if block_mapped {
-                        syscall::register_extra_mmio_mapping(
-                            PhysAddr::new(RP1_GPIO_PHYS + block_off),
-                            RP1_GPIO_VIRT + block_off,
-                            0x4000,
-                        );
-                    } else {
-                        gpio_ok = false;
-                    }
-                }
-                if gpio_ok {
-                    syscall::register_init_mmio_cap(19, PhysAddr::new(RP1_GPIO_PHYS), RP1_GPIO_LEN);
-                }
-            }
-
-            #[cfg(feature = "mmio-mbox")]
-            {
-                const MBOX_PHYS: u64 = 0x10_7C01_3000;
-                const MBOX_VIRT: u64 = 0xffff_b008_0000_0000;
-                if let Ok(va) = VirtAddr::new_page_aligned(MBOX_VIRT)
-                    && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(MBOX_PHYS))
-                    && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
-                {
-                    syscall::register_extra_mmio_mapping(
-                        PhysAddr::new(MBOX_PHYS),
-                        MBOX_VIRT,
-                        0x1000,
-                    );
-                    syscall::register_init_mmio_cap(20, PhysAddr::new(MBOX_PHYS), 0x1000);
-                }
-            }
-
-            #[cfg(feature = "mmio-thermal")]
-            {
-                const THERMAL_PHYS: u64 = 0x10_7D5D_2000;
-                const THERMAL_VIRT: u64 = 0xffff_b009_0000_0000;
-                if let Ok(va) = VirtAddr::new_page_aligned(THERMAL_VIRT)
-                    && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(THERMAL_PHYS))
-                    && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
-                {
-                    syscall::register_extra_mmio_mapping(
-                        PhysAddr::new(THERMAL_PHYS),
-                        THERMAL_VIRT,
-                        0x1000,
-                    );
-                    syscall::register_init_mmio_cap(21, PhysAddr::new(THERMAL_PHYS), 0x1000);
-                }
-            }
-
-            // Narrow RP1 peripheral capability to the 4 KiB RP1 UART0 page (`P10`) instead of
-            // spanning UART0, SPI0, I2C0, I2C1, and PWM0 in a single 420 KiB capability.
-            #[cfg(feature = "mmio-rp1-uart")]
-            {
-                const RP1_UART0_PHYS: u64 = 0x1F_0003_0000;
-                const RP1_UART0_VIRT: u64 = 0xffff_b00a_0000_0000;
-                if let Ok(va) = VirtAddr::new_page_aligned(RP1_UART0_VIRT)
-                    && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(RP1_UART0_PHYS))
-                    && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
-                {
-                    syscall::register_extra_mmio_mapping(
-                        PhysAddr::new(RP1_UART0_PHYS),
-                        RP1_UART0_VIRT,
-                        0x1000,
-                    );
-                    syscall::register_init_mmio_cap(22, PhysAddr::new(RP1_UART0_PHYS), 0x1000);
-                }
-            }
-
-            // BCM2712 MIP MSI-X (`0x10_0013_0000`), microSD SDHCI (`0x10_00ff_f000`),
-            // RP1 dual xHCI USB 3.0 (`0x1f_0020_0000` / `0x1f_0030_0000`), and PCIe ECAM.
-            const RPI5_MIP_PHYS: u64 = 0x10_0013_0000;
-            const RPI5_MIP_VIRT: u64 = 0xffff_b00b_0000_0000;
-            if let Ok(va) = VirtAddr::new_page_aligned(RPI5_MIP_VIRT)
-                && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_MIP_PHYS))
-                && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
-            {
-                gic::init_bcm2712_mip(RPI5_MIP_VIRT);
-            }
-
-            #[cfg(feature = "mmio-sdhci")]
-            {
-                const RPI5_SDHCI_PHYS: u64 = 0x10_00ff_f000;
-                const RPI5_SDHCI_VIRT: u64 = 0xffff_b00c_0000_0000;
-                if let Ok(va) = VirtAddr::new_page_aligned(RPI5_SDHCI_VIRT)
-                    && let Ok(fr) = PhysFrame::from_aligned(PhysAddr::new(RPI5_SDHCI_PHYS))
-                    && vspace.map_4k(va, fr, mmio_flags, &mut info.untyped).is_ok()
-                {
-                    syscall::register_extra_mmio_mapping(
-                        PhysAddr::new(RPI5_SDHCI_PHYS),
-                        RPI5_SDHCI_VIRT,
-                        0x1000,
-                    );
-                    syscall::register_init_mmio_cap(23, PhysAddr::new(RPI5_SDHCI_PHYS), 0x1000);
-                }
-            }
-
-            #[cfg(feature = "mmio-xhci")]
-            for (slot, xhci_phys, xhci_virt) in [
-                (24usize, 0x1f_0020_0000u64, 0xffff_b00d_0000_0000u64),
-                (25usize, 0x1f_0030_0000u64, 0xffff_b00e_0000_0000u64),
-            ] {
-                let mut xhci_ok = true;
-                for p in 0..4u64 {
-                    let off = p * 4096;
-                    let ok = VirtAddr::new_page_aligned(xhci_virt + off)
-                        .and_then(|va| {
-                            PhysFrame::from_aligned(PhysAddr::new(xhci_phys + off))
-                                .and_then(|fr| vspace.map_4k(va, fr, mmio_flags, &mut info.untyped))
-                        })
-                        .is_ok();
-                    if !ok {
-                        xhci_ok = false;
-                        break;
-                    }
-                }
-                if xhci_ok {
-                    syscall::register_extra_mmio_mapping(
-                        PhysAddr::new(xhci_phys),
-                        xhci_virt,
-                        0x4000,
-                    );
-                    syscall::register_init_mmio_cap(slot, PhysAddr::new(xhci_phys), 0x4000);
-                }
-            }
-
-            // PCIe ECAM and BCM2712 IOMMU are intentionally kept kernel-owned (`P4`):
-            // never hand raw PCIe configuration space or IOMMU registers to EL0 `init`.
-            // VideoCore VII V3D 7.1 (`0x10_0200_0000` Hub + `0x10_0200_8000` Core 0).
-            #[cfg(feature = "mmio-v3d")]
-            {
-                const RPI5_V3D_PHYS: u64 = 0x10_0200_0000;
-                const RPI5_V3D_LEN: u64 = 0x9000;
-                const RPI5_V3D_VIRT: u64 = 0xffff_b010_0000_0000;
-                let mut v3d_ok = true;
-                for off in [0x0000u64, 0x8000u64] {
-                    let ok = VirtAddr::new_page_aligned(RPI5_V3D_VIRT + off)
-                        .and_then(|va| {
-                            PhysFrame::from_aligned(PhysAddr::new(RPI5_V3D_PHYS + off))
-                                .and_then(|fr| vspace.map_4k(va, fr, mmio_flags, &mut info.untyped))
-                        })
-                        .is_ok();
-                    if ok {
-                        syscall::register_extra_mmio_mapping(
-                            PhysAddr::new(RPI5_V3D_PHYS + off),
-                            RPI5_V3D_VIRT + off,
-                            0x1000,
-                        );
-                    } else {
-                        v3d_ok = false;
-                    }
-                }
-                if v3d_ok {
-                    syscall::register_init_mmio_cap(28, PhysAddr::new(RPI5_V3D_PHYS), RPI5_V3D_LEN);
-                }
-            }
+        if !info.qemu_virt {
+            map_rpi5_peripherals(&mut vspace, &mut info.untyped);
         }
+        map_framebuffer(&mut vspace, &mut info.untyped, info.framebuffer);
 
-        // Map UEFI GOP / Limine linear framebuffer if present (capped at 4 MiB, slot 27).
-        if let Some(fb) = info.framebuffer
-            && fb.phys_addr != 0
-            && (fb.phys_addr & 0xFFF) == 0
-            && let Ok(mmio_flags) = PageFlags::new_wx(true, false, false, true)
-        {
-            const FB_VIRT: u64 = 0xffff_b012_0000_0000;
-            let raw_bytes = u64::from(fb.height).saturating_mul(u64::from(fb.pitch));
-            let map_bytes = raw_bytes.min(4 * 1024 * 1024);
-            let pages = map_bytes.div_ceil(4096);
-            let mut mapped_pages = 0u64;
-            for p in 0..pages {
-                let off = p * 4096;
-                let ok = VirtAddr::new_page_aligned(FB_VIRT + off)
-                    .and_then(|va| {
-                        PhysFrame::from_aligned(PhysAddr::new(fb.phys_addr + off))
-                            .and_then(|fr| vspace.map_4k(va, fr, mmio_flags, &mut info.untyped))
-                    })
-                    .is_ok();
-                if !ok {
-                    break;
-                }
-                mapped_pages += 1;
-            }
-            if mapped_pages > 0 {
-                let len = mapped_pages * 4096;
-                syscall::register_extra_mmio_mapping(PhysAddr::new(fb.phys_addr), FB_VIRT, len);
-                syscall::register_init_mmio_cap(27, PhysAddr::new(fb.phys_addr), len);
-            }
-        }
         #[cfg(feature = "smp")]
         let online_cpus = smp::bring_up_aps();
         #[cfg(not(feature = "smp"))]
         let online_cpus = 1usize;
         syscall::set_sys_info(online_cpus, info.interactive_shell);
 
+        let psci_label = match psci_conduit {
+            PsciConduit::Smc => "SMC",
+            PsciConduit::Hvc => "HVC",
+        };
         let mut serial = serial::Pl011::new();
         let _ = writeln!(
             serial,
-            "[newos-hal] board={} ACPI/GIC: uart={:#x} gicd={:#x} gicc={:#x} (v{}, cpus={}) timer_irq={} psci={} ecam={:#x} ap_sgi_acks={}",
+            "[newos-hal] board={} ACPI/GIC: uart={uart_phys:#x} gicd={dist_phys:#x} gicc={cpu_if_phys:#x} (v{}, cpus={}) timer_irq={virt_timer_irq} psci={psci_label} ecam={:#x} ap_sgi_acks={}",
             board.name,
-            uart_phys,
-            gicd_phys,
-            gicc_phys,
             acpi.gic_version,
             acpi.madt_cpus,
-            virt_timer_irq,
-            if use_smc { "SMC" } else { "HVC" },
             acpi.ecam_base.unwrap_or(0),
             smp::ap_sgi_ack_count(),
         );
@@ -1366,8 +1466,8 @@ impl HalPlatform for Aarch64Platform {
         self.board.arch
     }
 
-    fn board_name(&self) -> &'static str {
-        self.board.name
+    fn board_name(&self) -> Option<&'static str> {
+        Some(self.board.name)
     }
 
     fn security_features(&self) -> CpuSecurityFeatures {
@@ -1387,7 +1487,7 @@ impl HalPlatform for Aarch64Platform {
     }
 
     fn current_cpu_id(&self) -> u32 {
-        get_cpu_id() as u32
+        u32::try_from(get_cpu_id()).unwrap_or(u32::MAX)
     }
 
     fn online_cpus(&self) -> usize {
@@ -1445,12 +1545,7 @@ impl HalPlatform for Aarch64Platform {
     }
 
     fn random_u64(&mut self) -> u64 {
-        let mut x = ENTROPY_STATE.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
-            ^ syscall::read_cntvct();
-        // SplitMix64 finalizer for uniform ASLR slide distribution
-        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        x ^ (x >> 31)
+        next_aslr_entropy()
     }
 
     fn vspace_mut(&mut self) -> &mut Self::VSpace {
@@ -1491,14 +1586,10 @@ impl HalPlatform for Aarch64Platform {
     }
 
     fn start_userspace(&mut self) -> ! {
-        let top = guarded_el1_stack_top(0);
-        if top != 0 {
-            extern "C" fn bsp_userspace_trampoline() -> ! {
-                syscall::start_userspace()
-            }
+        if let Some(top) = guarded_el1_stack_top(0) {
             // SAFETY: `top` is a 16-byte-aligned 32 KiB mapped stack with an unmapped 4 KiB
             // guard page beneath it, and `bsp_userspace_trampoline` never returns.
-            unsafe { pivot_sp_and_jump(top, bsp_userspace_trampoline) }
+            unsafe { pivot_sp_and_jump(top.get(), bsp_userspace_trampoline) }
         }
         syscall::start_userspace()
     }

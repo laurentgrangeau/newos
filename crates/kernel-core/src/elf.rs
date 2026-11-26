@@ -3,7 +3,7 @@
 //! Only bootstrap EL0 protection domains (starting with `supervisor-pd`) are parsed by EL1; all subsequent
 //! processes and ELF binaries are loaded by userspace services.
 
-use crate::memory::{PageFlags, VirtAddr};
+use crate::memory::{PageAccess, PageCachePolicy, PageFlags, PagePrivilege, VirtAddr};
 use newos_abi::SysError;
 
 const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
@@ -18,10 +18,15 @@ const DT_NULL: u64 = 0;
 const DT_RELA: u64 = 7;
 const DT_RELASZ: u64 = 8;
 const DT_RELAENT: u64 = 9;
-const R_AARCH64_RELATIVE: u32 = 1027;
+const R_AARCH64_RELATIVE: u64 = 1027;
 
 const PF_X: u32 = 1 << 0;
 const PF_W: u32 = 1 << 1;
+
+#[inline]
+const fn is_relative_reloc(r_info: u64) -> bool {
+    (r_info & 0xFFFF_FFFF) == R_AARCH64_RELATIVE
+}
 
 /// Maximum `PT_LOAD` segments supported in the bootstrap `init` ELF64 image.
 pub const MAX_LOAD_SEGMENTS: usize = 8;
@@ -43,6 +48,14 @@ pub struct LoadSegment {
     pub flags: PageFlags,
 }
 
+/// Validated `DT_RELA` table byte range and entry stride inside the ELF image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelaTable {
+    start: usize,
+    end: usize,
+    entry_size: usize,
+}
+
 /// Parsed 64-bit EL0 ELF64 executable metadata (supports `ET_EXEC` and PIE `ET_DYN`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParsedElf64 {
@@ -51,8 +64,8 @@ pub struct ParsedElf64 {
     pub load_base: u64,
     segments: [Option<LoadSegment>; MAX_LOAD_SEGMENTS],
     segment_count: usize,
-    /// Validated `(file_start, file_end, entry_size)` for streaming `DT_RELA` relocations.
-    rela_table: Option<(usize, usize, usize)>,
+    /// Validated file range and stride for streaming `DT_RELA` relocations.
+    rela_table: Option<RelaTable>,
     reloc_count: usize,
 }
 
@@ -63,20 +76,31 @@ impl ParsedElf64 {
             .filter_map(Option::as_ref)
     }
 
+    #[must_use]
     pub const fn segment_count(&self) -> usize {
         self.segment_count
     }
 
+    #[must_use]
     pub const fn reloc_count(&self) -> usize {
         self.reloc_count
     }
 
     /// Stream every `R_AARCH64_RELATIVE` relocation directly from `bytes`.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if the relocation table entry size is `< 24` or bounds are invalid.
+    /// - Propagates any [`SysError`] returned by the caller's callback `f`.
     pub fn for_each_relative_reloc<F>(&self, bytes: &[u8], mut f: F) -> Result<usize, SysError>
     where
         F: FnMut(RelativeReloc) -> Result<(), SysError>,
     {
-        let Some((start, end, ent)) = self.rela_table else {
+        let Some(RelaTable {
+            start,
+            end,
+            entry_size: ent,
+        }) = self.rela_table
+        else {
             return Ok(0);
         };
         if ent < 24 {
@@ -91,8 +115,9 @@ impl ParsedElf64 {
             let r_offset = read_u64_le(bytes, off)?;
             let r_info = read_u64_le(bytes, off.checked_add(8).ok_or(SysError::InvalidArgument)?)?;
             let r_addend =
-                read_u64_le(bytes, off.checked_add(16).ok_or(SysError::InvalidArgument)?)? as i64;
-            if (r_info as u32) == R_AARCH64_RELATIVE {
+                read_u64_le(bytes, off.checked_add(16).ok_or(SysError::InvalidArgument)?)?
+                    .cast_signed();
+            if is_relative_reloc(r_info) {
                 f(RelativeReloc {
                     offset: r_offset,
                     addend: r_addend,
@@ -138,14 +163,147 @@ fn read_u64_le(bytes: &[u8], off: usize) -> Result<u64, SysError> {
     Ok(u64::from_le_bytes(slice))
 }
 
-/// Validate and parse a 64-bit little-endian AArch64 ELF64 binary (`ET_EXEC` or PIE `ET_DYN`)
+fn parse_load_segment(bytes: &[u8], off: usize, load_base: u64) -> Result<LoadSegment, SysError> {
+    let p_flags = read_u32_le(bytes, off + 4)?;
+    let p_offset =
+        usize::try_from(read_u64_le(bytes, off + 8)?).map_err(|_| SysError::InvalidArgument)?;
+    let p_vaddr = read_u64_le(bytes, off + 16)?
+        .checked_add(load_base)
+        .ok_or(SysError::InvalidArgument)?;
+    let p_filesz =
+        usize::try_from(read_u64_le(bytes, off + 32)?).map_err(|_| SysError::InvalidArgument)?;
+    let p_memsz = read_u64_le(bytes, off + 40)?;
+
+    if p_memsz < p_filesz as u64 {
+        return Err(SysError::InvalidArgument);
+    }
+    let end_file = p_offset
+        .checked_add(p_filesz)
+        .ok_or(SysError::InvalidArgument)?;
+    if end_file > bytes.len() {
+        return Err(SysError::InvalidArgument);
+    }
+    let end_vaddr = p_vaddr
+        .checked_add(p_memsz)
+        .ok_or(SysError::InvalidArgument)?;
+    if end_vaddr >= 0x0000_8000_0000_0000 {
+        return Err(SysError::InvalidArgument);
+    }
+
+    // Strict W^X enforced for EL0 segments.
+    let access = match ((p_flags & PF_W) != 0, (p_flags & PF_X) != 0) {
+        (true, true) => return Err(SysError::InvalidArgument),
+        (true, false) => PageAccess::ReadWrite,
+        (false, true) => PageAccess::ReadExecute,
+        (false, false) => PageAccess::ReadOnly,
+    };
+    let flags = PageFlags::new(
+        access,
+        PagePrivilege::User,
+        PageCachePolicy::NormalCacheable,
+    );
+
+    Ok(LoadSegment {
+        vaddr: p_vaddr,
+        mem_size: p_memsz,
+        file_offset: p_offset,
+        file_size: p_filesz,
+        flags,
+    })
+}
+
+fn parse_rela_table(
+    bytes: &[u8],
+    d_off: usize,
+    d_end: usize,
+    load_base: u64,
+    segments: &[Option<LoadSegment>],
+) -> Result<(Option<RelaTable>, usize), SysError> {
+    let mut rela_vaddr: Option<u64> = None;
+    let mut rela_sz: u64 = 0;
+    let mut rela_ent: u64 = 24;
+    let mut cur = d_off;
+    while let Some(next_cur) = cur.checked_add(16) {
+        if next_cur > d_end {
+            break;
+        }
+        let tag = read_u64_le(bytes, cur)?;
+        let val = read_u64_le(bytes, cur + 8)?;
+        cur = next_cur;
+        match tag {
+            DT_NULL => break,
+            DT_RELA => rela_vaddr = Some(val),
+            DT_RELASZ => rela_sz = val,
+            DT_RELAENT => rela_ent = val,
+            _ => {}
+        }
+    }
+
+    let Some(rv) = rela_vaddr.filter(|_| rela_sz > 0) else {
+        return Ok((None, 0));
+    };
+    if rela_ent < 24 {
+        return Err(SysError::InvalidArgument);
+    }
+    let target_va = rv.checked_add(load_base).ok_or(SysError::InvalidArgument)?;
+    // Translate `DT_RELA` vaddr into file offset via parsed `PT_LOAD` segments.
+    let start = segments
+        .iter()
+        .flatten()
+        .find_map(|seg| {
+            let seg_file_end = seg.vaddr.saturating_add(seg.file_size as u64);
+            if target_va >= seg.vaddr && target_va < seg_file_end {
+                let delta = usize::try_from(target_va - seg.vaddr).ok()?;
+                seg.file_offset.checked_add(delta)
+            } else {
+                None
+            }
+        })
+        .ok_or(SysError::InvalidArgument)?;
+    let total = usize::try_from(rela_sz).map_err(|_| SysError::InvalidArgument)?;
+    let ent = usize::try_from(rela_ent).map_err(|_| SysError::InvalidArgument)?;
+    let end = start.checked_add(total).ok_or(SysError::InvalidArgument)?;
+    if end > bytes.len() {
+        return Err(SysError::InvalidArgument);
+    }
+    let mut reloc_count = 0usize;
+    let mut off = start;
+    while let Some(next_off) = off.checked_add(ent) {
+        if next_off > end {
+            break;
+        }
+        let r_info = read_u64_le(bytes, off.checked_add(8).ok_or(SysError::InvalidArgument)?)?;
+        if is_relative_reloc(r_info) {
+            reloc_count += 1;
+        }
+        off = next_off;
+    }
+    Ok((
+        Some(RelaTable {
+            start,
+            end,
+            entry_size: ent,
+        }),
+        reloc_count,
+    ))
+}
+
+/// Validate and parse a 64-bit little-endian `AArch64` ELF64 binary (`ET_EXEC` or PIE `ET_DYN`)
 /// enforcing strict W^X and canonical lower-half EL0 addresses (`< 0x0000_8000_0000_0000`).
+///
+/// # Errors
+/// Propagates any validation error returned by [`parse_elf64_with_base`].
 pub fn parse_elf64(bytes: &[u8]) -> Result<ParsedElf64, SysError> {
     parse_elf64_with_base(bytes, 0)
 }
 
 /// Validate and parse an `ET_EXEC` or PIE `ET_DYN` ELF64 binary with an optional ASLR `pie_base`
 /// slide applied to `ET_DYN` virtual addresses and `R_AARCH64_RELATIVE` relocations.
+///
+/// # Errors
+/// - [`SysError::InvalidArgument`] if the header, program headers, segment bounds, W^X flags, or `DT_RELA` table are malformed.
+/// - [`SysError::Unsupported`] if the image is not 64-bit little-endian `AArch64` `ET_EXEC`/`ET_DYN`.
+/// - [`SysError::OutOfMemory`] if the image exceeds [`MAX_LOAD_SEGMENTS`].
 pub fn parse_elf64_with_base(bytes: &[u8], pie_base: u64) -> Result<ParsedElf64, SysError> {
     if bytes.len() < 64 || bytes[0..4] != ELF_MAGIC {
         return Err(SysError::InvalidArgument);
@@ -204,7 +362,7 @@ pub fn parse_elf64_with_base(bytes: &[u8], pie_base: u64) -> Result<ParsedElf64,
             if d_end > bytes.len() {
                 return Err(SysError::InvalidArgument);
             }
-            dyn_range = Some((d_off, d_sz));
+            dyn_range = Some((d_off, d_end));
             continue;
         }
         if p_type != PT_LOAD {
@@ -213,45 +371,7 @@ pub fn parse_elf64_with_base(bytes: &[u8], pie_base: u64) -> Result<ParsedElf64,
         if segment_count >= MAX_LOAD_SEGMENTS {
             return Err(SysError::OutOfMemory);
         }
-
-        let p_flags = read_u32_le(bytes, off + 4)?;
-        let p_offset =
-            usize::try_from(read_u64_le(bytes, off + 8)?).map_err(|_| SysError::InvalidArgument)?;
-        let p_vaddr = read_u64_le(bytes, off + 16)?
-            .checked_add(load_base)
-            .ok_or(SysError::InvalidArgument)?;
-        let p_filesz = usize::try_from(read_u64_le(bytes, off + 32)?)
-            .map_err(|_| SysError::InvalidArgument)?;
-        let p_memsz = read_u64_le(bytes, off + 40)?;
-
-        if p_memsz < p_filesz as u64 {
-            return Err(SysError::InvalidArgument);
-        }
-        let end_file = p_offset
-            .checked_add(p_filesz)
-            .ok_or(SysError::InvalidArgument)?;
-        if end_file > bytes.len() {
-            return Err(SysError::InvalidArgument);
-        }
-        let end_vaddr = p_vaddr
-            .checked_add(p_memsz)
-            .ok_or(SysError::InvalidArgument)?;
-        if end_vaddr >= 0x0000_8000_0000_0000 {
-            return Err(SysError::InvalidArgument);
-        }
-
-        // Strict W^X enforced for EL0 segments
-        let writable = (p_flags & PF_W) != 0;
-        let executable = (p_flags & PF_X) != 0;
-        let flags = PageFlags::new_wx(writable, executable, true, false)?;
-
-        segments[segment_count] = Some(LoadSegment {
-            vaddr: p_vaddr,
-            mem_size: p_memsz,
-            file_offset: p_offset,
-            file_size: p_filesz,
-            flags,
-        });
+        segments[segment_count] = Some(parse_load_segment(bytes, off, load_base)?);
         segment_count += 1;
     }
 
@@ -259,64 +379,12 @@ pub fn parse_elf64_with_base(bytes: &[u8], pie_base: u64) -> Result<ParsedElf64,
         return Err(SysError::InvalidArgument);
     }
 
-    let mut rela_table = None;
-    let mut reloc_count = 0usize;
-    if let Some((d_off, d_sz)) = dyn_range {
-        let mut rela_vaddr: Option<u64> = None;
-        let mut rela_sz: u64 = 0;
-        let mut rela_ent: u64 = 24;
-        let mut cur = d_off;
-        while cur + 16 <= d_off + d_sz {
-            let tag = read_u64_le(bytes, cur)?;
-            let val = read_u64_le(bytes, cur + 8)?;
-            cur += 16;
-            match tag {
-                DT_NULL => break,
-                DT_RELA => rela_vaddr = Some(val),
-                DT_RELASZ => rela_sz = val,
-                DT_RELAENT => rela_ent = val,
-                _ => {}
-            }
+    let (rela_table, reloc_count) = match dyn_range {
+        Some((d_off, d_end)) => {
+            parse_rela_table(bytes, d_off, d_end, load_base, &segments[..segment_count])?
         }
-        if let Some(rv) = rela_vaddr
-            && rela_sz > 0
-        {
-            if rela_ent < 24 {
-                return Err(SysError::InvalidArgument);
-            }
-            let target_va = rv.checked_add(load_base).ok_or(SysError::InvalidArgument)?;
-            // Translate `DT_RELA` vaddr into file offset via parsed `PT_LOAD` segments.
-            let mut rela_file_off = None;
-            for seg in segments[..segment_count].iter().flatten() {
-                let seg_file_end = seg.vaddr.saturating_add(seg.file_size as u64);
-                if target_va >= seg.vaddr && target_va < seg_file_end {
-                    let delta = (target_va - seg.vaddr) as usize;
-                    rela_file_off = seg.file_offset.checked_add(delta);
-                    break;
-                }
-            }
-            let start = rela_file_off.ok_or(SysError::InvalidArgument)?;
-            let total = usize::try_from(rela_sz).map_err(|_| SysError::InvalidArgument)?;
-            let ent = usize::try_from(rela_ent).map_err(|_| SysError::InvalidArgument)?;
-            let end = start.checked_add(total).ok_or(SysError::InvalidArgument)?;
-            if end > bytes.len() {
-                return Err(SysError::InvalidArgument);
-            }
-            let mut off = start;
-            while let Some(next_off) = off.checked_add(ent) {
-                if next_off > end {
-                    break;
-                }
-                let r_info =
-                    read_u64_le(bytes, off.checked_add(8).ok_or(SysError::InvalidArgument)?)?;
-                if (r_info as u32) == R_AARCH64_RELATIVE {
-                    reloc_count += 1;
-                }
-                off = next_off;
-            }
-            rela_table = Some((start, end, ent));
-        }
-    }
+        None => (None, 0),
+    };
 
     Ok(ParsedElf64 {
         entry,
@@ -460,7 +528,7 @@ mod tests {
 
         // Single R_AARCH64_RELATIVE entry at offset 320: offset=0x180, info=1027, addend=0x200
         img[320..328].copy_from_slice(&0x180u64.to_le_bytes());
-        img[328..336].copy_from_slice(&u64::from(R_AARCH64_RELATIVE).to_le_bytes());
+        img[328..336].copy_from_slice(&R_AARCH64_RELATIVE.to_le_bytes());
         img[336..344].copy_from_slice(&0x200i64.to_le_bytes());
 
         let parsed = parse_elf64_with_base(&img, 0x0080_0000).unwrap();

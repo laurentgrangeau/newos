@@ -5,7 +5,10 @@ use std::process::{Command, ExitStatus};
 use std::sync::OnceLock;
 
 use newos_abi::{CapId, ShutdownStatus, SysError};
-use newos_shell_core::shell::{RecordStream, ShellHost, SysInfo};
+use newos_shell_core::shell::{OutputMode, RecordStream, ShellHost, SysInfo};
+
+/// Function pointer type for mocked synchronous IPC calls.
+pub type IpcCallFn = fn(CapId, u64) -> Result<(u64, u64), SysError>;
 
 // ============================================================================
 // Sentinel types for `catch_unwind` around `Shell::run_interactive` (-> !)
@@ -21,6 +24,7 @@ pub struct YieldLimitExceeded(pub usize);
 // MockShellHost & DefaultIpcFallbackHost
 // ============================================================================
 
+#[derive(Debug)]
 pub struct MockShellHost {
     pub output: String,
     pub write_debug_calls: usize,
@@ -35,11 +39,10 @@ pub struct MockShellHost {
     pub fault_triggers: usize,
     pub net_calls: usize,
     pub read_queue: VecDeque<Result<u8, SysError>>,
-    pub ipc_call_fn: Option<fn(CapId, u64) -> Result<(u64, u64), SysError>>,
+    pub ipc_call_fn: Option<IpcCallFn>,
     pub ipc_send_res: Result<(), SysError>,
     pub ipc_recv_res: Result<(u64, u64), SysError>,
     pub max_yields_before_panic: Option<usize>,
-    pub exit_via_sentinel: bool,
     pub cycle_counter: u64,
 }
 
@@ -73,7 +76,6 @@ impl MockShellHost {
             ipc_send_res: Ok(()),
             ipc_recv_res: Ok((0xCAFE, 0x1234)),
             max_yields_before_panic: None,
-            exit_via_sentinel: true,
             cycle_counter: 1000,
         }
     }
@@ -125,19 +127,16 @@ impl ShellHost for MockShellHost {
 
     fn ipc_call(&mut self, cap: CapId, payload: u64) -> Result<(u64, u64), SysError> {
         self.ipc_call_calls += 1;
-        if let Some(f) = self.ipc_call_fn {
-            f(cap, payload)
-        } else {
-            Err(SysError::Unsupported)
-        }
+        self.ipc_call_fn
+            .map_or(Err(SysError::Unsupported), |f| f(cap, payload))
     }
 
     fn yield_now(&mut self) -> Result<u64, SysError> {
         self.yield_calls += 1;
-        if let Some(limit) = self.max_yields_before_panic {
-            if self.yield_calls > limit {
-                std::panic::panic_any(YieldLimitExceeded(self.yield_calls));
-            }
+        if let Some(limit) = self.max_yields_before_panic
+            && self.yield_calls > limit
+        {
+            std::panic::panic_any(YieldLimitExceeded(self.yield_calls));
         }
         Ok(self.yield_calls as u64)
     }
@@ -152,10 +151,7 @@ impl ShellHost for MockShellHost {
     }
 
     fn exit(&mut self, code: ShutdownStatus) -> ! {
-        if self.exit_via_sentinel {
-            std::panic::panic_any(ExitSentinel(code));
-        }
-        panic!("MockShellHost::exit({code:?})");
+        std::panic::panic_any(ExitSentinel(code));
     }
 
     fn handle_net(
@@ -163,7 +159,7 @@ impl ShellHost for MockShellHost {
         _subcmd: &str,
         _arg: Option<&str>,
         _stream: &mut RecordStream,
-        _silent: bool,
+        _mode: OutputMode,
     ) {
         self.net_calls += 1;
     }
@@ -171,6 +167,7 @@ impl ShellHost for MockShellHost {
 
 /// Host that intentionally relies on the default `ShellHost::ipc_call` fallback
 /// (`ipc_send` -> `yield_now` -> `ipc_recv`).
+#[derive(Debug, Default)]
 pub struct DefaultIpcFallbackHost {
     pub output: String,
     pub ipc_send_calls: usize,
@@ -181,13 +178,7 @@ pub struct DefaultIpcFallbackHost {
 
 impl DefaultIpcFallbackHost {
     pub fn new() -> Self {
-        Self {
-            output: String::new(),
-            ipc_send_calls: 0,
-            ipc_recv_calls: 0,
-            yield_calls: 0,
-            last_payload: 0,
-        }
+        Self::default()
     }
 }
 
@@ -231,6 +222,7 @@ pub const PF_X: u32 = 1 << 0;
 pub const PF_W: u32 = 1 << 1;
 pub const PF_R: u32 = 1 << 2;
 
+#[derive(Debug, Clone)]
 pub struct ElfSegSpec {
     pub p_type: u32,
     pub p_flags: u32,
@@ -242,7 +234,7 @@ pub struct ElfSegSpec {
 pub fn build_elf64(entry: u64, phentsize: u16, segs: &[ElfSegSpec]) -> Vec<u8> {
     let ehdr_size = 64usize;
     let phoff = ehdr_size as u64;
-    let stride = phentsize as usize;
+    let stride = usize::from(phentsize);
     let ph_table_size = stride * segs.len();
     let mut data_offset = ehdr_size + ph_table_size;
 
@@ -268,7 +260,8 @@ pub fn build_elf64(entry: u64, phentsize: u16, segs: &[ElfSegSpec]) -> Vec<u8> {
     // e_ehsize = 64, e_phentsize, e_phnum
     buf[52..54].copy_from_slice(&64u16.to_le_bytes());
     buf[54..56].copy_from_slice(&phentsize.to_le_bytes());
-    buf[56..58].copy_from_slice(&(segs.len() as u16).to_le_bytes());
+    let phnum = u16::try_from(segs.len()).expect("segment count fits in u16");
+    buf[56..58].copy_from_slice(&phnum.to_le_bytes());
 
     for (i, seg) in segs.iter().enumerate() {
         let off = ehdr_size + i * stride;
@@ -296,6 +289,7 @@ pub fn build_elf64(entry: u64, phentsize: u16, segs: &[ElfSegSpec]) -> Vec<u8> {
 // Deterministic Zero-Dependency Xorshift64 PRNG
 // ============================================================================
 
+#[derive(Debug, Clone)]
 pub struct Xorshift64 {
     state: u64,
 }
@@ -324,7 +318,8 @@ impl Xorshift64 {
         if bound == 0 {
             return 0;
         }
-        (self.next_u64() as usize) % bound
+        let bound_u64 = u64::try_from(bound).expect("bound fits in u64");
+        usize::try_from(self.next_u64() % bound_u64).expect("remainder < bound fits in usize")
     }
 
     pub fn fill_bytes(&mut self, dst: &mut [u8]) {
@@ -352,6 +347,7 @@ pub struct Tok {
     pub line: usize,
 }
 
+#[derive(Debug, Clone)]
 pub struct ScannedFile {
     pub lines: Vec<String>,
     pub tokens: Vec<Tok>,
@@ -372,31 +368,51 @@ pub fn find_repo_root() -> PathBuf {
 
 pub fn collect_rs_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    collect_rs_files_rec(dir, &mut out);
+    let mut worklist = vec![dir.to_path_buf()];
+    while let Some(current) = worklist.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                worklist.push(p);
+            } else if p.extension().and_then(std::ffi::OsStr::to_str) == Some("rs") {
+                out.push(p);
+            }
+        }
+    }
     out.sort();
     out
 }
 
-fn collect_rs_files_rec(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            collect_rs_files_rec(&p, out);
-        } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
-            out.push(p);
-        }
-    }
-}
-
-fn is_ident_start(b: u8) -> bool {
+const fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_'
 }
 
-fn is_ident_continue(b: u8) -> bool {
+const fn is_ident_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn skip_block_comment(bytes: &[u8], start: usize, line: &mut usize) -> usize {
+    let len = bytes.len();
+    let mut depth = 1usize;
+    let mut i = start + 2;
+    while i < len && depth > 0 {
+        if bytes[i] == b'\n' {
+            *line += 1;
+            i += 1;
+        } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            depth += 1;
+            i += 2;
+        } else if bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
+            depth -= 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    i
 }
 
 /// Scans a Rust source file into lexical tokens while skipping line comments,
@@ -436,22 +452,7 @@ pub fn scan_rust_source(path: &Path) -> ScannedFile {
 
         // Nested block comment: /* ... */
         if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
-            let mut depth = 1usize;
-            i += 2;
-            while i < len && depth > 0 {
-                if bytes[i] == b'\n' {
-                    line += 1;
-                    i += 1;
-                } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
-                    depth += 1;
-                    i += 2;
-                } else if bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
+            i = skip_block_comment(bytes, i, &mut line);
             continue;
         }
 
@@ -468,11 +469,13 @@ pub fn scan_rust_source(path: &Path) -> ScannedFile {
         }
 
         // Byte char literal: b'...'
-        if b == b'b' && i + 1 < len && bytes[i + 1] == b'\'' {
-            if let Some(next_i) = try_skip_char_literal(bytes, i + 1) {
-                i = next_i;
-                continue;
-            }
+        if b == b'b'
+            && i + 1 < len
+            && bytes[i + 1] == b'\''
+            && let Some(next_i) = try_skip_char_literal(bytes, i + 1)
+        {
+            i = next_i;
+            continue;
         }
 
         // Normal string literal: "..."
@@ -522,7 +525,9 @@ pub fn scan_rust_source(path: &Path) -> ScannedFile {
         }
 
         // Single punctuation char (ASCII) or UTF-8 char
-        let ch = src[i..].chars().next().unwrap();
+        let Some(ch) = src[i..].chars().next() else {
+            break;
+        };
         tokens.push(Tok {
             kind: TokKind::Punct,
             text: ch.to_string(),
@@ -708,8 +713,8 @@ pub fn strip_cfg_test(tokens: &[Tok]) -> Vec<Tok> {
 /// Returns 1-based line numbers of all `unsafe` items/blocks/attributes in `tokens`.
 pub fn find_unsafe_sites(tokens: &[Tok]) -> Vec<usize> {
     let mut sites = Vec::new();
-    for i in 0..tokens.len() {
-        if tokens[i].kind != TokKind::Ident || tokens[i].text != "unsafe" {
+    for (i, tok) in tokens.iter().enumerate() {
+        if tok.kind != TokKind::Ident || tok.text != "unsafe" {
             continue;
         }
         let is_kw_unsafe = tokens.get(i + 1).is_some_and(|next| {
@@ -721,7 +726,7 @@ pub fn find_unsafe_sites(tokens: &[Tok]) -> Vec<usize> {
             && tokens.get(i + 1).is_some_and(|next| next.text == "(");
 
         if is_kw_unsafe || is_attr_unsafe {
-            sites.push(tokens[i].line);
+            sites.push(tok.line);
         }
     }
     sites
@@ -745,19 +750,7 @@ fn inline_comment_has_safety(line: &str) -> bool {
         // Block comment (supports nesting)
         if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
             let start = i;
-            let mut depth = 1usize;
-            i += 2;
-            while i < len && depth > 0 {
-                if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
-                    depth += 1;
-                    i += 2;
-                } else if bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
+            i = skip_block_comment(bytes, i, &mut dummy_line);
             if line[start..i].contains("SAFETY:") {
                 return true;
             }
@@ -774,11 +767,13 @@ fn inline_comment_has_safety(line: &str) -> bool {
             continue;
         }
         // Byte char literal
-        if b == b'b' && i + 1 < len && bytes[i + 1] == b'\'' {
-            if let Some(next_i) = try_skip_char_literal(bytes, i + 1) {
-                i = next_i;
-                continue;
-            }
+        if b == b'b'
+            && i + 1 < len
+            && bytes[i + 1] == b'\''
+            && let Some(next_i) = try_skip_char_literal(bytes, i + 1)
+        {
+            i = next_i;
+            continue;
         }
         // Normal string literal
         if b == b'"' {
@@ -786,11 +781,11 @@ fn inline_comment_has_safety(line: &str) -> bool {
             continue;
         }
         // Char literal
-        if b == b'\'' {
-            if let Some(next_i) = try_skip_char_literal(bytes, i) {
-                i = next_i;
-                continue;
-            }
+        if b == b'\''
+            && let Some(next_i) = try_skip_char_literal(bytes, i)
+        {
+            i = next_i;
+            continue;
         }
         i += 1;
     }
@@ -812,19 +807,7 @@ fn count_brackets_in_line(line: &str) -> (usize, usize) {
             break;
         }
         if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
-            let mut depth = 1usize;
-            i += 2;
-            while i < len && depth > 0 {
-                if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
-                    depth += 1;
-                    i += 2;
-                } else if bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
+            i = skip_block_comment(bytes, i, &mut dummy_line);
             continue;
         }
         if let Some(after_raw) = try_skip_raw_string(bytes, i, &mut dummy_line) {
@@ -835,21 +818,23 @@ fn count_brackets_in_line(line: &str) -> (usize, usize) {
             i = skip_quoted_string(bytes, i + 1, &mut dummy_line);
             continue;
         }
-        if b == b'b' && i + 1 < len && bytes[i + 1] == b'\'' {
-            if let Some(next_i) = try_skip_char_literal(bytes, i + 1) {
-                i = next_i;
-                continue;
-            }
+        if b == b'b'
+            && i + 1 < len
+            && bytes[i + 1] == b'\''
+            && let Some(next_i) = try_skip_char_literal(bytes, i + 1)
+        {
+            i = next_i;
+            continue;
         }
         if b == b'"' {
             i = skip_quoted_string(bytes, i, &mut dummy_line);
             continue;
         }
-        if b == b'\'' {
-            if let Some(next_i) = try_skip_char_literal(bytes, i) {
-                i = next_i;
-                continue;
-            }
+        if b == b'\''
+            && let Some(next_i) = try_skip_char_literal(bytes, i)
+        {
+            i = next_i;
+            continue;
         }
         if b == b'[' {
             open += 1;
@@ -861,15 +846,18 @@ fn count_brackets_in_line(line: &str) -> (usize, usize) {
     (open, close)
 }
 
-/// Checks whether 1-based `line_num` has an inline `SAFETY:` comment or a
-/// contiguous preceding comment/attribute prelude containing `SAFETY:`.
+/// Checks whether 1-based `line_num` has an inline `SAFETY:` comment, a
+/// contiguous preceding comment/attribute prelude containing `SAFETY:`, or
+/// (for `unsafe fn` declarations) a canonical Rust `/// # Safety` doc section.
 pub fn has_safety_comment(lines: &[String], line_num: usize) -> bool {
     if line_num == 0 || line_num > lines.len() {
         return false;
     }
-    if inline_comment_has_safety(&lines[line_num - 1]) {
+    let site_line = &lines[line_num - 1];
+    if inline_comment_has_safety(site_line) {
         return true;
     }
+    let is_unsafe_fn = site_line.contains("unsafe fn");
 
     let mut idx = line_num - 1;
     let mut in_block_comment = false;
@@ -923,7 +911,9 @@ pub fn has_safety_comment(lines: &[String], line_num: usize) -> bool {
         }
 
         if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
-            if trimmed.contains("SAFETY:") {
+            if trimmed.contains("SAFETY:")
+                || (is_unsafe_fn && trimmed.starts_with("///") && trimmed.contains("# Safety"))
+            {
                 return true;
             }
             continue;
@@ -1011,6 +1001,7 @@ pub fn crate_forbids_unsafe_code(repo_root: &Path, crate_dir: &Path, root_src: &
 // OnceLock-Cached Offline `newos_bench` Builder & Runner
 // ============================================================================
 
+#[derive(Debug)]
 pub struct BenchRun {
     pub status: ExitStatus,
     pub stdout: String,
@@ -1019,133 +1010,144 @@ pub struct BenchRun {
 
 static BENCH_BIN: OnceLock<PathBuf> = OnceLock::new();
 
-fn build_newos_bench_once() -> &'static PathBuf {
-    BENCH_BIN.get_or_init(|| {
-        let root = find_repo_root();
-        let out_dir =
-            std::env::temp_dir().join(format!("newos_e2e_bench_bin_{}", std::process::id()));
-        fs::create_dir_all(&out_dir).expect("create temp dir for newos_bench");
+fn run_bench_rustc(root: &Path, name: &str, extra_args: &[&str]) {
+    let out = Command::new("rustc")
+        .current_dir(root)
+        .args([
+            "--edition",
+            "2024",
+            "-C",
+            "opt-level=3",
+            "--crate-name",
+            name,
+        ])
+        .args(extra_args)
+        .output()
+        .expect("spawn rustc");
+    assert!(
+        out.status.success(),
+        "rustc failed ({name}, {extra_args:?}):\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
 
-        let crypto_rlib = out_dir.join("libnewos_crypto.rlib");
-        let abi_rlib = out_dir.join("libnewos_abi.rlib");
-        let kc_rlib = out_dir.join("libnewos_kernel_core.rlib");
-        let sc_rlib = out_dir.join("libnewos_shell_core.rlib");
-        let bench_bin = out_dir.join("newos_bench");
-        let dep_flag = format!("dependency={}", out_dir.display());
+fn build_bench_deps(root: &Path, out_dir: &Path, dep_flag: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let crypto_rlib = out_dir.join("libnewos_crypto.rlib");
+    let abi_rlib = out_dir.join("libnewos_abi.rlib");
+    let kc_rlib = out_dir.join("libnewos_kernel_core.rlib");
+    let sc_rlib = out_dir.join("libnewos_shell_core.rlib");
 
-        let run_rustc = |args: &[String]| {
-            let out = Command::new("rustc")
-                .current_dir(&root)
-                .args(args)
-                .output()
-                .expect("spawn rustc");
-            assert!(
-                out.status.success(),
-                "rustc failed ({:?}):\nstdout:\n{}\nstderr:\n{}",
-                args,
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr),
-            );
-        };
+    let ext_crypto = format!("newos_crypto={}", crypto_rlib.display());
+    let ext_abi = format!("newos_abi={}", abi_rlib.display());
+    let crypto_out = crypto_rlib.display().to_string();
+    let abi_out = abi_rlib.display().to_string();
+    let kernel_core_out = kc_rlib.display().to_string();
+    let shell_core_out = sc_rlib.display().to_string();
 
-        run_rustc(&[
-            "--edition".into(),
-            "2024".into(),
-            "-C".into(),
-            "opt-level=3".into(),
-            "--crate-name".into(),
-            "newos_crypto".into(),
-            "--crate-type".into(),
-            "lib".into(),
-            "--cfg".into(),
-            "feature=\"sha3\"".into(),
-            "crates/crypto/src/lib.rs".into(),
-            "-o".into(),
-            crypto_rlib.display().to_string(),
-        ]);
-
-        run_rustc(&[
-            "--edition".into(),
-            "2024".into(),
-            "-C".into(),
-            "opt-level=3".into(),
-            "--crate-name".into(),
-            "newos_abi".into(),
-            "--crate-type".into(),
-            "lib".into(),
-            "--cfg".into(),
-            "feature=\"sha3\"".into(),
-            "-L".into(),
-            dep_flag.clone(),
-            "--extern".into(),
-            format!("newos_crypto={}", crypto_rlib.display()),
-            "crates/abi/src/lib.rs".into(),
-            "-o".into(),
-            abi_rlib.display().to_string(),
-        ]);
-
-        run_rustc(&[
-            "--edition".into(),
-            "2024".into(),
-            "-C".into(),
-            "opt-level=3".into(),
-            "--cfg".into(),
-            "feature=\"smp\"".into(),
-            "--cfg".into(),
-            "feature=\"sched-priority-rr\"".into(),
-            "-L".into(),
-            dep_flag.clone(),
-            "--crate-name".into(),
-            "newos_kernel_core".into(),
-            "--crate-type".into(),
-            "lib".into(),
-            "crates/kernel-core/src/lib.rs".into(),
-            "--extern".into(),
-            format!("newos_abi={}", abi_rlib.display()),
-            "-o".into(),
-            kc_rlib.display().to_string(),
-        ]);
-
-        run_rustc(&[
-            "--edition".into(),
-            "2024".into(),
-            "-C".into(),
-            "opt-level=3".into(),
-            "--crate-name".into(),
-            "newos_shell_core".into(),
-            "--crate-type".into(),
-            "lib".into(),
-            "-L".into(),
-            dep_flag.clone(),
-            "crates/shell-core/src/lib.rs".into(),
-            "--extern".into(),
-            format!("newos_abi={}", abi_rlib.display()),
-            "-o".into(),
-            sc_rlib.display().to_string(),
-        ]);
-
-        run_rustc(&[
-            "--edition".into(),
-            "2024".into(),
-            "-C".into(),
-            "opt-level=3".into(),
-            "--crate-name".into(),
-            "newos_bench".into(),
-            "-L".into(),
+    run_bench_rustc(
+        root,
+        "newos_crypto",
+        &[
+            "--crate-type",
+            "lib",
+            "--cfg",
+            "feature=\"sha3\"",
+            "crates/crypto/src/lib.rs",
+            "-o",
+            &crypto_out,
+        ],
+    );
+    run_bench_rustc(
+        root,
+        "newos_abi",
+        &[
+            "--crate-type",
+            "lib",
+            "--cfg",
+            "feature=\"sha3\"",
+            "-L",
             dep_flag,
-            "crates/bench/src/main.rs".into(),
-            "--extern".into(),
-            format!("newos_abi={}", abi_rlib.display()),
-            "--extern".into(),
-            format!("newos_kernel_core={}", kc_rlib.display()),
-            "--extern".into(),
-            format!("newos_shell_core={}", sc_rlib.display()),
-            "-o".into(),
-            bench_bin.display().to_string(),
-        ]);
+            "--extern",
+            &ext_crypto,
+            "crates/abi/src/lib.rs",
+            "-o",
+            &abi_out,
+        ],
+    );
+    run_bench_rustc(
+        root,
+        "newos_kernel_core",
+        &[
+            "--crate-type",
+            "lib",
+            "--cfg",
+            "feature=\"smp\"",
+            "--cfg",
+            "feature=\"sched-priority-rr\"",
+            "-L",
+            dep_flag,
+            "--extern",
+            &ext_abi,
+            "crates/kernel-core/src/lib.rs",
+            "-o",
+            &kernel_core_out,
+        ],
+    );
+    run_bench_rustc(
+        root,
+        "newos_shell_core",
+        &[
+            "--crate-type",
+            "lib",
+            "-L",
+            dep_flag,
+            "--extern",
+            &ext_abi,
+            "crates/shell-core/src/lib.rs",
+            "-o",
+            &shell_core_out,
+        ],
+    );
+    (abi_rlib, kc_rlib, sc_rlib)
+}
 
-        bench_bin
-    })
+fn build_newos_bench_once() -> &'static Path {
+    BENCH_BIN
+        .get_or_init(|| {
+            let root = find_repo_root();
+            let out_dir = root.join("target/newos_e2e_bench_bin");
+            fs::create_dir_all(&out_dir).expect("create build dir for newos_bench");
+            let dep_flag = format!("dependency={}", out_dir.display());
+            let (abi_rlib, kc_rlib, sc_rlib) = build_bench_deps(&root, &out_dir, &dep_flag);
+
+            let bench_bin = out_dir.join("newos_bench");
+            let ext_abi = format!("newos_abi={}", abi_rlib.display());
+            let ext_kernel_core = format!("newos_kernel_core={}", kc_rlib.display());
+            let ext_shell_core = format!("newos_shell_core={}", sc_rlib.display());
+            let bin_out = bench_bin.display().to_string();
+
+            run_bench_rustc(
+                &root,
+                "newos_bench",
+                &[
+                    "-L",
+                    &dep_flag,
+                    "crates/bench/src/main.rs",
+                    "--extern",
+                    &ext_abi,
+                    "--extern",
+                    &ext_kernel_core,
+                    "--extern",
+                    &ext_shell_core,
+                    "-o",
+                    &bin_out,
+                ],
+            );
+
+            bench_bin
+        })
+        .as_path()
 }
 
 pub fn run_newos_bench(args: &[&str]) -> BenchRun {
@@ -1165,11 +1167,10 @@ pub fn parse_metric_lines(stdout: &str) -> Vec<(String, String, String)> {
     let mut metrics = Vec::new();
     for line in stdout.lines() {
         let mut parts = line.split_whitespace();
-        if parts.next() == Some("METRIC") {
-            if let (Some(name), Some(val), Some(unit)) = (parts.next(), parts.next(), parts.next())
-            {
-                metrics.push((name.to_string(), val.to_string(), unit.to_string()));
-            }
+        if parts.next() == Some("METRIC")
+            && let (Some(name), Some(val), Some(unit)) = (parts.next(), parts.next(), parts.next())
+        {
+            metrics.push((name.to_string(), val.to_string(), unit.to_string()));
         }
     }
     metrics

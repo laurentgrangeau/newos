@@ -17,16 +17,20 @@ const MAX_NANOS: u32 = 999_999_999;
 ///
 /// Returns `(0, 0)` safely if `freq_hz == 0`. Never overflows for any `u64` inputs.
 #[inline]
+#[must_use]
 pub fn ticks_to_secs_nanos(elapsed_ticks: u64, freq_hz: u64) -> (u64, u32) {
     if freq_hz == 0 {
         return (0, 0);
     }
     let secs = elapsed_ticks / freq_hz;
     let rem = elapsed_ticks % freq_hz;
-    let nanos = match rem.checked_mul(NANOS_PER_SEC) {
-        Some(scaled) => (scaled / freq_hz) as u32,
-        None => ((u128::from(rem) * u128::from(NANOS_PER_SEC)) / u128::from(freq_hz)) as u32,
-    };
+    let nanos = rem.checked_mul(NANOS_PER_SEC).map_or_else(
+        || {
+            u32::try_from((u128::from(rem) * u128::from(NANOS_PER_SEC)) / u128::from(freq_hz))
+                .unwrap_or(MAX_NANOS)
+        },
+        |scaled| u32::try_from(scaled / freq_hz).unwrap_or(MAX_NANOS),
+    );
     (secs, nanos.min(MAX_NANOS))
 }
 
@@ -35,6 +39,7 @@ pub fn ticks_to_secs_nanos(elapsed_ticks: u64, freq_hz: u64) -> (u64, u32) {
 ///
 /// Seconds are right-aligned to at least 5 characters and expand automatically for
 /// uptimes `>= 100_000` seconds. Nanoseconds are always zero-padded to 9 digits.
+#[must_use]
 pub fn format_prefix(secs: u64, nanos: u32, buf: &mut [u8; MAX_PREFIX_LEN]) -> &str {
     let nanos = nanos.min(MAX_NANOS);
 
@@ -84,6 +89,16 @@ pub fn format_prefix(secs: u64, nanos: u32, buf: &mut [u8; MAX_PREFIX_LEN]) -> &
     core::str::from_utf8(&buf[..pos]).unwrap_or("")
 }
 
+/// Cursor position relative to the start of a serial log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LinePosition {
+    /// At column 0 of a line; the next printable byte should be preceded by a timestamp.
+    #[default]
+    LineStart,
+    /// Inside an already-started line; do not emit another timestamp until the next line.
+    MidLine,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscState {
     Normal,
@@ -95,7 +110,7 @@ enum EscState {
 /// without corrupting blank lines or ANSI CSI terminal control sequences (`\x1b[2J`, `\x1b[H`, `\r\x1b[K`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineTimestampState {
-    at_line_start: bool,
+    position: LinePosition,
     esc: EscState,
 }
 
@@ -108,21 +123,30 @@ impl Default for LineTimestampState {
 
 impl LineTimestampState {
     #[inline]
+    #[must_use]
     pub const fn new() -> Self {
-        Self::with_at_line_start(true)
+        Self::with_position(LinePosition::LineStart)
     }
 
     #[inline]
-    pub const fn with_at_line_start(at_line_start: bool) -> Self {
+    #[must_use]
+    pub const fn with_position(position: LinePosition) -> Self {
         Self {
-            at_line_start,
+            position,
             esc: EscState::Normal,
         }
     }
 
     #[inline]
+    #[must_use]
+    pub const fn position(&self) -> LinePosition {
+        self.position
+    }
+
+    #[inline]
+    #[must_use]
     pub const fn at_line_start(&self) -> bool {
-        self.at_line_start
+        matches!(self.position, LinePosition::LineStart)
     }
 
     /// Advance the state machine by one outgoing byte.
@@ -130,6 +154,7 @@ impl LineTimestampState {
     /// Returns `true` if a `[SSSSS.NNNNNNNNN] ` timestamp prefix should be emitted
     /// immediately before `byte`.
     #[inline]
+    #[must_use]
     pub fn on_byte(&mut self, byte: u8) -> bool {
         match self.esc {
             EscState::Esc => {
@@ -144,19 +169,19 @@ impl LineTimestampState {
                 if (0x40..=0x7E).contains(&byte) {
                     self.esc = EscState::Normal;
                     if byte == b'K' || byte == b'H' {
-                        self.at_line_start = true;
+                        self.position = LinePosition::LineStart;
                     }
                 } else if !(0x20..=0x3F).contains(&byte) {
                     self.esc = EscState::Normal;
                     if byte == b'\n' {
-                        self.at_line_start = true;
+                        self.position = LinePosition::LineStart;
                     }
                 }
                 false
             }
             EscState::Normal => match byte {
                 b'\n' => {
-                    self.at_line_start = true;
+                    self.position = LinePosition::LineStart;
                     false
                 }
                 b'\r' => false,
@@ -165,8 +190,8 @@ impl LineTimestampState {
                     false
                 }
                 _ => {
-                    if self.at_line_start {
-                        self.at_line_start = false;
+                    if matches!(self.position, LinePosition::LineStart) {
+                        self.position = LinePosition::MidLine;
                         true
                     } else {
                         false
@@ -268,5 +293,53 @@ mod tests {
             assert!(!st.on_byte(*b));
         }
         assert!(st.on_byte(b'n'));
+    }
+
+    #[test]
+    fn format_prefix_u64_max_fits_in_max_prefix_len() {
+        let mut buf = [0u8; MAX_PREFIX_LEN];
+        let rendered = format_prefix(u64::MAX, MAX_NANOS, &mut buf);
+        assert_eq!(rendered, "[18446744073709551615.999999999] ");
+        assert!(rendered.len() <= MAX_PREFIX_LEN);
+    }
+
+    #[test]
+    fn line_timestamp_state_position_constructors_and_escape_edge_cases() {
+        assert_eq!(LinePosition::default(), LinePosition::LineStart);
+
+        let def = LineTimestampState::default();
+        assert_eq!(def.position(), LinePosition::LineStart);
+        assert!(def.at_line_start());
+
+        let mut mid = LineTimestampState::with_position(LinePosition::MidLine);
+        assert_eq!(mid.position(), LinePosition::MidLine);
+        assert!(!mid.at_line_start());
+        assert!(!mid.on_byte(b'x'));
+
+        // Mid-line ANSI color sequence preserves MidLine.
+        for b in b"\x1b[32m" {
+            assert!(!mid.on_byte(*b));
+        }
+        assert_eq!(mid.position(), LinePosition::MidLine);
+        assert!(!mid.on_byte(b'y'));
+
+        // Non-CSI escape sequence (`\x1bX`) returns to Normal without resetting line start.
+        assert!(!mid.on_byte(0x1B));
+        assert!(!mid.on_byte(b'X'));
+        assert_eq!(mid.position(), LinePosition::MidLine);
+
+        // Malformed CSI interrupted by `\n` resets to LineStart.
+        assert!(!mid.on_byte(0x1B));
+        assert!(!mid.on_byte(b'['));
+        assert!(!mid.on_byte(b'3'));
+        assert!(!mid.on_byte(b'\n'));
+        assert_eq!(mid.position(), LinePosition::LineStart);
+        assert!(mid.at_line_start());
+        assert!(mid.on_byte(b'z'));
+        assert_eq!(mid.position(), LinePosition::MidLine);
+
+        let start = LineTimestampState::with_position(LinePosition::LineStart);
+        assert_eq!(start.position(), LinePosition::LineStart);
+        assert!(start.at_line_start());
     }
 }

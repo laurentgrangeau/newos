@@ -1,7 +1,7 @@
 //! Phase 7: Deterministic Host Chaos Testing & All-Domain Self-Healing Suite.
 //!
 //! Uses a seeded deterministic PRNG (`ChaosRng`) to inject faults, kills, cascading
-//! multi-domain crashes, in-flight IPC peer deaths, SpscRing peer resets, and crash-loop
+//! multi-domain crashes, in-flight IPC peer deaths, `SpscRing` peer resets, and crash-loop
 //! storms across all 6 `DomainRoleId`s (`Supervisor`, `Shell`, `Worker`, `Net`, `Key`, `Ssh`),
 //! asserting zero frame leaks, zero orphaned capabilities, zero deadlocks, and full service recovery.
 
@@ -21,7 +21,7 @@ const ALL_ROLES: [DomainRoleId; 6] = [
     DomainRoleId::Ssh,
 ];
 
-/// Deterministic SplitMix64 PRNG so every chaos failure is 100% reproducible from its seed.
+/// Deterministic `SplitMix64` PRNG so every chaos failure is 100% reproducible from its seed.
 struct ChaosRng(u64);
 impl ChaosRng {
     fn next_u64(&mut self) -> u64 {
@@ -32,7 +32,8 @@ impl ChaosRng {
         z ^ (z >> 31)
     }
     fn next_usize(&mut self, bound: usize) -> usize {
-        (self.next_u64() as usize) % bound
+        let bound_u64 = u64::try_from(bound).expect("bound fits u64");
+        usize::try_from(self.next_u64() % bound_u64).expect("remainder fits usize")
     }
 }
 
@@ -100,10 +101,9 @@ fn chaos_randomized_all_domain_fault_destroy_respawn_zero_leak_150_rounds() {
             frames[pd].push(f);
         }
         // Grant fresh endpoint cap to respawned PD
+        let ep_id = u32::try_from(pd + 1).expect("pd index fits u32");
         let _ = ipc.cspace_mut(pd).unwrap().insert_root(Capability::new(
-            CapObject::Endpoint {
-                id: (pd + 1) as u32,
-            },
+            CapObject::Endpoint { id: ep_id },
             Rights::READ.union(Rights::WRITE),
         ));
     };
@@ -130,7 +130,7 @@ fn chaos_randomized_all_domain_fault_destroy_respawn_zero_leak_150_rounds() {
         for &pd in &killed {
             ipc.clear_buffered_calls_from(pd);
             let _ = ipc.clear_domain_cspace(pd, |_, _| {});
-            for frame in pd_frames[pd].drain(..) {
+            for frame in core::mem::take(&mut pd_frames[pd]) {
                 assert!(
                     inv.reclaim_frame(frame),
                     "seed={SEED:#x} round={round} pd={pd} frame reclaim failed"
@@ -277,8 +277,8 @@ fn chaos_crash_loop_quarantine_and_exponential_backoff_protects_healthy_domains(
 fn chaos_scheduler_survives_mass_exit_and_re_spawn_cycles() {
     let mut sched: Scheduler<16> = Scheduler::new();
     for _cycle in 0..20usize {
-        for i in 0..4usize {
-            let _tid = sched.spawn(100 + i as u8).expect("spawn");
+        for i in 0..4u8 {
+            let _tid = sched.spawn(100 + i).expect("spawn");
         }
         // Exit and reclaim all 4 slots in reverse order
         for slot in (0..4usize).rev() {

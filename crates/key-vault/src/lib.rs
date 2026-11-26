@@ -4,7 +4,7 @@
 //!
 //! Designed for `newos-key-pd` (PD 3):
 //! - Ephemeral **ML-DSA-87** host keypair generated at boot from health-checked HW TRNG +
-//!   fast-key-erasure ChaCha20 CSPRNG (`newos-rng`). The private key never leaves this vault.
+//!   fast-key-erasure `ChaCha20` CSPRNG (`newos-rng`). The private key never leaves this vault.
 //! - **Hedged** FIPS 204 signing with 32 bytes of fresh CSPRNG randomness per signature
 //!   (fault-injection resistant on Raspberry Pi 5).
 //! - Strict FIPS 204 context domain separation:
@@ -28,6 +28,13 @@ pub const CTX_KEX: &[u8] = b"newos-ssh-kex-v1";
 /// FIPS 204 context string for client public-key userauth signatures.
 pub const CTX_USERAUTH: &[u8] = b"newos-ssh-userauth-v1";
 
+const CTX_KEX_LEN: u8 = 16;
+const _: () = assert!(CTX_KEX.len() == CTX_KEX_LEN as usize);
+#[cfg(test)]
+const CTX_USERAUTH_LEN: u8 = 21;
+#[cfg(test)]
+const _: () = assert!(CTX_USERAUTH.len() == CTX_USERAUTH_LEN as usize);
+
 /// Minimum milliseconds between host KEX signing operations (anti-oracle / anti-DoS).
 pub const SIGN_RATE_LIMIT_MS: i64 = 1_000;
 
@@ -46,14 +53,59 @@ pub enum VaultError {
     InvalidSignature,
 }
 
+impl From<RngError> for VaultError {
+    fn from(err: RngError) -> Self {
+        Self::Rng(err)
+    }
+}
+
+impl core::fmt::Display for VaultError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Rng(err) => write!(f, "vault RNG error: {err}"),
+            Self::RateLimited => f.write_str("vault KEX signing rate limited"),
+            Self::RandomBudgetExceeded => f.write_str("vault per-window random budget exceeded"),
+            Self::NoPendingSession => f.write_str("vault has no pending session"),
+            Self::SessionIdMismatch => f.write_str("vault session ID mismatch or replay"),
+            Self::UnauthorizedKey => f.write_str("vault client public key not authorized"),
+            Self::InvalidSignature => f.write_str("vault invalid ML-DSA-87 signature"),
+        }
+    }
+}
+
+impl core::error::Error for VaultError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Rng(err) => Some(err),
+            Self::RateLimited
+            | Self::RandomBudgetExceeded
+            | Self::NoPendingSession
+            | Self::SessionIdMismatch
+            | Self::UnauthorizedKey
+            | Self::InvalidSignature => None,
+        }
+    }
+}
+
+/// Active single-use pending KEX session awaiting user authentication.
+struct PendingSession {
+    session_id: [u8; 64],
+    auth_attempts: u8,
+}
+
+impl Drop for PendingSession {
+    fn drop(&mut self) {
+        self.session_id.zeroize();
+    }
+}
+
 /// Cryptographic vault owning the ML-DSA-87 host key and CSPRNG.
 pub struct KeyVault<E: EntropySource> {
     csprng: ConditionedCsprng<E>,
     host_sk: SigningKey<MlDsa87>,
     host_pk: [u8; key_ipc::MLDSA87_PK_BYTES],
     authorized_keys: &'static [[u8; key_ipc::MLDSA87_PK_BYTES]],
-    pending_session_id: Option<[u8; 64]>,
-    pending_auth_attempts: u8,
+    pending_session: Option<PendingSession>,
     seen_session_hashes: [[u8; 64]; 64],
     seen_session_count: usize,
     seen_session_cursor: usize,
@@ -63,6 +115,21 @@ pub struct KeyVault<E: EntropySource> {
     last_sign_ms: Option<i64>,
     sign_tokens: u32,
     random_bytes_in_window: usize,
+}
+
+impl<E: EntropySource> core::fmt::Debug for KeyVault<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("KeyVault")
+            .field("csprng", &"<redacted>")
+            .field("host_sk", &"<redacted>")
+            .field("host_pk_len", &self.host_pk.len())
+            .field("authorized_keys_count", &self.authorized_keys.len())
+            .field("has_pending_session", &self.pending_session.is_some())
+            .field("seen_session_count", &self.seen_session_count)
+            .field("sign_tokens", &self.sign_tokens)
+            .field("random_bytes_in_window", &self.random_bytes_in_window)
+            .finish_non_exhaustive()
+    }
 }
 
 #[inline]
@@ -85,10 +152,7 @@ const MAX_AUTH_ATTEMPTS_PER_SESSION: u8 = 3;
 
 impl<E: EntropySource> Drop for KeyVault<E> {
     fn drop(&mut self) {
-        if let Some(ref mut sid) = self.pending_session_id {
-            sid.zeroize();
-        }
-        self.pending_session_id = None;
+        self.pending_session = None;
         for h in &mut self.seen_session_hashes {
             h.zeroize();
         }
@@ -99,6 +163,10 @@ impl<E: EntropySource> Drop for KeyVault<E> {
 impl<E: EntropySource> KeyVault<E> {
     /// Initialize the vault from a hardware [`EntropySource`], fail-closed if NIST SP 800-90B
     /// health checks fail, and generate an ephemeral ML-DSA-87 host keypair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::Rng`] if the entropy source fails health checks or seeding.
     pub fn new(
         source: E,
         personalization: &[u8],
@@ -109,40 +177,41 @@ impl<E: EntropySource> KeyVault<E> {
 
     /// Initialize the vault with an optional provisioned 32-byte host-key seed (persistent host key
     /// across reboots) or ephemeral TRNG generation when `host_seed` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::Rng`] if the entropy source fails health checks or seed generation.
     pub fn new_with_optional_host_seed(
         source: E,
         personalization: &[u8],
         authorized_keys: &'static [[u8; key_ipc::MLDSA87_PK_BYTES]],
         host_seed: Option<[u8; 32]>,
     ) -> Result<Self, VaultError> {
-        let mut csprng =
-            ConditionedCsprng::new(source, personalization).map_err(VaultError::Rng)?;
-        let mut seed_bytes = match host_seed {
-            Some(s) => s,
-            None => {
-                let mut s = [0u8; 32];
-                csprng.fill_bytes(&mut s).map_err(VaultError::Rng)?;
-                s
-            }
+        let mut csprng = ConditionedCsprng::new(source, personalization)?;
+        let mut seed_bytes = if let Some(s) = host_seed {
+            s
+        } else {
+            let mut s = [0u8; 32];
+            csprng.fill_bytes(&mut s)?;
+            s
         };
         let mut seed = B32::default();
         seed.copy_from_slice(&seed_bytes);
         seed_bytes.zeroize();
 
-        let host_sk = SigningKey::<MlDsa87>::from_seed(&seed);
+        let signing_key = SigningKey::<MlDsa87>::from_seed(&seed);
         seed.zeroize();
 
-        let encoded_pk = host_sk.verifying_key().encode();
+        let encoded_pk = signing_key.verifying_key().encode();
         let mut host_pk = [0u8; key_ipc::MLDSA87_PK_BYTES];
         host_pk.copy_from_slice(encoded_pk.as_slice());
 
         Ok(Self {
             csprng,
-            host_sk,
+            host_sk: signing_key,
             host_pk,
             authorized_keys,
-            pending_session_id: None,
-            pending_auth_attempts: 0,
+            pending_session: None,
             seen_session_hashes: [[0u8; 64]; 64],
             seen_session_count: 0,
             seen_session_cursor: 0,
@@ -154,23 +223,30 @@ impl<E: EntropySource> KeyVault<E> {
     }
 
     /// Return the 2592-byte ML-DSA-87 host public key.
+    #[must_use]
     #[inline]
-    pub fn host_public_key(&self) -> &[u8; key_ipc::MLDSA87_PK_BYTES] {
+    pub const fn host_public_key(&self) -> &[u8; key_ipc::MLDSA87_PK_BYTES] {
         &self.host_pk
     }
 
     /// Compute the 64-byte FIPS 202 `SHA3-512` fingerprint of the ephemeral host public key.
-    pub fn host_fingerprint_sha3_512(&self) -> [u8; 64] {
+    #[must_use]
+    pub const fn host_fingerprint_sha3_512(&self) -> [u8; 64] {
         sha3_512(&self.host_pk)
     }
 
     /// Issue 4 fresh bytes of fast-key-erasure CSPRNG randomness for tagged IPC transport (`N1`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::RandomBudgetExceeded`] if the per-window budget is exhausted, or
+    /// [`VaultError::Rng`] if the underlying CSPRNG fails.
     pub fn get_random_u32(&mut self) -> Result<u32, VaultError> {
         if self.random_bytes_in_window.saturating_add(4) > key_ipc::MAX_RANDOM_BYTES_PER_WINDOW {
             return Err(VaultError::RandomBudgetExceeded);
         }
         let mut buf = [0u8; 4];
-        self.csprng.fill_bytes(&mut buf).map_err(VaultError::Rng)?;
+        self.csprng.fill_bytes(&mut buf)?;
         self.random_bytes_in_window += 4;
         let out = u32::from_le_bytes(buf);
         buf.zeroize();
@@ -178,12 +254,17 @@ impl<E: EntropySource> KeyVault<E> {
     }
 
     /// Issue 8 fresh bytes of fast-key-erasure CSPRNG randomness.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::RandomBudgetExceeded`] if the per-window budget is exhausted, or
+    /// [`VaultError::Rng`] if the underlying CSPRNG fails.
     pub fn get_random_u64(&mut self) -> Result<u64, VaultError> {
         if self.random_bytes_in_window.saturating_add(8) > key_ipc::MAX_RANDOM_BYTES_PER_WINDOW {
             return Err(VaultError::RandomBudgetExceeded);
         }
         let mut buf = [0u8; 8];
-        self.csprng.fill_bytes(&mut buf).map_err(VaultError::Rng)?;
+        self.csprng.fill_bytes(&mut buf)?;
         self.random_bytes_in_window += 8;
         let out = u64::from_le_bytes(buf);
         buf.zeroize();
@@ -193,8 +274,14 @@ impl<E: EntropySource> KeyVault<E> {
     /// Produce a **hedged** FIPS 204 ML-DSA-87 signature over the 64-byte `SHA3-512` exchange hash
     /// `hash64` using domain context [`CTX_KEX`], rate-limited via `now_ms`.
     ///
-    /// Rejects previously seen exchange hashes (`N6`) and records `pending_session_id = Some(*hash64)`
-    /// for single-use userauth replay binding.
+    /// Rejects previously seen exchange hashes (`N6`) and records a single-use pending session
+    /// bound to `*hash64` for userauth replay protection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::RateLimited`] if the token bucket is empty,
+    /// [`VaultError::SessionIdMismatch`] if `hash64` was already signed, or
+    /// [`VaultError::Rng`] if hedged signing randomness generation fails.
     pub fn sign_kex_hash(
         &mut self,
         hash64: &[u8; 64],
@@ -202,10 +289,12 @@ impl<E: EntropySource> KeyVault<E> {
     ) -> Result<[u8; key_ipc::MLDSA87_SIG_BYTES], VaultError> {
         if let Some(prev_ms) = self.last_sign_ms {
             let elapsed = now_ms.saturating_sub(prev_ms);
-            let refilled = (elapsed / SIGN_TOKEN_REFILL_MS) as u32;
-            if refilled > 0 {
-                self.sign_tokens =
-                    (self.sign_tokens.saturating_add(refilled)).min(SIGN_BUCKET_CAPACITY);
+            if elapsed >= SIGN_TOKEN_REFILL_MS {
+                let refilled = u32::try_from(elapsed / SIGN_TOKEN_REFILL_MS).unwrap_or(u32::MAX);
+                self.sign_tokens = self
+                    .sign_tokens
+                    .saturating_add(refilled)
+                    .min(SIGN_BUCKET_CAPACITY);
                 self.last_sign_ms = Some(now_ms);
             }
         } else {
@@ -231,15 +320,13 @@ impl<E: EntropySource> KeyVault<E> {
         }
 
         let mut rnd_bytes = [0u8; 32];
-        self.csprng
-            .fill_bytes(&mut rnd_bytes)
-            .map_err(VaultError::Rng)?;
+        self.csprng.fill_bytes(&mut rnd_bytes)?;
         let mut rnd = B32::default();
         rnd.copy_from_slice(&rnd_bytes);
         rnd_bytes.zeroize();
 
         // FIPS 204 Algorithm 2 M' domain prefix: [0x00, ctx.len()] || ctx || message
-        let prefix = [0u8, CTX_KEX.len() as u8];
+        let prefix = [0u8, CTX_KEX_LEN];
         let sig = self
             .host_sk
             .expanded_key()
@@ -250,8 +337,10 @@ impl<E: EntropySource> KeyVault<E> {
         let mut out = [0u8; key_ipc::MLDSA87_SIG_BYTES];
         out.copy_from_slice(encoded.as_slice());
 
-        self.pending_session_id = Some(*hash64);
-        self.pending_auth_attempts = 0;
+        self.pending_session = Some(PendingSession {
+            session_id: *hash64,
+            auth_attempts: 0,
+        });
         self.seen_session_hashes[self.seen_session_cursor] = *hash64;
         self.seen_session_cursor = (self.seen_session_cursor + 1) % self.seen_session_hashes.len();
         if self.seen_session_count < self.seen_session_hashes.len() {
@@ -264,41 +353,22 @@ impl<E: EntropySource> KeyVault<E> {
         Ok(out)
     }
 
-    /// Verify a client ML-DSA-87 userauth signature against `authorized_keys` under [`CTX_USERAUTH`].
-    ///
-    /// Permits up to `MAX_AUTH_ATTEMPTS_PER_SESSION` (3) attempts per handshake; immediately consumes
-    /// `pending_session_id` on success or upon reaching the attempt limit.
-    pub fn verify_user_auth(
-        &mut self,
+    fn verify_user_auth_inner(
+        &self,
+        expected_sid: &[u8; 64],
         client_pk: &[u8; key_ipc::MLDSA87_PK_BYTES],
         signed_data: &[u8],
         sig_bytes: &[u8; key_ipc::MLDSA87_SIG_BYTES],
     ) -> Result<(), VaultError> {
-        let Some(expected_sid) = self.pending_session_id else {
-            return Err(VaultError::NoPendingSession);
-        };
-        self.pending_auth_attempts = self.pending_auth_attempts.saturating_add(1);
-        let consume_now = self.pending_auth_attempts >= MAX_AUTH_ATTEMPTS_PER_SESSION;
-
         if signed_data.len() < 68 || signed_data[0..4] != [0, 0, 0, 64] {
-            if consume_now {
-                self.close_session();
-            }
             return Err(VaultError::SessionIdMismatch);
         }
-        let sid_match = bool::from(signed_data[4..68].ct_eq(&expected_sid));
-        if !sid_match {
-            if consume_now {
-                self.close_session();
-            }
+        if !bool::from(signed_data[4..68].ct_eq(expected_sid)) {
             return Err(VaultError::SessionIdMismatch);
         }
 
         // 2. Fail-closed constant-time authorized_keys lookup.
         if self.authorized_keys.is_empty() {
-            if consume_now {
-                self.close_session();
-            }
             return Err(VaultError::UnauthorizedKey);
         }
         let mut authorized = subtle::Choice::from(0u8);
@@ -306,9 +376,6 @@ impl<E: EntropySource> KeyVault<E> {
             authorized |= client_pk.ct_eq(allowed);
         }
         if !bool::from(authorized) {
-            if consume_now {
-                self.close_session();
-            }
             return Err(VaultError::UnauthorizedKey);
         }
 
@@ -319,31 +386,52 @@ impl<E: EntropySource> KeyVault<E> {
 
         let mut sig_arr = EncodedSignature::<MlDsa87>::default();
         sig_arr.copy_from_slice(sig_bytes);
-        let Some(sig) = Signature::<MlDsa87>::decode(&sig_arr) else {
-            if consume_now {
-                self.close_session();
-            }
-            return Err(VaultError::InvalidSignature);
-        };
+        let sig = Signature::<MlDsa87>::decode(&sig_arr).ok_or(VaultError::InvalidSignature)?;
 
         if !vk.verify_with_context(signed_data, CTX_USERAUTH, &sig) {
-            if consume_now {
-                self.close_session();
-            }
             return Err(VaultError::InvalidSignature);
         }
-        // Single-use: consume `pending_session_id` immediately upon successful authentication.
-        self.close_session();
         Ok(())
+    }
+
+    /// Verify a client ML-DSA-87 userauth signature against `authorized_keys` under [`CTX_USERAUTH`].
+    ///
+    /// Permits up to `MAX_AUTH_ATTEMPTS_PER_SESSION` (3) attempts per handshake; immediately consumes
+    /// the pending session on success or upon reaching the attempt limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::NoPendingSession`] if no KEX session is pending,
+    /// [`VaultError::SessionIdMismatch`] if `signed_data` does not bind the pending session ID,
+    /// [`VaultError::UnauthorizedKey`] if `client_pk` is not in `authorized_keys`, or
+    /// [`VaultError::InvalidSignature`] if ML-DSA-87 verification fails.
+    pub fn verify_user_auth(
+        &mut self,
+        client_pk: &[u8; key_ipc::MLDSA87_PK_BYTES],
+        signed_data: &[u8],
+        sig_bytes: &[u8; key_ipc::MLDSA87_SIG_BYTES],
+    ) -> Result<(), VaultError> {
+        let (expected_sid, consume_now) = {
+            let Some(session) = self.pending_session.as_mut() else {
+                return Err(VaultError::NoPendingSession);
+            };
+            session.auth_attempts = session.auth_attempts.saturating_add(1);
+            (
+                session.session_id,
+                session.auth_attempts >= MAX_AUTH_ATTEMPTS_PER_SESSION,
+            )
+        };
+
+        let result = self.verify_user_auth_inner(&expected_sid, client_pk, signed_data, sig_bytes);
+        if result.is_ok() || consume_now {
+            self.close_session();
+        }
+        result
     }
 
     /// Clear pending session state and reset per-KEX random budget on disconnect.
     pub fn close_session(&mut self) {
-        if let Some(ref mut sid) = self.pending_session_id {
-            sid.zeroize();
-        }
-        self.pending_session_id = None;
-        self.pending_auth_attempts = 0;
+        self.pending_session = None;
         self.random_bytes_in_window = 0;
     }
 }
@@ -353,8 +441,7 @@ pub struct KeyVaultServer<E: EntropySource> {
     vault: KeyVault<E>,
     kex_hash_buf: [u8; 64],
     kex_hash_len: usize,
-    sig_cache: [u8; key_ipc::MLDSA87_SIG_BYTES],
-    sig_ready: bool,
+    sig_cache: Option<[u8; key_ipc::MLDSA87_SIG_BYTES]>,
     auth_pk_buf: [u8; key_ipc::MLDSA87_PK_BYTES],
     auth_pk_len: usize,
     auth_msg_buf: [u8; MAX_USERAUTH_MSG_BYTES],
@@ -363,14 +450,35 @@ pub struct KeyVaultServer<E: EntropySource> {
     auth_sig_len: usize,
 }
 
+impl<E: EntropySource> core::fmt::Debug for KeyVaultServer<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("KeyVaultServer")
+            .field("vault", &self.vault)
+            .field("kex_hash_len", &self.kex_hash_len)
+            .field("sig_ready", &self.sig_cache.is_some())
+            .field("auth_pk_len", &self.auth_pk_len)
+            .field("auth_msg_len", &self.auth_msg_len)
+            .field("auth_sig_len", &self.auth_sig_len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<E: EntropySource> Drop for KeyVaultServer<E> {
+    fn drop(&mut self) {
+        self.kex_hash_buf.zeroize();
+        self.clear_sig_cache();
+        self.reset_auth_buffers();
+    }
+}
+
 impl<E: EntropySource> KeyVaultServer<E> {
-    pub fn new(vault: KeyVault<E>) -> Self {
+    #[must_use]
+    pub const fn new(vault: KeyVault<E>) -> Self {
         Self {
             vault,
             kex_hash_buf: [0u8; 64],
             kex_hash_len: 0,
-            sig_cache: [0u8; key_ipc::MLDSA87_SIG_BYTES],
-            sig_ready: false,
+            sig_cache: None,
             auth_pk_buf: [0u8; key_ipc::MLDSA87_PK_BYTES],
             auth_pk_len: 0,
             auth_msg_buf: [0u8; MAX_USERAUTH_MSG_BYTES],
@@ -380,8 +488,16 @@ impl<E: EntropySource> KeyVaultServer<E> {
         }
     }
 
-    pub fn vault(&self) -> &KeyVault<E> {
+    #[must_use]
+    pub const fn vault(&self) -> &KeyVault<E> {
         &self.vault
+    }
+
+    fn clear_sig_cache(&mut self) {
+        if let Some(ref mut sig) = self.sig_cache {
+            sig.zeroize();
+        }
+        self.sig_cache = None;
     }
 
     fn reset_auth_buffers(&mut self) {
@@ -391,6 +507,21 @@ impl<E: EntropySource> KeyVaultServer<E> {
         self.auth_msg_len = 0;
         self.auth_sig_buf.zeroize();
         self.auth_sig_len = 0;
+    }
+
+    fn push_chunk(
+        buf: &mut [u8],
+        cur_len: &mut usize,
+        chunk: &[u8],
+        len: usize,
+    ) -> (u64, Option<u64>) {
+        if cur_len.saturating_add(len) <= buf.len() {
+            buf[*cur_len..*cur_len + len].copy_from_slice(&chunk[..len]);
+            *cur_len += len;
+            (key_ipc::REPLY_OK, None)
+        } else {
+            (key_ipc::REPLY_DENIED, None)
+        }
     }
 
     /// Process a single 64-bit IPC request from `BOOTSTRAP_KEY_EP`.
@@ -405,43 +536,19 @@ impl<E: EntropySource> KeyVaultServer<E> {
 
         // Chunked push opcodes first
         if let Some((chunk, len)) = key_ipc::decode_chunk_req(req, key_ipc::OP_SIGN_KEX_PUSH_BASE) {
-            if self.kex_hash_len + len <= self.kex_hash_buf.len() {
-                self.kex_hash_buf[self.kex_hash_len..self.kex_hash_len + len]
-                    .copy_from_slice(&chunk[..len]);
-                self.kex_hash_len += len;
-                return (key_ipc::REPLY_OK, None);
-            }
-            return (key_ipc::REPLY_DENIED, None);
+            return Self::push_chunk(&mut self.kex_hash_buf, &mut self.kex_hash_len, &chunk, len);
         }
         if let Some((chunk, len)) = key_ipc::decode_chunk_req(req, key_ipc::OP_VERIFY_PUSH_PK_BASE)
         {
-            if self.auth_pk_len + len <= self.auth_pk_buf.len() {
-                self.auth_pk_buf[self.auth_pk_len..self.auth_pk_len + len]
-                    .copy_from_slice(&chunk[..len]);
-                self.auth_pk_len += len;
-                return (key_ipc::REPLY_OK, None);
-            }
-            return (key_ipc::REPLY_DENIED, None);
+            return Self::push_chunk(&mut self.auth_pk_buf, &mut self.auth_pk_len, &chunk, len);
         }
         if let Some((chunk, len)) = key_ipc::decode_chunk_req(req, key_ipc::OP_VERIFY_PUSH_MSG_BASE)
         {
-            if self.auth_msg_len + len <= self.auth_msg_buf.len() {
-                self.auth_msg_buf[self.auth_msg_len..self.auth_msg_len + len]
-                    .copy_from_slice(&chunk[..len]);
-                self.auth_msg_len += len;
-                return (key_ipc::REPLY_OK, None);
-            }
-            return (key_ipc::REPLY_DENIED, None);
+            return Self::push_chunk(&mut self.auth_msg_buf, &mut self.auth_msg_len, &chunk, len);
         }
         if let Some((chunk, len)) = key_ipc::decode_chunk_req(req, key_ipc::OP_VERIFY_PUSH_SIG_BASE)
         {
-            if self.auth_sig_len + len <= self.auth_sig_buf.len() {
-                self.auth_sig_buf[self.auth_sig_len..self.auth_sig_len + len]
-                    .copy_from_slice(&chunk[..len]);
-                self.auth_sig_len += len;
-                return (key_ipc::REPLY_OK, None);
-            }
-            return (key_ipc::REPLY_DENIED, None);
+            return Self::push_chunk(&mut self.auth_sig_buf, &mut self.auth_sig_len, &chunk, len);
         }
 
         let op = (req >> 56) as u8;
@@ -459,14 +566,16 @@ impl<E: EntropySource> KeyVaultServer<E> {
                 word[..take].copy_from_slice(&pk[byte_off..byte_off + take]);
                 (u64::from_le_bytes(word), None)
             }
-            key_ipc::OP_GET_RANDOM_U64 => match self.vault.get_random_u32() {
-                Ok(val) => (key_ipc::encode_random_u32_reply(val), None),
-                Err(_) => (key_ipc::REPLY_DENIED, None),
-            },
+            key_ipc::OP_GET_RANDOM_U64 => self
+                .vault
+                .get_random_u32()
+                .map_or((key_ipc::REPLY_DENIED, None), |val| {
+                    (key_ipc::encode_random_u32_reply(val), None)
+                }),
             key_ipc::OP_SIGN_KEX_RESET => {
                 self.kex_hash_buf.zeroize();
                 self.kex_hash_len = 0;
-                self.sig_ready = false;
+                self.clear_sig_cache();
                 (key_ipc::REPLY_OK, None)
             }
             key_ipc::OP_SIGN_KEX_COMMIT => {
@@ -475,8 +584,7 @@ impl<E: EntropySource> KeyVaultServer<E> {
                 }
                 match self.vault.sign_kex_hash(&self.kex_hash_buf, now_ms) {
                     Ok(sig) => {
-                        self.sig_cache = sig;
-                        self.sig_ready = true;
+                        self.sig_cache = Some(sig);
                         (key_ipc::REPLY_OK, None)
                     }
                     Err(VaultError::RateLimited) => (key_ipc::REPLY_RATE_LIMITED, None),
@@ -484,16 +592,16 @@ impl<E: EntropySource> KeyVaultServer<E> {
                 }
             }
             key_ipc::OP_SIGN_KEX_READ_WORD => {
-                if !self.sig_ready {
+                let Some(ref sig_cache) = self.sig_cache else {
                     return (0, None);
-                }
+                };
                 let byte_off = idx.saturating_mul(8);
-                if byte_off >= self.sig_cache.len() {
+                if byte_off >= sig_cache.len() {
                     return (0, None);
                 }
                 let mut word = [0u8; 8];
-                let take = (self.sig_cache.len() - byte_off).min(8);
-                word[..take].copy_from_slice(&self.sig_cache[byte_off..byte_off + take]);
+                let take = (sig_cache.len() - byte_off).min(8);
+                word[..take].copy_from_slice(&sig_cache[byte_off..byte_off + take]);
                 (u64::from_le_bytes(word), None)
             }
             key_ipc::OP_VERIFY_RESET => {
@@ -520,8 +628,7 @@ impl<E: EntropySource> KeyVaultServer<E> {
             }
             key_ipc::OP_CLOSE_SESSION => {
                 self.vault.close_session();
-                self.sig_cache.zeroize();
-                self.sig_ready = false;
+                self.clear_sig_cache();
                 self.reset_auth_buffers();
                 (key_ipc::REPLY_OK, Some(auth_gate_ipc::SESSION_CLOSE))
             }
@@ -531,13 +638,14 @@ impl<E: EntropySource> KeyVaultServer<E> {
 }
 
 /// Encode a 64-byte `SHA3-512` host fingerprint as unpadded standard Base64 (`86` ASCII bytes).
-pub fn encode_base64_64(digest: &[u8; 64]) -> [u8; 86] {
+#[must_use]
+pub const fn encode_base64_64(digest: &[u8; 64]) -> [u8; 86] {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = [0u8; 86];
     let mut i = 0usize;
     let mut o = 0usize;
     while i + 3 <= 64 {
-        let n = ((digest[i] as u32) << 16) | ((digest[i + 1] as u32) << 8) | (digest[i + 2] as u32);
+        let n = u32::from_be_bytes([0, digest[i], digest[i + 1], digest[i + 2]]);
         out[o] = TABLE[((n >> 18) & 63) as usize];
         out[o + 1] = TABLE[((n >> 12) & 63) as usize];
         out[o + 2] = TABLE[((n >> 6) & 63) as usize];
@@ -546,7 +654,7 @@ pub fn encode_base64_64(digest: &[u8; 64]) -> [u8; 86] {
         o += 4;
     }
     // 64 % 3 == 1 remaining byte -> 2 base64 chars (21 * 4 + 2 = 86)
-    let rem = (digest[63] as u32) << 16;
+    let rem = u32::from_be_bytes([0, digest[63], 0, 0]);
     out[84] = TABLE[((rem >> 18) & 63) as usize];
     out[85] = TABLE[((rem >> 12) & 63) as usize];
     out
@@ -566,7 +674,7 @@ mod tests {
                 let mut z = self.0;
                 z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
                 z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-                *b = (z ^ (z >> 31)) as u8;
+                *b = (z ^ (z >> 31)).to_le_bytes()[0];
             }
             Ok(())
         }
@@ -625,9 +733,9 @@ mod tests {
 
         // M12: Even after 80 more distinct handshakes (exceeding the 64-entry exact ring buffer),
         // replaying the original `hash64` MUST still be rejected by the unflushable Bloom filter.
-        for i in 10u64..90 {
+        for i in 10i64..90 {
             let h = sha3_512(&i.to_le_bytes());
-            assert!(vault.sign_kex_hash(&h, 3_000 + (i as i64) * 500).is_ok());
+            assert!(vault.sign_kex_hash(&h, 3_000 + i * 500).is_ok());
         }
         assert_eq!(
             vault.sign_kex_hash(&hash64, 100_000).err(),
@@ -637,13 +745,7 @@ mod tests {
 
     #[test]
     fn userauth_verifies_authorized_key_and_rejects_replay() {
-        static AUTH_KEYS: [[u8; key_ipc::MLDSA87_PK_BYTES]; 1] = {
-            // Runtime-populated via Box::leak in test below; this test uses a leaked slice.
-            [[0u8; key_ipc::MLDSA87_PK_BYTES]; 1]
-        };
-        let _ = AUTH_KEYS;
-
-        let (client_sk, client_pk) = make_client_keypair(0x5A);
+        let (client_signing_key, client_pk) = make_client_keypair(0x5A);
         let allowed_static: &'static [[u8; key_ipc::MLDSA87_PK_BYTES]] =
             std::boxed::Box::leak(std::boxed::Box::new([client_pk]));
 
@@ -656,7 +758,7 @@ mod tests {
 
         // 1. Host signs KEX hash -> sets single-use pending_session_id
         let sid = sha3_512(b"session-1");
-        let _ = vault.sign_kex_hash(&sid, 1_000).unwrap();
+        let _ = vault.sign_kex_hash(&sid, 1_000).expect("sign kex");
 
         // 2. Client signs `string(sid) || "userauth-payload"` under CTX_USERAUTH
         let mut signed_data = [0u8; 80];
@@ -664,10 +766,10 @@ mod tests {
         signed_data[4..68].copy_from_slice(&sid);
         signed_data[68..80].copy_from_slice(b"newos-user!!");
 
-        let prefix = [0u8, CTX_USERAUTH.len() as u8];
+        let prefix = [0u8, CTX_USERAUTH_LEN];
         let mut rnd = B32::default();
         rnd.as_mut_slice().fill(0x77);
-        let sig = client_sk
+        let sig = client_signing_key
             .expanded_key()
             .sign_internal(&[&prefix, CTX_USERAUTH, &signed_data], &rnd);
         let mut sig_bytes = [0u8; key_ipc::MLDSA87_SIG_BYTES];
@@ -699,17 +801,32 @@ mod tests {
         );
     }
 
+    fn push_ipc_chunks<E: EntropySource>(
+        srv: &mut KeyVaultServer<E>,
+        op_base: u8,
+        data: &[u8],
+        now_ms: i64,
+    ) {
+        for chunk in data.chunks(key_ipc::MAX_CHUNK_BYTES) {
+            let req = key_ipc::encode_chunk_req(op_base, chunk);
+            assert_eq!(
+                srv.handle_ipc_word(key_ipc::BADGE_SSH, req, now_ms),
+                (key_ipc::REPLY_OK, None)
+            );
+        }
+    }
+
     #[test]
     fn key_vault_server_enforces_ssh_pd_badge_and_emits_auth_gate() {
-        let (client_sk, client_pk) = make_client_keypair(0x99);
+        let (client_signing_key, client_pk) = make_client_keypair(0x99);
         let allowed_static: &'static [[u8; key_ipc::MLDSA87_PK_BYTES]] =
             std::boxed::Box::leak(std::boxed::Box::new([client_pk]));
-        let vault =
-            KeyVault::new(DeterministicTestEntropy(0x4444), b"ipc-srv", allowed_static).unwrap();
+        let vault = KeyVault::new(DeterministicTestEntropy(0x4444), b"ipc-srv", allowed_static)
+            .expect("vault init");
         let mut srv = KeyVaultServer::new(vault);
 
         // Wrong badge (e.g., `net-pd` role badge or legacy raw PD 4) is rejected
-        for wrong_badge in [newos_abi::role_badge::ROLE_NET as u64, 4] {
+        for wrong_badge in [u64::from(newos_abi::role_badge::ROLE_NET), 4] {
             assert_eq!(
                 srv.handle_ipc_word(
                     wrong_badge,
@@ -730,13 +847,7 @@ mod tests {
             ),
             (key_ipc::REPLY_OK, None)
         );
-        for chunk in sid.chunks(key_ipc::MAX_CHUNK_BYTES) {
-            let req = key_ipc::encode_chunk_req(key_ipc::OP_SIGN_KEX_PUSH_BASE, chunk);
-            assert_eq!(
-                srv.handle_ipc_word(key_ipc::BADGE_SSH, req, 1_000),
-                (key_ipc::REPLY_OK, None)
-            );
-        }
+        push_ipc_chunks(&mut srv, key_ipc::OP_SIGN_KEX_PUSH_BASE, &sid, 1_000);
         assert_eq!(
             srv.handle_ipc_word(
                 key_ipc::BADGE_SSH,
@@ -751,8 +862,8 @@ mod tests {
         signed_data[0..4].copy_from_slice(&64u32.to_be_bytes());
         signed_data[4..68].copy_from_slice(&sid);
         signed_data[68..72].copy_from_slice(b"auth");
-        let prefix = [0u8, CTX_USERAUTH.len() as u8];
-        let sig = client_sk
+        let prefix = [0u8, CTX_USERAUTH_LEN];
+        let sig = client_signing_key
             .expanded_key()
             .sign_internal(&[&prefix, CTX_USERAUTH, &signed_data], &B32::default());
         let mut sig_bytes = [0u8; key_ipc::MLDSA87_SIG_BYTES];
@@ -763,39 +874,19 @@ mod tests {
             key_ipc::encode_word_req(key_ipc::OP_VERIFY_RESET, 0),
             1_000,
         );
-        for c in client_pk.chunks(key_ipc::MAX_CHUNK_BYTES) {
-            assert_eq!(
-                srv.handle_ipc_word(
-                    key_ipc::BADGE_SSH,
-                    key_ipc::encode_chunk_req(key_ipc::OP_VERIFY_PUSH_PK_BASE, c),
-                    1_000
-                )
-                .0,
-                key_ipc::REPLY_OK
-            );
-        }
-        for c in signed_data.chunks(key_ipc::MAX_CHUNK_BYTES) {
-            assert_eq!(
-                srv.handle_ipc_word(
-                    key_ipc::BADGE_SSH,
-                    key_ipc::encode_chunk_req(key_ipc::OP_VERIFY_PUSH_MSG_BASE, c),
-                    1_000
-                )
-                .0,
-                key_ipc::REPLY_OK
-            );
-        }
-        for c in sig_bytes.chunks(key_ipc::MAX_CHUNK_BYTES) {
-            assert_eq!(
-                srv.handle_ipc_word(
-                    key_ipc::BADGE_SSH,
-                    key_ipc::encode_chunk_req(key_ipc::OP_VERIFY_PUSH_SIG_BASE, c),
-                    1_000
-                )
-                .0,
-                key_ipc::REPLY_OK
-            );
-        }
+        push_ipc_chunks(&mut srv, key_ipc::OP_VERIFY_PUSH_PK_BASE, &client_pk, 1_000);
+        push_ipc_chunks(
+            &mut srv,
+            key_ipc::OP_VERIFY_PUSH_MSG_BASE,
+            &signed_data,
+            1_000,
+        );
+        push_ipc_chunks(
+            &mut srv,
+            key_ipc::OP_VERIFY_PUSH_SIG_BASE,
+            &sig_bytes,
+            1_000,
+        );
         assert_eq!(
             srv.handle_ipc_word(
                 key_ipc::BADGE_SSH,
@@ -842,8 +933,8 @@ mod tests {
 
     #[test]
     fn userauth_rejects_unauthorized_key_short_data_wrong_sid_and_locks_after_3_attempts() {
-        let (_allowed_sk, allowed_pk) = make_client_keypair(0xA1);
-        let (other_sk, other_pk) = make_client_keypair(0xB2);
+        let (_allowed_signing_key, allowed_pk) = make_client_keypair(0xA1);
+        let (other_signing_key, other_pk) = make_client_keypair(0xB2);
         let allowed_static: &'static [[u8; key_ipc::MLDSA87_PK_BYTES]] =
             std::boxed::Box::leak(std::boxed::Box::new([allowed_pk]));
 
@@ -852,7 +943,7 @@ mod tests {
             b"neg-auth",
             allowed_static,
         )
-        .unwrap();
+        .expect("vault init");
 
         // No pending session yet
         let zero_sig = [0u8; key_ipc::MLDSA87_SIG_BYTES];
@@ -862,7 +953,7 @@ mod tests {
         );
 
         let sid = sha3_512(b"session-neg-1");
-        let _ = vault.sign_kex_hash(&sid, 1_000).unwrap();
+        let _ = vault.sign_kex_hash(&sid, 1_000).expect("sign kex");
 
         // Attempt 1: truncated signed_data
         assert_eq!(
@@ -883,8 +974,8 @@ mod tests {
         let mut valid_sid_data = [0u8; 72];
         valid_sid_data[0..4].copy_from_slice(&64u32.to_be_bytes());
         valid_sid_data[4..68].copy_from_slice(&sid);
-        let prefix = [0u8, CTX_USERAUTH.len() as u8];
-        let sig = other_sk
+        let prefix = [0u8, CTX_USERAUTH_LEN];
+        let sig = other_signing_key
             .expanded_key()
             .sign_internal(&[&prefix, CTX_USERAUTH, &valid_sid_data], &B32::default());
         let mut other_sig = [0u8; key_ipc::MLDSA87_SIG_BYTES];
@@ -903,11 +994,11 @@ mod tests {
 
     #[test]
     fn userauth_rejects_empty_authorized_keys_and_corrupted_signature() {
-        let (client_sk, client_pk) = make_client_keypair(0xC3);
+        let (client_signing_key, client_pk) = make_client_keypair(0xC3);
         let mut empty_vault =
-            KeyVault::new(DeterministicTestEntropy(0x6666), b"empty-ak", &[]).unwrap();
+            KeyVault::new(DeterministicTestEntropy(0x6666), b"empty-ak", &[]).expect("vault init");
         let sid = sha3_512(b"session-empty-ak");
-        let _ = empty_vault.sign_kex_hash(&sid, 1_000).unwrap();
+        let _ = empty_vault.sign_kex_hash(&sid, 1_000).expect("sign kex");
         let mut data = [0u8; 72];
         data[0..4].copy_from_slice(&64u32.to_be_bytes());
         data[4..68].copy_from_slice(&sid);
@@ -924,10 +1015,10 @@ mod tests {
             b"tamper-sig",
             allowed_static,
         )
-        .unwrap();
-        let _ = vault.sign_kex_hash(&sid, 1_000).unwrap();
-        let prefix = [0u8, CTX_USERAUTH.len() as u8];
-        let sig = client_sk
+        .expect("vault init");
+        let _ = vault.sign_kex_hash(&sid, 1_000).expect("sign kex");
+        let prefix = [0u8, CTX_USERAUTH_LEN];
+        let sig = client_signing_key
             .expanded_key()
             .sign_internal(&[&prefix, CTX_USERAUTH, &data], &B32::default());
         let mut sig_bytes = [0u8; key_ipc::MLDSA87_SIG_BYTES];
@@ -941,7 +1032,8 @@ mod tests {
 
     #[test]
     fn random_u32_respects_window_budget_and_resets_after_kex_sign() {
-        let mut vault = KeyVault::new(DeterministicTestEntropy(0x8888), b"u32-cap", &[]).unwrap();
+        let mut vault =
+            KeyVault::new(DeterministicTestEntropy(0x8888), b"u32-cap", &[]).expect("vault init");
         for _ in 0..(key_ipc::MAX_RANDOM_BYTES_PER_WINDOW / 4) {
             assert!(vault.get_random_u32().is_ok());
         }
@@ -954,5 +1046,79 @@ mod tests {
         let sid = sha3_512(b"reset-budget");
         assert!(vault.sign_kex_hash(&sid, 1_000).is_ok());
         assert!(vault.get_random_u32().is_ok());
+    }
+
+    #[test]
+    fn vault_error_display_error_source_and_from_rng_error() {
+        use core::error::Error as _;
+        use std::format;
+
+        let rng_err = RngError::HealthCheckFailed;
+        let converted: VaultError = rng_err.into();
+        assert_eq!(converted, VaultError::Rng(rng_err));
+        assert!(converted.source().is_some());
+        assert_ne!(format!("{converted}"), "");
+
+        for err in [
+            VaultError::RateLimited,
+            VaultError::RandomBudgetExceeded,
+            VaultError::NoPendingSession,
+            VaultError::SessionIdMismatch,
+            VaultError::UnauthorizedKey,
+            VaultError::InvalidSignature,
+        ] {
+            assert!(err.source().is_none());
+            assert_ne!(format!("{err}"), "");
+        }
+    }
+
+    #[test]
+    fn key_vault_and_server_debug_redact_secrets() {
+        use std::format;
+
+        let seed = [0xABu8; 32];
+        let mut vault = KeyVault::new_with_optional_host_seed(
+            DeterministicTestEntropy(0x9001),
+            b"debug-redact",
+            &[],
+            Some(seed),
+        )
+        .expect("vault init");
+        let sid = [0xCDu8; 64];
+        let _ = vault.sign_kex_hash(&sid, 1_000).expect("sign kex");
+
+        let vault_dbg = format!("{vault:?}");
+        assert!(vault_dbg.contains("<redacted>"));
+        assert!(!vault_dbg.contains("171, 171, 171"));
+        assert!(!vault_dbg.contains("205, 205, 205"));
+
+        let srv = KeyVaultServer::new(vault);
+        let srv_dbg = format!("{srv:?}");
+        assert!(srv_dbg.contains("<redacted>"));
+        assert!(srv_dbg.contains("KeyVaultServer"));
+    }
+
+    #[test]
+    fn sign_kex_hash_rejects_backwards_clock_rate_limit_bypass() {
+        let mut vault = KeyVault::new(DeterministicTestEntropy(0x9002), b"backwards-clk", &[])
+            .expect("vault init");
+
+        // Exhaust the entire SIGN_BUCKET_CAPACITY (4) burst at t = 10_000 ms
+        for i in 0u8..4 {
+            let h = sha3_512(&[b'b', b'c', i]);
+            assert!(vault.sign_kex_hash(&h, 10_000).is_ok());
+        }
+
+        // Backwards clock timestamps MUST NOT refill tokens (previously wrapped negative i64 to u32::MAX)
+        let h_back1 = sha3_512(b"backwards-1");
+        assert_eq!(
+            vault.sign_kex_hash(&h_back1, 1_000).err(),
+            Some(VaultError::RateLimited)
+        );
+        let h_back2 = sha3_512(b"backwards-2");
+        assert_eq!(
+            vault.sign_kex_hash(&h_back2, -500).err(),
+            Some(VaultError::RateLimited)
+        );
     }
 }

@@ -71,6 +71,7 @@ newos-shell-core = { path = "crates/shell-core" }
 newos-ssh-proto = { path = "crates/ssh" }
 newos-storage = { path = "crates/storage" }
 newos-user-rt = { path = "crates/user-rt" }
+newos-wdt = { path = "crates/wdt" }
 
 [profile.dev.package.newos-crypto]
 opt-level = 2

@@ -15,6 +15,9 @@ use crate::test_helpers::{MockVSpaceMapper, PhdrSpec, build_elf64, host_elf_mach
 
 #[test]
 fn tier4_kernel_ipc_worker_ping_pong_ring_burst_and_scheduler_200_rounds() {
+    const ROUNDS: u64 = 200;
+    const BURST: u64 = 16;
+
     let mut ipc = KernelIpcState::new();
     let (notif, req_ep, _) = ipc.init_bootstrap_caps(None).unwrap();
     let reply_ep = ipc
@@ -30,11 +33,8 @@ fn tier4_kernel_ipc_worker_ping_pong_ring_burst_and_scheduler_200_rounds() {
 
     let ring = SpscRing::<64>::new();
     let mut sup_turns = 0u64;
-    let mut wa_turns = 0u64;
-    let mut wb_turns = 0u64;
-
-    const ROUNDS: u64 = 200;
-    const BURST: u64 = 16;
+    let mut first_worker_turns = 0u64;
+    let mut second_worker_turns = 0u64;
 
     for round in 0..ROUNDS {
         // Supervisor turn
@@ -42,9 +42,9 @@ fn tier4_kernel_ipc_worker_ping_pong_ring_burst_and_scheduler_200_rounds() {
         if t == supervisor {
             sup_turns += 1;
         } else if t == worker_a {
-            wa_turns += 1;
+            first_worker_turns += 1;
         } else if t == worker_b {
-            wb_turns += 1;
+            second_worker_turns += 1;
         } else {
             panic!("idle thread must never be scheduled while priority-10 threads are ready");
         }
@@ -82,12 +82,12 @@ fn tier4_kernel_ipc_worker_ping_pong_ring_burst_and_scheduler_200_rounds() {
     }
 
     // All 3 priority-10 threads must share turns fairly (within +-1 of ROUNDS/3).
-    assert_eq!(sup_turns + wa_turns + wb_turns, ROUNDS);
-    let min_turns = sup_turns.min(wa_turns).min(wb_turns);
-    let max_turns = sup_turns.max(wa_turns).max(wb_turns);
+    assert_eq!(sup_turns + first_worker_turns + second_worker_turns, ROUNDS);
+    let min_turns = sup_turns.min(first_worker_turns).min(second_worker_turns);
+    let max_turns = sup_turns.max(first_worker_turns).max(second_worker_turns);
     assert!(
         max_turns - min_turns <= 1,
-        "round-robin fairness violated: sup={sup_turns}, wa={wa_turns}, wb={wb_turns}"
+        "round-robin fairness violated: sup={sup_turns}, first_worker={first_worker_turns}, second_worker={second_worker_turns}"
     );
 }
 
@@ -211,6 +211,7 @@ fn tier4_kernel_elf64_load_wx_and_bss_zeroing_invariant() {
     assert!(inv.push_raw_region(0x200_0000, 16 * PAGE_SIZE));
     let mut mapper = MockVSpaceMapper::new(PhysAddr::new(0x10_0000));
 
+    let page_len = usize::try_from(PAGE_SIZE).expect("PAGE_SIZE fits in usize");
     for seg in parsed.segments() {
         // Strict W^X invariant on every parsed segment.
         assert!(!(seg.flags.writable && seg.flags.executable));
@@ -218,9 +219,10 @@ fn tier4_kernel_elf64_load_wx_and_bss_zeroing_invariant() {
         for page_idx in 0..pages {
             let frame = inv.retype_frame().unwrap();
             mapper.zero_frame(&frame);
-            let page_file_start = (page_idx as usize) * (PAGE_SIZE as usize);
+            let page_file_start =
+                usize::try_from(page_idx).expect("page_idx fits in usize") * page_len;
             if page_file_start < seg.file_size {
-                let copy_len = (seg.file_size - page_file_start).min(PAGE_SIZE as usize);
+                let copy_len = (seg.file_size - page_file_start).min(page_len);
                 let src = &elf_bytes[seg.file_offset + page_file_start
                     ..seg.file_offset + page_file_start + copy_len];
                 mapper.write_frame_bytes(&frame, 0, src).unwrap();
@@ -238,7 +240,7 @@ fn tier4_kernel_elf64_load_wx_and_bss_zeroing_invariant() {
     assert!(bss2_flags.writable && !bss2_flags.executable);
     assert!(
         mapper
-            .read_frame_slice(bss2_phys, 0, PAGE_SIZE as usize)
+            .read_frame_slice(bss2_phys, 0, page_len)
             .iter()
             .all(|&b| b == 0)
     );
@@ -246,8 +248,8 @@ fn tier4_kernel_elf64_load_wx_and_bss_zeroing_invariant() {
 
 #[test]
 fn tier4_kernel_spsc_ring_concurrent_conservation_invariant() {
-    let ring = SpscRing::<128>::new();
     const N: u64 = 20_000;
+    let ring = SpscRing::<128>::new();
     let expected_xor: u64 = (0..N).fold(0u64, |acc, x| acc ^ x.wrapping_mul(0x9E37_79B9_7F4A_7C15));
 
     thread::scope(|s| {

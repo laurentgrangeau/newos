@@ -72,24 +72,26 @@ static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(256 * 1024);
 static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
 /// Returns `true` if the bootloader supports our requested Limine base revision.
+#[must_use]
 pub fn is_base_revision_supported() -> bool {
     BASE_REVISION.is_supported()
 }
 
 /// Expose Limine's Multi-Processing response for SMP secondary core bring-up.
+#[must_use]
 pub fn mp_response() -> Option<&'static MpResponse> {
     MP_REQUEST.response()
 }
 
 /// Extract a boot descriptor and bootstrap `UntypedInventory` from Limine.
+#[must_use]
 pub fn boot_info() -> BootInfo {
-    // If Limine fails to provide an HHDM response, `hhdm_offset` stays 0 and `Aarch64Platform::new`
+    // If Limine fails to provide an HHDM response, `hhdm_offset` stays 0 and `Aarch64Platform::init`
     // halts via `system_off(ShutdownStatus::Failed)` rather than panicking before UART init.
-    let hhdm_offset = HHDM_REQUEST.response().map(|resp| resp.offset).unwrap_or(0);
+    let hhdm_offset = HHDM_REQUEST.response().map_or(0, |resp| resp.offset);
     let kernel_virt_base = EXEC_ADDR_REQUEST
         .response()
-        .map(|resp| resp.virtual_base)
-        .unwrap_or(0);
+        .map_or(0, |resp| resp.virtual_base);
 
     let mut untyped = UntypedInventory::new();
     if let Some(mmap) = MEMORY_MAP_REQUEST.response() {
@@ -100,19 +102,16 @@ pub fn boot_info() -> BootInfo {
         }
     }
 
-    let cpu_count = MP_REQUEST.response().map(|mp| mp.cpus().len()).unwrap_or(1);
+    let cpu_count = MP_REQUEST.response().map_or(1, |mp| mp.cpus().len());
 
-    let rsdp_addr = RSDP_REQUEST
-        .response()
-        .map(|r| r.address as u64)
-        .unwrap_or(0);
+    let rsdp_addr = RSDP_REQUEST.response().map_or(0, |r| r.address as u64);
 
     let framebuffer = FRAMEBUFFER_REQUEST.response().and_then(|resp| {
         resp.framebuffers().first().map(|fb| FramebufferInfo {
             phys_addr: (fb.address() as u64).saturating_sub(hhdm_offset),
-            width: fb.width as u32,
-            height: fb.height as u32,
-            pitch: fb.pitch as u32,
+            width: u32::try_from(fb.width).unwrap_or(u32::MAX),
+            height: u32::try_from(fb.height).unwrap_or(u32::MAX),
+            pitch: u32::try_from(fb.pitch).unwrap_or(u32::MAX),
             bpp: fb.bpp,
             red_shift: fb.red_mask_shift,
             green_shift: fb.green_mask_shift,
@@ -147,8 +146,7 @@ pub fn boot_info() -> BootInfo {
 
     let cmdline = EXEC_FILE_REQUEST
         .response()
-        .map(|resp| resp.executable_file().cmdline())
-        .unwrap_or("");
+        .map_or("", |resp| resp.executable_file().cmdline());
     let interactive_shell = cmdline.contains("interactive");
     let qemu_virt = cmdline.contains("qemu");
 

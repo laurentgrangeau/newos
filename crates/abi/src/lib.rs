@@ -8,183 +8,267 @@ pub mod timestamp;
 pub use newos_crypto::sha3;
 
 /// Unforgeable handle indexing a slot inside a protection domain's capability space (`CSpace`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// # EL0↔EL1 Wire ABI Invariant
+///
+/// `CapId` is `#[repr(transparent)]` over a raw `u64` register value:
+/// - `0` (`CapId::NULL`) represents an empty / null capability slot at the syscall register boundary.
+/// - Non-zero handles pack `(generation: u32) << 32 | (slot: u32)`.
+///
+/// Use [`CapId::try_from_raw`] or [`CapId::as_non_zero`] at Rust boundaries that require a
+/// validated non-null capability handle.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct CapId(pub u64);
+pub struct CapId(u64);
 
 impl CapId {
     /// Sentinel representing an empty / null capability slot.
     pub const NULL: Self = Self(0);
 
-    /// Well-known bootstrap `Notification` capability installed in `supervisor-pd`'s CSpace (slot 1, gen 1).
-    pub const BOOTSTRAP_NOTIF: Self = Self((1u64 << 32) | 1);
+    /// Construct a bootstrap capability handle in generation 1 at `slot`.
+    #[inline]
+    const fn bootstrap(slot: u32) -> Self {
+        Self::from_parts(1, slot)
+    }
 
-    /// Well-known bootstrap `Endpoint` capability installed in `supervisor-pd`'s CSpace (slot 2, gen 1).
-    pub const BOOTSTRAP_EP: Self = Self((1u64 << 32) | 2);
+    /// Well-known bootstrap `Notification` capability installed in `supervisor-pd`'s `CSpace` (slot 1, gen 1).
+    pub const BOOTSTRAP_NOTIF: Self = Self::bootstrap(1);
+
+    /// Well-known bootstrap `Endpoint` capability installed in `supervisor-pd`'s `CSpace` (slot 2, gen 1).
+    pub const BOOTSTRAP_EP: Self = Self::bootstrap(2);
 
     /// Well-known bootstrap Fault `Notification` capability (slot 3, gen 1) signaled on EL0 faults.
-    pub const BOOTSTRAP_FAULT_NOTIF: Self = Self((1u64 << 32) | 3);
+    pub const BOOTSTRAP_FAULT_NOTIF: Self = Self::bootstrap(3);
 
     /// Well-known bootstrap NIC MMIO capability (slot 4, gen 1) for EL0 NIC drivers.
-    pub const BOOTSTRAP_NET_MMIO: Self = Self((1u64 << 32) | 4);
+    pub const BOOTSTRAP_NET_MMIO: Self = Self::bootstrap(4);
 
     /// Well-known bootstrap Console capability (slot 5, gen 1) gating `DebugRead`/`DebugWrite`.
-    pub const BOOTSTRAP_CONSOLE: Self = Self((1u64 << 32) | 5);
+    pub const BOOTSTRAP_CONSOLE: Self = Self::bootstrap(5);
 
     /// Well-known bootstrap Power/Platform capability (slot 6, gen 1) gating `Exit`/`SysInfo`.
-    pub const BOOTSTRAP_POWER: Self = Self((1u64 << 32) | 6);
+    pub const BOOTSTRAP_POWER: Self = Self::bootstrap(6);
 
     /// Well-known bootstrap `VSpace` capability (slot 7, gen 1) gating `MapPage`/`UnmapPage`/`VirtToPhys`.
-    pub const BOOTSTRAP_VSPACE: Self = Self((1u64 << 32) | 7);
+    pub const BOOTSTRAP_VSPACE: Self = Self::bootstrap(7);
 
     /// Well-known bootstrap `Thread` capability (slot 8, gen 1) for the caller's own thread.
-    pub const BOOTSTRAP_SELF_THREAD: Self = Self((1u64 << 32) | 8);
+    pub const BOOTSTRAP_SELF_THREAD: Self = Self::bootstrap(8);
 
     /// Well-known bootstrap `CNode` capability (slot 9, gen 1) for the caller's own `CSpace`.
-    pub const BOOTSTRAP_SELF_CNODE: Self = Self((1u64 << 32) | 9);
+    pub const BOOTSTRAP_SELF_CNODE: Self = Self::bootstrap(9);
 
     /// Well-known bootstrap `Untyped` physical memory capability (slot 10, gen 1) for `UntypedRetype`.
-    pub const BOOTSTRAP_UNTYPED: Self = Self((1u64 << 32) | 10);
+    pub const BOOTSTRAP_UNTYPED: Self = Self::bootstrap(10);
 
     /// Well-known bootstrap Console Log `Endpoint` capability (slot 11, gen 1).
     ///
     /// PD 0 (`supervisor-pd`, console owner) holds `Rights::ALL`; non-supervisor protection domains
     /// (`pd_id >= 1`) hold write-only (`Rights::WRITE`) with an immutable kernel-stamped badge.
-    pub const BOOTSTRAP_LOG_EP: Self = Self((1u64 << 32) | 11);
+    pub const BOOTSTRAP_LOG_EP: Self = Self::bootstrap(11);
 
     /// Well-known bootstrap Hardware RNG MMIO capability (slot 12, gen 1), exclusively owned
     /// by `newos-key-pd` (BCM2712 RNG200 on Raspberry Pi 5 or VirtIO-RNG slot on QEMU).
-    pub const BOOTSTRAP_RNG_MMIO: Self = Self((1u64 << 32) | 12);
+    pub const BOOTSTRAP_RNG_MMIO: Self = Self::bootstrap(12);
 
     /// Well-known bootstrap Network Data-Plane `Endpoint` capability (slot 13, gen 1)
     /// connecting `newos-net-pd` to `newos-ssh-pd` and `newos-supervisor-pd`.
-    pub const BOOTSTRAP_NET_EP: Self = Self((1u64 << 32) | 13);
+    pub const BOOTSTRAP_NET_EP: Self = Self::bootstrap(13);
 
     /// Well-known bootstrap Cryptographic Vault `Endpoint` capability (slot 14, gen 1)
     /// connecting `newos-key-pd` exclusively to `newos-ssh-pd`.
-    pub const BOOTSTRAP_KEY_EP: Self = Self((1u64 << 32) | 14);
+    pub const BOOTSTRAP_KEY_EP: Self = Self::bootstrap(14);
 
     /// Well-known bootstrap SSH Shell input `Endpoint` capability (slot 15, gen 1):
     /// unidirectional `newos-ssh-pd` (`Rights::WRITE`) -> `newos-supervisor-pd` (`Rights::READ`),
     /// gated by `BOOTSTRAP_AUTH_GATE_EP`.
-    pub const BOOTSTRAP_SSH_SHELL_EP: Self = Self((1u64 << 32) | 15);
+    pub const BOOTSTRAP_SSH_SHELL_EP: Self = Self::bootstrap(15);
 
     /// Well-known bootstrap Cryptographic Auth-Gate `Endpoint` capability (slot 16, gen 1).
     /// `newos-key-pd` holds write-only (`Rights::WRITE`); `newos-supervisor-pd` holds read-only
     /// (`Rights::READ`). `newos-ssh-pd` explicitly does NOT hold this capability.
-    pub const BOOTSTRAP_AUTH_GATE_EP: Self = Self((1u64 << 32) | 16);
+    pub const BOOTSTRAP_AUTH_GATE_EP: Self = Self::bootstrap(16);
 
     /// Well-known bootstrap SSH Shell output `Endpoint` capability (slot 17, gen 1):
     /// unidirectional `newos-supervisor-pd` (`Rights::WRITE`) -> `newos-ssh-pd` (`Rights::READ`).
-    pub const BOOTSTRAP_SSH_OUT_EP: Self = Self((1u64 << 32) | 17);
+    pub const BOOTSTRAP_SSH_OUT_EP: Self = Self::bootstrap(17);
 
     /// Well-known bootstrap Hardware Watchdog MMIO capability (slot 18, gen 1),
     /// exposing the Raspberry Pi 5 BCM2712 PM/Watchdog block (`0x10_7D20_0000`, `0x100` bytes).
-    pub const BOOTSTRAP_WDT_MMIO: Self = Self((1u64 << 32) | 18);
+    pub const BOOTSTRAP_WDT_MMIO: Self = Self::bootstrap(18);
 
     /// Well-known bootstrap RP1 40-pin GPIO MMIO capability (slot 19, gen 1),
     /// covering `IO_BANK0` (`0x1F_000D_0000`), `RIO0` (`0x1F_000E_0000`), and `PADS_BANK0` (`0x1F_000F_0000`).
-    pub const BOOTSTRAP_GPIO_MMIO: Self = Self((1u64 << 32) | 19);
+    pub const BOOTSTRAP_GPIO_MMIO: Self = Self::bootstrap(19);
 
-    /// Well-known bootstrap BCM2712 VideoCore Property Mailbox MMIO capability (slot 20, gen 1),
+    /// Well-known bootstrap BCM2712 `VideoCore` Property Mailbox MMIO capability (slot 20, gen 1),
     /// covering `0x10_7C01_3000` (Mailbox at offset `0x880`).
-    pub const BOOTSTRAP_MBOX_MMIO: Self = Self((1u64 << 32) | 20);
+    pub const BOOTSTRAP_MBOX_MMIO: Self = Self::bootstrap(20);
 
     /// Well-known bootstrap BCM2712 AVS TMON Thermal Sensor MMIO capability (slot 21, gen 1),
     /// covering `0x10_7D5D_2000` (TMON registers at offset `0x200`).
-    pub const BOOTSTRAP_THERMAL_MMIO: Self = Self((1u64 << 32) | 21);
+    pub const BOOTSTRAP_THERMAL_MMIO: Self = Self::bootstrap(21);
 
     /// Well-known bootstrap RP1 40-pin Bus Peripherals MMIO capability (slot 22, gen 1),
     /// covering RP1 `UART0` (`0x1F_0003_0000`), `SPI0` (`0x1F_0005_0000`), `I2C0`/`I2C1` (`0x1F_0007_0000`),
     /// and `PWM0` (`0x1F_0009_8000`).
-    pub const BOOTSTRAP_RP1_PERIPH_MMIO: Self = Self((1u64 << 32) | 22);
+    pub const BOOTSTRAP_RP1_PERIPH_MMIO: Self = Self::bootstrap(22);
 
     /// Well-known bootstrap BCM2712 microSD SDHCI MMIO capability (slot 23, gen 1, `0x10_00FF_F000`).
-    pub const BOOTSTRAP_SDHCI_MMIO: Self = Self((1u64 << 32) | 23);
+    pub const BOOTSTRAP_SDHCI_MMIO: Self = Self::bootstrap(23);
 
     /// Well-known bootstrap RP1 USB 3.0/2.0 xHCI0 MMIO capability (slot 24, gen 1, `0x1F_0020_0000`).
-    pub const BOOTSTRAP_XHCI0_MMIO: Self = Self((1u64 << 32) | 24);
+    pub const BOOTSTRAP_XHCI0_MMIO: Self = Self::bootstrap(24);
 
     /// Well-known bootstrap RP1 USB 3.0/2.0 xHCI1 MMIO capability (slot 25, gen 1, `0x1F_0030_0000`).
-    pub const BOOTSTRAP_XHCI1_MMIO: Self = Self((1u64 << 32) | 25);
+    pub const BOOTSTRAP_XHCI1_MMIO: Self = Self::bootstrap(25);
 
-    /// Well-known bootstrap PCIe ECAM configuration space MMIO capability (slot 26, gen 1).
-    pub const BOOTSTRAP_PCIE_ECAM_MMIO: Self = Self((1u64 << 32) | 26);
+    /// Well-known bootstrap `PCIe` ECAM configuration space MMIO capability (slot 26, gen 1).
+    pub const BOOTSTRAP_PCIE_ECAM_MMIO: Self = Self::bootstrap(26);
 
     /// Well-known bootstrap UEFI GOP / Limine Framebuffer MMIO capability (slot 27, gen 1).
-    pub const BOOTSTRAP_FB_MMIO: Self = Self((1u64 << 32) | 27);
+    pub const BOOTSTRAP_FB_MMIO: Self = Self::bootstrap(27);
 
-    /// Well-known bootstrap VideoCore VII V3D 7.1 GPU MMIO capability (slot 28, gen 1, `0x10_0200_0000`).
-    pub const BOOTSTRAP_V3D_MMIO: Self = Self((1u64 << 32) | 28);
+    /// Well-known bootstrap `VideoCore` VII V3D 7.1 GPU MMIO capability (slot 28, gen 1, `0x10_0200_0000`).
+    pub const BOOTSTRAP_V3D_MMIO: Self = Self::bootstrap(28);
 
     /// Well-known bootstrap BCM2712 IOMMU (`brcm,bcm2712-iommu`) MMIO capability (slot 29, gen 1, `0x10_0000_5000`).
-    pub const BOOTSTRAP_IOMMU_MMIO: Self = Self((1u64 << 32) | 29);
+    pub const BOOTSTRAP_IOMMU_MMIO: Self = Self::bootstrap(29);
 
     /// Well-known bootstrap network controller `IrqHandler` capability (slot 30, gen 1).
-    pub const BOOTSTRAP_NET_IRQ: Self = Self((1u64 << 32) | 30);
+    pub const BOOTSTRAP_NET_IRQ: Self = Self::bootstrap(30);
 
     /// Well-known bootstrap hardware RNG `IrqHandler` capability (slot 31, gen 1).
-    pub const BOOTSTRAP_RNG_IRQ: Self = Self((1u64 << 32) | 31);
+    pub const BOOTSTRAP_RNG_IRQ: Self = Self::bootstrap(31);
 
     /// Well-known bootstrap console UART `IrqHandler` capability (slot 32, gen 1).
-    pub const BOOTSTRAP_UART_IRQ: Self = Self((1u64 << 32) | 32);
+    pub const BOOTSTRAP_UART_IRQ: Self = Self::bootstrap(32);
 
     /// Well-known bootstrap `net-pd` event `Notification` capability (slot 33, gen 1).
-    pub const BOOTSTRAP_NET_NOTIF: Self = Self((1u64 << 32) | 33);
+    pub const BOOTSTRAP_NET_NOTIF: Self = Self::bootstrap(33);
 
     /// Well-known bootstrap `ssh-pd` event `Notification` capability (slot 34, gen 1).
-    pub const BOOTSTRAP_SSH_NOTIF: Self = Self((1u64 << 32) | 34);
+    pub const BOOTSTRAP_SSH_NOTIF: Self = Self::bootstrap(34);
 
     /// Well-known bootstrap `key-pd` event `Notification` capability (slot 35, gen 1).
-    pub const BOOTSTRAP_KEY_NOTIF: Self = Self((1u64 << 32) | 35);
+    pub const BOOTSTRAP_KEY_NOTIF: Self = Self::bootstrap(35);
 
     /// Well-known bootstrap shared-memory `Frame` capability for `net-pd` <-> `ssh-pd` `SpscRing` (slot 36, gen 1).
-    pub const BOOTSTRAP_NET_SSH_RING: Self = Self((1u64 << 32) | 36);
+    pub const BOOTSTRAP_NET_SSH_RING: Self = Self::bootstrap(36);
 
     /// Well-known bootstrap shared-memory `Frame` capability for `ssh-pd` <-> `key-pd` `SpscRing` (slot 37, gen 1).
-    pub const BOOTSTRAP_SSH_KEY_RING: Self = Self((1u64 << 32) | 37);
+    pub const BOOTSTRAP_SSH_KEY_RING: Self = Self::bootstrap(37);
 
     /// Well-known bootstrap `IoSpace` capability for DMA-pinned frame translation (slot 38, gen 1).
-    pub const BOOTSTRAP_IOSPACE: Self = Self((1u64 << 32) | 38);
+    pub const BOOTSTRAP_IOSPACE: Self = Self::bootstrap(38);
 
     /// Well-known bootstrap Normal-NC DMA descriptor ring `Frame` capability for `net-pd` (slot 39, gen 1).
-    pub const BOOTSTRAP_NET_DMA_RING: Self = Self((1u64 << 32) | 39);
+    pub const BOOTSTRAP_NET_DMA_RING: Self = Self::bootstrap(39);
 
     /// Well-known bootstrap child `Thread` capability for `newos-shell-pd` in PD 0's `CSpace` (slot 40, gen 1).
-    pub const BOOTSTRAP_SHELL_THREAD: Self = Self((1u64 << 32) | 40);
+    pub const BOOTSTRAP_SHELL_THREAD: Self = Self::bootstrap(40);
 
     /// Well-known bootstrap child `Thread` capability for `newos-worker-pd` in PD 0's `CSpace` (slot 41, gen 1).
-    pub const BOOTSTRAP_WORKER_THREAD: Self = Self((1u64 << 32) | 41);
+    pub const BOOTSTRAP_WORKER_THREAD: Self = Self::bootstrap(41);
 
     /// Well-known bootstrap child `Thread` capability for `newos-net-pd` in PD 0's `CSpace` (slot 42, gen 1).
-    pub const BOOTSTRAP_NET_THREAD: Self = Self((1u64 << 32) | 42);
+    pub const BOOTSTRAP_NET_THREAD: Self = Self::bootstrap(42);
 
     /// Well-known bootstrap child `Thread` capability for `newos-key-pd` in PD 0's `CSpace` (slot 43, gen 1).
-    pub const BOOTSTRAP_KEY_THREAD: Self = Self((1u64 << 32) | 43);
+    pub const BOOTSTRAP_KEY_THREAD: Self = Self::bootstrap(43);
 
     /// Well-known bootstrap child `Thread` capability for `newos-ssh-pd` in PD 0's `CSpace` (slot 44, gen 1).
-    pub const BOOTSTRAP_SSH_THREAD: Self = Self((1u64 << 32) | 44);
+    pub const BOOTSTRAP_SSH_THREAD: Self = Self::bootstrap(44);
 
     #[inline]
+    #[must_use]
     pub const fn new(raw: u64) -> Self {
         Self(raw)
     }
 
+    /// Pack `(generation, slot)` into a capability handle.
     #[inline]
+    #[must_use]
+    pub const fn from_parts(generation: u32, slot: u32) -> Self {
+        Self(((generation as u64) << 32) | (slot as u64))
+    }
+
+    /// Extract the 32-bit `CSpace` slot index.
+    #[inline]
+    #[must_use]
+    pub const fn slot(self) -> u32 {
+        (self.0 & 0xFFFF_FFFF) as u32
+    }
+
+    /// Extract the 32-bit monotonic generation counter.
+    #[inline]
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    /// Parse a raw register value into a non-null [`CapId`], returning `None` for `0` (`CapId::NULL`).
+    #[inline]
+    #[must_use]
+    pub const fn try_from_raw(raw: u64) -> Option<Self> {
+        if raw == 0 { None } else { Some(Self(raw)) }
+    }
+
+    /// Construct a guaranteed non-null [`CapId`] from a [`core::num::NonZeroU64`].
+    #[inline]
+    #[must_use]
+    pub const fn from_non_zero(nz: core::num::NonZeroU64) -> Self {
+        Self(nz.get())
+    }
+
+    /// Convert to [`core::num::NonZeroU64`], returning `None` if this handle is [`CapId::NULL`].
+    #[inline]
+    #[must_use]
+    pub const fn as_non_zero(self) -> Option<core::num::NonZeroU64> {
+        core::num::NonZeroU64::new(self.0)
+    }
+
+    #[inline]
+    #[must_use]
     pub const fn raw(self) -> u64 {
         self.0
     }
 
     #[inline]
+    #[must_use]
     pub const fn is_null(self) -> bool {
         self.0 == 0
+    }
+}
+
+impl core::fmt::Display for CapId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.is_null() {
+            f.write_str("CapId(null)")
+        } else {
+            write!(f, "CapId(gen={}, slot={})", self.generation(), self.slot())
+        }
+    }
+}
+
+impl From<core::num::NonZeroU64> for CapId {
+    #[inline]
+    fn from(nz: core::num::NonZeroU64) -> Self {
+        Self::from_non_zero(nz)
+    }
+}
+
+impl From<CapId> for u64 {
+    #[inline]
+    fn from(cap: CapId) -> Self {
+        cap.0
     }
 }
 
 /// Bitmask of permissions attached to a capability.
 ///
 /// Rights may only ever be attenuated (narrowed via intersection), never escalated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Rights(u8);
 
@@ -198,12 +282,14 @@ impl Rights {
     pub const ALL: Self = Self(0b0001_1111);
 
     #[inline]
+    #[must_use]
     pub const fn bits(self) -> u8 {
         self.0
     }
 
     /// Construct a `Rights` bitmask from raw bits, returning `None` if any unknown bit is set.
     #[inline]
+    #[must_use]
     pub const fn from_bits(bits: u8) -> Option<Self> {
         if (bits & !Self::ALL.0) == 0 {
             Some(Self(bits))
@@ -214,24 +300,65 @@ impl Rights {
 
     /// Construct a `Rights` bitmask from raw bits, truncating any unknown bits.
     #[inline]
+    #[must_use]
     pub const fn from_bits_truncate(bits: u8) -> Self {
         Self(bits & Self::ALL.0)
     }
 
     #[inline]
+    #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self((self.0 | other.0) & Self::ALL.0)
     }
 
     /// Strictly attenuate rights: the resulting set is always a subset of `self`.
     #[inline]
+    #[must_use]
     pub const fn attenuate(self, mask: Self) -> Self {
         Self(self.0 & mask.0)
     }
 
     #[inline]
+    #[must_use]
     pub const fn contains(self, required: Self) -> bool {
         (self.0 & required.0) == required.0
+    }
+}
+
+impl core::fmt::Display for Rights {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 == 0 {
+            return f.write_str("NONE");
+        }
+        let flags = [
+            (Self::READ, "R"),
+            (Self::WRITE, "W"),
+            (Self::EXEC, "X"),
+            (Self::GRANT, "G"),
+            (Self::REVOKE, "K"),
+        ];
+        for (flag, ch) in flags {
+            if self.contains(flag) {
+                f.write_str(ch)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl From<Rights> for u8 {
+    #[inline]
+    fn from(rights: Rights) -> Self {
+        rights.0
+    }
+}
+
+impl TryFrom<u8> for Rights {
+    type Error = SysError;
+
+    #[inline]
+    fn try_from(bits: u8) -> Result<Self, Self::Error> {
+        Self::from_bits(bits).ok_or(SysError::InvalidArgument)
     }
 }
 
@@ -256,6 +383,7 @@ pub enum ObjectType {
 
 impl ObjectType {
     #[inline]
+    #[must_use]
     pub const fn from_u64(raw: u64) -> Option<Self> {
         match raw {
             0 => Some(Self::Untyped),
@@ -273,6 +401,50 @@ impl ObjectType {
             12 => Some(Self::IoSpace),
             _ => None,
         }
+    }
+}
+
+impl core::fmt::Display for ObjectType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = match self {
+            Self::Untyped => "Untyped",
+            Self::Frame => "Frame",
+            Self::PageTable => "PageTable",
+            Self::VSpace => "VSpace",
+            Self::CNode => "CNode",
+            Self::Thread => "Thread",
+            Self::Endpoint => "Endpoint",
+            Self::Notification => "Notification",
+            Self::IrqHandler => "IrqHandler",
+            Self::MmioRegion => "MmioRegion",
+            Self::Console => "Console",
+            Self::PowerControl => "PowerControl",
+            Self::IoSpace => "IoSpace",
+        };
+        f.write_str(name)
+    }
+}
+
+impl From<ObjectType> for u8 {
+    #[inline]
+    fn from(obj: ObjectType) -> Self {
+        obj as Self
+    }
+}
+
+impl From<ObjectType> for u64 {
+    #[inline]
+    fn from(obj: ObjectType) -> Self {
+        obj as Self
+    }
+}
+
+impl TryFrom<u64> for ObjectType {
+    type Error = SysError;
+
+    #[inline]
+    fn try_from(raw: u64) -> Result<Self, Self::Error> {
+        Self::from_u64(raw).ok_or(SysError::InvalidArgument)
     }
 }
 
@@ -330,7 +502,7 @@ pub enum SyscallNumber {
     /// Transitively revoke all CDT descendants of `cap_id` in the caller's `CSpace` -> `revoked_count`.
     CapRevoke = 21,
     /// Grant an attenuated capability into the `CNode` designated by `dst_cnode_cap` (`Rights::WRITE`):
-    /// `(dst_cnode_cap, src_cap, rights | flags, badge)` -> `dst_cap_id` (preserves cross-process CDT).
+    /// `(dst_cnode_cap, src_cap, rights | flags, badge)` -> `dst_cap_id` (preserves cross-domain CDT).
     CapGrant = 22,
     /// Set scheduling priority (`0..=255`, higher = higher priority) on `thread_cap` (`Rights::WRITE`):
     /// `(thread_cap, priority)`.
@@ -390,6 +562,7 @@ pub enum SyscallNumber {
 
 impl SyscallNumber {
     #[inline]
+    #[must_use]
     pub const fn from_u64(raw: u64) -> Option<Self> {
         match raw {
             1 => Some(Self::DebugWrite),
@@ -439,6 +612,28 @@ impl SyscallNumber {
     }
 }
 
+impl core::fmt::Display for SyscallNumber {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(self, f)
+    }
+}
+
+impl From<SyscallNumber> for u64 {
+    #[inline]
+    fn from(num: SyscallNumber) -> Self {
+        num as Self
+    }
+}
+
+impl TryFrom<u64> for SyscallNumber {
+    type Error = SysError;
+
+    #[inline]
+    fn try_from(raw: u64) -> Result<Self, Self::Error> {
+        Self::from_u64(raw).ok_or(SysError::InvalidArgument)
+    }
+}
+
 /// Stable EL0 protection domain role discriminant used by [`SyscallNumber::DomainRespawn`] and
 /// [`SyscallNumber::DomainGetFaultInfo`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -454,6 +649,7 @@ pub enum DomainRoleId {
 
 impl DomainRoleId {
     #[inline]
+    #[must_use]
     pub const fn from_u64(raw: u64) -> Option<Self> {
         match raw {
             0 => Some(Self::Supervisor),
@@ -464,6 +660,36 @@ impl DomainRoleId {
             5 => Some(Self::Ssh),
             _ => None,
         }
+    }
+}
+
+impl core::fmt::Display for DomainRoleId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = match self {
+            Self::Supervisor => "supervisor-pd",
+            Self::Shell => "shell-pd",
+            Self::Worker => "worker-pd",
+            Self::Net => "net-pd",
+            Self::Key => "key-pd",
+            Self::Ssh => "ssh-pd",
+        };
+        f.write_str(name)
+    }
+}
+
+impl From<DomainRoleId> for u64 {
+    #[inline]
+    fn from(role: DomainRoleId) -> Self {
+        role as Self
+    }
+}
+
+impl TryFrom<u64> for DomainRoleId {
+    type Error = SysError;
+
+    #[inline]
+    fn try_from(raw: u64) -> Result<Self, Self::Error> {
+        Self::from_u64(raw).ok_or(SysError::InvalidArgument)
     }
 }
 
@@ -486,12 +712,39 @@ pub enum IrqTriggerMode {
 
 impl IrqTriggerMode {
     #[inline]
+    #[must_use]
     pub const fn from_u64(raw: u64) -> Option<Self> {
         match raw {
             0 => Some(Self::LevelHigh),
             1 => Some(Self::EdgeRising),
             _ => None,
         }
+    }
+}
+
+impl core::fmt::Display for IrqTriggerMode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = match self {
+            Self::LevelHigh => "level-high",
+            Self::EdgeRising => "edge-rising",
+        };
+        f.write_str(name)
+    }
+}
+
+impl From<IrqTriggerMode> for u64 {
+    #[inline]
+    fn from(mode: IrqTriggerMode) -> Self {
+        mode as Self
+    }
+}
+
+impl TryFrom<u64> for IrqTriggerMode {
+    type Error = SysError;
+
+    #[inline]
+    fn try_from(raw: u64) -> Result<Self, Self::Error> {
+        Self::from_u64(raw).ok_or(SysError::InvalidArgument)
     }
 }
 
@@ -509,6 +762,7 @@ pub enum DmaCacheOp {
 
 impl DmaCacheOp {
     #[inline]
+    #[must_use]
     pub const fn from_u64(raw: u64) -> Option<Self> {
         match raw {
             0 => Some(Self::Clean),
@@ -516,6 +770,33 @@ impl DmaCacheOp {
             2 => Some(Self::CleanInvalidate),
             _ => None,
         }
+    }
+}
+
+impl core::fmt::Display for DmaCacheOp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = match self {
+            Self::Clean => "clean",
+            Self::Invalidate => "invalidate",
+            Self::CleanInvalidate => "clean-invalidate",
+        };
+        f.write_str(name)
+    }
+}
+
+impl From<DmaCacheOp> for u64 {
+    #[inline]
+    fn from(op: DmaCacheOp) -> Self {
+        op as Self
+    }
+}
+
+impl TryFrom<u64> for DmaCacheOp {
+    type Error = SysError;
+
+    #[inline]
+    fn try_from(raw: u64) -> Result<Self, Self::Error> {
+        Self::from_u64(raw).ok_or(SysError::InvalidArgument)
     }
 }
 
@@ -545,6 +826,7 @@ pub mod cpu_isa {
     /// Pack ISA feature flags together with probed physical address width (`pa_bits`)
     /// and D-cache minimum line size (`dcache_line_bytes`) into one 64-bit syscall return word.
     #[inline]
+    #[must_use]
     pub const fn pack(flags: u64, pa_bits: u8, dcache_line_bytes: u16) -> u64 {
         (flags & 0xFFFF_FFFF)
             | ((pa_bits as u64) << 32)
@@ -552,15 +834,29 @@ pub mod cpu_isa {
     }
 
     #[inline]
+    #[must_use]
     pub const fn pa_bits(packed: u64) -> u8 {
         ((packed >> 32) & 0xFF) as u8
     }
 
     #[inline]
+    #[must_use]
     pub const fn dcache_line_bytes(packed: u64) -> u16 {
         ((packed >> 40) & 0xFFFF) as u16
     }
 }
+
+/// Error returned when converting an unrecognized raw syscall discriminant into [`SysError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnknownSysError(pub u64);
+
+impl core::fmt::Display for UnknownSysError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "unknown syscall error code: {}", self.0)
+    }
+}
+
+impl core::error::Error for UnknownSysError {}
 
 /// Typed syscall error codes — invalid userspace inputs always return an error, never a kernel panic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -577,6 +873,7 @@ pub enum SysError {
 
 impl SysError {
     #[inline]
+    #[must_use]
     pub const fn from_u64(raw: u64) -> Option<Self> {
         match raw {
             1 => Some(Self::InvalidCapability),
@@ -589,15 +886,128 @@ impl SysError {
             _ => None,
         }
     }
+
+    /// Return the stable `u64` wire discriminant for this syscall error.
+    #[inline]
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self as u64
+    }
+
+    /// Return a static human-readable description of this syscall error.
+    #[inline]
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidCapability => "invalid capability",
+            Self::InsufficientRights => "insufficient rights",
+            Self::OutOfMemory => "out of memory",
+            Self::InvalidArgument => "invalid argument",
+            Self::SlotOccupied => "slot occupied",
+            Self::WouldBlock => "would block",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+impl core::fmt::Display for SysError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl core::error::Error for SysError {}
+
+impl From<SysError> for u64 {
+    #[inline]
+    fn from(err: SysError) -> Self {
+        err.as_u64()
+    }
+}
+
+impl TryFrom<u64> for SysError {
+    type Error = UnknownSysError;
+
+    #[inline]
+    fn try_from(raw: u64) -> Result<Self, Self::Error> {
+        Self::from_u64(raw).ok_or(UnknownSysError(raw))
+    }
 }
 
 /// Shutdown/reset status reported on PSCI `SYSTEM_OFF` / `SYSTEM_RESET` (Raspberry Pi 5 & QEMU `aarch64` `virt`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum ShutdownStatus {
     Success = 0,
     Failed = 1,
     Reboot = 2,
+}
+
+impl ShutdownStatus {
+    #[inline]
+    #[must_use]
+    pub const fn from_u32(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Success),
+            1 => Some(Self::Failed),
+            2 => Some(Self::Reboot),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn from_u64(raw: u64) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Success),
+            1 => Some(Self::Failed),
+            2 => Some(Self::Reboot),
+            _ => None,
+        }
+    }
+}
+
+impl core::fmt::Display for ShutdownStatus {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = match self {
+            Self::Success => "OK",
+            Self::Failed => "FAILED",
+            Self::Reboot => "REBOOT",
+        };
+        f.write_str(name)
+    }
+}
+
+impl From<ShutdownStatus> for u32 {
+    #[inline]
+    fn from(status: ShutdownStatus) -> Self {
+        status as Self
+    }
+}
+
+impl From<ShutdownStatus> for u64 {
+    #[inline]
+    fn from(status: ShutdownStatus) -> Self {
+        status as Self
+    }
+}
+
+impl TryFrom<u32> for ShutdownStatus {
+    type Error = SysError;
+
+    #[inline]
+    fn try_from(raw: u32) -> Result<Self, Self::Error> {
+        Self::from_u32(raw).ok_or(SysError::InvalidArgument)
+    }
+}
+
+impl TryFrom<u64> for ShutdownStatus {
+    type Error = SysError;
+
+    #[inline]
+    fn try_from(raw: u64) -> Result<Self, Self::Error> {
+        Self::from_u64(raw).ok_or(SysError::InvalidArgument)
+    }
 }
 
 /// Register-only IPC log chunk framing for `CapId::BOOTSTRAP_LOG_EP`.
@@ -611,6 +1021,7 @@ pub mod log_ipc {
 
     /// Pack up to [`MAX_CHUNK_BYTES`] bytes into a single 64-bit IPC register payload.
     #[inline]
+    #[must_use]
     pub const fn encode_chunk(bytes: &[u8]) -> u64 {
         let len = if bytes.len() > MAX_CHUNK_BYTES {
             MAX_CHUNK_BYTES
@@ -628,6 +1039,7 @@ pub mod log_ipc {
 
     /// Unpack a 64-bit IPC log payload into `([u8; 7], len)`.
     #[inline]
+    #[must_use]
     pub const fn decode_chunk(word: u64) -> ([u8; MAX_CHUNK_BYTES], usize) {
         let raw_len = (word >> 56) as usize;
         let len = if raw_len > MAX_CHUNK_BYTES {
@@ -653,7 +1065,7 @@ pub mod log_ipc {
 pub mod role_badge {
     /// Role tag for `newos-supervisor-pd`.
     pub const ROLE_SUPERVISOR: u32 = 0x1000;
-    /// Role tag for `newos-worker-pd-pd`.
+    /// Role tag for `newos-worker-pd`.
     pub const ROLE_WORKER: u32 = 0x1001;
     /// Role tag for `newos-net-pd`.
     pub const ROLE_NET: u32 = 0x1002;
@@ -664,24 +1076,28 @@ pub mod role_badge {
 
     /// Pack a `(role_tag, diagnostic_pd_id)` pair into a single 64-bit `BOOTSTRAP_LOG_EP` badge.
     #[inline]
+    #[must_use]
     pub const fn encode_log_badge(role: u32, pd_id: u32) -> u64 {
         ((role as u64) << 32) | (pd_id as u64)
     }
 
     /// Extract the kernel-verified `role_tag` from a `BOOTSTRAP_LOG_EP` badge.
     #[inline]
+    #[must_use]
     pub const fn decode_log_role(badge: u64) -> u32 {
         (badge >> 32) as u32
     }
 
     /// Extract the diagnostic PD ID from a `BOOTSTRAP_LOG_EP` badge.
     #[inline]
+    #[must_use]
     pub const fn decode_log_pd_id(badge: u64) -> u32 {
-        badge as u32
+        (badge & 0xFFFF_FFFF) as u32
     }
 
     /// Human-readable role name for console log prefixes.
     #[inline]
+    #[must_use]
     pub const fn role_name(role: u32) -> &'static str {
         match role {
             ROLE_SUPERVISOR => "supervisor",
@@ -700,17 +1116,18 @@ pub mod role_badge {
 /// - `OP_POLL_STATUS (0x01)`: query connection/readiness bits + active IPv4 address
 /// - `OP_RECV_CHUNK  (0x02)`: pull up to 7 TCP RX bytes (reply: `0..=7` len in bits `56..64`, or `REPLY_EOF`)
 /// - `OP_GET_NET_INFO (0x03)`: supervisor-only query for gateway/prefix/driver, DNS server, or MAC
-/// - `OP_PING_START  (0x04)`: supervisor-only start non-blocking ICMPv4 echo request to IPv4 target
-/// - `OP_PING_POLL   (0x05)`: supervisor-only poll active ICMPv4 ping status/seq/rtt
+/// - `OP_PING_START  (0x04)`: supervisor-only start non-blocking `ICMPv4` echo request to IPv4 target
+/// - `OP_PING_POLL   (0x05)`: supervisor-only poll active `ICMPv4` ping status/seq/rtt
 /// - `OP_DNS_START   (0x06)`: supervisor-only start non-blocking DNS A-record query for buffered hostname
 /// - `OP_DNS_POLL    (0x07)`: supervisor-only poll active DNS query status/IPv4
-/// - `OP_DHCP_RENEW  (0x08)`: supervisor-only trigger DHCPv4 lease renewal/discovery
+/// - `OP_DHCP_RENEW  (0x08)`: supervisor-only trigger `DHCPv4` lease renewal/discovery
 /// - `OP_CLOSE       (0x0E)`: graceful TCP FIN close (`ssh-pd` only)
 /// - `OP_ABORT       (0x0F)`: immediate TCP RST abort (`ssh-pd` only)
 /// - `OP_SEND_BASE..=OP_SEND_BASE+7 (0x10..=0x17)`: push `len` (`0..=7`) TCP TX bytes (`ssh-pd` only)
 /// - `OP_DNS_CHUNK_BASE..=OP_DNS_CHUNK_BASE+7 (0x20..=0x27)`: reset (`len=0`) or append DNS hostname bytes (`supervisor-pd` only)
 pub mod net_ipc {
     pub const MAX_CHUNK_BYTES: usize = 7;
+    const MAX_CHUNK_BYTES_U8: u8 = 7;
 
     pub const OP_POLL_STATUS: u8 = 0x01;
     pub const OP_RECV_CHUNK: u8 = 0x02;
@@ -763,26 +1180,31 @@ pub mod net_ipc {
     pub const BADGE_SSH: u64 = crate::role_badge::ROLE_SSH as u64;
 
     #[inline]
+    #[must_use]
     pub const fn encode_poll_status() -> u64 {
         (OP_POLL_STATUS as u64) << 56
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_recv_chunk() -> u64 {
         (OP_RECV_CHUNK as u64) << 56
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_get_net_info(selector: u8) -> u64 {
         ((OP_GET_NET_INFO as u64) << 56) | (selector as u64)
     }
 
     #[inline]
+    #[must_use]
     pub const fn decode_get_net_info_selector(word: u64) -> u8 {
         (word & 0xFF) as u8
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_gateway_prefix_reply(
         gateway: Option<[u8; 4]>,
         prefix_len: u8,
@@ -796,6 +1218,7 @@ pub mod net_ipc {
     }
 
     #[inline]
+    #[must_use]
     pub const fn decode_gateway_prefix_reply(word: u64) -> (Option<[u8; 4]>, u8, u8) {
         let prefix_len = (word & 0xFF) as u8;
         let driver_id = ((word >> 8) & 0xFF) as u8;
@@ -809,6 +1232,7 @@ pub mod net_ipc {
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_dns_info_reply(dns: Option<[u8; 4]>) -> u64 {
         match dns {
             Some(ip) => ((u32::from_be_bytes(ip) as u64) << 32) | 1,
@@ -817,6 +1241,7 @@ pub mod net_ipc {
     }
 
     #[inline]
+    #[must_use]
     pub const fn decode_dns_info_reply(word: u64) -> Option<[u8; 4]> {
         if (word & 1) != 0 {
             Some(((word >> 32) as u32).to_be_bytes())
@@ -826,6 +1251,7 @@ pub mod net_ipc {
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_mac_reply(mac: [u8; 6]) -> u64 {
         (mac[0] as u64)
             | ((mac[1] as u64) << 8)
@@ -836,6 +1262,7 @@ pub mod net_ipc {
     }
 
     #[inline]
+    #[must_use]
     pub const fn decode_mac_reply(word: u64) -> [u8; 6] {
         [
             (word & 0xFF) as u8,
@@ -848,26 +1275,31 @@ pub mod net_ipc {
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_ping_start(target: [u8; 4]) -> u64 {
         ((OP_PING_START as u64) << 56) | (u32::from_be_bytes(target) as u64)
     }
 
     #[inline]
+    #[must_use]
     pub const fn decode_ping_start(word: u64) -> [u8; 4] {
-        (word as u32).to_be_bytes()
+        ((word & 0xFFFF_FFFF) as u32).to_be_bytes()
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_ping_poll() -> u64 {
         (OP_PING_POLL as u64) << 56
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_ping_reply(status: u8, seq: u16, rtt_ms: u32) -> u64 {
         ((status as u64) << 56) | ((seq as u64) << 32) | (rtt_ms as u64)
     }
 
     #[inline]
+    #[must_use]
     pub const fn decode_ping_reply(word: u64) -> (u8, u16, u32) {
         let status = (word >> 56) as u8;
         let seq = ((word >> 32) & 0xFFFF) as u16;
@@ -876,13 +1308,14 @@ pub mod net_ipc {
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_dns_chunk(bytes: &[u8]) -> u64 {
         let len = if bytes.len() > MAX_CHUNK_BYTES {
             MAX_CHUNK_BYTES
         } else {
             bytes.len()
         };
-        let mut word = ((OP_DNS_CHUNK_BASE + len as u8) as u64) << 56;
+        let mut word = ((OP_DNS_CHUNK_BASE as u64) + (len as u64)) << 56;
         let mut i = 0;
         while i < len {
             word |= (bytes[i] as u64) << (i * 8);
@@ -892,50 +1325,58 @@ pub mod net_ipc {
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_dns_start() -> u64 {
         (OP_DNS_START as u64) << 56
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_dns_poll() -> u64 {
         (OP_DNS_POLL as u64) << 56
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_dns_reply(status: u8, ipv4: [u8; 4]) -> u64 {
         ((status as u64) << 56) | (u32::from_be_bytes(ipv4) as u64)
     }
 
     #[inline]
+    #[must_use]
     pub const fn decode_dns_reply(word: u64) -> (u8, [u8; 4]) {
         let status = (word >> 56) as u8;
-        let ip = (word as u32).to_be_bytes();
+        let ip = ((word & 0xFFFF_FFFF) as u32).to_be_bytes();
         (status, ip)
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_dhcp_renew() -> u64 {
         (OP_DHCP_RENEW as u64) << 56
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_close() -> u64 {
         (OP_CLOSE as u64) << 56
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_abort() -> u64 {
         (OP_ABORT as u64) << 56
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_send_chunk(bytes: &[u8]) -> u64 {
         let len = if bytes.len() > MAX_CHUNK_BYTES {
             MAX_CHUNK_BYTES
         } else {
             bytes.len()
         };
-        let mut word = ((OP_SEND_BASE + len as u8) as u64) << 56;
+        let mut word = ((OP_SEND_BASE as u64) + (len as u64)) << 56;
         let mut i = 0;
         while i < len {
             word |= (bytes[i] as u64) << (i * 8);
@@ -945,12 +1386,14 @@ pub mod net_ipc {
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_status_reply(flags: u64, ipv4: [u8; 4]) -> u64 {
         let ip_u32 = u32::from_be_bytes(ipv4) as u64;
         (ip_u32 << 32) | (flags & 0xFFFF_FFFF)
     }
 
     #[inline]
+    #[must_use]
     pub const fn decode_status_reply(word: u64) -> (u64, [u8; 4]) {
         let flags = word & 0xFFFF_FFFF;
         let ip = ((word >> 32) as u32).to_be_bytes();
@@ -958,20 +1401,34 @@ pub mod net_ipc {
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_recv_reply(bytes: &[u8]) -> u64 {
         crate::log_ipc::encode_chunk(bytes)
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_recv_eof() -> u64 {
         (REPLY_EOF as u64) << 56
     }
 
+    /// Decode an `OP_RECV_CHUNK` reply word, returning `None` on [`REPLY_EOF`].
+    #[inline]
+    #[must_use]
+    pub const fn decode_recv_reply(word: u64) -> Option<([u8; MAX_CHUNK_BYTES], usize)> {
+        if ((word >> 56) as u8) == REPLY_EOF {
+            None
+        } else {
+            Some(crate::log_ipc::decode_chunk(word))
+        }
+    }
+
     /// Decode a `net_ipc` request word into `(opcode, [u8; 7], payload_len)`.
     #[inline]
+    #[must_use]
     pub const fn decode_request(word: u64) -> (u8, [u8; MAX_CHUNK_BYTES], usize) {
         let op = (word >> 56) as u8;
-        if op >= OP_SEND_BASE && op <= OP_SEND_BASE + (MAX_CHUNK_BYTES as u8) {
+        if op >= OP_SEND_BASE && op <= OP_SEND_BASE + MAX_CHUNK_BYTES_U8 {
             let len = (op - OP_SEND_BASE) as usize;
             let mut buf = [0u8; MAX_CHUNK_BYTES];
             let mut i = 0;
@@ -980,7 +1437,7 @@ pub mod net_ipc {
                 i += 1;
             }
             (OP_SEND_BASE, buf, len)
-        } else if op >= OP_DNS_CHUNK_BASE && op <= OP_DNS_CHUNK_BASE + (MAX_CHUNK_BYTES as u8) {
+        } else if op >= OP_DNS_CHUNK_BASE && op <= OP_DNS_CHUNK_BASE + MAX_CHUNK_BYTES_U8 {
             let len = (op - OP_DNS_CHUNK_BASE) as usize;
             let mut buf = [0u8; MAX_CHUNK_BYTES];
             let mut i = 0;
@@ -1032,6 +1489,7 @@ pub mod supervisor_notif {
 
     /// Encode a `ShutdownStatus` into its corresponding supervisor notification bit.
     #[inline]
+    #[must_use]
     pub const fn encode_shutdown(status: ShutdownStatus) -> u64 {
         match status {
             ShutdownStatus::Success => SHUTDOWN_OK,
@@ -1042,6 +1500,7 @@ pub mod supervisor_notif {
 
     /// Decode a shutdown/reboot request from a received notification bitmask.
     #[inline]
+    #[must_use]
     pub const fn decode_shutdown(bits: u64) -> Option<ShutdownStatus> {
         if (bits & REBOOT) != 0 {
             Some(ShutdownStatus::Reboot)
@@ -1068,6 +1527,7 @@ pub mod key_ipc {
     pub const MAX_RANDOM_BYTES_PER_WINDOW: usize = 256;
     /// Maximum chunk payload bytes carried in a single 64-bit IPC register word.
     pub const MAX_CHUNK_BYTES: usize = 7;
+    const MAX_CHUNK_BYTES_U8: u8 = 7;
 
     /// Kernel-stamped IPC role badge of `newos-ssh-pd`.
     pub const BADGE_SSH: u64 = crate::role_badge::ROLE_SSH as u64;
@@ -1094,33 +1554,37 @@ pub mod key_ipc {
     /// Encode 4 bytes of CSPRNG output with a non-zero `REPLY_OK` tag in bits `32..64` so a
     /// `REPLY_DENIED` (0) or `REPLY_RATE_LIMITED` (2) error can NEVER be mistaken for random bytes (`N1`).
     #[inline]
+    #[must_use]
     pub const fn encode_random_u32_reply(val: u32) -> u64 {
         (REPLY_OK << 32) | (val as u64)
     }
 
     /// Decode a tagged 4-byte CSPRNG reply, returning `None` on any error status (`N1`).
     #[inline]
+    #[must_use]
     pub const fn decode_random_u32_reply(word: u64) -> Option<u32> {
         if (word >> 32) == REPLY_OK {
-            Some(word as u32)
+            Some((word & 0xFFFF_FFFF) as u32)
         } else {
             None
         }
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_word_req(op: u8, word_index: u32) -> u64 {
         ((op as u64) << 56) | (word_index as u64)
     }
 
     #[inline]
+    #[must_use]
     pub const fn encode_chunk_req(base_op: u8, bytes: &[u8]) -> u64 {
         let len = if bytes.len() > MAX_CHUNK_BYTES {
             MAX_CHUNK_BYTES
         } else {
             bytes.len()
         };
-        let mut word = ((base_op + len as u8) as u64) << 56;
+        let mut word = (((base_op as u64) + (len as u64)) & 0xFF) << 56;
         let mut i = 0;
         while i < len {
             word |= (bytes[i] as u64) << (i * 8);
@@ -1130,12 +1594,13 @@ pub mod key_ipc {
     }
 
     #[inline]
+    #[must_use]
     pub const fn decode_chunk_req(
         word: u64,
         base_op: u8,
     ) -> Option<([u8; MAX_CHUNK_BYTES], usize)> {
         let op = (word >> 56) as u8;
-        if op < base_op || op > base_op + (MAX_CHUNK_BYTES as u8) {
+        if op < base_op || op > base_op.saturating_add(MAX_CHUNK_BYTES_U8) {
             return None;
         }
         let len = (op - base_op) as usize;
@@ -1315,9 +1780,7 @@ mod tests {
     #[test]
     fn object_type_cap_id_and_extreme_boundary_values() {
         for raw in 0..=12u64 {
-            let obj = ObjectType::from_u64(raw);
-            assert!(obj.is_some());
-            assert_eq!(obj.unwrap() as u64, raw);
+            assert_eq!(ObjectType::from_u64(raw).map(|o| o as u64), Some(raw));
         }
         assert_eq!(ObjectType::from_u64(13), None);
         assert_eq!(ObjectType::from_u64(u64::MAX), None);
@@ -1407,9 +1870,9 @@ mod tests {
         assert_eq!(net_ipc::decode_request(ping_req).0, net_ipc::OP_PING_START);
         assert_eq!(net_ipc::decode_ping_start(ping_req), [8, 8, 8, 8]);
 
-        let ping_rep = net_ipc::encode_ping_reply(net_ipc::PING_OK, 7, 14);
+        let ping_reply = net_ipc::encode_ping_reply(net_ipc::PING_OK, 7, 14);
         assert_eq!(
-            net_ipc::decode_ping_reply(ping_rep),
+            net_ipc::decode_ping_reply(ping_reply),
             (net_ipc::PING_OK, 7, 14)
         );
 
@@ -1459,5 +1922,214 @@ mod tests {
             supervisor_notif::SUPERVISOR_RESPAWNED_BIT & supervisor_notif::SHUTDOWN_MASK,
             0
         );
+    }
+
+    struct StackFmt {
+        buf: [u8; 128],
+        len: usize,
+    }
+
+    impl StackFmt {
+        const fn new() -> Self {
+            Self {
+                buf: [0u8; 128],
+                len: 0,
+            }
+        }
+
+        fn as_str(&self) -> &str {
+            core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+        }
+    }
+
+    impl core::fmt::Write for StackFmt {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let bytes = s.as_bytes();
+            let avail = self.buf.len().saturating_sub(self.len);
+            let copy = bytes.len().min(avail);
+            self.buf[self.len..self.len + copy].copy_from_slice(&bytes[..copy]);
+            self.len += copy;
+            Ok(())
+        }
+    }
+
+    fn fmt_display<T: core::fmt::Display>(val: T, out: &mut StackFmt) {
+        use core::fmt::Write as _;
+        out.len = 0;
+        assert!(write!(out, "{val}").is_ok());
+    }
+
+    #[test]
+    fn sys_error_display_core_error_and_try_from_roundtrip() {
+        fn assert_core_error<E: core::error::Error>(_: &E) {}
+
+        let mut out = StackFmt::new();
+        for raw in 1..=7u64 {
+            let err = SysError::try_from(raw);
+            assert!(err.is_ok());
+            if let Ok(code) = err {
+                assert_core_error(&code);
+                assert_eq!(code.as_u64(), raw);
+                assert_eq!(u64::from(code), raw);
+                fmt_display(code, &mut out);
+                assert_eq!(out.as_str(), code.as_str());
+                assert_ne!(out.as_str(), "");
+            }
+        }
+
+        for invalid in [0u64, 8, u64::MAX] {
+            let unknown = SysError::try_from(invalid);
+            assert_eq!(unknown, Err(UnknownSysError(invalid)));
+            if let Err(err) = unknown {
+                assert_core_error(&err);
+                fmt_display(err, &mut out);
+                assert!(out.as_str().contains("unknown syscall error code:"));
+            }
+        }
+    }
+
+    #[test]
+    fn cap_id_parts_non_zero_default_and_display() {
+        assert_eq!(CapId::default(), CapId::NULL);
+        assert_eq!(CapId::try_from_raw(0), None);
+        assert_eq!(CapId::NULL.as_non_zero(), None);
+        assert_eq!(u64::from(CapId::NULL), 0);
+
+        let raw = CapId::BOOTSTRAP_SSH_THREAD.raw();
+        assert_eq!(CapId::try_from_raw(raw), Some(CapId::BOOTSTRAP_SSH_THREAD));
+        assert_eq!(CapId::BOOTSTRAP_SSH_THREAD.generation(), 1);
+        assert_eq!(CapId::BOOTSTRAP_SSH_THREAD.slot(), 44);
+        assert_eq!(CapId::from_parts(1, 44), CapId::BOOTSTRAP_SSH_THREAD);
+
+        let nz = core::num::NonZeroU64::new(raw);
+        assert!(nz.is_some());
+        if let Some(non_zero) = nz {
+            assert_eq!(CapId::from_non_zero(non_zero), CapId::BOOTSTRAP_SSH_THREAD);
+            assert_eq!(CapId::from(non_zero), CapId::BOOTSTRAP_SSH_THREAD);
+            assert_eq!(CapId::BOOTSTRAP_SSH_THREAD.as_non_zero(), Some(non_zero));
+        }
+
+        let mut out = StackFmt::new();
+        fmt_display(CapId::NULL, &mut out);
+        assert_eq!(out.as_str(), "CapId(null)");
+        fmt_display(CapId::BOOTSTRAP_NOTIF, &mut out);
+        assert_eq!(out.as_str(), "CapId(gen=1, slot=1)");
+    }
+
+    #[test]
+    fn rights_default_try_from_and_display() {
+        assert_eq!(Rights::default(), Rights::NONE);
+        assert_eq!(u8::from(Rights::ALL), 0b0001_1111);
+        assert_eq!(Rights::try_from(0b0001_1111), Ok(Rights::ALL));
+        assert_eq!(
+            Rights::try_from(0b0010_0000),
+            Err(SysError::InvalidArgument)
+        );
+
+        let mut out = StackFmt::new();
+        fmt_display(Rights::NONE, &mut out);
+        assert_eq!(out.as_str(), "NONE");
+        fmt_display(Rights::ALL, &mut out);
+        assert_eq!(out.as_str(), "RWXGK");
+        fmt_display(Rights::READ.union(Rights::WRITE), &mut out);
+        assert_eq!(out.as_str(), "RW");
+    }
+
+    #[test]
+    fn abi_enums_try_from_from_and_display() {
+        let mut out = StackFmt::new();
+
+        for raw in 0..=12u64 {
+            let obj = ObjectType::try_from(raw);
+            assert!(obj.is_ok());
+            if let Ok(val) = obj {
+                assert_eq!(u64::from(val), raw);
+                assert_eq!(u64::from(u8::from(val)), raw);
+                fmt_display(val, &mut out);
+                assert_ne!(out.as_str(), "");
+            }
+        }
+        assert_eq!(ObjectType::try_from(13), Err(SysError::InvalidArgument));
+
+        for raw in 1..=42u64 {
+            let sc = SyscallNumber::try_from(raw);
+            assert!(sc.is_ok());
+            if let Ok(val) = sc {
+                assert_eq!(u64::from(val), raw);
+                fmt_display(val, &mut out);
+                assert_ne!(out.as_str(), "");
+            }
+        }
+        assert_eq!(SyscallNumber::try_from(0), Err(SysError::InvalidArgument));
+
+        for raw in 0..=5u64 {
+            let role = DomainRoleId::try_from(raw);
+            assert!(role.is_ok());
+            if let Ok(val) = role {
+                assert_eq!(u64::from(val), raw);
+                fmt_display(val, &mut out);
+                assert!(out.as_str().ends_with("-pd"));
+            }
+        }
+        assert_eq!(DomainRoleId::try_from(6), Err(SysError::InvalidArgument));
+
+        for raw in 0..=1u64 {
+            let trig = IrqTriggerMode::try_from(raw);
+            assert!(trig.is_ok());
+            if let Ok(val) = trig {
+                assert_eq!(u64::from(val), raw);
+                fmt_display(val, &mut out);
+                assert_ne!(out.as_str(), "");
+            }
+        }
+        assert_eq!(IrqTriggerMode::try_from(2), Err(SysError::InvalidArgument));
+
+        for raw in 0..=2u64 {
+            let op = DmaCacheOp::try_from(raw);
+            assert!(op.is_ok());
+            if let Ok(val) = op {
+                assert_eq!(u64::from(val), raw);
+                fmt_display(val, &mut out);
+                assert_ne!(out.as_str(), "");
+            }
+        }
+        assert_eq!(DmaCacheOp::try_from(3), Err(SysError::InvalidArgument));
+
+        for raw in 0..=2u32 {
+            let status = ShutdownStatus::try_from(raw);
+            assert!(status.is_ok());
+            if let Ok(val) = status {
+                assert_eq!(u32::from(val), raw);
+                assert_eq!(u64::from(val), u64::from(raw));
+                assert_eq!(ShutdownStatus::try_from(u64::from(raw)), Ok(val));
+                fmt_display(val, &mut out);
+                assert_ne!(out.as_str(), "");
+            }
+        }
+        assert_eq!(
+            ShutdownStatus::try_from(3u32),
+            Err(SysError::InvalidArgument)
+        );
+        assert_eq!(
+            ShutdownStatus::try_from(3u64),
+            Err(SysError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn net_ipc_decode_recv_reply_and_key_ipc_high_base_op() {
+        let word = net_ipc::encode_recv_reply(b"hello");
+        assert_eq!(
+            net_ipc::decode_recv_reply(word).map(|(b, l)| (b[..l] == *b"hello", l)),
+            Some((true, 5))
+        );
+        assert_eq!(net_ipc::decode_recv_reply(net_ipc::encode_recv_eof()), None);
+
+        // High base_op near u8::MAX must never overflow in decode_chunk_req.
+        for base_op in 0xFC..=0xFFu8 {
+            let req = key_ipc::encode_chunk_req(base_op, b"");
+            assert_eq!(key_ipc::decode_chunk_req(req, base_op), Some(([0u8; 7], 0)));
+            assert_eq!(key_ipc::decode_chunk_req(0, base_op), None);
+        }
     }
 }

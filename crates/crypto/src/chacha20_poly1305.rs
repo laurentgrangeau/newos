@@ -16,19 +16,19 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// Poly1305 authentication tag length in bytes.
 pub const TAG_LEN: usize = 16;
 
-#[inline(always)]
-fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
-    s[a] = s[a].wrapping_add(s[b]);
-    s[d] = (s[d] ^ s[a]).rotate_left(16);
-    s[c] = s[c].wrapping_add(s[d]);
-    s[b] = (s[b] ^ s[c]).rotate_left(12);
-    s[a] = s[a].wrapping_add(s[b]);
-    s[d] = (s[d] ^ s[a]).rotate_left(8);
-    s[c] = s[c].wrapping_add(s[d]);
-    s[b] = (s[b] ^ s[c]).rotate_left(7);
+#[inline]
+const fn quarter_round(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] = (state[d] ^ state[a]).rotate_left(16);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_left(12);
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] = (state[d] ^ state[a]).rotate_left(8);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_left(7);
 }
 
-/// RFC 8439 ChaCha20 64-byte block function with 32-bit counter and 96-bit nonce.
+/// RFC 8439 `ChaCha20` 64-byte block function with 32-bit counter and 96-bit nonce.
 fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
     let mut state = [
         0x6170_7865,
@@ -48,7 +48,7 @@ fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
         u32::from_le_bytes([nonce[4], nonce[5], nonce[6], nonce[7]]),
         u32::from_le_bytes([nonce[8], nonce[9], nonce[10], nonce[11]]),
     ];
-    let initial = state;
+    let mut initial = state;
     for _ in 0..10 {
         quarter_round(&mut state, 0, 4, 8, 12);
         quarter_round(&mut state, 1, 5, 9, 13);
@@ -64,6 +64,8 @@ fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
         let w = state[i].wrapping_add(initial[i]).to_le_bytes();
         out[i * 4..i * 4 + 4].copy_from_slice(&w);
     }
+    state.zeroize();
+    initial.zeroize();
     out
 }
 
@@ -86,13 +88,13 @@ pub(crate) fn poly1305_mac(otk: &[u8; 32], msg: &[u8]) -> [u8; TAG_LEN] {
     // Clamp r per RFC 8439 Section 2.5
     let mut r_bytes = [0u8; 16];
     r_bytes.copy_from_slice(&otk[..16]);
-    r_bytes[3] &= 15;
-    r_bytes[7] &= 15;
-    r_bytes[11] &= 15;
-    r_bytes[15] &= 15;
-    r_bytes[4] &= 252;
-    r_bytes[8] &= 252;
-    r_bytes[12] &= 252;
+    r_bytes[3] &= 0x0f;
+    r_bytes[7] &= 0x0f;
+    r_bytes[11] &= 0x0f;
+    r_bytes[15] &= 0x0f;
+    r_bytes[4] &= 0xfc;
+    r_bytes[8] &= 0xfc;
+    r_bytes[12] &= 0xfc;
 
     let t0 = u32::from_le_bytes([r_bytes[0], r_bytes[1], r_bytes[2], r_bytes[3]]);
     let t1 = u32::from_le_bytes([r_bytes[4], r_bytes[5], r_bytes[6], r_bytes[7]]);
@@ -162,6 +164,13 @@ pub(crate) fn poly1305_mac(otk: &[u8; 32], msg: &[u8]) -> [u8; TAG_LEN] {
         h1 += c;
     }
 
+    poly1305_finalize([h0, h1, h2, h3, h4], otk)
+}
+
+#[inline]
+fn poly1305_finalize(limbs: [u64; 5], otk: &[u8; 32]) -> [u8; TAG_LEN] {
+    let [mut h0, mut h1, mut h2, mut h3, mut h4] = limbs;
+
     // Final carry propagation
     let mut c = h1 >> 26;
     h1 &= 0x03ff_ffff;
@@ -213,20 +222,15 @@ pub(crate) fn poly1305_mac(otk: &[u8; 32], msg: &[u8]) -> [u8; TAG_LEN] {
     let s2 = u64::from(u32::from_le_bytes([otk[24], otk[25], otk[26], otk[27]]));
     let s3 = u64::from(u32::from_le_bytes([otk[28], otk[29], otk[30], otk[31]]));
 
-    let mut acc = f0 + s0;
-    let out0 = (acc as u32).to_le_bytes();
-    acc = (acc >> 32) + f1 + s1;
-    let out1 = (acc as u32).to_le_bytes();
-    acc = (acc >> 32) + f2 + s2;
-    let out2 = (acc as u32).to_le_bytes();
-    acc = (acc >> 32) + f3 + s3;
-    let out3 = (acc as u32).to_le_bytes();
-
     let mut tag = [0u8; TAG_LEN];
-    tag[0..4].copy_from_slice(&out0);
-    tag[4..8].copy_from_slice(&out1);
-    tag[8..12].copy_from_slice(&out2);
-    tag[12..16].copy_from_slice(&out3);
+    let mut acc = f0 + s0;
+    tag[0..4].copy_from_slice(&acc.to_le_bytes()[..4]);
+    acc = (acc >> 32) + f1 + s1;
+    tag[4..8].copy_from_slice(&acc.to_le_bytes()[..4]);
+    acc = (acc >> 32) + f2 + s2;
+    tag[8..12].copy_from_slice(&acc.to_le_bytes()[..4]);
+    acc = (acc >> 32) + f3 + s3;
+    tag[12..16].copy_from_slice(&acc.to_le_bytes()[..4]);
     tag
 }
 
@@ -244,8 +248,18 @@ pub struct OpenSshChaCha20Poly1305 {
     k_len: [u8; 32],
 }
 
+impl core::fmt::Debug for OpenSshChaCha20Poly1305 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OpenSshChaCha20Poly1305")
+            .field("k_main", &"[REDACTED]")
+            .field("k_len", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl OpenSshChaCha20Poly1305 {
     /// Construct from 64 bytes of `SHAKE256`-derived key material (`k_main[0..32] || k_len[32..64]`).
+    #[must_use]
     pub fn new(key_64: &[u8; 64]) -> Self {
         let mut k_main = [0u8; 32];
         let mut k_len = [0u8; 32];
@@ -256,6 +270,12 @@ impl OpenSshChaCha20Poly1305 {
 
     /// Encrypt a 4-byte length prefix + payload in-place (`buf[0..4]` = len, `buf[4..4+plen]` = body)
     /// and return the 16-byte Poly1305 tag covering `buf[0..4+plen]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `packet_with_len.len() < 4`. Prefer [`AeadCipher::seal_packet`] for fallible
+    /// length-checked sealing.
+    #[must_use]
     pub fn seal_in_place(&self, seq: u64, packet_with_len: &mut [u8]) -> [u8; TAG_LEN] {
         let nonce = seq_nonce(seq);
         let mut poly_blk = chacha20_block(&self.k_main, 0, &nonce);
@@ -272,6 +292,7 @@ impl OpenSshChaCha20Poly1305 {
     }
 
     /// Decrypt the 4-byte SSH packet length header without modifying the ciphertext buffer.
+    #[must_use]
     pub fn decrypt_length(&self, seq: u64, enc_len: [u8; 4]) -> u32 {
         let nonce = seq_nonce(seq);
         let mut dec = enc_len;
@@ -280,7 +301,13 @@ impl OpenSshChaCha20Poly1305 {
     }
 
     /// Verify the 16-byte Poly1305 tag in constant time, then decrypt `packet_with_len[4..]` in place.
+    ///
+    /// Returns `false` if `packet_with_len.len() < 4` or if tag verification fails.
+    #[must_use]
     pub fn open_in_place(&self, seq: u64, packet_with_len: &mut [u8], tag: &[u8; TAG_LEN]) -> bool {
+        if packet_with_len.len() < 4 {
+            return false;
+        }
         let nonce = seq_nonce(seq);
         let mut poly_blk = chacha20_block(&self.k_main, 0, &nonce);
         let mut otk = [0u8; 32];
@@ -414,6 +441,79 @@ mod tests {
             0x27, 0xa9,
         ];
         assert_eq!(poly1305_mac(&otk, msg), expected_tag);
+    }
+
+    #[test]
+    fn aead_cipher_trait_roundtrip_and_errors() {
+        let key = [0x5Au8; 64];
+        let cipher = OpenSshChaCha20Poly1305::new(&key);
+
+        let mut short = [0u8; 3];
+        assert_eq!(
+            cipher.seal_packet(0, &mut short),
+            Err(CryptoError::InvalidInput)
+        );
+        assert_eq!(
+            cipher.open_packet(0, &mut short, &[0u8; TAG_LEN]),
+            Err(CryptoError::InvalidInput)
+        );
+
+        let mut pkt = [0u8; 4 + 8];
+        pkt[0..4].copy_from_slice(&8u32.to_be_bytes());
+        pkt[4..12].copy_from_slice(b"newos-pq");
+        let sealed = cipher.seal_packet(3, &mut pkt);
+        assert!(sealed.is_ok());
+        if let Ok(mut tag) = sealed {
+            tag[0] ^= 0x80;
+            assert_eq!(
+                cipher.open_packet(3, &mut pkt, &tag),
+                Err(CryptoError::AuthenticationFailed)
+            );
+            tag[0] ^= 0x80;
+            assert_eq!(cipher.open_packet(3, &mut pkt, &tag), Ok(()));
+            assert_eq!(&pkt[4..12], b"newos-pq");
+        }
+    }
+
+    #[test]
+    fn open_in_place_short_buffer_returns_false_without_panic() {
+        let cipher = OpenSshChaCha20Poly1305::new(&[0x11u8; 64]);
+        let tag = [0u8; TAG_LEN];
+        assert!(!cipher.open_in_place(0, &mut [], &tag));
+        assert!(!cipher.open_in_place(0, &mut [1u8; 1], &tag));
+        assert!(!cipher.open_in_place(0, &mut [1u8; 3], &tag));
+    }
+
+    #[test]
+    fn debug_redacts_key_material() {
+        use core::fmt::Write as _;
+
+        struct StackWriter {
+            buf: [u8; 128],
+            len: usize,
+        }
+
+        impl core::fmt::Write for StackWriter {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let avail = self.buf.len().saturating_sub(self.len);
+                let copy = bytes.len().min(avail);
+                self.buf[self.len..self.len + copy].copy_from_slice(&bytes[..copy]);
+                self.len += copy;
+                Ok(())
+            }
+        }
+
+        let cipher = OpenSshChaCha20Poly1305::new(&[0xABu8; 64]);
+        let mut writer = StackWriter {
+            buf: [0u8; 128],
+            len: 0,
+        };
+        assert!(write!(&mut writer, "{cipher:?}").is_ok());
+        let formatted = core::str::from_utf8(&writer.buf[..writer.len]).unwrap_or("");
+        assert!(formatted.contains("OpenSshChaCha20Poly1305"));
+        assert!(formatted.contains("[REDACTED]"));
+        assert!(!formatted.contains("171"));
     }
 }
 

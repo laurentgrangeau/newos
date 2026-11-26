@@ -25,8 +25,83 @@ const _: () = {
     assert!(LINE_BUF_SIZE <= u8::MAX as usize);
 };
 
-/// Read-only system summary returned by `ShellHost::sys_info()`.
+/// Controls whether shell execution emits diagnostics and rendered records to the host console.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputMode {
+    #[default]
+    Emit,
+    Silent,
+}
+
+impl OutputMode {
+    #[must_use]
+    #[inline]
+    pub const fn is_silent(self) -> bool {
+        matches!(self, Self::Silent)
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn should_emit(self) -> bool {
+        matches!(self, Self::Emit)
+    }
+}
+
+/// Structured error returned by [`Shell::run_self_test`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellSelfTestError {
+    PutSaveDidNotCreateObject,
+    DeduplicationFailed,
+    MissingRefAfterUpdate(StoreError),
+    RefDidNotUpdate,
+    MissingRefAfterRollback(StoreError),
+    RollbackDidNotRestore,
+    PutTamperFailed(StoreError),
+    SealedRefAllowedWrite,
+    TypedPipelineFailed,
+}
+
+impl ShellSelfTestError {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PutSaveDidNotCreateObject => "put | save did not create object",
+            Self::DeduplicationFailed => "content deduplication failed",
+            Self::MissingRefAfterUpdate(_) => "missing @demo v2",
+            Self::RefDidNotUpdate => "@demo did not update to v2",
+            Self::MissingRefAfterRollback(_) => "missing @demo after rollback",
+            Self::RollbackDidNotRestore => "ref rollback did not restore v1",
+            Self::PutTamperFailed(_) => "put tamper failed",
+            Self::SealedRefAllowedWrite => "sealed ref allowed write!",
+            Self::TypedPipelineFailed => "typed pipeline `domains | where id == 1 | count` failed",
+        }
+    }
+}
+
+impl fmt::Display for ShellSelfTestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl core::error::Error for ShellSelfTestError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::MissingRefAfterUpdate(err)
+            | Self::MissingRefAfterRollback(err)
+            | Self::PutTamperFailed(err) => Some(err),
+            Self::PutSaveDidNotCreateObject
+            | Self::DeduplicationFailed
+            | Self::RefDidNotUpdate
+            | Self::RollbackDidNotRestore
+            | Self::SealedRefAllowedWrite
+            | Self::TypedPipelineFailed => None,
+        }
+    }
+}
+
+/// Read-only system summary returned by `ShellHost::sys_info()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SysInfo {
     pub online_cpus: u16,
     pub domain_count: u16,
@@ -45,22 +120,40 @@ pub trait ShellHost {
     fn sys_info(&mut self) -> SysInfo;
 
     /// Non-blocking 1-byte console read (default: `Err(SysError::WouldBlock)`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::WouldBlock`] when no byte is available, or another [`SysError`] on
+    /// fatal console failure.
     fn read_debug_byte(&mut self) -> Result<u8, SysError> {
         Err(SysError::WouldBlock)
     }
 
     /// Send a register-only fastpath IPC payload to an endpoint capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SysError`] if the capability is invalid, lacks rights, or IPC is unsupported.
     fn ipc_send(&mut self, _cap: CapId, _payload: u64) -> Result<(), SysError> {
         Err(SysError::Unsupported)
     }
 
     /// Receive a pending `(badge, payload)` pair from an endpoint capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::WouldBlock`] if no message is queued, or another [`SysError`] on
+    /// capability failure.
     fn ipc_recv(&mut self, _cap: CapId) -> Result<(u64, u64), SysError> {
         Err(SysError::WouldBlock)
     }
 
     /// Synchronous send+receive fastpath (`IpcCall`). Defaults to `ipc_send` + `yield_now` +
     /// `ipc_recv` for hosts that do not override it (e.g. `MockShellHost` in `tests/e2e`).
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`SysError`] from sending or receiving on `cap`.
     fn ipc_call(&mut self, cap: CapId, payload: u64) -> Result<(u64, u64), SysError> {
         self.ipc_send(cap, payload)?;
         let _ = self.yield_now();
@@ -68,11 +161,19 @@ pub trait ShellHost {
     }
 
     /// Yield the current thread's remaining time slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SysError`] if the underlying yield syscall fails.
     fn yield_now(&mut self) -> Result<u64, SysError> {
         Ok(0)
     }
 
     /// Read the monotonic CPU cycle counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SysError`] if the cycle counter is unavailable.
     fn read_cycles(&mut self) -> Result<u64, SysError> {
         Ok(0)
     }
@@ -95,7 +196,7 @@ pub trait ShellHost {
         _subcmd: &str,
         _arg: Option<&str>,
         _stream: &mut RecordStream,
-        _silent: bool,
+        _mode: OutputMode,
     ) {
     }
 
@@ -109,6 +210,7 @@ pub trait ShellHost {
 }
 
 /// Zero-output `core::fmt::Write` sink (used by `run_self_test` and silent helpers).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct NullWriter;
 
 impl Write for NullWriter {
@@ -126,7 +228,18 @@ pub struct BufferedWriter<const N: usize, W: Write> {
     pos: usize,
 }
 
+impl<const N: usize, W: Write + fmt::Debug> fmt::Debug for BufferedWriter<N, W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BufferedWriter")
+            .field("inner", &self.inner)
+            .field("buffered", &self.pos)
+            .field("capacity", &N)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<const N: usize, W: Write> BufferedWriter<N, W> {
+    #[must_use]
     #[inline]
     pub const fn new(inner: W) -> Self {
         Self {
@@ -136,11 +249,12 @@ impl<const N: usize, W: Write> BufferedWriter<N, W> {
         }
     }
 
-    pub fn inner(&self) -> &W {
+    #[must_use]
+    pub const fn inner(&self) -> &W {
         &self.inner
     }
 
-    pub fn inner_mut(&mut self) -> &mut W {
+    pub const fn inner_mut(&mut self) -> &mut W {
         &mut self.inner
     }
 
@@ -226,7 +340,7 @@ pub enum ExecOutcome {
 }
 
 /// Typed structured record flowing between `|` pipeline stages (zero text re-parsing).
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Record {
     Count(usize),
     Domain {
@@ -249,6 +363,12 @@ pub struct RecordStream {
     len: usize,
 }
 
+impl fmt::Debug for RecordStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(&self.items[..self.len]).finish()
+    }
+}
+
 impl Default for RecordStream {
     fn default() -> Self {
         Self::new()
@@ -256,6 +376,7 @@ impl Default for RecordStream {
 }
 
 impl RecordStream {
+    #[must_use]
     #[inline]
     pub const fn new() -> Self {
         Self {
@@ -265,25 +386,28 @@ impl RecordStream {
     }
 
     #[inline]
-    pub fn push(&mut self, rec: Record) {
+    pub const fn push(&mut self, rec: Record) {
         if self.len < MAX_STREAM_RECORDS {
             self.items[self.len] = rec;
             self.len += 1;
         }
     }
 
+    #[must_use]
     #[inline]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.len
     }
 
+    #[must_use]
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    #[must_use]
     #[inline]
-    pub fn first(&self) -> Option<Record> {
+    pub const fn first(&self) -> Option<Record> {
         if self.len > 0 {
             Some(self.items[0])
         } else {
@@ -292,12 +416,12 @@ impl RecordStream {
     }
 
     #[inline]
-    pub fn clear(&mut self) {
+    pub const fn clear(&mut self) {
         self.len = 0;
     }
 
     #[inline]
-    pub(crate) fn truncate(&mut self, limit: usize) {
+    pub(crate) const fn truncate(&mut self, limit: usize) {
         if limit < self.len {
             self.len = limit;
         }
@@ -427,12 +551,12 @@ impl<const N: usize> AsciiLine<N> {
     }
 
     #[inline]
-    fn clear(&mut self) {
+    const fn clear(&mut self) {
         self.len = 0;
     }
 
     #[inline]
-    fn push_byte(&mut self, b: u8) {
+    const fn push_byte(&mut self, b: u8) {
         if self.len < N {
             self.buf[self.len] = b;
             self.len += 1;
@@ -504,47 +628,28 @@ enum ParseError {
     TooManyArgs,
 }
 
-#[inline]
-const fn parse_error_msg(err: ParseError) -> &'static str {
-    match err {
-        ParseError::UnclosedQuote => "newos-shell-pd: unclosed quote\n",
-        ParseError::TooManyStages => "newos-shell-pd: too many pipeline stages (max 6)\n",
-        ParseError::EmptyStage => "newos-shell-pd: empty pipeline stage\n",
-        ParseError::TooManyArgs => "newos-shell-pd: too many arguments (max 12)\n",
+impl ParseError {
+    #[inline]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnclosedQuote => "newos-shell-pd: unclosed quote\n",
+            Self::TooManyStages => "newos-shell-pd: too many pipeline stages (max 6)\n",
+            Self::EmptyStage => "newos-shell-pd: empty pipeline stage\n",
+            Self::TooManyArgs => "newos-shell-pd: too many arguments (max 12)\n",
+        }
     }
 }
 
-#[inline]
-const fn store_error_str(e: StoreError) -> &'static str {
-    match e {
-        StoreError::NotFound => "NotFound",
-        StoreError::NoSpace => "NoSpace",
-        StoreError::TooLarge => "TooLarge",
-        StoreError::InvalidName => "InvalidName",
-        StoreError::ReadOnly => "ReadOnly",
-        StoreError::NoPreviousVersion => "NoPreviousVersion",
-        StoreError::CorruptSnapshot => "CorruptSnapshot",
-        StoreError::HashCollision => "HashCollision",
-    }
-}
-
-#[inline]
-const fn sys_error_str(e: SysError) -> &'static str {
-    match e {
-        SysError::InvalidCapability => "InvalidCapability",
-        SysError::InsufficientRights => "InsufficientRights",
-        SysError::OutOfMemory => "OutOfMemory",
-        SysError::InvalidArgument => "InvalidArgument",
-        SysError::SlotOccupied => "SlotOccupied",
-        SysError::WouldBlock => "WouldBlock",
-        SysError::Unsupported => "Unsupported",
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
 fn write_store_err<H: ShellHost>(host: &mut H, prefix: &str, e: StoreError) {
     let mut line = AsciiLine::<128>::new();
     line.push_str(prefix);
-    line.push_str(store_error_str(e));
+    line.push_str(e.as_str());
     line.push_byte(b'\n');
     host.write_debug(line.as_str());
 }
@@ -567,8 +672,20 @@ pub struct Shell<H: ShellHost> {
     history_count: u32,
 }
 
+impl<H: ShellHost + fmt::Debug> fmt::Debug for Shell<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Shell")
+            .field("store", &self.store)
+            .field("host", &self.host)
+            .field("cached_sys_info", &self.cached_sys_info)
+            .field("history_count", &self.history_count)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<H: ShellHost> Shell<H> {
-    pub fn new(host: H) -> Self {
+    #[must_use]
+    pub const fn new(host: H) -> Self {
         Self {
             store: ObjectStore::new(),
             host,
@@ -585,19 +702,21 @@ impl<H: ShellHost> Shell<H> {
         sys_info_cached_with(&mut self.host, &mut self.cached_sys_info)
     }
 
-    pub fn store(&self) -> &ObjectStore {
+    #[must_use]
+    pub const fn store(&self) -> &ObjectStore {
         &self.store
     }
 
-    pub fn store_mut(&mut self) -> &mut ObjectStore {
+    pub const fn store_mut(&mut self) -> &mut ObjectStore {
         &mut self.store
     }
 
-    pub fn host(&self) -> &H {
+    #[must_use]
+    pub const fn host(&self) -> &H {
         &self.host
     }
 
-    pub fn host_mut(&mut self) -> &mut H {
+    pub const fn host_mut(&mut self) -> &mut H {
         &mut self.host
     }
 
@@ -614,50 +733,59 @@ impl<H: ShellHost> Shell<H> {
         if len == 0 {
             return;
         }
-        let slot = (self.history_count as usize) % HISTORY_LEN;
-        self.history[slot][..len].copy_from_slice(&bytes[..len]);
-        self.history_lens[slot] = len as u8;
-        self.history_count = self.history_count.wrapping_add(1);
+        if let Ok(len_u8) = u8::try_from(len) {
+            let slot = (self.history_count as usize) % HISTORY_LEN;
+            self.history[slot][..len].copy_from_slice(&bytes[..len]);
+            self.history_lens[slot] = len_u8;
+            self.history_count = self.history_count.wrapping_add(1);
+        }
     }
 
     /// Automated CAOS + typed-pipeline self-check (run by `cargo xtask test`).
-    pub fn run_self_test(&mut self) -> Result<(), &'static str> {
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ShellSelfTestError`] describing which CAOS or typed-pipeline invariant failed.
+    pub fn run_self_test(&mut self) -> Result<(), ShellSelfTestError> {
         // 1. Typed pipeline: `put "v1" | save @demo`
         let before_objs = self.store.object_count();
-        let _ = self.exec_line_inner("put \"hello caos v1\" | save @demo", true);
+        let _ = self.exec_line_inner("put \"hello caos v1\" | save @demo", OutputMode::Silent);
         if self.store.object_count() != before_objs + 1 {
-            return Err("put | save did not create object");
+            return Err(ShellSelfTestError::PutSaveDidNotCreateObject);
         }
 
         // 2. Content deduplication: storing identical bytes must NOT allocate a new object!
-        let _ = self.exec_line_inner("put \"hello caos v1\"", true);
+        let _ = self.exec_line_inner("put \"hello caos v1\"", OutputMode::Silent);
         if self.store.object_count() != before_objs + 1 {
-            return Err("content deduplication failed");
+            return Err(ShellSelfTestError::DeduplicationFailed);
         }
 
         // 3. Atomic update + instant rollback: v1 -> v2 -> rollback -> v1
-        let _ = self.exec_line_inner("put \"hello caos v2\" | save @demo", true);
+        let _ = self.exec_line_inner("put \"hello caos v2\" | save @demo", OutputMode::Silent);
         let (_, v2) = self
             .store
             .get_any("@demo")
-            .map_err(|_| "missing @demo v2")?;
+            .map_err(ShellSelfTestError::MissingRefAfterUpdate)?;
         if v2 != b"hello caos v2" {
-            return Err("@demo did not update to v2");
+            return Err(ShellSelfTestError::RefDidNotUpdate);
         }
-        let _ = self.exec_line_inner("ref rollback @demo", true);
+        let _ = self.exec_line_inner("ref rollback @demo", OutputMode::Silent);
         let (_, v1) = self
             .store
             .get_any("@demo")
-            .map_err(|_| "missing @demo after rollback")?;
+            .map_err(ShellSelfTestError::MissingRefAfterRollback)?;
         if v1 != b"hello caos v1" {
-            return Err("ref rollback did not restore v1");
+            return Err(ShellSelfTestError::RollbackDidNotRestore);
         }
 
         // 4. Irreversible capability attenuation (`seal` -> read-only)
-        let _ = self.exec_line_inner("ref seal @demo", true);
-        let h2 = self.store.put(b"tamper").map_err(|_| "put tamper failed")?;
+        let _ = self.exec_line_inner("ref seal @demo", OutputMode::Silent);
+        let h2 = self
+            .store
+            .put(b"tamper")
+            .map_err(ShellSelfTestError::PutTamperFailed)?;
         if self.store.set_ref("@demo", h2) != Err(StoreError::ReadOnly) {
-            return Err("sealed ref allowed write!");
+            return Err(ShellSelfTestError::SealedRefAllowedWrite);
         }
 
         // 5. Typed pipeline filter & reduction: `domains | where id == 1 | count` -> 1
@@ -667,15 +795,13 @@ impl<H: ShellHost> Shell<H> {
             &mut self.host,
             &mut self.cached_sys_info,
             "domains | where id == 1 | count",
-            true,
+            OutputMode::Silent,
             &mut self.scratch_stream,
         );
         match self.scratch_stream.first() {
-            Some(Record::Count(1)) => {}
-            _ => return Err("typed pipeline `domains | where id == 1 | count` failed"),
+            Some(Record::Count(1)) => Ok(()),
+            _ => Err(ShellSelfTestError::TypedPipelineFailed),
         }
-
-        Ok(())
     }
 
     /// Run the interactive EL0 REPL (`cargo xtask run`).
@@ -685,9 +811,8 @@ impl<H: ShellHost> Shell<H> {
         let mut line_buf = [0u8; LINE_BUF_SIZE];
         loop {
             self.host.write_debug("newos λ ");
-            let len = match self.read_line_checked(&mut line_buf) {
-                Ok(n) => n,
-                Err(_) => self.host.exit(ShutdownStatus::Failed),
+            let Ok(len) = self.read_line_checked(&mut line_buf) else {
+                self.host.exit(ShutdownStatus::Failed);
             };
             let line = core::str::from_utf8(&line_buf[..len]).unwrap_or("").trim();
             if line.is_empty() {
@@ -822,7 +947,7 @@ impl<H: ShellHost> Shell<H> {
 
     /// Execute a single shell command line, writing output through `ShellHost::write_debug`.
     pub fn exec_line(&mut self, line: &str) -> ExecOutcome {
-        self.exec_line_inner(line, false)
+        self.exec_line_inner(line, OutputMode::Emit)
     }
 
     /// Evaluate a typed pipeline silently (no `write_debug` output) and return its `RecordStream`.
@@ -833,7 +958,7 @@ impl<H: ShellHost> Shell<H> {
             &mut self.host,
             &mut self.cached_sys_info,
             line,
-            true,
+            OutputMode::Silent,
             &mut stream,
         );
         stream
@@ -847,41 +972,37 @@ impl<H: ShellHost> Shell<H> {
             &mut self.host,
             &mut self.cached_sys_info,
             line,
-            true,
+            OutputMode::Silent,
             &mut self.scratch_stream,
         );
         &self.scratch_stream
     }
 
-    fn exec_line_inner(&mut self, line: &str, silent: bool) -> ExecOutcome {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return ExecOutcome::Continue;
-        }
+    fn exec_builtin(&mut self, trimmed: &str, mode: OutputMode) -> Option<ExecOutcome> {
         match trimmed {
             "exit" | "shutdown" => {
-                if !silent {
+                if mode.should_emit() {
                     self.host.write_debug("Shutting down NewOS...\n");
                 }
-                return ExecOutcome::Exit(ShutdownStatus::Success);
+                Some(ExecOutcome::Exit(ShutdownStatus::Success))
             }
             "clear" => {
-                if !silent {
+                if mode.should_emit() {
                     self.host.write_debug("\x1b[2J\x1b[H");
                 }
-                return ExecOutcome::Continue;
+                Some(ExecOutcome::Continue)
             }
             "crash" => {
-                if !silent {
+                if mode.should_emit() {
                     self.host.write_debug(
                         "[newos-shell-pd] triggering deliberate EL0 `udf #0` fault (kernel stays alive)...\n",
                     );
                 }
                 self.host.trigger_user_fault();
-                return ExecOutcome::Continue;
+                Some(ExecOutcome::Continue)
             }
             "history" => {
-                if !silent {
+                if mode.should_emit() {
                     let count = self.history_count as usize;
                     let total = count.min(HISTORY_LEN);
                     let start = count.saturating_sub(total);
@@ -901,18 +1022,18 @@ impl<H: ShellHost> Shell<H> {
                         }
                     }
                 }
-                return ExecOutcome::Continue;
+                Some(ExecOutcome::Continue)
             }
             "help" => {
-                if !silent {
+                if mode.should_emit() {
                     self.host.write_debug(HELP_TEXT);
                 }
-                return ExecOutcome::Continue;
+                Some(ExecOutcome::Continue)
             }
             "gc" => {
                 let reclaimed = self.store.gc();
                 let remaining = self.store.object_count();
-                if !silent {
+                if mode.should_emit() {
                     let mut row = AsciiLine::<96>::new();
                     row.push_str("gc: reclaimed ");
                     row.push_u64(reclaimed as u64);
@@ -921,12 +1042,12 @@ impl<H: ShellHost> Shell<H> {
                     row.push_str(" live\n");
                     self.host.write_debug(row.as_str());
                 }
-                return ExecOutcome::Continue;
+                Some(ExecOutcome::Continue)
             }
             "sys" => {
                 let info = self.sys_info_cached();
                 let obj_count = self.store.object_count();
-                if !silent {
+                if mode.should_emit() {
                     let mut row = AsciiLine::<96>::new();
                     row.push_str(concat!(
                         "NewOS ",
@@ -941,9 +1062,55 @@ impl<H: ShellHost> Shell<H> {
                     row.push_str(" objs)\n");
                     self.host.write_debug(row.as_str());
                 }
-                return ExecOutcome::Continue;
+                Some(ExecOutcome::Continue)
             }
-            _ => {}
+            _ => None,
+        }
+    }
+
+    fn exec_get_cmd(&mut self, toks: &[&str], mode: OutputMode) {
+        let Some(spec) = toks.get(1).copied().filter(|s| !s.is_empty()) else {
+            if mode.should_emit() {
+                self.host.write_debug("usage: get <@ref | obj:hash>\n");
+            }
+            return;
+        };
+        match self.store.get_any(spec) {
+            Ok((hash, bytes)) => {
+                if mode.should_emit() {
+                    let text = core::str::from_utf8(bytes).unwrap_or("<binary>");
+                    let mut row = AsciiLine::<192>::new();
+                    row.push_str("[obj:");
+                    row.push_hex16(hash.0);
+                    row.push_str(", ");
+                    row.push_u64(bytes.len() as u64);
+                    row.push_str("B]\n");
+                    row.push_str(text);
+                    row.push_byte(b'\n');
+                    self.host.write_debug(row.as_str());
+                }
+            }
+            Err(e) => {
+                if mode.should_emit() {
+                    let mut row = AsciiLine::<128>::new();
+                    row.push_str("get: ");
+                    row.push_str(spec);
+                    row.push_str(": ");
+                    row.push_str(e.as_str());
+                    row.push_byte(b'\n');
+                    self.host.write_debug(row.as_str());
+                }
+            }
+        }
+    }
+
+    fn exec_line_inner(&mut self, line: &str, mode: OutputMode) -> ExecOutcome {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return ExecOutcome::Continue;
+        }
+        if let Some(outcome) = self.exec_builtin(trimmed, mode) {
+            return outcome;
         }
 
         // Single-pass stage tokenizer: parses stage 0 directly without a separate `split_pipeline` pass.
@@ -951,8 +1118,8 @@ impl<H: ShellHost> Shell<H> {
         let (argc, next_rest) = match next_pipeline_stage(trimmed, &mut toks) {
             Ok(v) => v,
             Err(pe) => {
-                if !silent {
-                    self.host.write_debug(parse_error_msg(pe));
+                if mode.should_emit() {
+                    self.host.write_debug(pe.as_str());
                 }
                 return ExecOutcome::Continue;
             }
@@ -960,43 +1127,11 @@ impl<H: ShellHost> Shell<H> {
 
         if next_rest.is_none() {
             if argc > 0 && toks[0] == "get" {
-                let Some(spec) = toks.get(1).copied().filter(|s| !s.is_empty()) else {
-                    if !silent {
-                        self.host.write_debug("usage: get <@ref | obj:hash>\n");
-                    }
-                    return ExecOutcome::Continue;
-                };
-                match self.store.get_any(spec) {
-                    Ok((hash, bytes)) => {
-                        if !silent {
-                            let text = core::str::from_utf8(bytes).unwrap_or("<binary>");
-                            let mut row = AsciiLine::<192>::new();
-                            row.push_str("[obj:");
-                            row.push_hex16(hash.0);
-                            row.push_str(", ");
-                            row.push_u64(bytes.len() as u64);
-                            row.push_str("B]\n");
-                            row.push_str(text);
-                            row.push_byte(b'\n');
-                            self.host.write_debug(row.as_str());
-                        }
-                    }
-                    Err(e) => {
-                        if !silent {
-                            let mut row = AsciiLine::<128>::new();
-                            row.push_str("get: ");
-                            row.push_str(spec);
-                            row.push_str(": ");
-                            row.push_str(store_error_str(e));
-                            row.push_byte(b'\n');
-                            self.host.write_debug(row.as_str());
-                        }
-                    }
-                }
+                self.exec_get_cmd(&toks[..argc], mode);
                 return ExecOutcome::Continue;
             }
             if argc > 0 && toks[0] == "ref" {
-                self.exec_ref_cmd(&toks[1..argc], silent);
+                self.exec_ref_cmd(&toks[1..argc], mode);
                 return ExecOutcome::Continue;
             }
 
@@ -1006,10 +1141,10 @@ impl<H: ShellHost> Shell<H> {
                 &mut self.host,
                 &mut self.cached_sys_info,
                 &toks[..argc],
-                silent,
+                mode,
                 &mut self.scratch_stream,
             );
-            if ok && !silent {
+            if ok && mode.should_emit() {
                 let mut out = BufferedWriter::<SHELL_OUT_BUF, _>::new(HostWriter(&mut self.host));
                 self.scratch_stream.render(&mut out);
             }
@@ -1024,21 +1159,21 @@ impl<H: ShellHost> Shell<H> {
             &mut self.cached_sys_info,
             &toks[..argc],
             next_rest,
-            silent,
+            mode,
             &mut self.scratch_stream,
         );
-        if ok && !silent {
+        if ok && mode.should_emit() {
             let mut out = BufferedWriter::<SHELL_OUT_BUF, _>::new(HostWriter(&mut self.host));
             self.scratch_stream.render(&mut out);
         }
         ExecOutcome::Continue
     }
 
-    fn exec_ref_cmd(&mut self, args: &[&str], silent: bool) {
+    fn exec_ref_cmd(&mut self, args: &[&str], mode: OutputMode) {
         match args {
             ["set", name, hash_str] => {
                 let Some(hash) = ObjHash::parse_hex(hash_str) else {
-                    if !silent {
+                    if mode.should_emit() {
                         write_quoted_err(
                             &mut self.host,
                             "ref set: invalid hash `",
@@ -1050,7 +1185,7 @@ impl<H: ShellHost> Shell<H> {
                 };
                 match self.store.set_ref(name, hash) {
                     Ok(()) => {
-                        if !silent {
+                        if mode.should_emit() {
                             let mut row = AsciiLine::<96>::new();
                             row.push_str("bound @");
                             row.push_str(name.strip_prefix('@').unwrap_or(name));
@@ -1061,7 +1196,7 @@ impl<H: ShellHost> Shell<H> {
                         }
                     }
                     Err(e) => {
-                        if !silent {
+                        if mode.should_emit() {
                             write_store_err(&mut self.host, "ref set: ", e);
                         }
                     }
@@ -1069,7 +1204,7 @@ impl<H: ShellHost> Shell<H> {
             }
             ["seal", name] => match self.store.seal_ref(name) {
                 Ok(()) => {
-                    if !silent {
+                    if mode.should_emit() {
                         let mut row = AsciiLine::<64>::new();
                         row.push_str("sealed @");
                         row.push_str(name.strip_prefix('@').unwrap_or(name));
@@ -1078,14 +1213,14 @@ impl<H: ShellHost> Shell<H> {
                     }
                 }
                 Err(e) => {
-                    if !silent {
+                    if mode.should_emit() {
                         write_store_err(&mut self.host, "ref seal: ", e);
                     }
                 }
             },
             ["rollback", name] => match self.store.rollback_ref(name) {
                 Ok(h) => {
-                    if !silent {
+                    if mode.should_emit() {
                         let mut row = AsciiLine::<96>::new();
                         row.push_str("rollback @");
                         row.push_str(name.strip_prefix('@').unwrap_or(name));
@@ -1096,13 +1231,13 @@ impl<H: ShellHost> Shell<H> {
                     }
                 }
                 Err(e) => {
-                    if !silent {
+                    if mode.should_emit() {
                         write_store_err(&mut self.host, "ref rollback: ", e);
                     }
                 }
             },
             _ => {
-                if !silent {
+                if mode.should_emit() {
                     self.host.write_debug(
                         "usage: ref <set <name> <hash> | seal <name> | rollback <name>>\n",
                     );
@@ -1114,13 +1249,7 @@ impl<H: ShellHost> Shell<H> {
 
 #[inline]
 fn sys_info_cached_with<H: ShellHost>(host: &mut H, cache: &mut Option<SysInfo>) -> SysInfo {
-    if let Some(info) = *cache {
-        info
-    } else {
-        let info = host.sys_info();
-        *cache = Some(info);
-        info
-    }
+    *cache.get_or_insert_with(|| host.sys_info())
 }
 
 fn eval_pipeline_with<H: ShellHost>(
@@ -1128,7 +1257,7 @@ fn eval_pipeline_with<H: ShellHost>(
     host: &mut H,
     cached_sys_info: &mut Option<SysInfo>,
     line: &str,
-    silent: bool,
+    mode: OutputMode,
     stream: &mut RecordStream,
 ) -> bool {
     let trimmed = line.trim();
@@ -1139,8 +1268,8 @@ fn eval_pipeline_with<H: ShellHost>(
     let (argc, next_rest) = match next_pipeline_stage(trimmed, &mut toks) {
         Ok(v) => v,
         Err(pe) => {
-            if !silent {
-                host.write_debug(parse_error_msg(pe));
+            if mode.should_emit() {
+                host.write_debug(pe.as_str());
             }
             return false;
         }
@@ -1151,7 +1280,7 @@ fn eval_pipeline_with<H: ShellHost>(
         cached_sys_info,
         &toks[..argc],
         next_rest,
-        silent,
+        mode,
         stream,
     )
 }
@@ -1162,7 +1291,7 @@ fn eval_pipeline_tail_with<H: ShellHost>(
     cached_sys_info: &mut Option<SysInfo>,
     producer_toks: &[&str],
     rest: Option<&str>,
-    silent: bool,
+    mode: OutputMode,
     stream: &mut RecordStream,
 ) -> bool {
     let Some(mut rem) = rest else {
@@ -1171,7 +1300,7 @@ fn eval_pipeline_tail_with<H: ShellHost>(
             host,
             cached_sys_info,
             producer_toks,
-            silent,
+            mode,
             stream,
         );
     };
@@ -1184,8 +1313,8 @@ fn eval_pipeline_tail_with<H: ShellHost>(
     loop {
         if n_transforms >= MAX_STAGES - 1 {
             stream.clear();
-            if !silent {
-                host.write_debug(parse_error_msg(ParseError::TooManyStages));
+            if mode.should_emit() {
+                host.write_debug(ParseError::TooManyStages.as_str());
             }
             return false;
         }
@@ -1200,21 +1329,21 @@ fn eval_pipeline_tail_with<H: ShellHost>(
             }
             Err(pe) => {
                 stream.clear();
-                if !silent {
-                    host.write_debug(parse_error_msg(pe));
+                if mode.should_emit() {
+                    host.write_debug(pe.as_str());
                 }
                 return false;
             }
         }
     }
 
-    if !eval_producer_tokens_with(store, host, cached_sys_info, producer_toks, silent, stream) {
+    if !eval_producer_tokens_with(store, host, cached_sys_info, producer_toks, mode, stream) {
         return false;
     }
 
     for i in 0..n_transforms {
         let argc = stage_argcs[i];
-        if !eval_transform_tokens_with(store, host, &stage_toks[i][..argc], stream, silent) {
+        if !eval_transform_tokens_with(store, host, &stage_toks[i][..argc], stream, mode) {
             stream.clear();
             return false;
         }
@@ -1222,12 +1351,115 @@ fn eval_pipeline_tail_with<H: ShellHost>(
     true
 }
 
+fn concat_put_args(args: &[&str], buf: &mut [u8; MAX_BLOB_SIZE]) -> Result<usize, StoreError> {
+    let mut pos = 0usize;
+    for (i, arg) in args.iter().enumerate() {
+        let sep = usize::from(i > 0);
+        let b = arg.as_bytes();
+        let end = pos
+            .checked_add(sep)
+            .and_then(|p| p.checked_add(b.len()))
+            .filter(|&e| e <= MAX_BLOB_SIZE)
+            .ok_or(StoreError::TooLarge)?;
+        if sep == 1 {
+            buf[pos] = b' ';
+            pos += 1;
+        }
+        buf[pos..end].copy_from_slice(b);
+        pos = end;
+    }
+    Ok(pos)
+}
+
+fn eval_put_producer<H: ShellHost>(
+    store: &mut ObjectStore,
+    host: &mut H,
+    args: &[&str],
+    mode: OutputMode,
+    stream: &mut RecordStream,
+) -> bool {
+    let res = match args {
+        [] => store.put(&[]).map(|h| (h, 0)),
+        [single] => {
+            let b = single.as_bytes();
+            store.put(b).map(|h| (h, b.len()))
+        }
+        many => {
+            let mut buf = [0u8; MAX_BLOB_SIZE];
+            concat_put_args(many, &mut buf).and_then(|pos| store.put(&buf[..pos]).map(|h| (h, pos)))
+        }
+    };
+    match res {
+        Ok((hash, size)) => {
+            stream.push(Record::Object(ObjectMeta { hash, size }));
+            true
+        }
+        Err(e) => {
+            if mode.should_emit() {
+                write_store_err(host, "put: ", e);
+            }
+            false
+        }
+    }
+}
+
+fn eval_ping_producer<H: ShellHost>(
+    host: &mut H,
+    toks: &[&str],
+    mode: OutputMode,
+    stream: &mut RecordStream,
+) -> bool {
+    if toks.len() > 2 {
+        if mode.should_emit() {
+            host.write_debug("usage: ping [hex]\n");
+        }
+        return false;
+    }
+    let val = match toks.get(1).copied() {
+        None | Some("") => 0xA110_C0DE,
+        Some(raw) => {
+            let Some(v) = parse_hex_u64(raw) else {
+                if mode.should_emit() {
+                    write_quoted_err(host, "ping: invalid hex `", raw, "`\n");
+                }
+                return false;
+            };
+            v
+        }
+    };
+    match host.ipc_call(CapId::BOOTSTRAP_EP, val) {
+        Ok((badge, reply)) => {
+            stream.push(Record::Metric {
+                label: "ipc.badge",
+                value: badge,
+                unit: "(cap)",
+            });
+            stream.push(Record::Metric {
+                label: "ipc.reply",
+                value: reply,
+                unit: "(from worker)",
+            });
+            true
+        }
+        Err(e) => {
+            if mode.should_emit() {
+                let mut row = AsciiLine::<96>::new();
+                row.push_str("ping: ipc_call failed: ");
+                row.push_str(e.as_str());
+                row.push_byte(b'\n');
+                host.write_debug(row.as_str());
+            }
+            false
+        }
+    }
+}
+
 fn eval_producer_tokens_with<H: ShellHost>(
     store: &mut ObjectStore,
     host: &mut H,
     cached_sys_info: &mut Option<SysInfo>,
     toks: &[&str],
-    silent: bool,
+    mode: OutputMode,
     stream: &mut RecordStream,
 ) -> bool {
     if toks.is_empty() {
@@ -1263,104 +1495,12 @@ fn eval_producer_tokens_with<H: ShellHost>(
             });
             true
         }
-        "put" => {
-            let res = match &toks[1..] {
-                [] => store.put(&[]).map(|h| (h, 0)),
-                [single] => {
-                    let b = single.as_bytes();
-                    store.put(b).map(|h| (h, b.len()))
-                }
-                args => {
-                    let mut buf = [0u8; MAX_BLOB_SIZE];
-                    let mut pos = 0usize;
-                    let mut overflow = false;
-                    for (i, arg) in args.iter().enumerate() {
-                        let sep = usize::from(i > 0);
-                        let b = arg.as_bytes();
-                        match pos.checked_add(sep).and_then(|p| p.checked_add(b.len())) {
-                            Some(end) if end <= MAX_BLOB_SIZE => {
-                                if sep == 1 {
-                                    buf[pos] = b' ';
-                                    pos += 1;
-                                }
-                                buf[pos..pos + b.len()].copy_from_slice(b);
-                                pos += b.len();
-                            }
-                            _ => {
-                                overflow = true;
-                                break;
-                            }
-                        }
-                    }
-                    if overflow {
-                        Err(StoreError::TooLarge)
-                    } else {
-                        store.put(&buf[..pos]).map(|h| (h, pos))
-                    }
-                }
-            };
-            match res {
-                Ok((hash, size)) => {
-                    stream.push(Record::Object(ObjectMeta { hash, size }));
-                    true
-                }
-                Err(e) => {
-                    if !silent {
-                        write_store_err(host, "put: ", e);
-                    }
-                    false
-                }
-            }
-        }
-        "ping" => {
-            if toks.len() > 2 {
-                if !silent {
-                    host.write_debug("usage: ping [hex]\n");
-                }
-                return false;
-            }
-            let val = match toks.get(1).copied() {
-                None | Some("") => 0xA110_C0DE,
-                Some(raw) => match parse_hex_u64(raw) {
-                    Some(v) => v,
-                    None => {
-                        if !silent {
-                            write_quoted_err(host, "ping: invalid hex `", raw, "`\n");
-                        }
-                        return false;
-                    }
-                },
-            };
-            match host.ipc_call(CapId::BOOTSTRAP_EP, val) {
-                Ok((badge, reply)) => {
-                    stream.push(Record::Metric {
-                        label: "ipc.badge",
-                        value: badge,
-                        unit: "(cap)",
-                    });
-                    stream.push(Record::Metric {
-                        label: "ipc.reply",
-                        value: reply,
-                        unit: "(from worker)",
-                    });
-                    true
-                }
-                Err(e) => {
-                    if !silent {
-                        let mut row = AsciiLine::<96>::new();
-                        row.push_str("ping: ipc_call failed: ");
-                        row.push_str(sys_error_str(e));
-                        row.push_byte(b'\n');
-                        host.write_debug(row.as_str());
-                    }
-                    false
-                }
-            }
-        }
+        "put" => eval_put_producer(store, host, &toks[1..], mode, stream),
+        "ping" => eval_ping_producer(host, toks, mode, stream),
         "net" => {
             let sub = toks.get(1).copied().unwrap_or("");
             let arg = toks.get(2).copied().filter(|s| !s.is_empty());
-            host.handle_net(sub, arg, stream, silent);
+            host.handle_net(sub, arg, stream, mode);
             true
         }
         "bench" => {
@@ -1379,7 +1519,7 @@ fn eval_producer_tokens_with<H: ShellHost>(
             true
         }
         other => {
-            if !silent {
+            if mode.should_emit() {
                 write_quoted_err(
                     host,
                     "newos-shell-pd: unknown producer `",
@@ -1392,12 +1532,87 @@ fn eval_producer_tokens_with<H: ShellHost>(
     }
 }
 
+fn eval_first_transform<H: ShellHost>(
+    host: &mut H,
+    toks: &[&str],
+    stream: &mut RecordStream,
+    mode: OutputMode,
+) -> bool {
+    if toks.len() > 2 {
+        stream.clear();
+        if mode.should_emit() {
+            host.write_debug("usage: ... | first <n>\n");
+        }
+        return false;
+    }
+    let limit = if toks.len() == 1 {
+        1
+    } else {
+        let raw = toks[1];
+        let valid_digits = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
+        if !valid_digits {
+            stream.clear();
+            if mode.should_emit() {
+                write_quoted_err(host, "first: invalid count `", raw, "`\n");
+            }
+            return false;
+        }
+        let Ok(n) = raw.parse::<usize>() else {
+            stream.clear();
+            if mode.should_emit() {
+                write_quoted_err(host, "first: invalid count `", raw, "`\n");
+            }
+            return false;
+        };
+        n
+    };
+    stream.truncate(limit);
+    true
+}
+
+fn eval_save_transform<H: ShellHost>(
+    store: &mut ObjectStore,
+    host: &mut H,
+    toks: &[&str],
+    stream: &mut RecordStream,
+    mode: OutputMode,
+) -> bool {
+    let Some(ref_name) = toks.get(1).copied().filter(|s| !s.is_empty()) else {
+        stream.clear();
+        if mode.should_emit() {
+            host.write_debug("usage: ... | save @<name>\n");
+        }
+        return false;
+    };
+    let Some(Record::Object(meta)) = stream.first() else {
+        stream.clear();
+        if mode.should_emit() {
+            host.write_debug("save: expected an Object record from upstream\n");
+        }
+        return false;
+    };
+    if let Err(e) = store.set_ref(ref_name, meta.hash) {
+        stream.clear();
+        if mode.should_emit() {
+            let mut row = AsciiLine::<128>::new();
+            row.push_str("save ");
+            row.push_str(ref_name);
+            row.push_str(": ");
+            row.push_str(e.as_str());
+            row.push_byte(b'\n');
+            host.write_debug(row.as_str());
+        }
+        return false;
+    }
+    true
+}
+
 fn eval_transform_tokens_with<H: ShellHost>(
     store: &mut ObjectStore,
     host: &mut H,
     toks: &[&str],
     stream: &mut RecordStream,
-    silent: bool,
+    mode: OutputMode,
 ) -> bool {
     let argc = toks.len();
     if argc == 0 {
@@ -1411,75 +1626,12 @@ fn eval_transform_tokens_with<H: ShellHost>(
             stream.push(Record::Count(n));
             true
         }
-        "first" => {
-            if argc > 2 {
-                stream.clear();
-                if !silent {
-                    host.write_debug("usage: ... | first <n>\n");
-                }
-                return false;
-            }
-            let limit = if argc == 1 {
-                1
-            } else {
-                let raw = toks[1];
-                if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) {
-                    match raw.parse::<usize>() {
-                        Ok(n) => n,
-                        Err(_) => {
-                            stream.clear();
-                            if !silent {
-                                write_quoted_err(host, "first: invalid count `", raw, "`\n");
-                            }
-                            return false;
-                        }
-                    }
-                } else {
-                    stream.clear();
-                    if !silent {
-                        write_quoted_err(host, "first: invalid count `", raw, "`\n");
-                    }
-                    return false;
-                }
-            };
-            stream.truncate(limit);
-            true
-        }
-        "save" => {
-            let Some(ref_name) = toks.get(1).copied().filter(|s| !s.is_empty()) else {
-                stream.clear();
-                if !silent {
-                    host.write_debug("usage: ... | save @<name>\n");
-                }
-                return false;
-            };
-            if let Some(Record::Object(meta)) = stream.first() {
-                if let Err(e) = store.set_ref(ref_name, meta.hash) {
-                    stream.clear();
-                    if !silent {
-                        let mut row = AsciiLine::<128>::new();
-                        row.push_str("save ");
-                        row.push_str(ref_name);
-                        row.push_str(": ");
-                        row.push_str(store_error_str(e));
-                        row.push_byte(b'\n');
-                        host.write_debug(row.as_str());
-                    }
-                    return false;
-                }
-                true
-            } else {
-                stream.clear();
-                if !silent {
-                    host.write_debug("save: expected an Object record from upstream\n");
-                }
-                false
-            }
-        }
+        "first" => eval_first_transform(host, toks, stream, mode),
+        "save" => eval_save_transform(store, host, toks, stream, mode),
         "where" => {
             if argc != 4 {
                 stream.clear();
-                if !silent {
+                if mode.should_emit() {
                     host.write_debug("usage: ... | where <field> <op> <value>\n");
                 }
                 return false;
@@ -1489,7 +1641,7 @@ fn eval_transform_tokens_with<H: ShellHost>(
                 true
             } else {
                 stream.clear();
-                if !silent {
+                if mode.should_emit() {
                     host.write_debug("where: invalid predicate\n");
                 }
                 false
@@ -1497,7 +1649,7 @@ fn eval_transform_tokens_with<H: ShellHost>(
         }
         other => {
             stream.clear();
-            if !silent {
+            if mode.should_emit() {
                 write_quoted_err(
                     host,
                     "newos-shell-pd: unknown stage `",
@@ -1550,7 +1702,7 @@ impl CmpOp {
     }
 
     #[inline]
-    fn eval(self, lhs: u64, rhs: u64) -> bool {
+    const fn eval(self, lhs: u64, rhs: u64) -> bool {
         match self {
             Self::Eq => lhs == rhs,
             Self::Ne => lhs != rhs,
@@ -1578,7 +1730,7 @@ impl EqOp {
     }
 
     #[inline]
-    fn eval_eq(self, equal: bool) -> bool {
+    const fn eval_eq(self, equal: bool) -> bool {
         match self {
             Self::Eq => equal,
             Self::Ne => !equal,
@@ -1720,6 +1872,7 @@ fn parse_hex_u64(s: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
     struct MockHost {
         out_buf: [u8; 4096],
         out_len: usize,
@@ -1783,10 +1936,11 @@ mod tests {
 
         fn ipc_recv(&mut self, _cap: CapId) -> Result<(u64, u64), SysError> {
             self.ipc_recv_syscalls += 1;
-            match self.last_ipc_payload.take() {
-                Some(p) => Ok((0x5E14, p.wrapping_add(1))),
-                None => Err(SysError::WouldBlock),
-            }
+            self.last_ipc_payload
+                .take()
+                .map_or(Err(SysError::WouldBlock), |p| {
+                    Ok((0x5E14, p.wrapping_add(1)))
+                })
         }
 
         fn yield_now(&mut self) -> Result<u64, SysError> {
@@ -2079,7 +2233,7 @@ mod tests {
         sh.record_history(s);
         assert_eq!(sh.exec_line("history"), ExecOutcome::Continue);
         assert!(sh.host().output_str().contains("1  aaaaaaaa"));
-        assert!(!sh.host().output_str().is_empty());
+        assert_ne!(sh.host().output_str(), "");
     }
 
     #[test]
@@ -2088,20 +2242,20 @@ mod tests {
         let before = sh.store().object_count();
 
         // Single-token > 128B (129 'x' bytes)
-        let mut cmd = [b'x'; 133];
-        cmd[..4].copy_from_slice(b"put ");
-        let cmd_str = core::str::from_utf8(&cmd).unwrap();
-        assert_eq!(sh.exec_line(cmd_str), ExecOutcome::Continue);
+        let mut single_cmd = [b'x'; 133];
+        single_cmd[..4].copy_from_slice(b"put ");
+        let single_cmd_str = core::str::from_utf8(&single_cmd).unwrap();
+        assert_eq!(sh.exec_line(single_cmd_str), ExecOutcome::Continue);
         assert!(sh.host().output_str().contains("put: TooLarge"));
         assert_eq!(sh.store().object_count(), before);
 
         // Multi-token > 128B (65 + ' ' + 65 = 131B)
         let mut sh2 = Shell::new(MockHost::new());
-        let mut cmd2 = [b'y'; 4 + 65 + 1 + 65];
-        cmd2[..4].copy_from_slice(b"put ");
-        cmd2[4 + 65] = b' ';
-        let cmd2_str = core::str::from_utf8(&cmd2).unwrap();
-        assert_eq!(sh2.exec_line(cmd2_str), ExecOutcome::Continue);
+        let mut multi_cmd = [b'y'; 4 + 65 + 1 + 65];
+        multi_cmd[..4].copy_from_slice(b"put ");
+        multi_cmd[4 + 65] = b' ';
+        let multi_cmd_str = core::str::from_utf8(&multi_cmd).unwrap();
+        assert_eq!(sh2.exec_line(multi_cmd_str), ExecOutcome::Continue);
         assert!(sh2.host().output_str().contains("put: TooLarge"));
         assert_eq!(sh2.store().object_count(), before);
     }
@@ -2132,6 +2286,29 @@ mod tests {
 
     #[test]
     fn where_first_ping_invalid_args_and_ipc_error_diagnosed() {
+        struct FailIpcHost {
+            out: [u8; 256],
+            len: usize,
+        }
+        impl ShellHost for FailIpcHost {
+            fn write_debug(&mut self, s: &str) {
+                let b = s.as_bytes();
+                let n = b.len().min(self.out.len() - self.len);
+                self.out[self.len..self.len + n].copy_from_slice(&b[..n]);
+                self.len += n;
+            }
+            fn sys_info(&mut self) -> SysInfo {
+                SysInfo {
+                    online_cpus: 1,
+                    domain_count: 1,
+                    interactive_shell: false,
+                }
+            }
+            fn ipc_call(&mut self, _cap: CapId, _payload: u64) -> Result<(u64, u64), SysError> {
+                Err(SysError::InvalidCapability)
+            }
+        }
+
         // Invalid `where` field/op/rhs/argc (including unprefixed hex "dead")
         for cmd in [
             "objects | where badfield == 1",
@@ -2168,40 +2345,17 @@ mod tests {
         }
 
         // `ping` with IPC error from host
-        struct FailIpcHost {
-            out: [u8; 256],
-            len: usize,
-        }
-        impl ShellHost for FailIpcHost {
-            fn write_debug(&mut self, s: &str) {
-                let b = s.as_bytes();
-                let n = b.len().min(self.out.len() - self.len);
-                self.out[self.len..self.len + n].copy_from_slice(&b[..n]);
-                self.len += n;
-            }
-            fn sys_info(&mut self) -> SysInfo {
-                SysInfo {
-                    online_cpus: 1,
-                    domain_count: 1,
-                    interactive_shell: false,
-                }
-            }
-            fn ipc_call(&mut self, _cap: CapId, _payload: u64) -> Result<(u64, u64), SysError> {
-                Err(SysError::InvalidCapability)
-            }
-        }
         let mut sh = Shell::new(FailIpcHost {
             out: [0u8; 256],
             len: 0,
         });
         assert_eq!(sh.exec_line("ping 0x42"), ExecOutcome::Continue);
         let out = core::str::from_utf8(&sh.host().out[..sh.host().len]).unwrap();
-        assert!(out.contains("ping: ipc_call failed: InvalidCapability"));
+        assert!(out.contains("ping: ipc_call failed: invalid capability"));
     }
 
     #[test]
     fn read_line_breaks_on_fatal_error_and_coalesces_ctrl_l() {
-        // 1. Fatal read_debug_byte error breaks immediately with 0 yield_now calls.
         struct FatalReadHost {
             yields: usize,
         }
@@ -2222,13 +2376,6 @@ mod tests {
                 Ok(0)
             }
         }
-        let mut sh = Shell::new(FatalReadHost { yields: 0 });
-        let mut buf = [0u8; LINE_BUF_SIZE];
-        assert_eq!(sh.read_line(&mut buf), 0);
-        assert_eq!(sh.host().yields, 0);
-
-        // 2. Ctrl-L coalesces screen clear + prompt + buffer into 1 write_debug syscall,
-        //    and drain_background_logs clamps n > 256 and emits 1 write_debug syscall.
         struct CtrlLAndLogHost {
             writes: usize,
             step: usize,
@@ -2267,6 +2414,15 @@ mod tests {
                 }
             }
         }
+
+        // 1. Fatal read_debug_byte error breaks immediately with 0 yield_now calls.
+        let mut sh = Shell::new(FatalReadHost { yields: 0 });
+        let mut buf = [0u8; LINE_BUF_SIZE];
+        assert_eq!(sh.read_line(&mut buf), 0);
+        assert_eq!(sh.host().yields, 0);
+
+        // 2. Ctrl-L coalesces screen clear + prompt + buffer into 1 write_debug syscall,
+        //    and drain_background_logs clamps n > 256 and emits 1 write_debug syscall.
         let mut sh2 = Shell::new(CtrlLAndLogHost {
             writes: 0,
             step: 0,
@@ -2299,7 +2455,7 @@ mod tests {
             r#"put "leak4" | first 1 | first 1 | first 1 | first 1 | first 1 | count"#,
             r#"put "leak5" | where a b c d e f g h i j k l"#,
             r#"put "leak6" | save @leakref |"#,
-            r#"ping 0x10 |"#,
+            "ping 0x10 |",
         ];
         for cmd in bad_cmds {
             sh.host_mut().out_len = 0;
@@ -2398,5 +2554,107 @@ mod tests {
         let mut line_buf = [0u8; LINE_BUF_SIZE];
         let len = sh.read_line(&mut line_buf);
         assert_eq!(core::str::from_utf8(&line_buf[..len]), Ok("aλb"));
+    }
+
+    #[test]
+    fn shell_self_test_error_display_and_source() {
+        extern crate std;
+        use core::error::Error as _;
+        use std::format;
+
+        let wrapping = [
+            ShellSelfTestError::MissingRefAfterUpdate(StoreError::NotFound),
+            ShellSelfTestError::MissingRefAfterRollback(StoreError::ReadOnly),
+            ShellSelfTestError::PutTamperFailed(StoreError::NoSpace),
+        ];
+        for err in wrapping {
+            assert_eq!(format!("{err}"), err.as_str());
+            assert!(err.source().is_some());
+        }
+
+        let standalone = [
+            ShellSelfTestError::PutSaveDidNotCreateObject,
+            ShellSelfTestError::DeduplicationFailed,
+            ShellSelfTestError::RefDidNotUpdate,
+            ShellSelfTestError::RollbackDidNotRestore,
+            ShellSelfTestError::SealedRefAllowedWrite,
+            ShellSelfTestError::TypedPipelineFailed,
+        ];
+        for err in standalone {
+            assert_eq!(format!("{err}"), err.as_str());
+            assert!(err.source().is_none());
+        }
+    }
+
+    #[test]
+    fn output_mode_controls_handle_net_and_debug_writes() {
+        struct NetModeHost {
+            last_mode: Option<OutputMode>,
+            writes: usize,
+        }
+        impl ShellHost for NetModeHost {
+            fn write_debug(&mut self, _s: &str) {
+                self.writes += 1;
+            }
+            fn sys_info(&mut self) -> SysInfo {
+                SysInfo::default()
+            }
+            fn handle_net(
+                &mut self,
+                _subcmd: &str,
+                _arg: Option<&str>,
+                _stream: &mut RecordStream,
+                mode: OutputMode,
+            ) {
+                self.last_mode = Some(mode);
+            }
+        }
+
+        assert_eq!(OutputMode::default(), OutputMode::Emit);
+        assert!(OutputMode::Emit.should_emit());
+        assert!(!OutputMode::Emit.is_silent());
+        assert!(OutputMode::Silent.is_silent());
+        assert!(!OutputMode::Silent.should_emit());
+
+        let mut sh = Shell::new(NetModeHost {
+            last_mode: None,
+            writes: 0,
+        });
+        let _ = sh.eval_pipeline("net dhcp");
+        assert_eq!(sh.host().last_mode, Some(OutputMode::Silent));
+        assert_eq!(sh.host().writes, 0);
+
+        let _ = sh.exec_line("net dhcp");
+        assert_eq!(sh.host().last_mode, Some(OutputMode::Emit));
+        assert!(sh.host().writes > 0);
+    }
+
+    #[test]
+    fn public_shell_types_implement_standard_traits() {
+        extern crate std;
+        use std::format;
+
+        let info = SysInfo::default();
+        assert_eq!(info.online_cpus, 0);
+        assert_eq!(info.domain_count, 0);
+        assert!(!info.interactive_shell);
+
+        let nw = NullWriter;
+        assert_eq!(nw, NullWriter);
+        assert!(format!("{nw:?}").contains("NullWriter"));
+
+        let bw = BufferedWriter::<16, _>::new(NullWriter);
+        assert!(format!("{bw:?}").contains("BufferedWriter"));
+
+        let rec = Record::Count(7);
+        assert_eq!(rec, Record::Count(7));
+        assert!(format!("{rec:?}").contains("Count(7)"));
+
+        let mut stream = RecordStream::default();
+        stream.push(rec);
+        assert!(format!("{stream:?}").contains("Count(7)"));
+
+        let sh = Shell::new(MockHost::new());
+        assert!(format!("{sh:?}").contains("Shell"));
     }
 }

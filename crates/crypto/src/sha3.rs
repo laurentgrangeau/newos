@@ -1,6 +1,6 @@
 //! Pure `const fn` FIPS 202 **SHA3-512** (Keccak-f[1600]).
 //!
-//! Shared across NewOS EL1 Verified Boot ELF attestation (`newos-kernel-core`) and
+//! Shared across `NewOS` EL1 Verified Boot ELF attestation (`newos-kernel-core`) and
 //! EL0 Content-Addressed Object Store (`newos-shell-core`), eliminating all SHA-2 from the OS.
 
 /// SHA3-512 sponge rate in bytes (`(1600 - 2 * 512) / 8 = 72` bytes = 9 lanes).
@@ -52,14 +52,14 @@ const PI: [usize; 25] = [
 
 /// Perform the 24-round Keccak-f[1600] permutation in `const fn` safe Rust.
 #[inline]
-const fn keccak_f1600(mut a: [u64; 25]) -> [u64; 25] {
+const fn keccak_f1600(mut state: [u64; 25]) -> [u64; 25] {
     let mut round = 0;
     while round < 24 {
         // Theta
         let mut c = [0u64; 5];
         let mut x = 0;
         while x < 5 {
-            c[x] = a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20];
+            c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
             x += 1;
         }
         let mut d = [0u64; 5];
@@ -68,18 +68,18 @@ const fn keccak_f1600(mut a: [u64; 25]) -> [u64; 25] {
             d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
             x += 1;
         }
-        let mut i = 0;
-        while i < 25 {
-            a[i] ^= d[i % 5];
-            i += 1;
+        let mut lane = 0;
+        while lane < 25 {
+            state[lane] ^= d[lane % 5];
+            lane += 1;
         }
 
         // Rho + Pi
-        let mut b = [0u64; 25];
-        i = 0;
-        while i < 25 {
-            b[PI[i]] = a[i].rotate_left(RHO[i]);
-            i += 1;
+        let mut rho_pi = [0u64; 25];
+        lane = 0;
+        while lane < 25 {
+            rho_pi[PI[lane]] = state[lane].rotate_left(RHO[lane]);
+            lane += 1;
         }
 
         // Chi
@@ -88,18 +88,19 @@ const fn keccak_f1600(mut a: [u64; 25]) -> [u64; 25] {
             let row = y * 5;
             x = 0;
             while x < 5 {
-                a[row + x] = b[row + x] ^ ((!b[row + ((x + 1) % 5)]) & b[row + ((x + 2) % 5)]);
+                state[row + x] = rho_pi[row + x]
+                    ^ ((!rho_pi[row + ((x + 1) % 5)]) & rho_pi[row + ((x + 2) % 5)]);
                 x += 1;
             }
             y += 1;
         }
 
         // Iota
-        a[0] ^= RC[round];
+        state[0] ^= RC[round];
 
         round += 1;
     }
-    a
+    state
 }
 
 #[inline]
@@ -124,6 +125,7 @@ const fn absorb_block(mut state: [u64; 25], block: &[u8; RATE_BYTES]) -> [u64; 2
 }
 
 /// Compute the 64-byte FIPS 202 **SHA3-512** digest of `data` without heap allocation (`const fn`).
+#[must_use]
 pub const fn sha3_512(data: &[u8]) -> [u8; DIGEST_BYTES] {
     let mut state = [0u64; 25];
     let mut pos = 0;
@@ -169,6 +171,7 @@ pub const fn sha3_512(data: &[u8]) -> [u8; DIGEST_BYTES] {
 
 /// Return the first 64 bits (big-endian) of the FIPS 202 **SHA3-512** digest for compact
 /// boot attestation logs and CAOS content addressing.
+#[must_use]
 pub const fn digest_prefix_u64(data: &[u8]) -> u64 {
     let d = sha3_512(data);
     u64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])
@@ -240,6 +243,7 @@ pub fn shake256(input: &[u8], out: &mut [u8]) {
 }
 
 /// Marker type implementing [`crate::Hasher`] for FIPS 202 `SHA3-512`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Sha3_512;
 
 impl crate::Hasher<DIGEST_BYTES> for Sha3_512 {
@@ -257,6 +261,7 @@ impl crate::Hasher<DIGEST_BYTES> for Sha3_512 {
 }
 
 /// Marker type implementing [`crate::Xof`] for FIPS 202 `SHAKE256`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Shake256;
 
 impl crate::Xof for Shake256 {
@@ -355,5 +360,16 @@ mod tests {
         let mut wide = [0u8; 200];
         shake256(b"abc", &mut wide);
         assert_eq!(&wide[..32], &abc_out);
+    }
+
+    #[test]
+    fn marker_types_implement_standard_traits() {
+        fn assert_std_traits<T: core::fmt::Debug + Default + Copy + Eq + core::hash::Hash>(
+            expected: T,
+        ) {
+            assert_eq!(T::default(), expected);
+        }
+        assert_std_traits(Sha3_512);
+        assert_std_traits(Shake256);
     }
 }

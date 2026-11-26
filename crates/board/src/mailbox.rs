@@ -1,4 +1,4 @@
-//! Raspberry Pi 5 (BCM2712) VideoCore Property Mailbox Driver.
+//! Raspberry Pi 5 (BCM2712) `VideoCore` Property Mailbox Driver.
 //!
 //! Physical MMIO page: `0x10_7C01_3000` (Mailbox registers start at offset `0x880`).
 //! Uses a 16-byte-aligned property buffer with explicit `dma_clean`/`dma_invalidate`.
@@ -7,7 +7,7 @@ use crate::MmioDmaTransport;
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 use newos_abi::SysError;
 
-/// Page-aligned physical base of the BCM2712 VideoCore Mailbox MMIO window.
+/// Page-aligned physical base of the BCM2712 `VideoCore` Mailbox MMIO window.
 pub const BCM2712_MBOX_PAGE_PHYS: u64 = 0x10_7C01_3000;
 /// Byte offset of Mailbox 0 within the `0x10_7C01_3000` page (`0x10_7C01_3880`).
 pub const MBOX_BASE_OFF: u64 = 0x880;
@@ -34,7 +34,24 @@ pub const TAG_GET_TEMPERATURE: u32 = 0x0003_0006;
 
 const MAX_POLL_ITERS: u32 = 200_000;
 
-/// 16-byte-aligned static DMA buffer for VideoCore Property Mailbox messages.
+/// Power domain state for `VideoCore` `TAG_SET_POWER_STATE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerState {
+    Off,
+    On,
+}
+
+impl PowerState {
+    /// Return `true` if this power domain state is [`Self::On`].
+    #[inline]
+    #[must_use]
+    pub const fn is_on(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+/// 16-byte-aligned static DMA buffer for `VideoCore` Property Mailbox messages.
+#[derive(Debug)]
 #[repr(C, align(16))]
 pub struct MailboxBuf {
     words: [AtomicU32; 16],
@@ -47,6 +64,8 @@ impl Default for MailboxBuf {
 }
 
 impl MailboxBuf {
+    /// Create a zero-initialized 16-byte-aligned property mailbox buffer.
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             words: [const { AtomicU32::new(0) }; 16],
@@ -64,19 +83,28 @@ impl MailboxBuf {
     }
 }
 
-/// Capability-scoped EL0 driver for the BCM2712 VideoCore Property Mailbox.
+/// Capability-scoped EL0 driver for the BCM2712 `VideoCore` Property Mailbox.
+#[derive(Debug)]
 pub struct VideoCoreMailbox<'a, T: MmioDmaTransport> {
     transport: T,
     buf: &'a MailboxBuf,
 }
 
 impl<'a, T: MmioDmaTransport> VideoCoreMailbox<'a, T> {
+    /// Construct a `VideoCore` Property Mailbox driver bound to `transport` and static `buf`.
+    #[must_use]
     pub const fn new(transport: T, buf: &'a MailboxBuf) -> Self {
         Self { transport, buf }
     }
 
     /// Execute a single-tag property call with `req_words` payload (up to 4 words),
     /// returning the first two response `u32` words.
+    ///
+    /// # Errors
+    /// Returns [`SysError::InvalidArgument`] if `req_words.len() > 4`, `resp_len_bytes > 16`, or
+    /// the DMA buffer physical address is unaligned / above 4 GiB; [`SysError::WouldBlock`] on
+    /// TX/RX FIFO poll timeout; [`SysError::Unsupported`] if the firmware rejects the tag; or a
+    /// transport [`SysError`].
     pub fn call_tag(
         &self,
         tag: u32,
@@ -86,15 +114,18 @@ impl<'a, T: MmioDmaTransport> VideoCoreMailbox<'a, T> {
         if req_words.len() > 4 || resp_len_bytes > 16 {
             return Err(SysError::InvalidArgument);
         }
-        let val_words = (req_words.len()).max((resp_len_bytes as usize).div_ceil(4));
+        let val_words = req_words.len().max((resp_len_bytes as usize).div_ceil(4));
         let total_words = 6 + val_words; // header(2) + tag_hdr(3) + val_words + end_tag(1)
-        let total_bytes = (total_words * 4) as u32;
+        let total_bytes = u32::try_from(total_words * 4).map_err(|_| SysError::InvalidArgument)?;
+        let val_bytes = u32::try_from(val_words * 4).map_err(|_| SysError::InvalidArgument)?;
+        let req_bytes =
+            u32::try_from(req_words.len() * 4).map_err(|_| SysError::InvalidArgument)?;
 
         self.buf.set(0, total_bytes);
         self.buf.set(1, 0); // request code
         self.buf.set(2, tag);
-        self.buf.set(3, (val_words * 4) as u32);
-        self.buf.set(4, (req_words.len() * 4) as u32);
+        self.buf.set(3, val_bytes);
+        self.buf.set(4, req_bytes);
         for i in 0..val_words {
             self.buf.set(5 + i, req_words.get(i).copied().unwrap_or(0));
         }
@@ -104,13 +135,13 @@ impl<'a, T: MmioDmaTransport> VideoCoreMailbox<'a, T> {
         self.transport.dma_clean(self.buf)?;
 
         let phys = self.transport.virt_to_phys(self.buf)?;
-        if (phys & 0xF) != 0 || (phys >> 32) != 0 {
+        let phys32 = u32::try_from(phys).map_err(|_| SysError::InvalidArgument)?;
+        if (phys32 & 0xF) != 0 {
             // VideoCore mailbox requires a 16-byte-aligned 32-bit bus/physical address.
             return Err(SysError::InvalidArgument);
         }
-        let msg = ((phys as u32) & !0xF) | MBOX_CHANNEL_PROP;
+        let msg = (phys32 & !0xF) | MBOX_CHANNEL_PROP;
 
-        // Wait until Mailbox 1 TX FIFO is not full
         // Drain any stale/late replies from Mailbox 0 RX FIFO before sending a new request (`P12`).
         for _ in 0..16u32 {
             if (self.transport.read32(REG_MBOX0_STATUS)? & MBOX_STATUS_EMPTY) != 0 {
@@ -152,43 +183,82 @@ impl<'a, T: MmioDmaTransport> VideoCoreMailbox<'a, T> {
         Err(SysError::WouldBlock)
     }
 
+    /// Query the `VideoCore` firmware revision.
+    ///
+    /// # Errors
+    /// Returns [`SysError`] if the mailbox transaction fails.
     pub fn get_firmware_revision(&self) -> Result<u32, SysError> {
         Ok(self.call_tag(TAG_GET_FIRMWARE_REV, &[], 4)?.0)
     }
 
+    /// Query the Raspberry Pi board model identifier.
+    ///
+    /// # Errors
+    /// Returns [`SysError`] if the mailbox transaction fails.
     pub fn get_board_model(&self) -> Result<u32, SysError> {
         Ok(self.call_tag(TAG_GET_BOARD_MODEL, &[], 4)?.0)
     }
 
+    /// Query the Raspberry Pi board revision code.
+    ///
+    /// # Errors
+    /// Returns [`SysError`] if the mailbox transaction fails.
     pub fn get_board_revision(&self) -> Result<u32, SysError> {
         Ok(self.call_tag(TAG_GET_BOARD_REV, &[], 4)?.0)
     }
 
+    /// Query the 64-bit board serial number.
+    ///
+    /// # Errors
+    /// Returns [`SysError`] if the mailbox transaction fails.
     pub fn get_board_serial(&self) -> Result<u64, SysError> {
         let (lo, hi) = self.call_tag(TAG_GET_BOARD_SERIAL, &[], 8)?;
         Ok(u64::from(lo) | (u64::from(hi) << 32))
     }
 
-    /// Return `(base_addr, size_bytes)` of low ARM memory reported by VideoCore.
+    /// Return `(base_addr, size_bytes)` of low ARM memory reported by `VideoCore`.
+    ///
+    /// # Errors
+    /// Returns [`SysError`] if the mailbox transaction fails.
     pub fn get_arm_memory(&self) -> Result<(u32, u32), SysError> {
         self.call_tag(TAG_GET_ARM_MEMORY, &[], 8)
     }
 
-    /// Query SoC temperature in milli-degrees Celsius (e.g., `48_500` = 48.5 °C).
+    /// Query `SoC` temperature in milli-degrees Celsius (e.g., `48_500` = 48.5 °C).
+    ///
+    /// # Errors
+    /// Returns [`SysError`] if the mailbox transaction fails.
     pub fn get_soc_temperature_millic(&self) -> Result<u32, SysError> {
         Ok(self.call_tag(TAG_GET_TEMPERATURE, &[0], 8)?.1)
     }
 
     /// Query hardware clock rate in Hz for `clock_id` (e.g., `3` = ARM, `4` = Core).
+    ///
+    /// # Errors
+    /// Returns [`SysError`] if the mailbox transaction fails.
     pub fn get_clock_rate_hz(&self, clock_id: u32) -> Result<u32, SysError> {
         Ok(self.call_tag(TAG_GET_CLOCK_RATE, &[clock_id], 8)?.1)
     }
 
-    /// Set VideoCore power domain state (`on = true/false`, `wait = true`).
-    pub fn set_power_state(&self, device_id: u32, on: bool) -> Result<bool, SysError> {
-        let state = if on { 0b11 } else { 0b10 }; // bit 0 = ON, bit 1 = WAIT
-        let (_, resp) = self.call_tag(TAG_SET_POWER_STATE, &[device_id, state], 8)?;
-        Ok((resp & 1) != 0)
+    /// Set `VideoCore` power domain state (`wait = true`) and return the resulting state.
+    ///
+    /// # Errors
+    /// Returns [`SysError`] if the mailbox transaction fails.
+    pub fn set_power_state(
+        &self,
+        device_id: u32,
+        state: PowerState,
+    ) -> Result<PowerState, SysError> {
+        let bits = match state {
+            PowerState::On => 0b11,  // bit 0 = ON, bit 1 = WAIT
+            PowerState::Off => 0b10, // bit 0 = OFF, bit 1 = WAIT
+        };
+        let (_, resp) = self.call_tag(TAG_SET_POWER_STATE, &[device_id, bits], 8)?;
+        Ok(if (resp & 1) != 0 {
+            PowerState::On
+        } else {
+            PowerState::Off
+        })
     }
 }
 
@@ -200,6 +270,7 @@ mod tests {
 
     struct MockMailbox<'a> {
         buf: &'a MailboxBuf,
+        dma_phys: u64,
         last_msg: RefCell<u32>,
         cleans: RefCell<u32>,
         invalidates: RefCell<u32>,
@@ -226,6 +297,10 @@ mod tests {
                         self.buf.set(5, 0x1234_5678);
                         self.buf.set(6, 0xABCD_0001);
                     }
+                    TAG_SET_POWER_STATE => {
+                        let req_bits = self.buf.get(6);
+                        self.buf.set(6, req_bits & 1);
+                    }
                     _ => {}
                 }
                 return Ok(());
@@ -236,7 +311,7 @@ mod tests {
 
     impl MmioDmaTransport for &MockMailbox<'_> {
         fn virt_to_phys<T>(&self, _value: &T) -> Result<u64, SysError> {
-            Ok(0x0010_0000) // valid 16-byte-aligned 32-bit DMA address
+            Ok(self.dma_phys)
         }
 
         fn dma_clean<T>(&self, _value: &T) -> Result<(), SysError> {
@@ -255,6 +330,7 @@ mod tests {
         let buf = MailboxBuf::new();
         let mock = MockMailbox {
             buf: &buf,
+            dma_phys: 0x0010_0000,
             last_msg: RefCell::new(0),
             cleans: RefCell::new(0),
             invalidates: RefCell::new(0),
@@ -265,5 +341,61 @@ mod tests {
         assert_eq!(mbox.get_board_serial(), Ok(0xABCD_0001_1234_5678));
         assert_eq!(*mock.cleans.borrow(), 3);
         assert_eq!(*mock.invalidates.borrow(), 3);
+    }
+
+    #[test]
+    fn mailbox_power_state_and_argument_validation() {
+        let buf = MailboxBuf::new();
+        let mock = MockMailbox {
+            buf: &buf,
+            dma_phys: 0x0010_0000,
+            last_msg: RefCell::new(0),
+            cleans: RefCell::new(0),
+            invalidates: RefCell::new(0),
+        };
+        let mbox = VideoCoreMailbox::new(&mock, &buf);
+
+        let on = mbox.set_power_state(3, PowerState::On).expect("power on");
+        assert_eq!(on, PowerState::On);
+        assert!(on.is_on());
+
+        let off = mbox.set_power_state(3, PowerState::Off).expect("power off");
+        assert_eq!(off, PowerState::Off);
+        assert!(!off.is_on());
+
+        // Oversized req_words / resp_len_bytes rejected
+        assert_eq!(
+            mbox.call_tag(TAG_GET_BOARD_REV, &[1, 2, 3, 4, 5], 4),
+            Err(SysError::InvalidArgument)
+        );
+        assert_eq!(
+            mbox.call_tag(TAG_GET_BOARD_REV, &[], 20),
+            Err(SysError::InvalidArgument)
+        );
+
+        // Unaligned or >32-bit DMA physical address rejected
+        let unaligned = MockMailbox {
+            buf: &buf,
+            dma_phys: 0x0010_0004,
+            last_msg: RefCell::new(0),
+            cleans: RefCell::new(0),
+            invalidates: RefCell::new(0),
+        };
+        assert_eq!(
+            VideoCoreMailbox::new(&unaligned, &buf).get_board_revision(),
+            Err(SysError::InvalidArgument)
+        );
+
+        let high_phys = MockMailbox {
+            buf: &buf,
+            dma_phys: 1u64 << 32,
+            last_msg: RefCell::new(0),
+            cleans: RefCell::new(0),
+            invalidates: RefCell::new(0),
+        };
+        assert_eq!(
+            VideoCoreMailbox::new(&high_phys, &buf).get_board_revision(),
+            Err(SysError::InvalidArgument)
+        );
     }
 }

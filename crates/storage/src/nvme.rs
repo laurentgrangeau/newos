@@ -1,6 +1,6 @@
-//! NVMe 1.4 PCIe SSD Block Driver.
+//! `NVMe` 1.4 `PCIe` SSD Block Driver.
 //!
-//! Targets NVMe SSDs attached to the Raspberry Pi 5 PCIe 2.0 x1 FFC connector, using
+//! Targets `NVMe` SSDs attached to the Raspberry Pi 5 `PCIe` 2.0 `x1` FFC connector, using
 //! 4 KiB-aligned Submission/Completion Queues and PRP1 data buffers with `dma_clean`/`dma_invalidate`.
 
 use crate::{BlockDevice, SECTOR_SIZE, StorageDmaTransport};
@@ -29,10 +29,24 @@ const ADMIN_OP_CREATE_IOCQ: u8 = 0x05;
 const NVM_OP_WRITE: u8 = 0x01;
 const NVM_OP_READ: u8 = 0x02;
 
-const QUEUE_DEPTH: usize = 8;
+const QUEUE_DEPTH_U16: u16 = 8;
+const QUEUE_DEPTH: usize = QUEUE_DEPTH_U16 as usize;
+const QUEUE_DEPTH_MINUS_ONE: u32 = (QUEUE_DEPTH_U16 - 1) as u32;
 const MAX_POLL: u32 = 100_000;
 
-/// 64-byte NVMe Submission Queue Entry (`SQE`).
+const _: () = assert!(QUEUE_DEPTH == QUEUE_DEPTH_U16 as usize);
+
+#[inline]
+const fn split_u64_le(val: u64) -> (u32, u32) {
+    let bytes = val.to_le_bytes();
+    (
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+    )
+}
+
+/// 64-byte `NVMe` Submission Queue Entry (`SQE`).
+#[derive(Debug)]
 #[repr(C)]
 pub struct NvmeSqe {
     cdw0: AtomicU32,
@@ -50,6 +64,12 @@ pub struct NvmeSqe {
 }
 
 const _: () = assert!(core::mem::size_of::<NvmeSqe>() == 64);
+
+impl Default for NvmeSqe {
+    fn default() -> Self {
+        Self::zero()
+    }
+}
 
 impl NvmeSqe {
     const fn zero() -> Self {
@@ -70,7 +90,8 @@ impl NvmeSqe {
     }
 }
 
-/// 16-byte NVMe Completion Queue Entry (`CQE`).
+/// 16-byte `NVMe` Completion Queue Entry (`CQE`).
+#[derive(Debug)]
 #[repr(C)]
 pub struct NvmeCqe {
     dw0: AtomicU32,
@@ -81,6 +102,12 @@ pub struct NvmeCqe {
 }
 
 const _: () = assert!(core::mem::size_of::<NvmeCqe>() == 16);
+
+impl Default for NvmeCqe {
+    fn default() -> Self {
+        Self::zero()
+    }
+}
 
 impl NvmeCqe {
     const fn zero() -> Self {
@@ -94,16 +121,20 @@ impl NvmeCqe {
     }
 }
 
+#[derive(Debug)]
 #[repr(C, align(4096))]
 struct SqPage([NvmeSqe; QUEUE_DEPTH]);
 
+#[derive(Debug)]
 #[repr(C, align(4096))]
 struct CqPage([NvmeCqe; QUEUE_DEPTH]);
 
+#[derive(Debug)]
 #[repr(C, align(4096))]
 struct DataPage([AtomicU8; 4096]);
 
-/// Static 4 KiB-aligned DMA queues & PRP1 data page for NVMe 1.4.
+/// Static 4 KiB-aligned DMA queues & PRP1 data page for `NVMe` 1.4.
+#[derive(Debug)]
 pub struct NvmeDma {
     admin_sq: SqPage,
     admin_cq: CqPage,
@@ -119,6 +150,8 @@ impl Default for NvmeDma {
 }
 
 impl NvmeDma {
+    /// Create a zero-initialized static 4 KiB-aligned DMA region for `NVMe` 1.4.
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             admin_sq: SqPage([const { NvmeSqe::zero() }; QUEUE_DEPTH]),
@@ -130,16 +163,17 @@ impl NvmeDma {
     }
 }
 
-/// Capability-scoped EL0 NVMe 1.4 PCIe SSD driver.
+/// Capability-scoped EL0 `NVMe` 1.4 `PCIe` SSD driver.
+#[derive(Debug)]
 pub struct NvmeController<'a, T: StorageDmaTransport> {
     transport: T,
     dma: &'a NvmeDma,
     dstrd_bytes: u64,
-    admin_sq_tail: usize,
-    admin_cq_head: usize,
+    admin_sq_tail: u16,
+    admin_cq_head: u16,
     admin_phase: bool,
-    io_sq_tail: usize,
-    io_cq_head: usize,
+    io_sq_tail: u16,
+    io_cq_head: u16,
     io_phase: bool,
     next_cid: u16,
     nsid: u32,
@@ -147,7 +181,12 @@ pub struct NvmeController<'a, T: StorageDmaTransport> {
 }
 
 impl<'a, T: StorageDmaTransport> NvmeController<'a, T> {
-    /// Reset, enable, and create I/O CQ/SQ #1 on an NVMe 1.4 controller.
+    /// Reset, enable, and create I/O CQ/SQ #1 on an `NVMe` 1.4 controller.
+    ///
+    /// # Errors
+    /// Returns [`SysError::WouldBlock`] if the controller fails to disable/enable or admin queue
+    /// creation times out, [`SysError::InvalidArgument`] if an admin command returns a non-zero
+    /// status, or a transport [`SysError`].
     pub fn init(transport: T, dma: &'a NvmeDma, sectors: u64) -> Result<Self, SysError> {
         let cap_hi = transport.read32(REG_CAP_HI)?;
         let dstrd = cap_hi & 0xF;
@@ -168,14 +207,16 @@ impl<'a, T: StorageDmaTransport> NvmeController<'a, T> {
         }
 
         // 2. Program Admin Queue Attributes & 64-bit ASQ/ACQ physical bases
-        let qsize = (QUEUE_DEPTH as u32) - 1;
+        let qsize = QUEUE_DEPTH_MINUS_ONE;
         transport.write32(REG_AQA, (qsize << 16) | qsize)?;
-        let asq_phys = transport.virt_to_phys(&dma.admin_sq)?;
-        let acq_phys = transport.virt_to_phys(&dma.admin_cq)?;
-        transport.write32(REG_ASQ_LO, asq_phys as u32)?;
-        transport.write32(REG_ASQ_HI, (asq_phys >> 32) as u32)?;
-        transport.write32(REG_ACQ_LO, acq_phys as u32)?;
-        transport.write32(REG_ACQ_HI, (acq_phys >> 32) as u32)?;
+        let admin_subq_phys = transport.virt_to_phys(&dma.admin_sq)?;
+        let admin_compq_phys = transport.virt_to_phys(&dma.admin_cq)?;
+        let (subq_lo, subq_hi) = split_u64_le(admin_subq_phys);
+        let (compq_lo, compq_hi) = split_u64_le(admin_compq_phys);
+        transport.write32(REG_ASQ_LO, subq_lo)?;
+        transport.write32(REG_ASQ_HI, subq_hi)?;
+        transport.write32(REG_ACQ_LO, compq_lo)?;
+        transport.write32(REG_ACQ_HI, compq_hi)?;
 
         // 3. Enable controller (64B SQE, 16B CQE, 4 KiB page size) and wait for CSTS.RDY == 1
         transport.write32(REG_CC, CC_EN | CC_IOSQES_64B | CC_IOCQES_16B)?;
@@ -207,18 +248,18 @@ impl<'a, T: StorageDmaTransport> NvmeController<'a, T> {
         };
 
         // 4. Create I/O Completion Queue #1 and Submission Queue #1
-        let iocq_phys = ctrl.transport.virt_to_phys(&dma.io_cq)?;
-        let iosq_phys = ctrl.transport.virt_to_phys(&dma.io_sq)?;
+        let io_compq_phys = ctrl.transport.virt_to_phys(&dma.io_cq)?;
+        let io_subq_phys = ctrl.transport.virt_to_phys(&dma.io_sq)?;
         ctrl.submit_admin(
             ADMIN_OP_CREATE_IOCQ,
-            iocq_phys,
-            ((qsize) << 16) | 1,
+            io_compq_phys,
+            (qsize << 16) | 1,
             1, // PC=1 (physically contiguous)
         )?;
         ctrl.submit_admin(
             ADMIN_OP_CREATE_IOSQ,
-            iosq_phys,
-            ((qsize) << 16) | 1,
+            io_subq_phys,
+            (qsize << 16) | 1,
             (1 << 16) | 1, // CQID=1, PC=1
         )?;
 
@@ -226,12 +267,12 @@ impl<'a, T: StorageDmaTransport> NvmeController<'a, T> {
     }
 
     #[inline]
-    fn sq_doorbell(&self, qid: u64) -> u64 {
+    const fn sq_doorbell(&self, qid: u64) -> u64 {
         REG_DOORBELL_BASE + (2 * qid) * self.dstrd_bytes
     }
 
     #[inline]
-    fn cq_doorbell(&self, qid: u64) -> u64 {
+    const fn cq_doorbell(&self, qid: u64) -> u64 {
         REG_DOORBELL_BASE + (2 * qid + 1) * self.dstrd_bytes
     }
 
@@ -245,7 +286,7 @@ impl<'a, T: StorageDmaTransport> NvmeController<'a, T> {
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1).max(1);
         let slot = self.admin_sq_tail;
-        let sqe = &self.dma.admin_sq.0[slot];
+        let sqe = &self.dma.admin_sq.0[usize::from(slot)];
         sqe.cdw0.store(
             u32::from(opcode) | (u32::from(cid) << 16),
             Ordering::Relaxed,
@@ -259,22 +300,22 @@ impl<'a, T: StorageDmaTransport> NvmeController<'a, T> {
         fence(Ordering::SeqCst);
         self.transport.dma_clean(sqe)?;
 
-        self.admin_sq_tail = (slot + 1) % QUEUE_DEPTH;
+        self.admin_sq_tail = (slot + 1) % QUEUE_DEPTH_U16;
         self.transport
-            .write32(self.sq_doorbell(0), self.admin_sq_tail as u32)?;
+            .write32(self.sq_doorbell(0), u32::from(self.admin_sq_tail))?;
 
-        let cqe = &self.dma.admin_cq.0[self.admin_cq_head];
+        let cqe = &self.dma.admin_cq.0[usize::from(self.admin_cq_head)];
         for _ in 0..MAX_POLL {
             self.transport.dma_invalidate(cqe)?;
             let status = cqe.status.load(Ordering::Acquire);
             if ((status & 1) != 0) == self.admin_phase {
                 let err_code = status >> 1;
-                self.admin_cq_head = (self.admin_cq_head + 1) % QUEUE_DEPTH;
+                self.admin_cq_head = (self.admin_cq_head + 1) % QUEUE_DEPTH_U16;
                 if self.admin_cq_head == 0 {
                     self.admin_phase = !self.admin_phase;
                 }
                 self.transport
-                    .write32(self.cq_doorbell(0), self.admin_cq_head as u32)?;
+                    .write32(self.cq_doorbell(0), u32::from(self.admin_cq_head))?;
                 return if err_code == 0 {
                     Ok(())
                 } else {
@@ -291,7 +332,7 @@ impl<'a, T: StorageDmaTransport> NvmeController<'a, T> {
         self.next_cid = self.next_cid.wrapping_add(1).max(1);
         let prp1 = self.transport.virt_to_phys(&self.dma.data_page)?;
         let slot = self.io_sq_tail;
-        let sqe = &self.dma.io_sq.0[slot];
+        let sqe = &self.dma.io_sq.0[usize::from(slot)];
         sqe.cdw0.store(
             u32::from(opcode) | (u32::from(cid) << 16),
             Ordering::Relaxed,
@@ -299,29 +340,30 @@ impl<'a, T: StorageDmaTransport> NvmeController<'a, T> {
         sqe.nsid.store(self.nsid, Ordering::Relaxed);
         sqe.prp1.store(prp1, Ordering::Relaxed);
         sqe.prp2.store(0, Ordering::Relaxed);
-        sqe.cdw10.store(lba as u32, Ordering::Relaxed);
-        sqe.cdw11.store((lba >> 32) as u32, Ordering::Relaxed);
+        let (lba_lo, lba_hi) = split_u64_le(lba);
+        sqe.cdw10.store(lba_lo, Ordering::Relaxed);
+        sqe.cdw11.store(lba_hi, Ordering::Relaxed);
         sqe.cdw12.store(0, Ordering::Relaxed); // NLB = 0 => 1 logical block (512 B)
         fence(Ordering::SeqCst);
         self.transport.dma_clean(sqe)?;
 
-        self.io_sq_tail = (slot + 1) % QUEUE_DEPTH;
+        self.io_sq_tail = (slot + 1) % QUEUE_DEPTH_U16;
         self.transport
-            .write32(self.sq_doorbell(1), self.io_sq_tail as u32)?;
+            .write32(self.sq_doorbell(1), u32::from(self.io_sq_tail))?;
 
         for _ in 0..MAX_POLL {
-            let cqe = &self.dma.io_cq.0[self.io_cq_head];
+            let cqe = &self.dma.io_cq.0[usize::from(self.io_cq_head)];
             self.transport.dma_invalidate(cqe)?;
             let status = cqe.status.load(Ordering::Acquire);
             if ((status & 1) != 0) == self.io_phase {
                 let got_cid = cqe.cid.load(Ordering::Acquire);
                 let err_code = status >> 1;
-                self.io_cq_head = (self.io_cq_head + 1) % QUEUE_DEPTH;
+                self.io_cq_head = (self.io_cq_head + 1) % QUEUE_DEPTH_U16;
                 if self.io_cq_head == 0 {
                     self.io_phase = !self.io_phase;
                 }
                 self.transport
-                    .write32(self.cq_doorbell(1), self.io_cq_head as u32)?;
+                    .write32(self.cq_doorbell(1), u32::from(self.io_cq_head))?;
                 // Discard stale completions from previously timed-out commands (`P12`).
                 if got_cid != cid {
                     continue;
@@ -386,8 +428,8 @@ mod tests {
     impl StorageMmioTransport for &MockNvme<'_> {
         fn read32(&self, offset: u64) -> Result<u32, SysError> {
             match offset {
-                REG_CAP_HI => Ok(0), // dstrd = 0 -> 4 B stride
                 REG_CSTS => Ok(if *self.enabled.borrow() { CSTS_RDY } else { 0 }),
+                // REG_CAP_HI and other registers default to 0 (dstrd = 0 -> 4 B stride).
                 _ => Ok(0),
             }
         }
@@ -427,7 +469,7 @@ mod tests {
 
     impl StorageDmaTransport for &MockNvme<'_> {
         fn virt_to_phys<T>(&self, value: &T) -> Result<u64, SysError> {
-            Ok((value as *const T as usize) as u64)
+            Ok(core::ptr::from_ref::<T>(value).addr() as u64)
         }
     }
 

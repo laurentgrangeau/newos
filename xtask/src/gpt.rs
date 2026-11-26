@@ -3,6 +3,7 @@
 //! Wraps a FAT32 EFI System Partition (ESP) image into a standard 512-byte-sector GPT disk
 //! with an EFI System Partition (`C12A7328-F81F-11D2-BA4B-00A0C93EC93B`) aligned at 1 MiB (LBA 2048).
 
+use crate::error::XtaskError;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
@@ -30,6 +31,7 @@ const PART_GUID: [u8; 16] = [
 ];
 
 /// Standard IEEE 802.3 CRC32 used by UEFI GPT headers and partition entry arrays.
+#[must_use]
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
@@ -43,14 +45,23 @@ pub fn crc32(data: &[u8]) -> u32 {
 }
 
 /// Compute the byte size of the FAT32 ESP partition for a given total GPT disk size in bytes.
-pub fn esp_partition_bytes(total_disk_bytes: u64) -> Result<u64, String> {
+///
+/// # Errors
+///
+/// Returns [`XtaskError::Gpt`] if `total_disk_bytes` is not a multiple of [`SECTOR_SIZE`] or is
+/// too small to fit the 1 MiB aligned FAT32 ESP and backup GPT metadata.
+pub fn esp_partition_bytes(total_disk_bytes: u64) -> Result<u64, XtaskError> {
     if !total_disk_bytes.is_multiple_of(SECTOR_SIZE) {
-        return Err("GPT disk size must be a multiple of 512 bytes".to_string());
+        return Err(XtaskError::Gpt(
+            "GPT disk size must be a multiple of 512 bytes".to_string(),
+        ));
     }
     let total_sectors = total_disk_bytes / SECTOR_SIZE;
     let overhead_tail = GPT_ARRAY_SECTORS + 1; // 32 backup entry sectors + 1 backup header sector
     if total_sectors <= ESP_START_LBA + overhead_tail + 64 {
-        return Err("GPT disk image is too small for a FAT32 ESP".to_string());
+        return Err(XtaskError::Gpt(
+            "GPT disk image is too small for a FAT32 ESP".to_string(),
+        ));
     }
     let last_usable_lba = total_sectors - overhead_tail - 1;
     let esp_sectors = last_usable_lba - ESP_START_LBA + 1;
@@ -59,7 +70,7 @@ pub fn esp_partition_bytes(total_disk_bytes: u64) -> Result<u64, String> {
 
 fn build_protective_mbr(total_sectors: u64) -> [u8; 512] {
     let mut mbr = [0u8; 512];
-    let size_lba = (total_sectors.saturating_sub(1)).min(u64::from(u32::MAX)) as u32;
+    let size_lba = u32::try_from(total_sectors.saturating_sub(1)).unwrap_or(u32::MAX);
     // Partition entry 0 at offset 446: type 0xEE (GPT Protective)
     mbr[446] = 0x00;
     mbr[447..450].copy_from_slice(&[0x00, 0x02, 0x00]);
@@ -117,20 +128,25 @@ fn build_gpt_header(
 
 /// Assemble a complete UEFI GPT disk image at `out_path` by placing the formatted FAT32 ESP
 /// partition image (`esp_path`) at LBA 2048 (1 MiB) and writing Protective MBR + Primary/Backup GPT.
+///
+/// # Errors
+///
+/// Returns [`XtaskError::Gpt`] if the disk size or ESP file size does not match GPT geometry, or
+/// [`XtaskError::Io`] if reading the ESP or writing the output image fails.
 pub fn write_gpt_disk_image(
     out_path: &Path,
     esp_path: &Path,
     total_disk_bytes: u64,
     label: &str,
-) -> Result<(), String> {
+) -> Result<(), XtaskError> {
     let expected_esp = esp_partition_bytes(total_disk_bytes)?;
     let esp_meta = std::fs::metadata(esp_path)
-        .map_err(|e| format!("failed to stat ESP {}: {e}", esp_path.display()))?;
+        .map_err(|e| XtaskError::io(format!("failed to stat ESP {}", esp_path.display()), e))?;
     if esp_meta.len() != expected_esp {
-        return Err(format!(
+        return Err(XtaskError::Gpt(format!(
             "ESP size mismatch: expected {expected_esp} bytes, got {}",
             esp_meta.len()
-        ));
+        )));
     }
 
     let total_sectors = total_disk_bytes / SECTOR_SIZE;
@@ -163,38 +179,44 @@ pub fn write_gpt_disk_image(
         .truncate(true)
         .write(true)
         .open(out_path)
-        .map_err(|e| format!("failed to create GPT disk {}: {e}", out_path.display()))?;
+        .map_err(|e| {
+            XtaskError::io(
+                format!("failed to create GPT disk {}", out_path.display()),
+                e,
+            )
+        })?;
     out.set_len(total_disk_bytes)
-        .map_err(|e| format!("failed to size GPT disk: {e}"))?;
+        .map_err(|e| XtaskError::io("failed to size GPT disk", e))?;
 
     // LBA 0: Protective MBR
     out.seek(SeekFrom::Start(0))
         .and_then(|_| out.write_all(&mbr))
-        .map_err(|e| format!("write MBR: {e}"))?;
+        .map_err(|e| XtaskError::io("write MBR", e))?;
     // LBA 1: Primary GPT Header
     out.seek(SeekFrom::Start(SECTOR_SIZE))
         .and_then(|_| out.write_all(&primary_hdr))
-        .map_err(|e| format!("write primary GPT header: {e}"))?;
+        .map_err(|e| XtaskError::io("write primary GPT header", e))?;
     // LBA 2..33: Primary Partition Entry Array
     out.seek(SeekFrom::Start(2 * SECTOR_SIZE))
         .and_then(|_| out.write_all(&entries))
-        .map_err(|e| format!("write primary GPT entries: {e}"))?;
+        .map_err(|e| XtaskError::io("write primary GPT entries", e))?;
     // LBA 2048..last_usable_lba: FAT32 ESP
     out.seek(SeekFrom::Start(ESP_START_LBA * SECTOR_SIZE))
-        .map_err(|e| format!("seek ESP: {e}"))?;
-    let mut esp_file =
-        File::open(esp_path).map_err(|e| format!("open ESP {}: {e}", esp_path.display()))?;
-    std::io::copy(&mut esp_file, &mut out).map_err(|e| format!("copy ESP into GPT: {e}"))?;
+        .map_err(|e| XtaskError::io("seek ESP", e))?;
+    let mut esp_file = File::open(esp_path)
+        .map_err(|e| XtaskError::io(format!("open ESP {}", esp_path.display()), e))?;
+    std::io::copy(&mut esp_file, &mut out).map_err(|e| XtaskError::io("copy ESP into GPT", e))?;
     // Backup Partition Entry Array
     out.seek(SeekFrom::Start(backup_entries_lba * SECTOR_SIZE))
         .and_then(|_| out.write_all(&entries))
-        .map_err(|e| format!("write backup GPT entries: {e}"))?;
+        .map_err(|e| XtaskError::io("write backup GPT entries", e))?;
     // Backup GPT Header
     out.seek(SeekFrom::Start(backup_header_lba * SECTOR_SIZE))
         .and_then(|_| out.write_all(&backup_hdr))
-        .map_err(|e| format!("write backup GPT header: {e}"))?;
+        .map_err(|e| XtaskError::io("write backup GPT header", e))?;
 
-    out.flush().map_err(|e| format!("flush GPT disk: {e}"))?;
+    out.flush()
+        .map_err(|e| XtaskError::io("flush GPT disk", e))?;
     Ok(())
 }
 
@@ -205,6 +227,17 @@ mod tests {
     #[test]
     fn crc32_matches_standard_check_vector() {
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn esp_partition_bytes_rejects_misaligned_and_too_small_disks() {
+        assert!(matches!(esp_partition_bytes(513), Err(XtaskError::Gpt(_))));
+        assert!(matches!(
+            esp_partition_bytes(1024 * 1024),
+            Err(XtaskError::Gpt(_))
+        ));
+        let valid = esp_partition_bytes(64 * 1024 * 1024).expect("64 MiB disk is valid");
+        assert!(valid > 60 * 1024 * 1024);
     }
 
     #[test]

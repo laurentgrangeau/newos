@@ -850,7 +850,7 @@ fn t1_elf_max_load_segments_order_preserved() {
             p_flags: PF_R,
             p_vaddr: 0x40_0000 + (i as u64) * 0x1000,
             p_memsz: 64,
-            data: vec![i as u8; 8],
+            data: vec![u8::try_from(i).expect("MAX_LOAD_SEGMENTS <= 255"); 8],
         })
         .collect();
     let elf = build_elf64(0x40_0000, 56, &segs);
@@ -920,11 +920,11 @@ fn t1_shell_builtins_and_exit_outcomes() {
     let mut sh = Shell::new(MockShellHost::new());
 
     assert_eq!(sh.exec_line("help"), ExecOutcome::Continue);
-    assert!(!sh.host().output.is_empty());
+    assert_ne!(sh.host().output, "");
 
     sh.host_mut().clear_output();
     assert_eq!(sh.exec_line("sys"), ExecOutcome::Continue);
-    assert!(!sh.host().output.is_empty());
+    assert_ne!(sh.host().output, "");
 
     assert_eq!(sh.exec_line("crash"), ExecOutcome::Continue);
     assert_eq!(sh.host().fault_triggers, 1);
@@ -1011,7 +1011,7 @@ fn t1_shell_buffered_writer_utf8_and_record_stream_render() {
     rs_count.push(Record::Count(3));
     let mut rendered_count = String::new();
     rs_count.render(&mut rendered_count);
-    assert!(rendered_count.contains("3"));
+    assert!(rendered_count.contains('3'));
 }
 
 // ============================================================================
@@ -1089,5 +1089,5 @@ fn t1_bench_help_flag_exits_zero() {
 fn t1_bench_unknown_flag_exits_code_2() {
     let run = run_newos_bench(&["--definitely-unknown-flag"]);
     assert_eq!(run.status.code(), Some(2));
-    assert!(!run.stderr.is_empty());
+    assert_ne!(run.stderr, "");
 }

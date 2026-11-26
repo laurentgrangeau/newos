@@ -4,22 +4,78 @@
 //! Zero kernel heap. All operations are
 //! capability-checked through the caller's `CNode`.
 
-use crate::cspace::{CNode, CapObject, Capability, ExternalParent};
+use crate::cspace::{CNode, CapObject, Capability, ExternalParent, IrqController};
 use crate::memory::{PhysAddr, UntypedInventory};
+use core::fmt;
 use newos_abi::{CapId, ObjectType, Rights, SysError, auth_gate_ipc, key_ipc, net_ipc, role_badge};
 
 const MAX_NOTIFICATIONS: usize = 16;
+const MAX_NOTIFICATIONS_U32: u32 = 16;
 /// Maximum number of kernel IPC `Endpoint` objects (`0..MAX_ENDPOINTS`).
 pub const MAX_ENDPOINTS: usize = 16;
+const MAX_ENDPOINTS_U32: u32 = 16;
 const ROOT_CSPACE_SLOTS: usize = 64;
-/// Maximum number of isolated process capability spaces (`PD 0..MAX_IPC_DOMAINS`).
+/// Maximum number of isolated protection-domain capability spaces (`PD 0..MAX_IPC_DOMAINS`).
 pub const MAX_IPC_DOMAINS: usize = 8;
 
 const _: () = assert!(MAX_ENDPOINTS <= 16);
+const _: () = assert!(MAX_ENDPOINTS_U32 as usize == MAX_ENDPOINTS);
+const _: () = assert!(MAX_NOTIFICATIONS_U32 as usize == MAX_NOTIFICATIONS);
 const _: () = assert!(MAX_IPC_DOMAINS + 2 <= u8::MAX as usize);
 
-/// Register-only fastpath IPC message delivered through an `Endpoint`.
+/// `VSpace` capability rights granted to `newos-key-pd` at bootstrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyPdVSpaceAccess {
+    /// Write-only (`FrameMap` only, e.g. Raspberry Pi 5 where `VirtToPhys` is withheld).
+    WriteOnly,
+    /// Read-write (`FrameMap` + `VirtToPhys` for QEMU `VirtIO`-RNG DMA).
+    ReadWrite,
+}
+
+/// Compact 1-byte endpoint occupancy and buffered `IpcCall` sender PD encoding.
+///
+/// Encoding: `0` = empty, `1` = plain send (`sender_pd == None`), `2 + pd_id` = buffered `IpcCall`
+/// from `pd_id` (`0..MAX_IPC_DOMAINS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+struct EndpointState(u8);
+
+impl EndpointState {
+    const EMPTY: Self = Self(0);
+    const PLAIN_SEND: Self = Self(1);
+
+    #[inline]
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    #[inline]
+    fn from_sender(sender_pd: Option<usize>) -> Self {
+        match sender_pd {
+            Some(p) if p < MAX_IPC_DOMAINS => {
+                u8::try_from(p).map_or(Self::PLAIN_SEND, |v| Self(v + 2))
+            }
+            _ => Self::PLAIN_SEND,
+        }
+    }
+
+    #[inline]
+    const fn sender_pd(self) -> Option<usize> {
+        if self.0 >= 2 {
+            Some((self.0 - 2) as usize)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn matches_sender(self, sender_pd: usize) -> bool {
+        sender_pd < MAX_IPC_DOMAINS && u8::try_from(sender_pd).is_ok_and(|v| self.0 == v + 2)
+    }
+}
+
+/// Register-only fastpath IPC message delivered through an `Endpoint`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IpcMessage {
     pub badge: u64,
     pub payload: u64,
@@ -44,6 +100,7 @@ pub struct IpcStats {
 }
 
 impl IpcStats {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             ipc_sends: 0,
@@ -56,17 +113,16 @@ impl IpcStats {
     }
 }
 
-/// Fixed-capacity kernel IPC + per-process isolated `CSpace` state.
+/// Fixed-capacity kernel IPC + per-domain isolated `CSpace` state.
 ///
 /// PD 0 (`supervisor-pd`) owns `root_cspace`; PDs `1..MAX_IPC_DOMAINS` each own an independent
-/// `CNode<64>` so unprivileged processes cannot access capabilities belonging to `supervisor-pd`
-/// (such as `BOOTSTRAP_NET_MMIO` or `BOOTSTRAP_FAULT_NOTIF`).
+/// `CNode<64>` so unprivileged protection domains cannot access capabilities belonging to
+/// `supervisor-pd` (such as `BOOTSTRAP_NET_MMIO` or `BOOTSTRAP_FAULT_NOTIF`).
 pub struct KernelIpcState {
     pub root_cspace: CNode<ROOT_CSPACE_SLOTS>,
     domain_cspaces: [CNode<ROOT_CSPACE_SLOTS>; MAX_IPC_DOMAINS - 1],
-    /// Per-endpoint occupancy + buffered `IpcCall` sender PD:
-    /// `0` = empty, `1` = occupied (`sender_pid == None`), `2 + pd_id` = occupied (`Some(pd_id)`).
-    endpoint_state: [u8; MAX_ENDPOINTS],
+    /// Per-endpoint occupancy + buffered `IpcCall` sender PD.
+    endpoint_state: [EndpointState; MAX_ENDPOINTS],
     endpoints: [IpcMessage; MAX_ENDPOINTS],
     stats: IpcStats,
     notifications: [u64; MAX_NOTIFICATIONS],
@@ -76,6 +132,16 @@ pub struct KernelIpcState {
 
 const _: () = assert!(core::mem::size_of::<KernelIpcState>() <= 25_224);
 
+impl fmt::Debug for KernelIpcState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KernelIpcState")
+            .field("stats", &self.stats)
+            .field("next_endpoint_id", &self.next_endpoint_id)
+            .field("next_notif_id", &self.next_notif_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for KernelIpcState {
     fn default() -> Self {
         Self::new()
@@ -83,11 +149,13 @@ impl Default for KernelIpcState {
 }
 
 impl KernelIpcState {
+    #[must_use]
+    #[allow(clippy::large_stack_arrays)] // Intentional: no_std zero-heap EL1 static initialized via const fn KernelIpcState::new().
     pub const fn new() -> Self {
         Self {
             root_cspace: CNode::new(),
             domain_cspaces: [const { CNode::new() }; MAX_IPC_DOMAINS - 1],
-            endpoint_state: [0; MAX_ENDPOINTS],
+            endpoint_state: [EndpointState::EMPTY; MAX_ENDPOINTS],
             endpoints: [IpcMessage::EMPTY; MAX_ENDPOINTS],
             stats: IpcStats::new(),
             notifications: [0; MAX_NOTIFICATIONS],
@@ -97,28 +165,60 @@ impl KernelIpcState {
     }
 
     #[inline]
+    fn validate_child_pd(pd_id: usize) -> Result<u32, SysError> {
+        if pd_id == 0 || pd_id >= MAX_IPC_DOMAINS {
+            return Err(SysError::InvalidArgument);
+        }
+        u32::try_from(pd_id).map_err(|_| SysError::InvalidArgument)
+    }
+
+    #[inline]
+    fn child_cspace_mut(
+        &mut self,
+        pd_id: usize,
+    ) -> Result<(&mut CNode<ROOT_CSPACE_SLOTS>, u32), SysError> {
+        let pd_u32 = Self::validate_child_pd(pd_id)?;
+        Ok((&mut self.domain_cspaces[pd_id - 1], pd_u32))
+    }
+
+    #[inline]
+    fn make_external_parent(cnode_id: usize, slot: usize) -> Result<ExternalParent, SysError> {
+        let cnode_u16 = u16::try_from(cnode_id).map_err(|_| SysError::InvalidArgument)?;
+        let slot_u16 = u16::try_from(slot).map_err(|_| SysError::InvalidArgument)?;
+        Ok(ExternalParent {
+            cnode_id: cnode_u16,
+            slot: slot_u16,
+        })
+    }
+
+    #[inline]
+    #[must_use]
     pub const fn stats(&self) -> IpcStats {
         self.stats
     }
 
     #[inline]
-    pub fn reset_stats(&mut self) {
+    pub const fn reset_stats(&mut self) {
         self.stats = IpcStats::new();
     }
 
     #[inline]
+    #[must_use]
     pub const fn root_cspace(&self) -> &CNode<ROOT_CSPACE_SLOTS> {
         &self.root_cspace
     }
 
     #[inline]
-    pub fn root_cspace_mut(&mut self) -> &mut CNode<ROOT_CSPACE_SLOTS> {
+    pub const fn root_cspace_mut(&mut self) -> &mut CNode<ROOT_CSPACE_SLOTS> {
         &mut self.root_cspace
     }
 
-    /// Borrow the isolated `CNode` for process `pd_id` (`0..MAX_IPC_DOMAINS`).
-    #[inline(always)]
-    pub fn cspace(&self, pd_id: usize) -> Result<&CNode<ROOT_CSPACE_SLOTS>, SysError> {
+    /// Borrow the isolated `CNode` for protection domain `pd_id` (`0..MAX_IPC_DOMAINS`).
+    ///
+    /// # Errors
+    /// Returns [`SysError::InvalidArgument`] if `pd_id >= MAX_IPC_DOMAINS`.
+    #[inline]
+    pub const fn cspace(&self, pd_id: usize) -> Result<&CNode<ROOT_CSPACE_SLOTS>, SysError> {
         if pd_id == 0 {
             Ok(&self.root_cspace)
         } else if pd_id < MAX_IPC_DOMAINS {
@@ -128,9 +228,15 @@ impl KernelIpcState {
         }
     }
 
-    /// Mutably borrow the isolated `CNode` for process `pd_id` (`0..MAX_IPC_DOMAINS`).
-    #[inline(always)]
-    pub fn cspace_mut(&mut self, pd_id: usize) -> Result<&mut CNode<ROOT_CSPACE_SLOTS>, SysError> {
+    /// Mutably borrow the isolated `CNode` for protection domain `pd_id` (`0..MAX_IPC_DOMAINS`).
+    ///
+    /// # Errors
+    /// Returns [`SysError::InvalidArgument`] if `pd_id >= MAX_IPC_DOMAINS`.
+    #[inline]
+    pub const fn cspace_mut(
+        &mut self,
+        pd_id: usize,
+    ) -> Result<&mut CNode<ROOT_CSPACE_SLOTS>, SysError> {
         if pd_id == 0 {
             Ok(&mut self.root_cspace)
         } else if pd_id < MAX_IPC_DOMAINS {
@@ -148,6 +254,9 @@ impl KernelIpcState {
     /// - Slot 5 (`BOOTSTRAP_CONSOLE`): `Console` capability (`READ | WRITE`)
     /// - Slot 6 (`BOOTSTRAP_POWER`): `PowerControl` capability (`Exit` / `SysInfo`)
     /// - Slot 7 (`BOOTSTRAP_VSPACE`): `VSpace` capability (`MapPage` / `UnmapPage` / `VirtToPhys`)
+    ///
+    /// # Errors
+    /// Returns [`SysError::SlotOccupied`] or [`SysError::OutOfMemory`] if any bootstrap slot is already occupied.
     pub fn init_bootstrap_caps(
         &mut self,
         net_mmio: Option<(PhysAddr, u64)>,
@@ -230,6 +339,9 @@ impl KernelIpcState {
     }
 
     /// Install a capability-scoped `MmioRegion` (`R|W`) at `slot` in `supervisor-pd` (PD 0)'s `CSpace`.
+    ///
+    /// # Errors
+    /// Propagates any insertion error from [`CNode::insert_root_at`].
     pub fn register_bootstrap_mmio_cap(
         &mut self,
         slot: usize,
@@ -245,25 +357,29 @@ impl KernelIpcState {
 
     /// Install `CapId::BOOTSTRAP_WDT_MMIO` (slot 18, gen 1, `R|W`) in `supervisor-pd` (PD 0)'s `CSpace`
     /// for the Raspberry Pi 5 BCM2712 hardware watchdog (`0x10_7D20_0000`, `0x100` bytes).
+    ///
+    /// # Errors
+    /// Propagates any insertion error from [`Self::register_bootstrap_mmio_cap`].
     pub fn register_wdt_mmio_cap(&mut self, phys: PhysAddr, len: u64) -> Result<CapId, SysError> {
         self.register_bootstrap_mmio_cap(18, phys, len)
     }
 
     /// Install strict least-privilege capabilities for `newos-net-pd` (Network & DMA plane).
     ///
-    /// Holds ONLY `BOOTSTRAP_NET_MMIO` (`R|W`), `BOOTSTRAP_VSPACE` (`R` only for `VirtToPhys`),
+    /// Holds ONLY `BOOTSTRAP_NET_MMIO` (`R|W`), `BOOTSTRAP_VSPACE` (`R|W`),
     /// `BOOTSTRAP_NET_EP` (`R|W`, server), and write-only `BOOTSTRAP_LOG_EP` (`W`, role-badged).
     /// Explicitly omits `RNG_MMIO`, `KEY_EP`, `AUTH_GATE_EP`, `SSH_SHELL_EP`, `THREAD`, `CNODE`,
     /// `CONSOLE`, `POWER`, `UNTYPED`, and `GRANT`/`REVOKE`.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id == 0` or `pd_id >= MAX_IPC_DOMAINS`.
+    /// - [`SysError::SlotOccupied`] if any target bootstrap slot is already occupied.
     pub fn init_net_pd_bootstrap_caps(
         &mut self,
         pd_id: usize,
         net_mmio: Option<(PhysAddr, u64)>,
     ) -> Result<(), SysError> {
-        if pd_id == 0 || pd_id >= MAX_IPC_DOMAINS {
-            return Err(SysError::InvalidArgument);
-        }
-        let cnode = &mut self.domain_cspaces[pd_id - 1];
+        let (cnode, pd_u32) = self.child_cspace_mut(pd_id)?;
         let rw = Rights::READ.union(Rights::WRITE);
         if let Some((phys, len)) = net_mmio {
             let _ = cnode
@@ -283,7 +399,7 @@ impl KernelIpcState {
             Capability {
                 object: CapObject::Endpoint { id: 1 },
                 rights: Rights::WRITE,
-                badge: role_badge::encode_log_badge(role_badge::ROLE_NET, pd_id as u32),
+                badge: role_badge::encode_log_badge(role_badge::ROLE_NET, pd_u32),
             },
         )?;
         let _ = cnode.insert_root_at(13, Capability::new(CapObject::Endpoint { id: 2 }, rw))?;
@@ -299,22 +415,25 @@ impl KernelIpcState {
 
     /// Install strict least-privilege capabilities for `newos-key-pd` (Entropy & PQ Signing Vault).
     ///
-    /// Holds ONLY `BOOTSTRAP_RNG_MMIO` (`R|W`), `BOOTSTRAP_VSPACE` (`R` only, QEMU VirtIO-RNG DMA
-    /// only — omitted on Raspberry Pi 5), `BOOTSTRAP_KEY_EP` (`R|W`, server), write-only
-    /// `BOOTSTRAP_AUTH_GATE_EP` (`W`, badged `auth_gate_ipc::BADGE_KEYD`), and write-only
-    /// `BOOTSTRAP_LOG_EP` (`W`, role-badged).
+    /// Holds ONLY `BOOTSTRAP_RNG_MMIO` (`R|W`), `BOOTSTRAP_VSPACE` (controlled by `vspace_access`),
+    /// `BOOTSTRAP_KEY_EP` (`R|W`, server), write-only `BOOTSTRAP_AUTH_GATE_EP` (`W`, badged
+    /// `auth_gate_ipc::BADGE_KEY`), and write-only `BOOTSTRAP_LOG_EP` (`W`, role-badged).
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id == 0` or `pd_id >= MAX_IPC_DOMAINS`.
+    /// - [`SysError::SlotOccupied`] if any target bootstrap slot is already occupied.
     pub fn init_key_pd_bootstrap_caps(
         &mut self,
         pd_id: usize,
         rng_mmio: Option<(PhysAddr, u64)>,
-        allow_vspace_read: bool,
+        vspace_access: KeyPdVSpaceAccess,
     ) -> Result<(), SysError> {
-        if pd_id == 0 || pd_id >= MAX_IPC_DOMAINS {
-            return Err(SysError::InvalidArgument);
-        }
-        let cnode = &mut self.domain_cspaces[pd_id - 1];
+        let (cnode, pd_u32) = self.child_cspace_mut(pd_id)?;
         let rw = Rights::READ.union(Rights::WRITE);
-        let vspace_rights = if allow_vspace_read { rw } else { Rights::WRITE };
+        let vspace_rights = match vspace_access {
+            KeyPdVSpaceAccess::ReadWrite => rw,
+            KeyPdVSpaceAccess::WriteOnly => Rights::WRITE,
+        };
         let _ = cnode.insert_root_at(
             7,
             Capability::new(
@@ -329,7 +448,7 @@ impl KernelIpcState {
             Capability {
                 object: CapObject::Endpoint { id: 1 },
                 rights: Rights::WRITE,
-                badge: role_badge::encode_log_badge(role_badge::ROLE_KEY, pd_id as u32),
+                badge: role_badge::encode_log_badge(role_badge::ROLE_KEY, pd_u32),
             },
         )?;
         if let Some((phys, len)) = rng_mmio {
@@ -357,15 +476,16 @@ impl KernelIpcState {
 
     /// Install strict least-privilege capabilities for `newos-ssh-pd` (Untrusted SSH Parser).
     ///
-    /// Holds **ZERO** MMIO capabilities, **ZERO** `VSpace` capability, **ZERO** `AUTH_GATE_EP`,
+    /// Holds **ZERO** MMIO capabilities, **ZERO** `VSpace` read capability, **ZERO** `AUTH_GATE_EP`,
     /// **ZERO** `THREAD`/`CNODE`/`GRANT`/`REVOKE`. Holds ONLY role-badged `BOOTSTRAP_NET_EP`,
     /// `BOOTSTRAP_KEY_EP`, `BOOTSTRAP_SSH_SHELL_EP`, `BOOTSTRAP_SSH_OUT_EP`, and write-only
     /// `BOOTSTRAP_LOG_EP`.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id == 0` or `pd_id >= MAX_IPC_DOMAINS`.
+    /// - [`SysError::SlotOccupied`] if any target bootstrap slot is already occupied.
     pub fn init_ssh_pd_bootstrap_caps(&mut self, pd_id: usize) -> Result<(), SysError> {
-        if pd_id == 0 || pd_id >= MAX_IPC_DOMAINS {
-            return Err(SysError::InvalidArgument);
-        }
-        let cnode = &mut self.domain_cspaces[pd_id - 1];
+        let (cnode, pd_u32) = self.child_cspace_mut(pd_id)?;
         let rw = Rights::READ.union(Rights::WRITE);
         let _ = cnode.insert_root_at(
             7,
@@ -381,7 +501,7 @@ impl KernelIpcState {
             Capability {
                 object: CapObject::Endpoint { id: 1 },
                 rights: Rights::WRITE,
-                badge: role_badge::encode_log_badge(role_badge::ROLE_SSH, pd_id as u32),
+                badge: role_badge::encode_log_badge(role_badge::ROLE_SSH, pd_u32),
             },
         )?;
         let _ = cnode.insert_root_at(
@@ -430,19 +550,20 @@ impl KernelIpcState {
 
     /// Install least-privilege bootstrap capabilities for an isolated protection domain (`pd_id >= 1`).
     ///
-    /// Grants `BOOTSTRAP_NOTIF` (`READ | WRITE`), `BOOTSTRAP_EP` (`READ | WRITE`, badge `0x5E14`),
+    /// Grants `BOOTSTRAP_NOTIF` (`READ | WRITE`), `BOOTSTRAP_EP` (`READ`, badge `0x5E14`),
     /// `BOOTSTRAP_SELF_THREAD` (`READ | WRITE`), and write-only `BOOTSTRAP_LOG_EP` (`WRITE`,
     /// immutable kernel-stamped role+PD badge) for routing console output through `supervisor-pd`.
     /// Direct `Console` UART access, hardware MMIO, supervisor fault notifications, `PowerControl`,
     /// `VSpace`, and peer `CNode` capabilities are intentionally withheld.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id == 0` or `pd_id >= MAX_IPC_DOMAINS`.
+    /// - [`SysError::SlotOccupied`] if any target bootstrap slot is already occupied.
     pub fn init_worker_pd_bootstrap_caps(
         &mut self,
         pd_id: usize,
     ) -> Result<(CapId, CapId), SysError> {
-        if pd_id == 0 || pd_id >= MAX_IPC_DOMAINS {
-            return Err(SysError::InvalidArgument);
-        }
-        let cnode = &mut self.domain_cspaces[pd_id - 1];
+        let (cnode, pd_u32) = self.child_cspace_mut(pd_id)?;
         let rw = Rights::READ.union(Rights::WRITE);
         let notif =
             cnode.insert_root_at(1, Capability::new(CapObject::Notification { id: 0 }, rw))?;
@@ -454,22 +575,18 @@ impl KernelIpcState {
                 badge: 0x5E14,
             },
         )?;
-        let _ = cnode.insert_root_at(
-            8,
-            Capability::new(CapObject::Thread { id: pd_id as u32 }, rw),
-        )?;
+        let _ = cnode.insert_root_at(8, Capability::new(CapObject::Thread { id: pd_u32 }, rw))?;
         let _ = cnode.insert_root_at(
             11,
             Capability {
                 object: CapObject::Endpoint { id: 1 },
                 rights: Rights::WRITE,
-                badge: role_badge::encode_log_badge(role_badge::ROLE_WORKER, pd_id as u32),
+                badge: role_badge::encode_log_badge(role_badge::ROLE_WORKER, pd_u32),
             },
         )?;
         Ok((notif, ep))
     }
 
-    /// Install designated `Thread` and `CNode` capabilities for `child_pd` into PD 0 (`supervisor-pd`).
     /// Install least-privilege capabilities for standalone EL0 `newos-shell-pd` (`DomainRole::Shell`).
     ///
     /// Holds `BOOTSTRAP_NOTIF`, `BOOTSTRAP_EP`, write-only `BOOTSTRAP_FAULT_NOTIF` (for graceful
@@ -477,11 +594,12 @@ impl KernelIpcState {
     /// `BOOTSTRAP_POWER` (`SysInfo` only — cannot halt/reboot directly), `BOOTSTRAP_LOG_EP` (`R|W`),
     /// `BOOTSTRAP_SSH_SHELL_EP` (`R`), `BOOTSTRAP_AUTH_GATE_EP` (`R`), `BOOTSTRAP_SSH_OUT_EP` (`W`),
     /// and read-only `BOOTSTRAP_SELF_THREAD`. Explicitly omits all MMIO and `Untyped` caps.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id == 0` or `pd_id >= MAX_IPC_DOMAINS`.
+    /// - [`SysError::SlotOccupied`] if any target bootstrap slot is already occupied.
     pub fn init_shell_pd_bootstrap_caps(&mut self, pd_id: usize) -> Result<(), SysError> {
-        if pd_id == 0 || pd_id >= MAX_IPC_DOMAINS {
-            return Err(SysError::InvalidArgument);
-        }
-        let cnode = &mut self.domain_cspaces[pd_id - 1];
+        let (cnode, pd_u32) = self.child_cspace_mut(pd_id)?;
         let rw = Rights::READ.union(Rights::WRITE);
         let _ = cnode.insert_root_at(1, Capability::new(CapObject::Notification { id: 0 }, rw))?;
         let _ = cnode.insert_root_at(
@@ -496,7 +614,7 @@ impl KernelIpcState {
         let _ = cnode.insert_root_at(6, Capability::new(CapObject::PowerControl, Rights::READ))?;
         let _ = cnode.insert_root_at(
             10,
-            Capability::new(CapObject::Thread { id: pd_id as u32 }, Rights::READ),
+            Capability::new(CapObject::Thread { id: pd_u32 }, Rights::READ),
         )?;
         let _ = cnode.insert_root_at(11, Capability::new(CapObject::Endpoint { id: 1 }, rw))?;
         let _ = cnode.insert_root_at(
@@ -515,21 +633,19 @@ impl KernelIpcState {
     }
 
     /// Register `Thread` and `CNode` management capabilities for `child_pd` inside PD 0's
-    /// root `CSpace` so the root supervisor can manage and destroy child processes.
+    /// root `CSpace` so the root supervisor can manage and destroy child protection domains.
     /// Reuses existing slots if `child_pd` was respawned into a recycled PD slot.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `child_pd == 0` or `child_pd >= MAX_IPC_DOMAINS`.
+    /// - [`SysError::OutOfMemory`] if PD 0's `CSpace` has no free slots.
     pub fn register_child_caps_in_root(
         &mut self,
         child_pd: usize,
     ) -> Result<(CapId, CapId), SysError> {
-        if child_pd == 0 || child_pd >= MAX_IPC_DOMAINS {
-            return Err(SysError::InvalidArgument);
-        }
-        let thread_obj = CapObject::Thread {
-            id: child_pd as u32,
-        };
-        let cnode_obj = CapObject::CNode {
-            id: child_pd as u32,
-        };
+        let child_u32 = Self::validate_child_pd(child_pd)?;
+        let thread_obj = CapObject::Thread { id: child_u32 };
+        let cnode_obj = CapObject::CNode { id: child_u32 };
         let thread_cap = if self.root_cspace.has_live_object(thread_obj) {
             CapId::NULL
         } else {
@@ -547,18 +663,24 @@ impl KernelIpcState {
 
     /// Install or refresh a deterministic child `Thread` capability at fixed `slot` (e.g., slots
     /// `40..=44` for `BOOTSTRAP_{SHELL,WORKER,NET,KEY,SSH}_THREAD`) in PD 0's `CSpace`.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `child_pd` or `slot` is out of range.
+    /// - [`SysError::SlotOccupied`] if `slot` holds a non-`Thread` capability.
     pub fn register_child_thread_cap_in_root(
         &mut self,
         slot: usize,
         child_pd: usize,
     ) -> Result<CapId, SysError> {
-        if child_pd == 0 || child_pd >= MAX_IPC_DOMAINS {
-            return Err(SysError::InvalidArgument);
-        }
-        self.root_cspace.bind_thread_at(slot, child_pd as u32)
+        let child_u32 = Self::validate_child_pd(child_pd)?;
+        self.root_cspace.bind_thread_at(slot, child_u32)
     }
 
     /// Validate a `Thread` capability in `pd_id`'s `CSpace`, returning the designated target `pd_id`.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id` is out of range or the cap is not a valid `Thread`.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn validate_thread_for(
         &self,
@@ -581,6 +703,10 @@ impl KernelIpcState {
     }
 
     /// Validate a `CNode` capability in `pd_id`'s `CSpace`, returning the designated target `pd_id`.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id` is out of range or the cap is not a valid `CNode`.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn validate_cnode_for(
         &self,
@@ -603,6 +729,9 @@ impl KernelIpcState {
     }
 
     /// Bind the hardware page-table root physical address onto `pd_id`'s `BOOTSTRAP_VSPACE` cap.
+    ///
+    /// # Errors
+    /// Propagates any error from [`Self::cspace_mut`] or [`CNode::bind_vspace_root`].
     pub fn bind_bootstrap_vspace(
         &mut self,
         pd_id: usize,
@@ -613,27 +742,36 @@ impl KernelIpcState {
     }
 
     /// Bind the largest usable `UntypedInventory` region index onto PD 0's `BOOTSTRAP_UNTYPED` cap.
+    ///
+    /// # Errors
+    /// Propagates any error from [`CNode::bind_untyped_region`].
     pub fn bind_bootstrap_untyped_region(&mut self, region_index: u16) -> Result<(), SysError> {
         self.root_cspace
             .bind_untyped_region(CapId::BOOTSTRAP_UNTYPED, region_index)
     }
 
     /// Register a hardware `IrqHandler` capability at bootstrap slot `slot` in `pd_id`'s `CSpace`.
+    ///
+    /// # Errors
+    /// Propagates any error from [`Self::cspace_mut`] or [`CNode::insert_root_at`].
     pub fn register_bootstrap_irq_cap(
         &mut self,
         pd_id: usize,
         slot: usize,
         irq: u16,
-        is_mip: bool,
+        controller: IrqController,
     ) -> Result<CapId, SysError> {
         let rw = Rights::READ.union(Rights::WRITE);
         self.cspace_mut(pd_id)?.insert_root_at(
             slot,
-            Capability::new(CapObject::IrqHandler { irq, is_mip }, rw),
+            Capability::new(CapObject::IrqHandler { irq, controller }, rw),
         )
     }
 
     /// Register a shared-memory `Frame` capability at bootstrap slot `slot` in `pd_id`'s `CSpace`.
+    ///
+    /// # Errors
+    /// Propagates any error from [`Self::cspace_mut`] or [`CNode::insert_root_at`].
     pub fn register_bootstrap_frame_cap(
         &mut self,
         pd_id: usize,
@@ -645,30 +783,39 @@ impl KernelIpcState {
             .insert_root_at(slot, Capability::new(CapObject::Frame { phys }, rw))
     }
 
-    /// Return `true` if any active `CSpace` holds a live `CapObject::IrqHandler { irq, is_mip }`.
+    /// Return `true` if any active `CSpace` holds a live `CapObject::IrqHandler { irq, controller }`.
     #[inline]
-    pub fn has_live_irq_cap(&self, irq: u16, is_mip: bool) -> bool {
-        let obj = CapObject::IrqHandler { irq, is_mip };
+    #[must_use]
+    pub fn has_live_irq_cap(&self, irq: u16, controller: IrqController) -> bool {
+        let obj = CapObject::IrqHandler { irq, controller };
         self.root_cspace.has_live_object(obj)
             || self.domain_cspaces.iter().any(|cn| cn.has_live_object(obj))
     }
 
-    /// Validate an `IrqHandler` capability in `pd_id`'s `CSpace`, returning `(irq, is_mip)`.
+    /// Validate an `IrqHandler` capability in `pd_id`'s `CSpace`, returning `(irq, controller)`.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id` is invalid or `cap_id` is not an `IrqHandler`.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn validate_irq_for(
         &self,
         pd_id: usize,
         cap_id: CapId,
         required: Rights,
-    ) -> Result<(u16, bool), SysError> {
+    ) -> Result<(u16, IrqController), SysError> {
         let cap = self.cspace(pd_id)?.lookup(cap_id, required)?;
         match cap.object {
-            CapObject::IrqHandler { irq, is_mip } => Ok((irq, is_mip)),
+            CapObject::IrqHandler { irq, controller } => Ok((irq, controller)),
             _ => Err(SysError::InvalidArgument),
         }
     }
 
     /// Validate a `Notification` capability in `pd_id`'s `CSpace`, returning its notification ID.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id` is invalid, `cap_id` is not a `Notification`, or its ID is out of range.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn validate_notification_id_for(
         &self,
@@ -685,6 +832,10 @@ impl KernelIpcState {
 
     /// Validate a `Notification` capability in `pd_id`'s `CSpace` for `NotifySignal`, returning
     /// `(notif_id, effective_badge)` where `effective_badge` incorporates any immutable cap badge.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id` is invalid, `cap_id` is not a `Notification`, or its ID is out of range.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn resolve_notify_signal_for(
         &self,
@@ -708,6 +859,9 @@ impl KernelIpcState {
     }
 
     /// Bitwise-OR `badge` into notification `notif_id`, returning the updated 64-bit signal word.
+    ///
+    /// # Errors
+    /// Returns [`SysError::InvalidArgument`] if `notif_id` is out of range.
     #[inline]
     pub fn notify_signal_id(&mut self, notif_id: u32, badge: u64) -> Result<u64, SysError> {
         let slot = self
@@ -722,6 +876,9 @@ impl KernelIpcState {
     /// Atomically consume `(word & mask)` from notification `notif_id`, preserving unmatched bits.
     ///
     /// Rejects `mask == 0` with [`SysError::InvalidArgument`].
+    ///
+    /// # Errors
+    /// Returns [`SysError::InvalidArgument`] if `mask == 0` or `notif_id` is out of range.
     #[inline]
     pub fn notify_consume_mask(&mut self, notif_id: u32, mask: u64) -> Result<u64, SysError> {
         if mask == 0 {
@@ -740,6 +897,10 @@ impl KernelIpcState {
     }
 
     /// Validate a `Console` capability in `pd_id`'s `CSpace` (`WRITE` for `DebugWrite`, `READ` for `DebugRead`).
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id` is invalid or `cap_id` is not a `Console`.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn validate_console_for(
         &self,
@@ -755,6 +916,10 @@ impl KernelIpcState {
     }
 
     /// Validate a `PowerControl` capability in `pd_id`'s `CSpace` (`WRITE` for `Exit`, `READ` for `SysInfo`).
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id` is invalid or `cap_id` is not a `PowerControl`.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn validate_power_for(
         &self,
@@ -771,6 +936,10 @@ impl KernelIpcState {
 
     /// Validate a `VSpace` capability in `pd_id`'s `CSpace` (`WRITE` for `MapPage`/`UnmapPage`,
     /// `READ` for `VirtToPhys`), returning its bound hardware root physical address.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id` is invalid or `cap_id` is not a `VSpace`.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn validate_vspace_for(
         &self,
@@ -786,6 +955,10 @@ impl KernelIpcState {
     }
 
     /// Resolve an `Endpoint` capability in `pd_id`'s `CSpace`, returning `(endpoint_id, badge)`.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id` is invalid or `cap_id` is not an `Endpoint`.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn lookup_endpoint_for(
         &self,
@@ -802,6 +975,10 @@ impl KernelIpcState {
 
     /// Bitwise-OR `badge` (or the capability's immutable badge if non-zero) into a `Notification`
     /// resolved in `pd_id`'s `CSpace`.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id` is invalid, `cap_id` is not a `Notification`, or its ID is out of range.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn notify_signal_for(
         &mut self,
@@ -827,12 +1004,19 @@ impl KernelIpcState {
     }
 
     /// Bitwise-OR `badge` into a `Notification` in PD 0's root `CSpace`.
+    ///
+    /// # Errors
+    /// Propagates any error returned by [`Self::notify_signal_for`].
     #[inline]
     pub fn notify_signal(&mut self, cap_id: CapId, badge: u64) -> Result<(), SysError> {
         self.notify_signal_for(0, cap_id, badge)
     }
 
     /// Atomically read and clear the 64-bit signal word of a `Notification` in `pd_id`'s `CSpace`.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id` is invalid, `cap_id` is not a `Notification`, or its ID is out of range.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn notify_poll_for(&mut self, pd_id: usize, cap_id: CapId) -> Result<u64, SysError> {
         let id = {
@@ -853,43 +1037,50 @@ impl KernelIpcState {
     }
 
     /// Atomically read and clear the 64-bit signal word of a `Notification` in PD 0's `CSpace`.
+    ///
+    /// # Errors
+    /// Propagates any error returned by [`Self::notify_poll_for`].
     #[inline]
     pub fn notify_poll(&mut self, cap_id: CapId) -> Result<u64, SysError> {
         self.notify_poll_for(0, cap_id)
     }
 
     /// Buffer a fastpath IPC message into an already-validated `Endpoint` (`ep_id`),
-    /// optionally recording `sender_pid` for buffered `IpcCall` reply tracking.
-    #[inline(always)]
+    /// optionally recording `sender_pd` for buffered `IpcCall` reply tracking.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `ep_id >= MAX_ENDPOINTS`.
+    /// - [`SysError::WouldBlock`] if the endpoint already holds an unread message.
+    #[inline]
     pub fn ipc_send_resolved(
         &mut self,
         ep_id: u32,
         badge: u64,
         payload: u64,
-        sender_pid: Option<usize>,
+        sender_pd: Option<usize>,
     ) -> Result<(), SysError> {
         let idx = ep_id as usize;
         if idx >= MAX_ENDPOINTS {
             return Err(SysError::InvalidArgument);
         }
-        if self.endpoint_state[idx] != 0 {
+        if !self.endpoint_state[idx].is_empty() {
             self.stats.would_blocks = self.stats.would_blocks.wrapping_add(1);
             return Err(SysError::WouldBlock);
         }
         self.endpoints[idx] = IpcMessage { badge, payload };
-        self.endpoint_state[idx] = match sender_pid {
-            None => 1,
-            Some(p) if p < MAX_IPC_DOMAINS => 2 + p as u8,
-            Some(_) => 1,
-        };
+        self.endpoint_state[idx] = EndpointState::from_sender(sender_pd);
         self.stats.ipc_sends = self.stats.ipc_sends.wrapping_add(1);
         Ok(())
     }
 
     /// Receive a buffered fastpath IPC message from an already-validated `Endpoint` (`ep_id`),
-    /// returning `(message, optional_sender_pid)`.
-    #[inline(always)]
-    pub fn ipc_recv_resolved(
+    /// returning `(message, optional_sender_pd)`.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `ep_id >= MAX_ENDPOINTS`.
+    /// - [`SysError::WouldBlock`] if no message is currently buffered in `ep_id`.
+    #[inline]
+    pub const fn ipc_recv_resolved(
         &mut self,
         ep_id: u32,
     ) -> Result<(IpcMessage, Option<usize>), SysError> {
@@ -898,48 +1089,45 @@ impl KernelIpcState {
             return Err(SysError::InvalidArgument);
         }
         let state = self.endpoint_state[idx];
-        if state == 0 {
+        if state.is_empty() {
             self.stats.would_blocks = self.stats.would_blocks.wrapping_add(1);
             return Err(SysError::WouldBlock);
         }
-        self.endpoint_state[idx] = 0;
+        self.endpoint_state[idx] = EndpointState::EMPTY;
         let msg = self.endpoints[idx];
-        let sender = if state >= 2 {
-            Some((state - 2) as usize)
-        } else {
-            None
-        };
+        let sender = state.sender_pd();
         self.stats.ipc_recvs = self.stats.ipc_recvs.wrapping_add(1);
         Ok((msg, sender))
     }
 
-    /// Drain all occupied endpoints holding a buffered `IpcCall` (`sender_pid.is_some()`),
+    /// Drain all occupied endpoints holding a buffered `IpcCall` (`sender_pd.is_some()`),
     /// clearing each endpoint's occupancy and invoking `on_sender(pd_id)` for every caller.
     pub fn drain_buffered_call_senders(&mut self, mut on_sender: impl FnMut(usize)) {
         for slot in &mut self.endpoint_state {
-            let state = *slot;
-            if state >= 2 {
-                *slot = 0;
-                on_sender((state - 2) as usize);
+            if let Some(pd_id) = slot.sender_pd() {
+                *slot = EndpointState::EMPTY;
+                on_sender(pd_id);
             }
         }
     }
 
-    /// Clear any buffered `IpcCall` whose sender was `sender_pd` (called on process teardown).
+    /// Clear any buffered `IpcCall` whose sender was `sender_pd` (called on protection-domain teardown).
     pub fn clear_buffered_calls_from(&mut self, sender_pd: usize) {
         if sender_pd >= MAX_IPC_DOMAINS {
             return;
         }
-        let target = 2u8 + sender_pd as u8;
         for slot in &mut self.endpoint_state {
-            if *slot == target {
-                *slot = 0;
+            if slot.matches_sender(sender_pd) {
+                *slot = EndpointState::EMPTY;
             }
         }
     }
 
     /// Send a register-only fastpath IPC payload to an `Endpoint` in `pd_id`'s `CSpace`.
-    #[inline(always)]
+    ///
+    /// # Errors
+    /// Propagates any error from [`Self::lookup_endpoint_for`] or [`Self::ipc_send_resolved`].
+    #[inline]
     pub fn ipc_send_for(
         &mut self,
         pd_id: usize,
@@ -951,7 +1139,10 @@ impl KernelIpcState {
     }
 
     /// Send a register-only fastpath IPC payload to an `Endpoint` in PD 0's `CSpace`.
-    #[inline(always)]
+    ///
+    /// # Errors
+    /// Propagates any error returned by [`Self::ipc_send_for`].
+    #[inline]
     pub fn ipc_send(&mut self, cap_id: CapId, payload: u64) -> Result<(), SysError> {
         self.ipc_send_for(0, cap_id, payload)
     }
@@ -959,14 +1150,20 @@ impl KernelIpcState {
     /// Receive a pending register-only fastpath IPC message from an `Endpoint` in `pd_id`'s `CSpace`.
     ///
     /// Requires the server receive right (`Rights::READ`), which is never granted to pure clients.
-    #[inline(always)]
+    ///
+    /// # Errors
+    /// Propagates any error from [`Self::lookup_endpoint_for`] or [`Self::ipc_recv_resolved`].
+    #[inline]
     pub fn ipc_recv_for(&mut self, pd_id: usize, cap_id: CapId) -> Result<IpcMessage, SysError> {
         let (id, _) = self.lookup_endpoint_for(pd_id, cap_id, Rights::READ)?;
         self.ipc_recv_resolved(id).map(|(msg, _)| msg)
     }
 
     /// Receive a pending register-only fastpath IPC message from an `Endpoint` in PD 0's `CSpace`.
-    #[inline(always)]
+    ///
+    /// # Errors
+    /// Propagates any error returned by [`Self::ipc_recv_for`].
+    #[inline]
     pub fn ipc_recv(&mut self, cap_id: CapId) -> Result<IpcMessage, SysError> {
         self.ipc_recv_for(0, cap_id)
     }
@@ -974,6 +1171,11 @@ impl KernelIpcState {
     /// Synchronous direct call/reply fastpath on an `Endpoint` in `pd_id`'s `CSpace`.
     ///
     /// Requires `Rights::WRITE` only so clients never need receive authority (`H1`).
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if the endpoint ID is out of range or `cap_id` is not an `Endpoint`.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
+    /// - [`SysError::WouldBlock`] if the endpoint already holds an unread buffered message.
     #[inline]
     pub fn ipc_call_for(
         &mut self,
@@ -987,7 +1189,7 @@ impl KernelIpcState {
         if idx >= MAX_ENDPOINTS {
             return Err(SysError::InvalidArgument);
         }
-        if self.endpoint_state[idx] != 0 {
+        if !self.endpoint_state[idx].is_empty() {
             self.stats.would_blocks = self.stats.would_blocks.wrapping_add(1);
             return Err(SysError::WouldBlock);
         }
@@ -997,6 +1199,9 @@ impl KernelIpcState {
     }
 
     /// Synchronous direct call/reply fastpath on an `Endpoint` in PD 0's `CSpace`.
+    ///
+    /// # Errors
+    /// Propagates any error returned by [`Self::ipc_call_for`].
     #[inline]
     pub fn ipc_call(
         &mut self,
@@ -1008,6 +1213,9 @@ impl KernelIpcState {
     }
 
     /// Derive a new capability in `pd_id`'s `CSpace` (`dst_slot == 0` auto-selects a free slot).
+    ///
+    /// # Errors
+    /// Propagates any error from [`Self::cspace_mut`], [`CNode::find_free_slot`], or [`CNode::mint`].
     pub fn cap_mint_for(
         &mut self,
         pd_id: usize,
@@ -1026,6 +1234,9 @@ impl KernelIpcState {
     }
 
     /// Copy a capability verbatim in `pd_id`'s `CSpace` (`dst_slot == 0` auto-selects a free slot).
+    ///
+    /// # Errors
+    /// Propagates any error returned by [`Self::cap_mint_for`].
     pub fn cap_copy_for(
         &mut self,
         pd_id: usize,
@@ -1036,7 +1247,10 @@ impl KernelIpcState {
     }
 
     /// Move a capability to another slot in `pd_id`'s `CSpace` (`dst_slot == 0` auto-selects),
-    /// updating any cross-process `ExternalParent` CDT links referencing the moved slot.
+    /// updating any cross-domain `ExternalParent` CDT links referencing the moved slot.
+    ///
+    /// # Errors
+    /// Propagates any error from [`Self::cspace_mut`], [`CNode::slot_index`], or [`CNode::move_cap`].
     pub fn cap_move_for(
         &mut self,
         pd_id: usize,
@@ -1051,14 +1265,8 @@ impl KernelIpcState {
             dst_slot
         };
         let new_id = cnode.move_cap(src, slot)?;
-        let old_ext = ExternalParent {
-            cnode_id: pd_id as u16,
-            slot: old_slot as u16,
-        };
-        let new_ext = ExternalParent {
-            cnode_id: pd_id as u16,
-            slot: slot as u16,
-        };
+        let old_ext = Self::make_external_parent(pd_id, old_slot)?;
+        let new_ext = Self::make_external_parent(pd_id, slot)?;
         for other in 0..MAX_IPC_DOMAINS {
             if let Ok(other_cn) = self.cspace_mut(other) {
                 other_cn.reparent_external_children(old_ext, Some(new_ext));
@@ -1067,13 +1275,19 @@ impl KernelIpcState {
         Ok(new_id)
     }
 
-    /// Delete a single capability slot from `pd_id`'s `CSpace`, preserving cross-process CDT ancestry.
+    /// Delete a single capability slot from `pd_id`'s `CSpace`, preserving cross-domain CDT ancestry.
+    ///
+    /// # Errors
+    /// Propagates any error returned by [`Self::cap_delete_for_with_frame_reclaim_cb`].
     pub fn cap_delete_for(&mut self, pd_id: usize, cap_id: CapId) -> Result<(), SysError> {
         self.cap_delete_for_with_frame_reclaim_cb(pd_id, cap_id, |_, _| {})
     }
 
-    /// Delete a single capability slot from `pd_id`'s `CSpace`, preserving cross-process CDT ancestry,
+    /// Delete a single capability slot from `pd_id`'s `CSpace`, preserving cross-domain CDT ancestry,
     /// and invoking `on_deleted_frame(phys, can_reclaim)` if the deleted capability was a `Frame` (`M3`).
+    ///
+    /// # Errors
+    /// Propagates any error from [`Self::cspace`], [`CNode::lookup`], or [`CNode::delete`].
     pub fn cap_delete_for_with_frame_reclaim_cb(
         &mut self,
         pd_id: usize,
@@ -1084,16 +1298,11 @@ impl KernelIpcState {
         let (slot, intra_parent, ext_parent) = self.cspace(pd_id)?.parent_info(cap_id)?;
         self.cspace_mut(pd_id)?.delete(cap_id)?;
 
-        let old_ext = ExternalParent {
-            cnode_id: pd_id as u16,
-            slot: slot as u16,
+        let old_ext = Self::make_external_parent(pd_id, slot)?;
+        let replacement = match intra_parent {
+            Some(p) => Some(Self::make_external_parent(pd_id, p)?),
+            None => ext_parent,
         };
-        let replacement = intra_parent
-            .map(|p| ExternalParent {
-                cnode_id: pd_id as u16,
-                slot: p as u16,
-            })
-            .or(ext_parent);
         for other in 0..MAX_IPC_DOMAINS {
             if let Ok(other_cn) = self.cspace_mut(other) {
                 other_cn.reparent_external_children(old_ext, replacement);
@@ -1109,14 +1318,15 @@ impl KernelIpcState {
     /// Clear all capabilities held by an exited protection domain `pd_id` (`M4`), reparenting
     /// any external CDT descendants in other domains and invoking `on_frame(phys, can_reclaim)`
     /// for any `Frame` capabilities it held.
+    ///
+    /// # Errors
+    /// Returns [`SysError::InvalidArgument`] if `pd_id == 0` or `pd_id >= MAX_IPC_DOMAINS`.
     pub fn clear_domain_cspace(
         &mut self,
         pd_id: usize,
         mut on_frame: impl FnMut(PhysAddr, bool),
     ) -> Result<(), SysError> {
-        if pd_id == 0 || pd_id >= MAX_IPC_DOMAINS {
-            return Err(SysError::InvalidArgument);
-        }
+        let _ = Self::validate_child_pd(pd_id)?;
         // Reparent any cross-domain CDT children that pointed into `pd_id` before clearing.
         let mut reparents: [(usize, Option<ExternalParent>); ROOT_CSPACE_SLOTS] =
             [(0, None); ROOT_CSPACE_SLOTS];
@@ -1129,10 +1339,7 @@ impl KernelIpcState {
             }
         }
         for &(slot, replacement) in &reparents[..reparent_len] {
-            let old_ext = ExternalParent {
-                cnode_id: pd_id as u16,
-                slot: slot as u16,
-            };
+            let old_ext = Self::make_external_parent(pd_id, slot)?;
             for other in 0..MAX_IPC_DOMAINS {
                 if other != pd_id
                     && let Ok(other_cn) = self.cspace_mut(other)
@@ -1160,24 +1367,34 @@ impl KernelIpcState {
         Ok(())
     }
 
-    /// Retype an `IrqHandler` capability for `(irq, is_mip)` from a designated `Untyped`
+    /// Retype an `IrqHandler` capability for `(irq, controller)` from a designated `Untyped`
     /// capability in `pd_id`'s `CSpace`, rejecting duplicate live bindings for the same IRQ.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `irq` is out of range for `controller` or `untyped_cap` is not `Untyped`.
+    /// - [`SysError::SlotOccupied`] if a live `IrqHandler` for `(irq, controller)` already exists or `dst_slot` is occupied.
+    /// - [`SysError::InvalidCapability`], [`SysError::InsufficientRights`], or [`SysError::OutOfMemory`] if insertion fails.
     pub fn untyped_retype_irq_for(
         &mut self,
         pd_id: usize,
         untyped_cap: CapId,
         dst_slot: usize,
         irq: u16,
-        is_mip: bool,
+        controller: IrqController,
     ) -> Result<CapId, SysError> {
-        if is_mip {
-            if irq >= 64 {
-                return Err(SysError::InvalidArgument);
+        match controller {
+            IrqController::Mip => {
+                if irq >= 64 {
+                    return Err(SysError::InvalidArgument);
+                }
             }
-        } else if !(32..1020).contains(&irq) {
-            return Err(SysError::InvalidArgument);
+            IrqController::GicSpi => {
+                if !(32..1020).contains(&irq) {
+                    return Err(SysError::InvalidArgument);
+                }
+            }
         }
-        if self.has_live_irq_cap(irq, is_mip) {
+        if self.has_live_irq_cap(irq, controller) {
             return Err(SysError::SlotOccupied);
         }
         let slot = if dst_slot == 0 {
@@ -1188,12 +1405,13 @@ impl KernelIpcState {
         self.cspace_mut(pd_id)?.insert_retyped_child(
             untyped_cap,
             slot,
-            CapObject::IrqHandler { irq, is_mip },
+            CapObject::IrqHandler { irq, controller },
         )
     }
 
     /// Return `true` if any active `CSpace` holds a live `CapObject::Endpoint { id }` with `Rights::READ`.
     #[inline]
+    #[must_use]
     pub fn has_live_endpoint_server(&self, id: u32) -> bool {
         let obj = CapObject::Endpoint { id };
         self.root_cspace
@@ -1206,6 +1424,7 @@ impl KernelIpcState {
 
     /// Return `true` if any active `CSpace` holds a live `CapObject::Endpoint { id }` capability.
     #[inline]
+    #[must_use]
     pub fn has_live_endpoint_cap(&self, id: u32) -> bool {
         let obj = CapObject::Endpoint { id };
         self.root_cspace.has_live_object(obj)
@@ -1214,6 +1433,7 @@ impl KernelIpcState {
 
     /// Return `true` if any active `CSpace` holds a live `CapObject::Notification { id }` capability.
     #[inline]
+    #[must_use]
     pub fn has_live_notif_cap(&self, id: u32) -> bool {
         let obj = CapObject::Notification { id };
         self.root_cspace.has_live_object(obj)
@@ -1229,7 +1449,7 @@ impl KernelIpcState {
             return Some(id);
         }
         // Scan dynamic endpoint IDs (skipping reserved bootstrap IDs 0..=6) for any unused slot.
-        (7..(MAX_ENDPOINTS as u32)).find(|&id| !self.has_live_endpoint_cap(id))
+        (7..MAX_ENDPOINTS_U32).find(|&id| !self.has_live_endpoint_cap(id))
     }
 
     /// Allocate a free notification ID (`0..MAX_NOTIFICATIONS`), recycling IDs whose capabilities
@@ -1241,11 +1461,12 @@ impl KernelIpcState {
             return Some(id);
         }
         // Scan dynamic notification IDs (skipping reserved bootstrap IDs 0..=1) for any unused slot.
-        (2..(MAX_NOTIFICATIONS as u32)).find(|&id| !self.has_live_notif_cap(id))
+        (2..MAX_NOTIFICATIONS_U32).find(|&id| !self.has_live_notif_cap(id))
     }
 
     /// Return `true` if any active `CSpace` holds a live `CapObject::Frame { phys }` capability.
     #[inline]
+    #[must_use]
     pub fn has_live_frame_cap(&self, phys: PhysAddr) -> bool {
         self.root_cspace.has_live_frame_cap(phys)
             || self
@@ -1255,6 +1476,10 @@ impl KernelIpcState {
     }
 
     /// Validate an `IoSpace` capability in `pd_id`'s `CSpace`, returning its domain ID.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id` is invalid or `cap_id` is not an `IoSpace`.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn validate_iospace_for(
         &self,
@@ -1270,6 +1495,10 @@ impl KernelIpcState {
     }
 
     /// Validate a `Frame` capability in `pd_id`'s `CSpace`, returning its physical base address.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id` is invalid or `cap_id` is not a `Frame`.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn validate_frame_for(
         &self,
@@ -1286,6 +1515,11 @@ impl KernelIpcState {
 
     /// Retype a kernel object (`Frame`, `Endpoint`, `Notification`) from a designated `Untyped`
     /// capability in `pd_id`'s `CSpace` (`dst_slot == 0` auto-selects a free slot).
+    ///
+    /// # Errors
+    /// - [`SysError::Unsupported`] if `obj_type` cannot be retyped via this call.
+    /// - [`SysError::OutOfMemory`] if object IDs, slots, or untyped memory are exhausted.
+    /// - Propagates capability validation errors from [`CNode`].
     pub fn untyped_retype_for(
         &mut self,
         pd_id: usize,
@@ -1311,7 +1545,7 @@ impl KernelIpcState {
                     slot,
                     CapObject::Endpoint { id: ep_id },
                 )?;
-                self.endpoint_state[ep_id as usize] = 0;
+                self.endpoint_state[ep_id as usize] = EndpointState::EMPTY;
                 Ok(cap_id)
             }
             ObjectType::Notification => {
@@ -1332,6 +1566,9 @@ impl KernelIpcState {
     /// `on_revoked_frame(phys, can_reclaim)` for each unique revoked `CapObject::Frame { phys }`
     /// per revoked `CSpace`, where `can_reclaim` is `true` ONLY when NO live `CapObject::Frame`
     /// capability for `phys` remains in any `CSpace` (preventing physical-frame aliasing / UAF).
+    ///
+    /// # Errors
+    /// Propagates any error from [`Self::cspace_mut`] or [`CNode::revoke_with_mask_cb`].
     pub fn cap_revoke_for_with_frame_reclaim_cb(
         &mut self,
         pd_id: usize,
@@ -1395,6 +1632,9 @@ impl KernelIpcState {
 
     /// Transitively revoke all CDT descendants of `cap_id` across all `CSpace`s, invoking
     /// `on_revoked_frame` for EVERY revoked `CapObject::Frame { phys }` (no fixed buffer cap).
+    ///
+    /// # Errors
+    /// Propagates any error from [`Self::cspace_mut`] or [`CNode::revoke_with_mask_cb`].
     pub fn cap_revoke_for_with_frame_cb(
         &mut self,
         pd_id: usize,
@@ -1433,6 +1673,9 @@ impl KernelIpcState {
     /// Transitively revoke all CDT descendants of `cap_id` across all `CSpace`s, collecting any
     /// revoked `CapObject::Frame { phys }` addresses into `revoked_frames` so hardware PTEs can
     /// be unmapped and flushed (`H-3`). Returns `(revoked_cap_count, collected_frame_count)`.
+    ///
+    /// # Errors
+    /// Propagates any error returned by [`Self::cap_revoke_for_with_frame_cb`].
     pub fn cap_revoke_for_collecting_frames(
         &mut self,
         pd_id: usize,
@@ -1450,7 +1693,10 @@ impl KernelIpcState {
     }
 
     /// Transitively revoke all CDT descendants of `cap_id` across `pd_id`'s `CSpace` AND any
-    /// capabilities granted into other processes' `CSpace`s (multi-hop cross-process CDT).
+    /// capabilities granted into other protection domains' `CSpace`s (multi-hop cross-domain CDT).
+    ///
+    /// # Errors
+    /// Propagates any error returned by [`Self::cap_revoke_for_with_frame_cb`].
     pub fn cap_revoke_for(&mut self, pd_id: usize, cap_id: CapId) -> Result<usize, SysError> {
         self.cap_revoke_for_with_frame_cb(pd_id, cap_id, |_| {})
     }
@@ -1458,6 +1704,11 @@ impl KernelIpcState {
     /// Grant an attenuated capability from `src_pd`'s `CSpace` into the `CNode` designated by
     /// `dst_cnode_cap` (`CapObject::CNode`, requiring `Rights::WRITE`), validating that the
     /// target PD is `< active_procs`.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `dst_pd >= active_procs` or `new_badge == Some(0)`.
+    /// - [`SysError::InsufficientRights`] if `src_cap` lacks `Rights::GRANT` or is already badged.
+    /// - Propagates capability lookup and insertion errors from [`CNode`].
     pub fn cap_grant_between_checked(
         &mut self,
         src_pd: usize,
@@ -1492,10 +1743,7 @@ impl KernelIpcState {
             rights: cap.rights.attenuate(rights_mask),
             badge,
         };
-        let ext_parent = ExternalParent {
-            cnode_id: src_pd as u16,
-            slot: src_slot as u16,
-        };
+        let ext_parent = Self::make_external_parent(src_pd, src_slot)?;
         self.cspace_mut(dst_pd)?
             .insert_external_derived(derived, ext_parent)
     }
@@ -1504,7 +1752,10 @@ impl KernelIpcState {
     /// `dst_cnode_cap` (`CapObject::CNode`, requiring `Rights::WRITE`).
     ///
     /// Enforces `Rights::GRANT` on `src_cap`, non-escalating rights attenuation, immutable non-zero
-    /// badging, and preserves cross-process CDT ancestry for transitive `CapRevoke`.
+    /// badging, and preserves cross-domain CDT ancestry for transitive `CapRevoke`.
+    ///
+    /// # Errors
+    /// Propagates any error returned by [`Self::cap_grant_between_checked`].
     pub fn cap_grant_between(
         &mut self,
         src_pd: usize,
@@ -1524,6 +1775,10 @@ impl KernelIpcState {
     }
 
     /// Validate an EL0 driver's 32-bit MMIO read against `pd_id`'s `MmioRegion` capability.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `offset` is unaligned, out of bounds, or `cap_id` is not `MmioRegion`.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn validate_mmio_read32_for(
         &self,
@@ -1535,6 +1790,10 @@ impl KernelIpcState {
     }
 
     /// Validate an EL0 driver's 32-bit MMIO write against `pd_id`'s `MmioRegion` capability.
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `offset` is unaligned, out of bounds, or `cap_id` is not `MmioRegion`.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn validate_mmio_write32_for(
         &self,
@@ -1546,12 +1805,18 @@ impl KernelIpcState {
     }
 
     /// Validate an EL0 driver's 32-bit MMIO read in PD 0's `CSpace`.
+    ///
+    /// # Errors
+    /// Propagates any error returned by [`Self::validate_mmio_read32_for`].
     #[inline]
     pub fn validate_mmio_read32(&self, cap_id: CapId, offset: u64) -> Result<PhysAddr, SysError> {
         self.validate_mmio_read32_for(0, cap_id, offset)
     }
 
     /// Validate an EL0 driver's 32-bit MMIO write in PD 0's `CSpace`.
+    ///
+    /// # Errors
+    /// Propagates any error returned by [`Self::validate_mmio_write32_for`].
     #[inline]
     pub fn validate_mmio_write32(&self, cap_id: CapId, offset: u64) -> Result<PhysAddr, SysError> {
         self.validate_mmio_write32_for(0, cap_id, offset)
@@ -1559,6 +1824,10 @@ impl KernelIpcState {
 
     /// Validate an `MmioRegion` capability in `pd_id`'s `CSpace` for `MmioMap`, returning
     /// `(phys_base, len, writable)` (requires `Rights::READ`; `writable` reflects `Rights::WRITE`).
+    ///
+    /// # Errors
+    /// - [`SysError::InvalidArgument`] if `pd_id` is invalid or `cap_id` is not `MmioRegion`.
+    /// - [`SysError::InvalidCapability`] or [`SysError::InsufficientRights`] if lookup fails.
     #[inline]
     pub fn validate_mmio_region_for(
         &self,
@@ -2108,13 +2377,13 @@ mod tests {
         let mut ipc = KernelIpcState::new();
         let _ = ipc.init_bootstrap_caps(None).unwrap();
 
-        // Resolved send/recv tracks sender_pid and rejects out-of-range endpoint IDs.
+        // Resolved send/recv tracks sender_pd and rejects out-of-range endpoint IDs.
         assert_eq!(
-            ipc.ipc_send_resolved(MAX_ENDPOINTS as u32, 0, 1, None),
+            ipc.ipc_send_resolved(MAX_ENDPOINTS_U32, 0, 1, None),
             Err(SysError::InvalidArgument)
         );
         assert_eq!(
-            ipc.ipc_recv_resolved(MAX_ENDPOINTS as u32),
+            ipc.ipc_recv_resolved(MAX_ENDPOINTS_U32),
             Err(SysError::InvalidArgument)
         );
         ipc.ipc_send_resolved(0, 0x5E14, 0xDEAD, Some(3)).unwrap();
@@ -2368,22 +2637,7 @@ mod tests {
         assert!(ipc.cspace(0).unwrap().lookup(g2_b, Rights::READ).is_ok());
     }
 
-    #[test]
-    fn three_process_ssh_capability_isolation_enforces_least_privilege() {
-        let mut ipc = KernelIpcState::new();
-        let net_mmio = Some((PhysAddr::new(0x1F_0010_0000), 0x4000));
-        let rng_mmio = Some((PhysAddr::new(0x10_7D20_8000), 0x28));
-
-        // PD 0 (`supervisor-pd`): holds no NET_MMIO when net-pd owns it, no RNG_MMIO, no KEY_EP,
-        // read-only AUTH_GATE_EP, and SSH_SHELL_EP.
-        ipc.init_bootstrap_caps(None).unwrap();
-        // PD 2 (`net-pd`): NIC MMIO + read-only VSpace + NET_EP + badged LOG_EP only.
-        ipc.init_net_pd_bootstrap_caps(2, net_mmio).unwrap();
-        // PD 3 (`key-pd`, Raspberry Pi 5 mode): RNG MMIO + KEY_EP + write-only AUTH_GATE_EP, NO VSpace.
-        ipc.init_key_pd_bootstrap_caps(3, rng_mmio, false).unwrap();
-        // PD 4 (`ssh-pd`): ZERO MMIO, ZERO VSpace, ZERO AUTH_GATE_EP, ZERO THREAD/CNODE.
-        ipc.init_ssh_pd_bootstrap_caps(4).unwrap();
-
+    fn assert_ssh_mmio_and_vspace_isolation(ipc: &KernelIpcState) {
         // 1. MMIO isolation
         assert_eq!(
             ipc.validate_mmio_read32_for(2, CapId::BOOTSTRAP_NET_MMIO, 0),
@@ -2440,7 +2694,9 @@ mod tests {
             ipc.validate_vspace_for(4, CapId::BOOTSTRAP_VSPACE, Rights::WRITE),
             Ok(PhysAddr::new(0))
         );
+    }
 
+    fn assert_ssh_endpoint_and_least_privilege_isolation(ipc: &mut KernelIpcState) {
         // 3. Auth-gate isolation: ONLY `key-pd` (PD 3) can write, ONLY `supervisor-pd` (PD 0) can read.
         // `ssh-pd` (PD 4) and `net-pd` (PD 2) cannot forge SessionOpen!
         assert_eq!(
@@ -2511,16 +2767,38 @@ mod tests {
     }
 
     #[test]
+    fn three_process_ssh_capability_isolation_enforces_least_privilege() {
+        let mut ipc = KernelIpcState::new();
+        let net_mmio = Some((PhysAddr::new(0x1F_0010_0000), 0x4000));
+        let rng_mmio = Some((PhysAddr::new(0x10_7D20_8000), 0x28));
+
+        // PD 0 (`supervisor-pd`): holds no NET_MMIO when net-pd owns it, no RNG_MMIO, no KEY_EP,
+        // read-only AUTH_GATE_EP, and SSH_SHELL_EP.
+        ipc.init_bootstrap_caps(None).unwrap();
+        // PD 2 (`net-pd`): NIC MMIO + read-write VSpace + NET_EP + badged LOG_EP only.
+        ipc.init_net_pd_bootstrap_caps(2, net_mmio).unwrap();
+        // PD 3 (`key-pd`, Raspberry Pi 5 mode): RNG MMIO + KEY_EP + write-only AUTH_GATE_EP, WRITE-only VSpace.
+        ipc.init_key_pd_bootstrap_caps(3, rng_mmio, KeyPdVSpaceAccess::WriteOnly)
+            .unwrap();
+        // PD 4 (`ssh-pd`): ZERO MMIO, WRITE-only VSpace, ZERO AUTH_GATE_EP, ZERO THREAD/CNODE.
+        ipc.init_ssh_pd_bootstrap_caps(4).unwrap();
+
+        assert_ssh_mmio_and_vspace_isolation(&ipc);
+        assert_ssh_endpoint_and_least_privilege_isolation(&mut ipc);
+    }
+
+    #[test]
     fn role_badges_are_independent_of_spawn_order_and_pid() {
         let mut ipc = KernelIpcState::new();
         ipc.init_bootstrap_caps(None).unwrap();
 
         // Spawn protection domains in a non-default order and without `worker-pd` (PD 1=net-pd, 2=key-pd, 3=ssh-pd).
         ipc.init_net_pd_bootstrap_caps(1, None).unwrap();
-        ipc.init_key_pd_bootstrap_caps(2, None, false).unwrap();
+        ipc.init_key_pd_bootstrap_caps(2, None, KeyPdVSpaceAccess::WriteOnly)
+            .unwrap();
         ipc.init_ssh_pd_bootstrap_caps(3).unwrap();
 
-        // `key-pd` (at PD 2, not 3) still presents `auth_gate_ipc::BADGE_KEYD` to `supervisor-pd`.
+        // `key-pd` (at PD 2, not 3) still presents `auth_gate_ipc::BADGE_KEY` to `supervisor-pd`.
         assert_eq!(
             ipc.ipc_send_for(
                 2,
@@ -2592,21 +2870,24 @@ mod tests {
     #[test]
     fn irq_handler_cap_registration_validation_and_live_tracking() {
         let mut ipc = KernelIpcState::new();
-        assert!(!ipc.has_live_irq_cap(33, false));
+        assert!(!ipc.has_live_irq_cap(33, IrqController::GicSpi));
         let cap = ipc
-            .register_bootstrap_irq_cap(0, 32, 33, false)
+            .register_bootstrap_irq_cap(0, 32, 33, IrqController::GicSpi)
             .expect("register uart irq");
         assert_eq!(cap, CapId::BOOTSTRAP_UART_IRQ);
-        assert!(ipc.has_live_irq_cap(33, false));
-        assert!(!ipc.has_live_irq_cap(33, true));
-        assert_eq!(ipc.validate_irq_for(0, cap, Rights::WRITE), Ok((33, false)));
+        assert!(ipc.has_live_irq_cap(33, IrqController::GicSpi));
+        assert!(!ipc.has_live_irq_cap(33, IrqController::Mip));
+        assert_eq!(
+            ipc.validate_irq_for(0, cap, Rights::WRITE),
+            Ok((33, IrqController::GicSpi))
+        );
         let mip_cap = ipc
-            .register_bootstrap_irq_cap(0, 30, 5, true)
+            .register_bootstrap_irq_cap(0, 30, 5, IrqController::Mip)
             .expect("register mip irq");
         assert_eq!(mip_cap, CapId::BOOTSTRAP_NET_IRQ);
         assert_eq!(
             ipc.validate_irq_for(0, mip_cap, Rights::READ),
-            Ok((5, true))
+            Ok((5, IrqController::Mip))
         );
     }
 
@@ -2680,6 +2961,88 @@ mod tests {
             ipc.register_child_thread_cap_in_root(1, 3),
             Err(SysError::SlotOccupied)
         );
+    }
+
+    #[test]
+    fn kernel_ipc_state_debug_endpoint_state_key_vspace_access_and_irq_retype() {
+        use core::fmt::Write as _;
+
+        struct Buf([u8; 256], usize);
+        impl core::fmt::Write for Buf {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let n = bytes.len().min(self.0.len() - self.1);
+                self.0[self.1..self.1 + n].copy_from_slice(&bytes[..n]);
+                self.1 += n;
+                Ok(())
+            }
+        }
+
+        // EndpointState encoding & behavior
+        assert!(EndpointState::EMPTY.is_empty());
+        assert_eq!(EndpointState::EMPTY.sender_pd(), None);
+        assert!(!EndpointState::PLAIN_SEND.is_empty());
+        assert_eq!(EndpointState::PLAIN_SEND.sender_pd(), None);
+        let s3 = EndpointState::from_sender(Some(3));
+        assert!(!s3.is_empty());
+        assert_eq!(s3.sender_pd(), Some(3));
+        assert!(s3.matches_sender(3));
+        assert!(!s3.matches_sender(4));
+        assert_eq!(
+            EndpointState::from_sender(Some(MAX_IPC_DOMAINS)),
+            EndpointState::PLAIN_SEND
+        );
+        assert_eq!(
+            IpcMessage::default(),
+            IpcMessage {
+                badge: 0,
+                payload: 0
+            }
+        );
+
+        let mut ipc = KernelIpcState::new();
+        let _ = ipc.init_bootstrap_caps(None).expect("bootstrap");
+
+        // KeyPdVSpaceAccess::ReadWrite grants both READ and WRITE on BOOTSTRAP_VSPACE.
+        ipc.init_key_pd_bootstrap_caps(2, None, KeyPdVSpaceAccess::ReadWrite)
+            .expect("key-pd rw");
+        assert_eq!(
+            ipc.validate_vspace_for(2, CapId::BOOTSTRAP_VSPACE, Rights::READ),
+            Ok(PhysAddr::new(0))
+        );
+        assert_eq!(
+            ipc.validate_vspace_for(2, CapId::BOOTSTRAP_VSPACE, Rights::WRITE),
+            Ok(PhysAddr::new(0))
+        );
+
+        // untyped_retype_irq_for validates IrqController bounds and prevents duplicates.
+        assert_eq!(
+            ipc.untyped_retype_irq_for(0, CapId::BOOTSTRAP_UNTYPED, 0, 31, IrqController::GicSpi),
+            Err(SysError::InvalidArgument)
+        );
+        assert_eq!(
+            ipc.untyped_retype_irq_for(0, CapId::BOOTSTRAP_UNTYPED, 0, 64, IrqController::Mip),
+            Err(SysError::InvalidArgument)
+        );
+        let gic_cap = ipc
+            .untyped_retype_irq_for(0, CapId::BOOTSTRAP_UNTYPED, 0, 48, IrqController::GicSpi)
+            .expect("retype gic irq");
+        assert_eq!(
+            ipc.validate_irq_for(0, gic_cap, Rights::READ),
+            Ok((48, IrqController::GicSpi))
+        );
+        assert_eq!(
+            ipc.untyped_retype_irq_for(0, CapId::BOOTSTRAP_UNTYPED, 0, 48, IrqController::GicSpi),
+            Err(SysError::SlotOccupied)
+        );
+
+        // O(1) non-exhaustive Debug formatting on KernelIpcState.
+        let mut buf = Buf([0; 256], 0);
+        write!(&mut buf, "{ipc:?}").expect("format debug");
+        let rendered = core::str::from_utf8(&buf.0[..buf.1]).expect("utf8");
+        assert!(rendered.contains("KernelIpcState"));
+        assert!(rendered.contains("next_endpoint_id"));
+        assert!(rendered.contains(".."));
     }
 }
 

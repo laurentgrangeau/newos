@@ -81,6 +81,108 @@ impl std::fmt::Display for ParseError {
     }
 }
 
+impl std::error::Error for ParseError {}
+
+/// Structured verification errors for benchmark speed and IPC acceptance invariants.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BenchVerifyError {
+    MissingKey {
+        dataset: &'static str,
+        key: &'static str,
+    },
+    InvalidLatency {
+        group: &'static str,
+        key: &'static str,
+        baseline: f64,
+        post_opt: f64,
+    },
+    NotFaster {
+        group: &'static str,
+        base_sum: f64,
+        post_sum: f64,
+        geomean_ratio: f64,
+        improved: usize,
+        total: usize,
+    },
+    InvalidIpcCount {
+        key: &'static str,
+        baseline: f64,
+        post_opt: f64,
+    },
+    IpcRegression {
+        key: &'static str,
+        baseline: f64,
+        post_opt: f64,
+    },
+    InconsistentIpcTotal {
+        dataset: &'static str,
+        reported_total: f64,
+        component_sum: f64,
+    },
+    IpcNotReduced {
+        baseline: f64,
+        post_opt: f64,
+    },
+}
+
+impl std::fmt::Display for BenchVerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingKey { dataset, key } => write!(f, "missing {dataset} key {key}"),
+            Self::InvalidLatency {
+                group,
+                key,
+                baseline,
+                post_opt,
+            } => write!(
+                f,
+                "invalid or non-positive {group} latency for {key}: base={baseline}, post={post_opt}"
+            ),
+            Self::NotFaster {
+                group,
+                base_sum,
+                post_sum,
+                geomean_ratio,
+                improved,
+                total,
+            } => write!(
+                f,
+                "{group} not faster: base_sum={base_sum:.2}, post_sum={post_sum:.2}, geomean_ratio={geomean_ratio:.4}, improved={improved}/{total}"
+            ),
+            Self::InvalidIpcCount {
+                key,
+                baseline,
+                post_opt,
+            } => write!(
+                f,
+                "invalid IPC count for `{key}`: baseline={baseline}, post_opt={post_opt}"
+            ),
+            Self::IpcRegression {
+                key,
+                baseline,
+                post_opt,
+            } => write!(
+                f,
+                "IPC regression on `{key}`: baseline={baseline}, post_opt={post_opt}"
+            ),
+            Self::InconsistentIpcTotal {
+                dataset,
+                reported_total,
+                component_sum,
+            } => write!(
+                f,
+                "{dataset} ipc.total_consumption ({reported_total}) != sum of 5 component IPC metrics ({component_sum})"
+            ),
+            Self::IpcNotReduced { baseline, post_opt } => write!(
+                f,
+                "ipc.total_consumption did not decrease: baseline={baseline}, post_opt={post_opt}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BenchVerifyError {}
+
 /// Returns true if `name` is a latency/speed metric (`kernel.*` or `shell.*`).
 pub fn is_speed_metric(name: &str) -> bool {
     KERNEL_SPEED_KEYS.contains(&name) || SHELL_SPEED_KEYS.contains(&name)
@@ -246,6 +348,171 @@ fn is_separator_row(cells: &[&str]) -> bool {
         })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MdSection {
+    None,
+    Baseline,
+    PostOpt,
+    Comparison,
+}
+
+#[derive(Default)]
+struct MdTableCols {
+    metric: Option<usize>,
+    baseline: Option<usize>,
+    post: Option<usize>,
+    value: Option<usize>,
+}
+
+fn classify_heading(line: &str, current: MdSection) -> MdSection {
+    let lower = line.to_ascii_lowercase();
+    let has_post = lower.contains("post-opt")
+        || lower.contains("post opt")
+        || lower.contains("optimized")
+        || lower.contains("after");
+    let has_baseline = lower.contains("baseline") || lower.contains("before");
+    if has_post && !has_baseline {
+        MdSection::PostOpt
+    } else if lower.contains("comparison") || (has_baseline && has_post) {
+        MdSection::Comparison
+    } else if has_baseline {
+        MdSection::Baseline
+    } else {
+        current
+    }
+}
+
+fn insert_section_metric(
+    section: MdSection,
+    known_key_count: usize,
+    baseline: &mut BTreeMap<String, f64>,
+    post_opt: &mut BTreeMap<String, f64>,
+    name: &str,
+    val: f64,
+) {
+    match section {
+        MdSection::PostOpt => {
+            post_opt.insert(name.to_string(), val);
+        }
+        MdSection::Comparison if baseline.len() == known_key_count => {
+            post_opt.insert(name.to_string(), val);
+        }
+        MdSection::Baseline | MdSection::Comparison | MdSection::None => {
+            baseline.entry(name.to_string()).or_insert(val);
+        }
+    }
+}
+
+fn parse_md_metric_line(
+    line: &str,
+    line_no: usize,
+    section: MdSection,
+    known_key_count: usize,
+    baseline: &mut BTreeMap<String, f64>,
+    post_opt: &mut BTreeMap<String, f64>,
+) -> Result<(), ParseError> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() != 4 {
+        return Err(ParseError::MalformedLine {
+            line_no,
+            detail: format!("malformed METRIC line in markdown: `{line}`"),
+        });
+    }
+    let name = parts[1].trim_matches(|c| matches!(c, '`' | '*' | '_'));
+    let val: f64 = parts[2].parse().map_err(|_| ParseError::InvalidValue {
+        name: name.to_string(),
+        raw: parts[2].to_string(),
+    })?;
+    validate_value_and_unit(name, val, parts[3])?;
+    insert_section_metric(section, known_key_count, baseline, post_opt, name, val);
+    Ok(())
+}
+
+fn parse_md_table_row(
+    line: &str,
+    section: MdSection,
+    known_keys: &[&str],
+    cols: &mut MdTableCols,
+    baseline: &mut BTreeMap<String, f64>,
+    post_opt: &mut BTreeMap<String, f64>,
+) -> Result<(), ParseError> {
+    let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+    if is_separator_row(&cells) {
+        return Ok(());
+    }
+    // Detect table header row with `Metric` at any column index.
+    let lower_cells: Vec<String> = cells.iter().map(|c| c.to_ascii_lowercase()).collect();
+    if let Some(m_col) = lower_cells.iter().position(|c| c.contains("metric")) {
+        cols.metric = Some(m_col);
+        cols.baseline = lower_cells
+            .iter()
+            .position(|c| c.contains("baseline") || c.contains("before"));
+        cols.post = lower_cells
+            .iter()
+            .position(|c| c.contains("post") || c.contains("optimized") || c.contains("after"));
+        cols.value = lower_cells
+            .iter()
+            .position(|c| c == "value" || c.contains("value"));
+        return Ok(());
+    }
+
+    let m_idx = cols.metric.unwrap_or(0);
+    let Some(raw_metric) = cells.get(m_idx) else {
+        return Ok(());
+    };
+    let metric_name = raw_metric
+        .trim()
+        .trim_matches(|c| matches!(c, '`' | '*' | '_'))
+        .trim();
+    if !known_keys.contains(&metric_name) {
+        return Ok(());
+    }
+
+    // Case A: unified table with baseline and/or post-opt columns.
+    if let Some(b_idx) = cols.baseline {
+        if let Some(raw_b) = cells.get(b_idx)
+            && let Some(v) = parse_cell_number(metric_name, raw_b)?
+        {
+            baseline.entry(metric_name.to_string()).or_insert(v);
+        }
+        if let Some(p_idx) = cols.post
+            && let Some(raw_p) = cells.get(p_idx)
+            && let Some(v) = parse_cell_number(metric_name, raw_p)?
+        {
+            post_opt.insert(metric_name.to_string(), v);
+        }
+        return Ok(());
+    }
+
+    // Case B: single-value section table (e.g. | Category | Metric | Value | Unit | or | Metric | Value | Unit |).
+    let v_idx = cols.value.unwrap_or(m_idx + 1);
+    if let Some(raw_v) = cells.get(v_idx)
+        && let Some(v) = parse_cell_number(metric_name, raw_v)?
+    {
+        insert_section_metric(
+            section,
+            known_keys.len(),
+            baseline,
+            post_opt,
+            metric_name,
+            v,
+        );
+    }
+    Ok(())
+}
+
+fn check_missing_keys(known_keys: &[&str], map: &BTreeMap<String, f64>) -> Result<(), ParseError> {
+    let missing: Vec<String> = known_keys
+        .iter()
+        .filter(|k| !map.contains_key(**k))
+        .map(|k| (*k).to_string())
+        .collect();
+    if !missing.is_empty() {
+        return Err(ParseError::MissingMetrics(missing));
+    }
+    Ok(())
+}
+
 /// Parses `BENCHMARK_RESULTS.md`, supporting either:
 /// 1. A unified comparison markdown table with `Metric`, `Baseline`, and `Post-Opt` columns
 ///    (with `Metric` in any column, e.g. `| Category | Metric | M1 Baseline | M4 Post-Opt | ... |`), OR
@@ -258,164 +525,44 @@ pub fn parse_benchmark_results_md(md: &str) -> Result<BenchmarkReport, ParseErro
     let known_keys = all_metric_keys();
     let mut baseline = BTreeMap::new();
     let mut post_opt = BTreeMap::new();
-
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Section {
-        None,
-        Baseline,
-        PostOpt,
-        Comparison,
-    }
-    let mut section = Section::None;
-    let mut metric_col: Option<usize> = None;
-    let mut baseline_col: Option<usize> = None;
-    let mut post_col: Option<usize> = None;
-    let mut value_col: Option<usize> = None;
+    let mut section = MdSection::None;
+    let mut cols = MdTableCols::default();
 
     for (idx, raw_line) in md.lines().enumerate() {
         let line = raw_line.trim();
         if line.starts_with('#') {
-            let lower = line.to_ascii_lowercase();
-            metric_col = None;
-            baseline_col = None;
-            post_col = None;
-            value_col = None;
-            let has_post = lower.contains("post-opt")
-                || lower.contains("post opt")
-                || lower.contains("optimized")
-                || lower.contains("after");
-            let has_baseline = lower.contains("baseline") || lower.contains("before");
-            if has_post && !has_baseline {
-                section = Section::PostOpt;
-            } else if lower.contains("comparison") || (has_baseline && has_post) {
-                section = Section::Comparison;
-            } else if has_baseline {
-                section = Section::Baseline;
-            }
-            continue;
-        }
-
-        if line.starts_with("METRIC ") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() != 4 {
-                return Err(ParseError::MalformedLine {
-                    line_no: idx + 1,
-                    detail: format!("malformed METRIC line in markdown: `{line}`"),
-                });
-            }
-            let name = parts[1].trim_matches(|c| matches!(c, '`' | '*' | '_'));
-            let val: f64 = parts[2].parse().map_err(|_| ParseError::InvalidValue {
-                name: name.to_string(),
-                raw: parts[2].to_string(),
-            })?;
-            validate_value_and_unit(name, val, parts[3])?;
-            match section {
-                Section::PostOpt => {
-                    post_opt.insert(name.to_string(), val);
-                }
-                Section::Comparison if baseline.len() == known_keys.len() => {
-                    post_opt.insert(name.to_string(), val);
-                }
-                _ => {
-                    baseline.entry(name.to_string()).or_insert(val);
-                }
-            }
-            continue;
-        }
-
-        if line.starts_with('|') && line.ends_with('|') {
-            let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
-            if is_separator_row(&cells) {
-                continue;
-            }
-            // Detect table header row with `Metric` at any column index.
-            let lower_cells: Vec<String> = cells.iter().map(|c| c.to_ascii_lowercase()).collect();
-            if let Some(m_col) = lower_cells.iter().position(|c| c.contains("metric")) {
-                metric_col = Some(m_col);
-                baseline_col = lower_cells
-                    .iter()
-                    .position(|c| c.contains("baseline") || c.contains("before"));
-                post_col = lower_cells.iter().position(|c| {
-                    c.contains("post") || c.contains("optimized") || c.contains("after")
-                });
-                value_col = lower_cells
-                    .iter()
-                    .position(|c| c == "value" || c.contains("value"));
-                continue;
-            }
-
-            let m_idx = metric_col.unwrap_or(0);
-            let Some(raw_metric) = cells.get(m_idx) else {
-                continue;
-            };
-            let metric_name = raw_metric
-                .trim()
-                .trim_matches(|c| matches!(c, '`' | '*' | '_'))
-                .trim();
-            if !known_keys.contains(&metric_name) {
-                continue;
-            }
-
-            // Case A: unified table with baseline and/or post-opt columns.
-            if let Some(b_idx) = baseline_col {
-                if let Some(raw_b) = cells.get(b_idx)
-                    && let Some(v) = parse_cell_number(metric_name, raw_b)?
-                {
-                    baseline.entry(metric_name.to_string()).or_insert(v);
-                }
-                if let Some(p_idx) = post_col
-                    && let Some(raw_p) = cells.get(p_idx)
-                    && let Some(v) = parse_cell_number(metric_name, raw_p)?
-                {
-                    post_opt.insert(metric_name.to_string(), v);
-                }
-                continue;
-            }
-
-            // Case B: single-value section table (e.g. | Category | Metric | Value | Unit | or | Metric | Value | Unit |).
-            let v_idx = value_col.unwrap_or(m_idx + 1);
-            if let Some(raw_v) = cells.get(v_idx)
-                && let Some(v) = parse_cell_number(metric_name, raw_v)?
-            {
-                match section {
-                    Section::PostOpt => {
-                        post_opt.insert(metric_name.to_string(), v);
-                    }
-                    Section::Comparison if baseline.len() == known_keys.len() => {
-                        post_opt.insert(metric_name.to_string(), v);
-                    }
-                    Section::Baseline | Section::Comparison | Section::None => {
-                        baseline.entry(metric_name.to_string()).or_insert(v);
-                    }
-                }
-            }
+            cols = MdTableCols::default();
+            section = classify_heading(line, section);
+        } else if line.starts_with("METRIC ") {
+            parse_md_metric_line(
+                line,
+                idx + 1,
+                section,
+                known_keys.len(),
+                &mut baseline,
+                &mut post_opt,
+            )?;
+        } else if line.starts_with('|') && line.ends_with('|') {
+            parse_md_table_row(
+                line,
+                section,
+                &known_keys,
+                &mut cols,
+                &mut baseline,
+                &mut post_opt,
+            )?;
         }
     }
 
     if baseline.is_empty() {
         return Err(ParseError::MissingSection("Baseline".to_string()));
     }
-
-    let missing_base: Vec<String> = known_keys
-        .iter()
-        .filter(|k| !baseline.contains_key(**k))
-        .map(|k| (*k).to_string())
-        .collect();
-    if !missing_base.is_empty() {
-        return Err(ParseError::MissingMetrics(missing_base));
-    }
+    check_missing_keys(&known_keys, &baseline)?;
 
     let post_opt_map = if post_opt.is_empty() {
         None
     } else {
-        let missing_post: Vec<String> = known_keys
-            .iter()
-            .filter(|k| !post_opt.contains_key(**k))
-            .map(|k| (*k).to_string())
-            .collect();
-        if !missing_post.is_empty() {
-            return Err(ParseError::MissingMetrics(missing_post));
-        }
+        check_missing_keys(&known_keys, &post_opt)?;
         Some(post_opt)
     };
 
@@ -425,86 +572,73 @@ pub fn parse_benchmark_results_md(md: &str) -> Result<BenchmarkReport, ParseErro
     })
 }
 
+fn verify_speed_group(
+    group: &'static str,
+    keys: &[&'static str],
+    baseline: &BTreeMap<String, f64>,
+    post_opt: &BTreeMap<String, f64>,
+) -> Result<(), BenchVerifyError> {
+    let mut base_sum = 0.0;
+    let mut post_sum = 0.0;
+    let mut log_ratio_sum = 0.0;
+    let mut improved = 0usize;
+
+    for &key in keys {
+        let b = *baseline.get(key).ok_or(BenchVerifyError::MissingKey {
+            dataset: "baseline",
+            key,
+        })?;
+        let p = *post_opt.get(key).ok_or(BenchVerifyError::MissingKey {
+            dataset: "post-opt",
+            key,
+        })?;
+        if !b.is_finite() || !p.is_finite() || b <= 0.0 || p <= 0.0 {
+            return Err(BenchVerifyError::InvalidLatency {
+                group,
+                key,
+                baseline: b,
+                post_opt: p,
+            });
+        }
+        base_sum += b;
+        post_sum += p;
+        log_ratio_sum += (p / b).ln();
+        if p < b {
+            improved += 1;
+        }
+    }
+
+    let key_count = f64::from(u32::try_from(keys.len()).expect("key count fits u32"));
+    let geomean_ratio = (log_ratio_sum / key_count).exp();
+    if !geomean_ratio.is_finite() || post_sum >= base_sum || geomean_ratio >= 1.0 || improved == 0 {
+        return Err(BenchVerifyError::NotFaster {
+            group,
+            base_sum,
+            post_sum,
+            geomean_ratio,
+            improved,
+            total: keys.len(),
+        });
+    }
+    Ok(())
+}
+
 /// Verifies post-optimization kernel speed is strictly faster than baseline:
 /// - Total kernel latency sum is strictly lower (`post_sum < base_sum`)
 /// - Geometric mean ratio `(post / base)` is strictly `< 1.0`
 pub fn verify_kernel_faster(
     baseline: &BTreeMap<String, f64>,
     post_opt: &BTreeMap<String, f64>,
-) -> Result<(), String> {
-    let mut base_sum = 0.0;
-    let mut post_sum = 0.0;
-    let mut log_ratio_sum = 0.0;
-    let mut improved = 0usize;
-
-    for &key in KERNEL_SPEED_KEYS {
-        let b = *baseline
-            .get(key)
-            .ok_or_else(|| format!("missing baseline key {key}"))?;
-        let p = *post_opt
-            .get(key)
-            .ok_or_else(|| format!("missing post-opt key {key}"))?;
-        if !b.is_finite() || !p.is_finite() || b <= 0.0 || p <= 0.0 {
-            return Err(format!(
-                "invalid or non-positive kernel latency for {key}: base={b}, post={p}"
-            ));
-        }
-        base_sum += b;
-        post_sum += p;
-        log_ratio_sum += (p / b).ln();
-        if p < b {
-            improved += 1;
-        }
-    }
-
-    let geomean_ratio = (log_ratio_sum / (KERNEL_SPEED_KEYS.len() as f64)).exp();
-    if !geomean_ratio.is_finite() || post_sum >= base_sum || geomean_ratio >= 1.0 || improved == 0 {
-        return Err(format!(
-            "kernel not faster: base_sum={base_sum:.2}, post_sum={post_sum:.2}, geomean_ratio={geomean_ratio:.4}, improved={improved}/{}",
-            KERNEL_SPEED_KEYS.len()
-        ));
-    }
-    Ok(())
+) -> Result<(), BenchVerifyError> {
+    verify_speed_group("kernel", KERNEL_SPEED_KEYS, baseline, post_opt)
 }
 
 /// Verifies post-optimization shell speed is strictly faster than baseline.
 pub fn verify_shell_faster(
     baseline: &BTreeMap<String, f64>,
     post_opt: &BTreeMap<String, f64>,
-) -> Result<(), String> {
-    let mut base_sum = 0.0;
-    let mut post_sum = 0.0;
-    let mut log_ratio_sum = 0.0;
-    let mut improved = 0usize;
-
-    for &key in SHELL_SPEED_KEYS {
-        let b = *baseline
-            .get(key)
-            .ok_or_else(|| format!("missing baseline key {key}"))?;
-        let p = *post_opt
-            .get(key)
-            .ok_or_else(|| format!("missing post-opt key {key}"))?;
-        if !b.is_finite() || !p.is_finite() || b <= 0.0 || p <= 0.0 {
-            return Err(format!(
-                "invalid or non-positive shell latency for {key}: base={b}, post={p}"
-            ));
-        }
-        base_sum += b;
-        post_sum += p;
-        log_ratio_sum += (p / b).ln();
-        if p < b {
-            improved += 1;
-        }
-    }
-
-    let geomean_ratio = (log_ratio_sum / (SHELL_SPEED_KEYS.len() as f64)).exp();
-    if !geomean_ratio.is_finite() || post_sum >= base_sum || geomean_ratio >= 1.0 || improved == 0 {
-        return Err(format!(
-            "shell not faster: base_sum={base_sum:.2}, post_sum={post_sum:.2}, geomean_ratio={geomean_ratio:.4}, improved={improved}/{}",
-            SHELL_SPEED_KEYS.len()
-        ));
-    }
-    Ok(())
+) -> Result<(), BenchVerifyError> {
+    verify_speed_group("shell", SHELL_SPEED_KEYS, baseline, post_opt)
 }
 
 /// Verifies post-optimization IPC consumption is strictly reduced with zero IPC regressions,
@@ -512,14 +646,16 @@ pub fn verify_shell_faster(
 pub fn verify_ipc_reduced(
     baseline: &BTreeMap<String, f64>,
     post_opt: &BTreeMap<String, f64>,
-) -> Result<(), String> {
+) -> Result<(), BenchVerifyError> {
     for &key in IPC_CONSUMPTION_KEYS {
-        let b = *baseline
-            .get(key)
-            .ok_or_else(|| format!("missing baseline IPC key {key}"))?;
-        let p = *post_opt
-            .get(key)
-            .ok_or_else(|| format!("missing post-opt IPC key {key}"))?;
+        let b = *baseline.get(key).ok_or(BenchVerifyError::MissingKey {
+            dataset: "baseline IPC",
+            key,
+        })?;
+        let p = *post_opt.get(key).ok_or(BenchVerifyError::MissingKey {
+            dataset: "post-opt IPC",
+            key,
+        })?;
         if !b.is_finite()
             || !p.is_finite()
             || b < 0.0
@@ -527,14 +663,18 @@ pub fn verify_ipc_reduced(
             || b.fract().abs() > 1e-9
             || p.fract().abs() > 1e-9
         {
-            return Err(format!(
-                "invalid IPC count for `{key}`: baseline={b}, post_opt={p}"
-            ));
+            return Err(BenchVerifyError::InvalidIpcCount {
+                key,
+                baseline: b,
+                post_opt: p,
+            });
         }
         if p > b {
-            return Err(format!(
-                "IPC regression on `{key}`: baseline={b}, post_opt={p}"
-            ));
+            return Err(BenchVerifyError::IpcRegression {
+                key,
+                baseline: b,
+                post_opt: p,
+            });
         }
     }
 
@@ -545,21 +685,26 @@ pub fn verify_ipc_reduced(
     let p_total = post_opt["ipc.total_consumption"];
 
     if (b_total - base_component_sum).abs() > 1e-9 {
-        return Err(format!(
-            "baseline ipc.total_consumption ({b_total}) != sum of 5 component IPC metrics ({base_component_sum})"
-        ));
+        return Err(BenchVerifyError::InconsistentIpcTotal {
+            dataset: "baseline",
+            reported_total: b_total,
+            component_sum: base_component_sum,
+        });
     }
     if (p_total - post_component_sum).abs() > 1e-9 {
-        return Err(format!(
-            "post_opt ipc.total_consumption ({p_total}) != sum of 5 component IPC metrics ({post_component_sum})"
-        ));
+        return Err(BenchVerifyError::InconsistentIpcTotal {
+            dataset: "post_opt",
+            reported_total: p_total,
+            component_sum: post_component_sum,
+        });
     }
 
     let any_component_reduced = component_keys.iter().any(|k| post_opt[*k] < baseline[*k]);
     if !any_component_reduced || p_total >= b_total {
-        return Err(format!(
-            "ipc.total_consumption did not decrease: baseline={b_total}, post_opt={p_total}"
-        ));
+        return Err(BenchVerifyError::IpcNotReduced {
+            baseline: b_total,
+            post_opt: p_total,
+        });
     }
     Ok(())
 }

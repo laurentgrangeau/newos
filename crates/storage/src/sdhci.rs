@@ -40,26 +40,48 @@ const CMD_RESP_48: u32 = 0b10 << 16;
 const CMD_RESP_136: u32 = 0b01 << 16;
 const CMD_DATA_PRESENT: u32 = 1 << 21;
 
+const SECTOR_SIZE_U32: u32 = 512;
+const _: () = assert!(SECTOR_SIZE == SECTOR_SIZE_U32 as usize);
+
 const MAX_POLL: u32 = 100_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardAddressing {
+    /// Standard-capacity SDSC card (byte-addressed).
+    Byte,
+    /// High/extended-capacity SDHC/SDXC card (512-byte block-addressed).
+    Block,
+}
+
 /// Capability-scoped EL0 BCM2712 microSD SDHCI driver.
+#[derive(Debug)]
 pub struct Bcm2712Sdhci<T: StorageMmioTransport> {
     transport: T,
     rca: u32,
-    high_capacity: bool,
+    addressing: CardAddressing,
     sectors: u64,
 }
 
 impl<T: StorageMmioTransport> Bcm2712Sdhci<T> {
     /// Reset the SDHCI host controller, bring up an inserted SD/SDHC/SDXC card, and select it.
+    ///
+    /// # Errors
+    /// Returns [`SysError::WouldBlock`] if the controller reset, clock stabilization, card
+    /// presence, or card initialization times out; [`SysError::InvalidArgument`] if the card
+    /// reports an error; or a transport [`SysError`].
     pub fn init(transport: T, fallback_sectors: u64) -> Result<Self, SysError> {
         // 1. Software reset all
         transport.write32(REG_CLK_RESET, SW_RESET_ALL)?;
+        let mut reset_done = false;
         for _ in 0..MAX_POLL {
             if (transport.read32(REG_CLK_RESET)? & SW_RESET_ALL) == 0 {
+                reset_done = true;
                 break;
             }
             core::hint::spin_loop();
+        }
+        if !reset_done {
+            return Err(SysError::WouldBlock);
         }
 
         // 2. Check card presence
@@ -70,11 +92,16 @@ impl<T: StorageMmioTransport> Bcm2712Sdhci<T> {
         // 3. Enable internal clock, wait stable, enable SD clock + power (3.3V)
         transport.write32(REG_HOST_CTRL, 0x0F << 8)?; // 3.3V bus power on
         transport.write32(REG_CLK_RESET, CLK_INT_EN | (0x40 << 8))?;
+        let mut clk_stable = false;
         for _ in 0..MAX_POLL {
             if (transport.read32(REG_CLK_RESET)? & CLK_INT_STABLE) != 0 {
+                clk_stable = true;
                 break;
             }
             core::hint::spin_loop();
+        }
+        if !clk_stable {
+            return Err(SysError::WouldBlock);
         }
         transport.write32(REG_CLK_RESET, CLK_INT_EN | CLK_SD_EN | (0x40 << 8))?;
         transport.write32(REG_INT_STATUS_EN, 0xFFFF_FFFF)?;
@@ -83,7 +110,7 @@ impl<T: StorageMmioTransport> Bcm2712Sdhci<T> {
         let mut dev = Self {
             transport,
             rca: 0,
-            high_capacity: true,
+            addressing: CardAddressing::Block,
             sectors: fallback_sectors,
         };
 
@@ -101,24 +128,33 @@ impl<T: StorageMmioTransport> Bcm2712Sdhci<T> {
         if (ocr & (1 << 31)) == 0 {
             return Err(SysError::WouldBlock);
         }
-        dev.high_capacity = (ocr & (1 << 30)) != 0;
+        dev.addressing = if (ocr & (1 << 30)) != 0 {
+            CardAddressing::Block
+        } else {
+            CardAddressing::Byte
+        };
         let _ = dev.send_cmd(2, 0, CMD_RESP_136)?;
         let r6 = dev.send_cmd(3, 0, CMD_RESP_48)?;
         dev.rca = r6 & 0xFFFF_0000;
         let _ = dev.send_cmd(7, dev.rca, CMD_RESP_48)?;
-        if !dev.high_capacity {
-            let _ = dev.send_cmd(16, SECTOR_SIZE as u32, CMD_RESP_48)?;
+        if dev.addressing == CardAddressing::Byte {
+            let _ = dev.send_cmd(16, SECTOR_SIZE_U32, CMD_RESP_48)?;
         }
         Ok(dev)
     }
 
     fn send_cmd(&self, cmd_idx: u8, arg: u32, flags: u32) -> Result<u32, SysError> {
+        let mut ready = false;
         for _ in 0..MAX_POLL {
             let ps = self.transport.read32(REG_PRESENT_STATE)?;
             if (ps & (PSTATE_CMD_INHIBIT | PSTATE_DAT_INHIBIT)) == 0 {
+                ready = true;
                 break;
             }
             core::hint::spin_loop();
+        }
+        if !ready {
+            return Err(SysError::WouldBlock);
         }
         self.transport.write32(REG_INT_STATUS, 0xFFFF_FFFF)?;
         self.transport.write32(REG_ARGUMENT, arg)?;
@@ -166,14 +202,13 @@ impl<T: StorageMmioTransport> BlockDevice for Bcm2712Sdhci<T> {
         if lba >= self.sectors {
             return Err(SysError::InvalidArgument);
         }
-        let arg = if self.high_capacity {
-            u32::try_from(lba).map_err(|_| SysError::InvalidArgument)?
-        } else {
-            u32::try_from(lba.saturating_mul(SECTOR_SIZE as u64))
-                .map_err(|_| SysError::InvalidArgument)?
+        let arg = match self.addressing {
+            CardAddressing::Block => u32::try_from(lba).map_err(|_| SysError::InvalidArgument)?,
+            CardAddressing::Byte => u32::try_from(lba.saturating_mul(u64::from(SECTOR_SIZE_U32)))
+                .map_err(|_| SysError::InvalidArgument)?,
         };
         self.transport
-            .write32(REG_BLK_SIZE_COUNT, (1 << 16) | (SECTOR_SIZE as u32))?;
+            .write32(REG_BLK_SIZE_COUNT, (1 << 16) | SECTOR_SIZE_U32)?;
         let _ = self.send_cmd(17, arg, CMD_RESP_48 | CMD_DATA_PRESENT | XFER_READ)?;
         self.wait_int(INT_BUF_READ_READY)?;
         for chunk in dst.as_chunks_mut::<4>().0 {
@@ -187,14 +222,13 @@ impl<T: StorageMmioTransport> BlockDevice for Bcm2712Sdhci<T> {
         if lba >= self.sectors {
             return Err(SysError::InvalidArgument);
         }
-        let arg = if self.high_capacity {
-            u32::try_from(lba).map_err(|_| SysError::InvalidArgument)?
-        } else {
-            u32::try_from(lba.saturating_mul(SECTOR_SIZE as u64))
-                .map_err(|_| SysError::InvalidArgument)?
+        let arg = match self.addressing {
+            CardAddressing::Block => u32::try_from(lba).map_err(|_| SysError::InvalidArgument)?,
+            CardAddressing::Byte => u32::try_from(lba.saturating_mul(u64::from(SECTOR_SIZE_U32)))
+                .map_err(|_| SysError::InvalidArgument)?,
         };
         self.transport
-            .write32(REG_BLK_SIZE_COUNT, (1 << 16) | (SECTOR_SIZE as u32))?;
+            .write32(REG_BLK_SIZE_COUNT, (1 << 16) | SECTOR_SIZE_U32)?;
         let _ = self.send_cmd(24, arg, CMD_RESP_48 | CMD_DATA_PRESENT)?;
         self.wait_int(INT_BUF_WRITE_READY)?;
         for chunk in src.as_chunks::<4>().0 {
@@ -277,5 +311,64 @@ mod tests {
         let mut rx = [0u8; SECTOR_SIZE];
         sd.read_block(7, &mut rx).expect("read sector");
         assert_eq!(rx, tx);
+    }
+
+    #[test]
+    fn sdhci_init_returns_would_block_on_absent_card_or_timeout() {
+        struct StuckSdhci {
+            clk_reset: u32,
+            present_state: u32,
+        }
+        impl StorageMmioTransport for StuckSdhci {
+            fn read32(&self, offset: u64) -> Result<u32, SysError> {
+                match offset {
+                    REG_CLK_RESET => Ok(self.clk_reset),
+                    REG_PRESENT_STATE => Ok(self.present_state),
+                    _ => Ok(0),
+                }
+            }
+            fn write32(&self, _offset: u64, _val: u32) -> Result<(), SysError> {
+                Ok(())
+            }
+        }
+
+        // SW_RESET_ALL never clears -> WouldBlock
+        assert_eq!(
+            Bcm2712Sdhci::init(
+                StuckSdhci {
+                    clk_reset: SW_RESET_ALL,
+                    present_state: PSTATE_CARD_INSERTED,
+                },
+                1024
+            )
+            .err(),
+            Some(SysError::WouldBlock)
+        );
+
+        // Card absent -> WouldBlock
+        assert_eq!(
+            Bcm2712Sdhci::init(
+                StuckSdhci {
+                    clk_reset: CLK_INT_STABLE,
+                    present_state: 0,
+                },
+                1024
+            )
+            .err(),
+            Some(SysError::WouldBlock)
+        );
+
+        // CLK_INT_STABLE never sets -> WouldBlock
+        assert_eq!(
+            Bcm2712Sdhci::init(
+                StuckSdhci {
+                    clk_reset: 0,
+                    present_state: PSTATE_CARD_INSERTED,
+                },
+                1024
+            )
+            .err(),
+            Some(SysError::WouldBlock)
+        );
     }
 }

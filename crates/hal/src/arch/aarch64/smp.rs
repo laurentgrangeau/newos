@@ -1,20 +1,32 @@
-//! SMP secondary core (AP) bring-up on `aarch64` (Cortex-A76 / Raspberry Pi 5) via Limine MP,
-//! per-core hardening (`PAN`/`SSBS`, `CPACR_EL1.FPEN`), GICv2 secondary CPU interface init,
-//! and cross-core SGI IPI wakeup verification.
+//! SMP secondary core (AP) bring-up on `aarch64` (`Cortex-A76` / Raspberry Pi 5).
+//!
+//! Handles Limine MP secondary bring-up, per-core hardening (`PAN`/`SSBS`, `CPACR_EL1.FPEN`),
+//! `GICv2` secondary CPU interface init, and cross-core SGI IPI wakeup verification.
 
 use core::arch::asm;
+use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use limine::mp::MpInfo;
+use newos_abi::ShutdownStatus;
 
 use crate::boot;
+
+/// Scheduling activity state of a secondary core (`0..8`) for cross-core wakeup IPIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreActivity {
+    /// Core is actively executing or dispatching EL0 protection domains.
+    Active,
+    /// Core is parked in low-power `wfi` awaiting runnable work.
+    Idle,
+}
 
 static ONLINE_CPUS: AtomicUsize = AtomicUsize::new(1);
 static AP_SGI_ACK_COUNT: AtomicU64 = AtomicU64::new(0);
 static USERSPACE_READY: AtomicBool = AtomicBool::new(false);
 static IDLE_AP_MASK: AtomicU8 = AtomicU8::new(0);
 
-/// Signal all parked secondary Cortex-A76 cores that EL0 processes are ready to schedule,
-/// waking them via GICv2 `SGI_RESCHEDULE`.
+/// Signal all parked secondary `Cortex-A76` cores that EL0 protection domains are ready to
+/// schedule, waking them via `GICv2` `SGI_RESCHEDULE`.
 pub fn signal_userspace_ready() {
     USERSPACE_READY.store(true, Ordering::Release);
     let online = ONLINE_CPUS.load(Ordering::Acquire);
@@ -29,20 +41,23 @@ pub fn signal_userspace_ready() {
     }
 }
 
-/// Record whether core `cpu_id` (`0..8`) is currently idle in `wfi`.
+/// Record whether core `cpu_id` (`0..8`) is currently active or idle in `wfi`.
 #[inline]
-pub fn mark_ap_idle(cpu_id: usize, idle: bool) {
+pub fn set_ap_activity(cpu_id: usize, activity: CoreActivity) {
     if cpu_id < 8 {
         let bit = 1u8 << cpu_id;
-        if idle {
-            IDLE_AP_MASK.fetch_or(bit, Ordering::Release);
-        } else {
-            IDLE_AP_MASK.fetch_and(!bit, Ordering::Release);
+        match activity {
+            CoreActivity::Idle => {
+                IDLE_AP_MASK.fetch_or(bit, Ordering::Release);
+            }
+            CoreActivity::Active => {
+                IDLE_AP_MASK.fetch_and(!bit, Ordering::Release);
+            }
         }
     }
 }
 
-/// Wake any idle secondary Cortex-A76 cores via GICv2 `SGI_RESCHEDULE` when work becomes runnable.
+/// Wake any idle secondary `Cortex-A76` cores via `GICv2` `SGI_RESCHEDULE` when work becomes runnable.
 #[inline]
 pub fn wake_idle_aps() {
     let mask = IDLE_AP_MASK.load(Ordering::Acquire);
@@ -58,13 +73,15 @@ pub(super) fn record_ap_sgi_ack() {
 }
 
 /// Number of cross-core SGIs acknowledged by secondary cores.
+#[must_use]
 #[inline]
 pub fn ap_sgi_ack_count() -> u64 {
     AP_SGI_ACK_COUNT.load(Ordering::Acquire)
 }
 
-/// Boot all secondary ARM64 cores discovered by Limine, wait until they are online,
-/// and broadcast a GICv2 `SGI_RESCHEDULE` IPI to verify cross-core interrupt delivery.
+/// Boot all secondary `ARM64` cores discovered by Limine, wait until they are online,
+/// and broadcast a `GICv2` `SGI_RESCHEDULE` IPI to verify cross-core interrupt delivery.
+#[must_use]
 pub fn bring_up_aps() -> usize {
     let Some(mp) = boot::mp_response() else {
         return 1;
@@ -111,6 +128,10 @@ pub fn bring_up_aps() -> usize {
     actual_online
 }
 
+extern "C" fn ap_sched_trampoline() -> ! {
+    super::syscall::ap_enter_scheduler()
+}
+
 // SAFETY: Limine invokes this `extern "C"` AP entry point once per secondary core
 // with a valid `&MpInfo` and a dedicated per-CPU stack.
 unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
@@ -120,7 +141,15 @@ unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
     super::syscall::enable_fp_simd();
     super::install_vectors();
     super::gic::init_secondary();
-    assert_eq!(super::get_cpu_id(), cpu_id);
+    let actual_id = super::get_cpu_id();
+    if actual_id != cpu_id {
+        let mut s = super::serial::UnlockedPl011;
+        let _ = writeln!(
+            s,
+            "[newos-hal] FATAL AP TPIDR_EL1 mismatch: expected={cpu_id} actual={actual_id}"
+        );
+        super::system_off(ShutdownStatus::Failed);
+    }
 
     // SAFETY: Unmasking EL1 IRQ bit (`daifclr #2`) on secondary core so GICv2 SGIs wake `wfi`.
     unsafe {
@@ -139,14 +168,11 @@ unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
 
     // Enter multi-core EL0 scheduler on this secondary Cortex-A76 core, pivoting to the
     // per-CPU guarded EL1 kernel stack when provisioned.
-    let top = super::guarded_el1_stack_top(cpu_id as usize);
-    if top != 0 {
-        extern "C" fn ap_sched_trampoline() -> ! {
-            super::syscall::ap_enter_scheduler()
-        }
+    let cpu_idx = usize::try_from(cpu_id).unwrap_or(usize::MAX);
+    if let Some(top) = super::guarded_el1_stack_top(cpu_idx) {
         // SAFETY: `top` is a 16-byte-aligned 32 KiB mapped stack with an unmapped 4 KiB guard
         // page beneath it, and `ap_sched_trampoline` never returns.
-        unsafe { super::pivot_sp_and_jump(top, ap_sched_trampoline) }
+        unsafe { super::pivot_sp_and_jump(top.get(), ap_sched_trampoline) }
     }
     super::syscall::ap_enter_scheduler()
 }

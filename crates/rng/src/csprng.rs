@@ -1,10 +1,10 @@
 //! NIST SP 800-90B Startup Health Tests + `SHAKE256` Conditioning + Fast-Key-Erasure
-//! **ChaCha20** CSPRNG.
+//! **`ChaCha20`** CSPRNG.
 //!
 //! - **Fail-closed health checks:** Repetition Count Test (RCT) and Adaptive Proportion Test (APT)
 //!   over every 64-byte hardware TRNG seed block reject stuck, constant, or all-zero sources.
 //! - **Fast-key-erasure (backtracking resistance):** Every `fill_bytes` call derives
-//!   `next_key (32 B) || output` from the current ChaCha20 key and immediately overwrites and
+//!   `next_key (32 B) || output` from the current `ChaCha20` key and immediately overwrites and
 //!   scrubs the prior key so a future memory compromise cannot recover past outputs.
 //! - **Periodic hardware reseeding:** Automatically mixes 64 fresh health-checked hardware TRNG
 //!   bytes via `SHAKE256(key || hw_entropy)` every 64 KiB of generated output.
@@ -22,6 +22,10 @@ pub const RESEED_INTERVAL_BYTES: usize = 65_536;
 ///
 /// - **Repetition Count Test (RCT):** rejects if `>= 6` identical consecutive bytes appear.
 /// - **Adaptive Proportion Test (APT):** rejects if any byte value appears `> 16` times in 64 bytes.
+///
+/// # Errors
+/// Returns [`RngError::HealthCheckFailed`] if the sample fails RCT, APT, diversity,
+/// linear-counter, or periodic-pattern checks.
 pub fn verify_entropy_health(sample: &[u8; SEED_BLOCK_BYTES]) -> Result<(), RngError> {
     // 1. Repetition Count Test (catches all-zero, all-0xFF, and stuck shift-register runs)
     let mut prev = sample[0];
@@ -57,17 +61,18 @@ pub fn verify_entropy_health(sample: &[u8; SEED_BLOCK_BYTES]) -> Result<(), RngE
     }
 
     // 3. Constant-delta / linear counter check (rejects monotonic counters like 0,1,2,... `N12`).
-    let first_delta = sample[1].wrapping_sub(sample[0]);
+    let mut prev_delta = sample[1].wrapping_sub(sample[0]);
     let mut same_delta_run = 1usize;
     for i in 2..sample.len() {
         let d = sample[i].wrapping_sub(sample[i - 1]);
-        if d == first_delta {
+        if d == prev_delta {
             same_delta_run += 1;
             if same_delta_run >= 12 {
                 return Err(RngError::HealthCheckFailed);
             }
         } else {
-            same_delta_run = 0;
+            prev_delta = d;
+            same_delta_run = 1;
         }
     }
 
@@ -88,25 +93,25 @@ pub fn verify_entropy_health(sample: &[u8; SEED_BLOCK_BYTES]) -> Result<(), RngE
     Ok(())
 }
 
-#[inline(always)]
+#[inline]
 fn scrub(buf: &mut [u8]) {
     buf.fill(0);
     core::hint::black_box(buf);
 }
 
-#[inline(always)]
-fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
-    s[a] = s[a].wrapping_add(s[b]);
-    s[d] = (s[d] ^ s[a]).rotate_left(16);
-    s[c] = s[c].wrapping_add(s[d]);
-    s[b] = (s[b] ^ s[c]).rotate_left(12);
-    s[a] = s[a].wrapping_add(s[b]);
-    s[d] = (s[d] ^ s[a]).rotate_left(8);
-    s[c] = s[c].wrapping_add(s[d]);
-    s[b] = (s[b] ^ s[c]).rotate_left(7);
+#[inline]
+const fn quarter_round(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] = (state[d] ^ state[a]).rotate_left(16);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_left(12);
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] = (state[d] ^ state[a]).rotate_left(8);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_left(7);
 }
 
-/// Constant-time RFC 8439 ChaCha20 block function (ARX only, zero lookup tables).
+/// Constant-time RFC 8439 `ChaCha20` block function (ARX only, zero lookup tables).
 pub(crate) fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
     let mut state = [
         0x6170_7865,
@@ -149,11 +154,20 @@ pub(crate) fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> 
     out
 }
 
-/// Health-checked, `SHAKE256`-conditioned, fast-key-erasure **ChaCha20** CSPRNG.
+/// Health-checked, `SHAKE256`-conditioned, fast-key-erasure **`ChaCha20`** CSPRNG.
 pub struct ConditionedCsprng<E: EntropySource> {
     source: E,
     key: [u8; 32],
     bytes_since_reseed: usize,
+}
+
+impl<E: EntropySource> core::fmt::Debug for ConditionedCsprng<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ConditionedCsprng")
+            .field("key", &"<redacted>")
+            .field("bytes_since_reseed", &self.bytes_since_reseed)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<E: EntropySource> Drop for ConditionedCsprng<E> {
@@ -167,6 +181,9 @@ impl<E: EntropySource> ConditionedCsprng<E> {
     /// domain-separated personalization (e.g., `CNTVCT_EL0` timestamp bytes).
     ///
     /// Fails closed if the hardware source fails NIST SP 800-90B startup health checks.
+    ///
+    /// # Errors
+    /// Returns [`RngError`] if the entropy source fails or the startup health check fails.
     pub fn new(mut source: E, personalization: &[u8]) -> Result<Self, RngError> {
         let mut raw = [0u8; SEED_BLOCK_BYTES];
         source.fill_entropy(&mut raw)?;
@@ -195,6 +212,9 @@ impl<E: EntropySource> ConditionedCsprng<E> {
     }
 
     /// Mix 512 fresh health-checked hardware TRNG bits into the CSPRNG state via `SHAKE256`.
+    ///
+    /// # Errors
+    /// Returns [`RngError`] if the entropy source fails or the health check fails.
     pub fn reseed(&mut self) -> Result<(), RngError> {
         let mut raw = [0u8; SEED_BLOCK_BYTES];
         self.source.fill_entropy(&mut raw)?;
@@ -222,7 +242,12 @@ impl<E: EntropySource> ConditionedCsprng<E> {
     /// Fill `dst` with cryptographically strong random bytes using **fast-key-erasure**:
     /// block 0 produces `next_key (32 B) || first_32_out`, subsequent blocks produce remaining
     /// output, and `self.key` is immediately overwritten with `next_key` before returning.
+    ///
+    /// # Errors
+    /// Returns [`RngError`] if an automatic reseed fails or the block counter overflows.
     pub fn fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), RngError> {
+        const ZERO_NONCE: [u8; 12] = [0u8; 12];
+
         if dst.is_empty() {
             return Ok(());
         }
@@ -230,7 +255,6 @@ impl<E: EntropySource> ConditionedCsprng<E> {
             self.reseed()?;
         }
 
-        const ZERO_NONCE: [u8; 12] = [0u8; 12];
         let mut block0 = chacha20_block(&self.key, 0, &ZERO_NONCE);
         let mut next_key = [0u8; 32];
         next_key.copy_from_slice(&block0[..32]);
@@ -260,7 +284,7 @@ impl<E: EntropySource> ConditionedCsprng<E> {
     }
 
     #[cfg(test)]
-    pub(crate) fn debug_key_snapshot(&self) -> [u8; 32] {
+    pub(crate) const fn debug_key_snapshot(&self) -> [u8; 32] {
         self.key
     }
 }
@@ -277,7 +301,7 @@ mod tests {
                 let mut z = self.0;
                 z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
                 z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-                *b = (z ^ (z >> 31)) as u8;
+                *b = (z ^ (z >> 31)).to_le_bytes()[0];
             }
             Ok(())
         }
@@ -292,7 +316,9 @@ mod tests {
 
     fn good_sample(seed: u64) -> [u8; SEED_BLOCK_BYTES] {
         let mut s = [0u8; SEED_BLOCK_BYTES];
-        SplitMixEntropy(seed).fill_entropy(&mut s).unwrap();
+        SplitMixEntropy(seed)
+            .fill_entropy(&mut s)
+            .expect("splitmix entropy");
         s
     }
 
@@ -326,20 +352,30 @@ mod tests {
         // 3. Low diversity (< 16 unique values, e.g. 8-byte non-repeating-period mix)
         let mut low_div = [0u8; SEED_BLOCK_BYTES];
         for (i, slot) in low_div.iter_mut().enumerate() {
-            *slot = ((i * 7 + (i / 8)) % 10) as u8;
+            *slot = u8::try_from((i * 7 + (i / 8)) % 10).expect("mod 10 fits in u8");
         }
         assert_eq!(
             verify_entropy_health(&low_div),
             Err(RngError::HealthCheckFailed)
         );
 
-        // 4. Linear monotonic counter (0, 1, 2, ..., 63)
+        // 4. Linear monotonic counter (0, 1, 2, ..., 63) and offset-1 linear counter
         let mut linear = [0u8; SEED_BLOCK_BYTES];
-        for (i, slot) in linear.iter_mut().enumerate() {
-            *slot = i as u8;
+        for (i, slot) in (0u8..).zip(&mut linear) {
+            *slot = i;
         }
         assert_eq!(
             verify_entropy_health(&linear),
+            Err(RngError::HealthCheckFailed)
+        );
+
+        let mut offset_linear = [0u8; SEED_BLOCK_BYTES];
+        offset_linear[0] = 0x99;
+        for (i, slot) in (0u8..).zip(&mut offset_linear[1..]) {
+            *slot = i;
+        }
+        assert_eq!(
+            verify_entropy_health(&offset_linear),
             Err(RngError::HealthCheckFailed)
         );
 
@@ -358,32 +394,64 @@ mod tests {
     fn csprng_fast_key_erasure_empty_fill_reseed_and_hardware_fault() {
         assert!(ConditionedCsprng::new(FailingEntropy, b"fail").is_err());
 
-        let mut rng = ConditionedCsprng::new(SplitMixEntropy(0xCAFE), b"csprng-unit").unwrap();
+        let mut rng =
+            ConditionedCsprng::new(SplitMixEntropy(0xCAFE), b"csprng-unit").expect("seed csprng");
         let k0 = rng.debug_key_snapshot();
 
         // Empty fill is a no-op and preserves key
-        rng.fill_bytes(&mut []).unwrap();
+        rng.fill_bytes(&mut []).expect("empty fill");
         assert_eq!(rng.debug_key_snapshot(), k0);
 
         // Single fill mutates key (fast-key-erasure) and produces non-zero output
         let mut out1 = [0u8; 48];
-        rng.fill_bytes(&mut out1).unwrap();
+        rng.fill_bytes(&mut out1).expect("fill out1");
         let k1 = rng.debug_key_snapshot();
         assert_ne!(k0, k1);
 
         let mut out2 = [0u8; 48];
-        rng.fill_bytes(&mut out2).unwrap();
+        rng.fill_bytes(&mut out2).expect("fill out2");
         assert_ne!(out1, out2);
 
         // Explicit reseed advances key and resets byte counter
         let k2 = rng.debug_key_snapshot();
-        rng.reseed().unwrap();
+        rng.reseed().expect("reseed");
         assert_ne!(rng.debug_key_snapshot(), k2);
 
         // Crossing RESEED_INTERVAL_BYTES triggers automatic reseed cleanly
         let mut big = [0u8; 1024];
         for _ in 0..65 {
-            rng.fill_bytes(&mut big).unwrap();
+            rng.fill_bytes(&mut big).expect("fill big");
         }
+    }
+
+    #[test]
+    fn csprng_debug_redacts_secret_key() {
+        use core::fmt::Write;
+
+        struct Buf {
+            data: [u8; 128],
+            len: usize,
+        }
+        impl Write for Buf {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let take = bytes.len().min(self.data.len() - self.len);
+                self.data[self.len..self.len + take].copy_from_slice(&bytes[..take]);
+                self.len += take;
+                Ok(())
+            }
+        }
+
+        let rng =
+            ConditionedCsprng::new(SplitMixEntropy(0xBEEF), b"debug-test").expect("seed csprng");
+        let mut out = Buf {
+            data: [0u8; 128],
+            len: 0,
+        };
+        write!(out, "{rng:?}").expect("format debug");
+        let rendered = core::str::from_utf8(&out.data[..out.len]).expect("utf8");
+        assert!(rendered.contains("ConditionedCsprng"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("bytes_since_reseed: 0"));
     }
 }

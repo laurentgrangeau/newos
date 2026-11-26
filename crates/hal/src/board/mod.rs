@@ -1,7 +1,7 @@
-//! Pluggable Board / SoC Hardware Descriptors (`newos-hal::board`).
+//! Pluggable Board / `SoC` Hardware Descriptors (`newos-hal::board`).
 //!
 //! Decouples board-specific MMIO physical addresses, interrupt controllers, and PSCI
-//! conduits from CPU architecture code so new boards or SoCs can be added cleanly.
+//! conduits from CPU architecture code so new boards or `SoCs` can be added cleanly.
 
 #[cfg(feature = "board-qemu-virt")]
 pub mod qemu_virt;
@@ -16,41 +16,76 @@ pub struct MmioRegion {
 }
 
 impl MmioRegion {
+    #[must_use]
     pub const fn new(phys_base: u64, size: u64) -> Self {
         Self { phys_base, size }
     }
 }
 
-/// Hardware interrupt line owned by a board peripheral (GIC SPI or BCM2712 MIP MSI-X).
+/// Hardware interrupt line owned by a board peripheral (`GIC` SPI or `BCM2712` MIP `MSI-X`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IrqLine {
-    pub irq: u16,
-    pub is_mip: bool,
+pub enum IrqLine {
+    /// ARM `GICv2`/`GIC-400` Shared Peripheral Interrupt line.
+    Gic(u16),
+    /// `BCM2712` MIP `MSI-X` vector (`0..64`).
+    Mip(u16),
 }
 
 impl IrqLine {
+    #[must_use]
     pub const fn gic(irq: u16) -> Self {
-        Self { irq, is_mip: false }
+        Self::Gic(irq)
     }
 
+    #[must_use]
     pub const fn mip(vector: u16) -> Self {
-        Self {
-            irq: vector,
-            is_mip: true,
+        Self::Mip(vector)
+    }
+
+    #[must_use]
+    pub const fn irq(self) -> u16 {
+        match self {
+            Self::Gic(irq) | Self::Mip(irq) => irq,
+        }
+    }
+
+    #[must_use]
+    pub const fn controller(self) -> newos_kernel_core::cspace::IrqController {
+        match self {
+            Self::Gic(_) => newos_kernel_core::cspace::IrqController::GicSpi,
+            Self::Mip(_) => newos_kernel_core::cspace::IrqController::Mip,
         }
     }
 }
 
-/// Static hardware description of a target board / SoC.
-#[derive(Debug, Clone, Copy)]
+/// ARM PSCI firmware invocation conduit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PsciConduit {
+    /// Hypervisor Call (`hvc #0`, e.g. QEMU `virt`).
+    Hvc,
+    /// Secure Monitor Call (`smc #0`, e.g. Raspberry Pi 5 ATF/EL3).
+    Smc,
+}
+
+/// Board peripheral bus model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeripheralBus {
+    /// Native `SoC` MMIO peripherals (e.g. Raspberry Pi 5 `BCM2712` + `RP1`).
+    Native,
+    /// `VirtIO` MMIO transport bus (e.g. QEMU `virt`).
+    VirtioMmio,
+}
+
+/// Static hardware description of a target board / `SoC`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoardDescriptor {
     pub name: &'static str,
     pub arch: &'static str,
     pub uart: MmioRegion,
     pub gicd: MmioRegion,
     pub gicc: MmioRegion,
-    pub psci_use_smc: bool,
-    pub is_virtio_bus: bool,
+    pub psci_conduit: PsciConduit,
+    pub peripheral_bus: PeripheralBus,
     pub net_mmio: Option<MmioRegion>,
     pub rng_mmio: Option<MmioRegion>,
     pub wdt_mmio: Option<MmioRegion>,
@@ -60,7 +95,8 @@ pub struct BoardDescriptor {
 }
 
 /// Select the active compiled-in [`BoardDescriptor`] based on runtime cmdline hints.
-pub fn select_board(qemu_hint: bool) -> &'static BoardDescriptor {
+#[must_use]
+pub const fn select_board(qemu_hint: bool) -> &'static BoardDescriptor {
     #[cfg(all(feature = "board-rpi5", feature = "board-qemu-virt"))]
     {
         if qemu_hint {

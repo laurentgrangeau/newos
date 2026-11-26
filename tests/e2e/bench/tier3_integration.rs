@@ -6,7 +6,7 @@
 //! implemented.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::SystemTime;
@@ -15,7 +15,7 @@ use crate::bench_parser::{
     IPC_CONSUMPTION_KEYS, parse_benchmark_results_md, parse_metric_lines, validate_complete_metrics,
 };
 
-static BENCH_BIN: OnceLock<String> = OnceLock::new();
+static BENCH_BIN: OnceLock<PathBuf> = OnceLock::new();
 
 fn newest_mtime_in_dir(dir: &Path) -> Option<SystemTime> {
     let mut newest: Option<SystemTime> = None;
@@ -28,10 +28,7 @@ fn newest_mtime_in_dir(dir: &Path) -> Option<SystemTime> {
             entry.metadata().ok().and_then(|m| m.modified().ok())
         };
         if let Some(t) = candidate {
-            newest = Some(match newest {
-                Some(prev) if prev >= t => prev,
-                _ => t,
-            });
+            newest = Some(newest.map_or(t, |prev| prev.max(t)));
         }
     }
     newest
@@ -61,13 +58,137 @@ fn is_bench_binary_fresh(bin: &Path) -> bool {
     true
 }
 
-fn ensure_bench_binary() -> String {
+fn run_rustc(root: &Path, name: &str, extra_args: &[&str]) {
+    let out = Command::new("rustc")
+        .current_dir(root)
+        .args([
+            "--edition",
+            "2024",
+            "-C",
+            "opt-level=3",
+            "--crate-name",
+            name,
+        ])
+        .args(extra_args)
+        .output()
+        .expect("invoke rustc");
+    assert!(
+        out.status.success(),
+        "failed to build {name}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn build_bench_binary(root: &Path, out_dir: &Path) -> PathBuf {
+    let crypto_rlib = out_dir.join("libnewos_crypto.rlib");
+    let abi_rlib = out_dir.join("libnewos_abi.rlib");
+    let kernel_rlib = out_dir.join("libnewos_kernel_core.rlib");
+    let shell_rlib = out_dir.join("libnewos_shell_core.rlib");
+    let bin_path = out_dir.join("newos_bench");
+
+    let dep_flag = format!("dependency={}", out_dir.display());
+    let ext_crypto = format!("newos_crypto={}", crypto_rlib.display());
+    let ext_abi = format!("newos_abi={}", abi_rlib.display());
+    let ext_kernel = format!("newos_kernel_core={}", kernel_rlib.display());
+    let ext_shell = format!("newos_shell_core={}", shell_rlib.display());
+
+    let crypto_out = crypto_rlib.display().to_string();
+    let abi_out = abi_rlib.display().to_string();
+    let kernel_out = kernel_rlib.display().to_string();
+    let shell_out = shell_rlib.display().to_string();
+    let bin_out = bin_path.display().to_string();
+
+    run_rustc(
+        root,
+        "newos_crypto",
+        &[
+            "--crate-type",
+            "lib",
+            "--cfg",
+            "feature=\"sha3\"",
+            "crates/crypto/src/lib.rs",
+            "-o",
+            &crypto_out,
+        ],
+    );
+    run_rustc(
+        root,
+        "newos_abi",
+        &[
+            "--crate-type",
+            "lib",
+            "--cfg",
+            "feature=\"sha3\"",
+            "crates/abi/src/lib.rs",
+            "-L",
+            &dep_flag,
+            "--extern",
+            &ext_crypto,
+            "-o",
+            &abi_out,
+        ],
+    );
+    run_rustc(
+        root,
+        "newos_kernel_core",
+        &[
+            "--crate-type",
+            "lib",
+            "--cfg",
+            "feature=\"smp\"",
+            "--cfg",
+            "feature=\"sched-priority-rr\"",
+            "crates/kernel-core/src/lib.rs",
+            "-L",
+            &dep_flag,
+            "--extern",
+            &ext_abi,
+            "-o",
+            &kernel_out,
+        ],
+    );
+    run_rustc(
+        root,
+        "newos_shell_core",
+        &[
+            "--crate-type",
+            "lib",
+            "crates/shell-core/src/lib.rs",
+            "-L",
+            &dep_flag,
+            "--extern",
+            &ext_abi,
+            "-o",
+            &shell_out,
+        ],
+    );
+    run_rustc(
+        root,
+        "newos_bench",
+        &[
+            "crates/bench/src/main.rs",
+            "-L",
+            &dep_flag,
+            "--extern",
+            &ext_abi,
+            "--extern",
+            &ext_kernel,
+            "--extern",
+            &ext_shell,
+            "-o",
+            &bin_out,
+        ],
+    );
+    bin_path
+}
+
+fn ensure_bench_binary() -> &'static Path {
     BENCH_BIN
         .get_or_init(|| {
             let root = crate::workspace_root();
             let workspace_bin = root.join("target/bench/newos_bench");
             if is_bench_binary_fresh(&workspace_bin) {
-                return workspace_bin.to_string_lossy().into_owned();
+                return workspace_bin;
             }
             assert!(
                 root.join("crates/bench/src/main.rs").exists(),
@@ -78,152 +199,17 @@ fn ensure_bench_binary() -> String {
                 "crates/shell-core/src/lib.rs does not exist yet (awaited from M1)"
             );
 
-            let out_dir =
-                std::env::temp_dir().join(format!("newos_bench_e2e_{}", std::process::id()));
-            fs::create_dir_all(&out_dir).expect("create isolated temp dir for newos_bench");
-
-            let abi_rlib = out_dir.join("libnewos_abi.rlib");
-            let kernel_rlib = out_dir.join("libnewos_kernel_core.rlib");
-            let shell_rlib = out_dir.join("libnewos_shell_core.rlib");
-            let bin_path = out_dir.join("newos_bench");
-
-            let crypto_rlib = out_dir.join("libnewos_crypto.rlib");
-            let dep_flag = format!("dependency={}", out_dir.display());
-            let ext_crypto = format!("newos_crypto={}", crypto_rlib.display());
-            let ext_abi = format!("newos_abi={}", abi_rlib.display());
-            let ext_kernel = format!("newos_kernel_core={}", kernel_rlib.display());
-            let ext_shell = format!("newos_shell_core={}", shell_rlib.display());
-
-            let steps: [(&str, Vec<String>); 5] = [
-                (
-                    "newos_crypto",
-                    vec![
-                        "--edition".into(),
-                        "2024".into(),
-                        "-C".into(),
-                        "opt-level=3".into(),
-                        "--crate-name".into(),
-                        "newos_crypto".into(),
-                        "--crate-type".into(),
-                        "lib".into(),
-                        "--cfg".into(),
-                        "feature=\"sha3\"".into(),
-                        "crates/crypto/src/lib.rs".into(),
-                        "-o".into(),
-                        crypto_rlib.display().to_string(),
-                    ],
-                ),
-                (
-                    "newos_abi",
-                    vec![
-                        "--edition".into(),
-                        "2024".into(),
-                        "-C".into(),
-                        "opt-level=3".into(),
-                        "--crate-name".into(),
-                        "newos_abi".into(),
-                        "--crate-type".into(),
-                        "lib".into(),
-                        "--cfg".into(),
-                        "feature=\"sha3\"".into(),
-                        "crates/abi/src/lib.rs".into(),
-                        "-L".into(),
-                        dep_flag.clone(),
-                        "--extern".into(),
-                        ext_crypto.clone(),
-                        "-o".into(),
-                        abi_rlib.display().to_string(),
-                    ],
-                ),
-                (
-                    "newos_kernel_core",
-                    vec![
-                        "--edition".into(),
-                        "2024".into(),
-                        "-C".into(),
-                        "opt-level=3".into(),
-                        "--crate-name".into(),
-                        "newos_kernel_core".into(),
-                        "--crate-type".into(),
-                        "lib".into(),
-                        "--cfg".into(),
-                        "feature=\"smp\"".into(),
-                        "--cfg".into(),
-                        "feature=\"sched-priority-rr\"".into(),
-                        "crates/kernel-core/src/lib.rs".into(),
-                        "-L".into(),
-                        dep_flag.clone(),
-                        "--extern".into(),
-                        ext_abi.clone(),
-                        "-o".into(),
-                        kernel_rlib.display().to_string(),
-                    ],
-                ),
-                (
-                    "newos_shell_core",
-                    vec![
-                        "--edition".into(),
-                        "2024".into(),
-                        "-C".into(),
-                        "opt-level=3".into(),
-                        "--crate-name".into(),
-                        "newos_shell_core".into(),
-                        "--crate-type".into(),
-                        "lib".into(),
-                        "crates/shell-core/src/lib.rs".into(),
-                        "-L".into(),
-                        dep_flag.clone(),
-                        "--extern".into(),
-                        ext_abi.clone(),
-                        "-o".into(),
-                        shell_rlib.display().to_string(),
-                    ],
-                ),
-                (
-                    "newos_bench",
-                    vec![
-                        "--edition".into(),
-                        "2024".into(),
-                        "-C".into(),
-                        "opt-level=3".into(),
-                        "--crate-name".into(),
-                        "newos_bench".into(),
-                        "crates/bench/src/main.rs".into(),
-                        "-L".into(),
-                        dep_flag,
-                        "--extern".into(),
-                        ext_abi,
-                        "--extern".into(),
-                        ext_kernel,
-                        "--extern".into(),
-                        ext_shell,
-                        "-o".into(),
-                        bin_path.display().to_string(),
-                    ],
-                ),
-            ];
-
-            for (name, args) in &steps {
-                let out = Command::new("rustc")
-                    .current_dir(&root)
-                    .args(args)
-                    .output()
-                    .expect("invoke rustc");
-                assert!(
-                    out.status.success(),
-                    "failed to build {name}: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-            }
-            bin_path.display().to_string()
+            let out_dir = root.join("target/newos_bench_e2e_bin");
+            fs::create_dir_all(&out_dir).expect("create isolated build dir for newos_bench");
+            build_bench_binary(&root, &out_dir)
         })
-        .clone()
+        .as_path()
 }
 
 #[test]
 fn tier3_bench_live_build_and_execute_all_16_metrics() {
     let bin = ensure_bench_binary();
-    let out = Command::new(&bin)
+    let out = Command::new(bin)
         .output()
         .expect("execute target/bench/newos_bench");
     assert!(
@@ -242,12 +228,14 @@ fn tier3_bench_live_build_and_execute_all_16_metrics() {
 #[test]
 fn tier3_bench_repeated_runs_have_deterministic_ipc_counts() {
     let bin = ensure_bench_binary();
-    let run1 = Command::new(&bin).output().expect("run 1");
-    let run2 = Command::new(&bin).output().expect("run 2");
+    let run1 = Command::new(bin).output().expect("run 1");
+    let run2 = Command::new(bin).output().expect("run 2");
     assert!(run1.status.success() && run2.status.success());
 
-    let m1 = parse_metric_lines(&String::from_utf8_lossy(&run1.stdout)).unwrap();
-    let m2 = parse_metric_lines(&String::from_utf8_lossy(&run2.stdout)).unwrap();
+    let out1 = std::str::from_utf8(&run1.stdout).expect("newos_bench stdout must be valid UTF-8");
+    let out2 = std::str::from_utf8(&run2.stdout).expect("newos_bench stdout must be valid UTF-8");
+    let m1 = parse_metric_lines(out1).unwrap();
+    let m2 = parse_metric_lines(out2).unwrap();
     validate_complete_metrics(&m1).unwrap();
     validate_complete_metrics(&m2).unwrap();
 

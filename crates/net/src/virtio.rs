@@ -1,4 +1,4 @@
-//! Modern VirtIO 1.0+ (v2) MMIO Network Driver.
+//! Modern `VirtIO` 1.0+ (v2) MMIO Network Driver.
 //!
 //! Runs in EL0 using capability-scoped `MmioRead32`/`MmioWrite32` and `VirtToPhys`.
 //! Every DMA ring and packet buffer is page-aligned (`<= 4096B`) so it never crosses a page boundary.
@@ -7,10 +7,21 @@ use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering, fence};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
+use crate::{NetError, phys_hi32, phys_lo32};
+
 const QUEUE_SIZE: usize = 32;
+const QUEUE_SIZE_U16: u16 = 32;
+const QUEUE_SIZE_U32: u32 = 32;
 const VIRTIO_NET_HDR_LEN: usize = 12;
 const PKT_BUF_SIZE: usize = 2048; // Divides 4096 evenly -> never crosses a 4 KiB page boundary!
+const PKT_BUF_SIZE_U32: u32 = 2048;
 const PKT_BUF_WORDS: usize = PKT_BUF_SIZE / 8;
+
+const _: () = {
+    assert!(QUEUE_SIZE == QUEUE_SIZE_U16 as usize);
+    assert!(QUEUE_SIZE == QUEUE_SIZE_U32 as usize);
+    assert!(PKT_BUF_SIZE == PKT_BUF_SIZE_U32 as usize);
+};
 
 // Modern VirtIO-MMIO v2 register offsets
 const REG_DRIVER_FEATURES: u64 = 0x020;
@@ -170,7 +181,19 @@ pub struct VirtioNetDma {
     tx_bufs: [PacketBuf; QUEUE_SIZE],
 }
 
+impl core::fmt::Debug for VirtioNetDma {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VirtioNetDma")
+            .field("queue_size", &QUEUE_SIZE)
+            .field("pkt_buf_size", &PKT_BUF_SIZE)
+            .finish_non_exhaustive()
+    }
+}
+
 impl VirtioNetDma {
+    #[must_use]
+    // Intentional: `#![no_std]` zero-alloc DMA backing store evaluated into `.bss` `static`s.
+    #[allow(clippy::large_stack_arrays)]
     pub const fn new() -> Self {
         Self {
             rx_desc: DescTable([const { VirtqDesc::new() }; QUEUE_SIZE]),
@@ -211,7 +234,7 @@ impl Default for VirtioNetDma {
     }
 }
 
-/// Live EL0 VirtIO 1.0+ (v2) network device implementing `smoltcp::phy::Device`.
+/// Live EL0 `VirtIO` 1.0+ (v2) network device implementing `smoltcp::phy::Device`.
 pub struct VirtioNetDevice<'a, T: MmioDmaTransport> {
     transport: T,
     slot_base: u64,
@@ -224,34 +247,52 @@ pub struct VirtioNetDevice<'a, T: MmioDmaTransport> {
     pub tx_packets: u64,
 }
 
+impl<T: MmioDmaTransport> core::fmt::Debug for VirtioNetDevice<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VirtioNetDevice")
+            .field("slot_base", &self.slot_base)
+            .field("rx_last_used", &self.rx_last_used)
+            .field("tx_next_desc", &self.tx_next_desc)
+            .field("rx_packets", &self.rx_packets)
+            .field("tx_packets", &self.tx_packets)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a, T: MmioDmaTransport> VirtioNetDevice<'a, T> {
-    /// Initialize a modern VirtIO-MMIO v2 network device at `slot` and arm RX/TX virtqueues.
-    pub fn init(transport: T, slot: u8, dma: &'a VirtioNetDma) -> Result<Self, &'static str> {
+    /// Initialize a modern `VirtIO`-MMIO v2 network device at `slot` and arm RX/TX virtqueues.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetError::MmioFailed`], [`NetError::DmaTranslateFailed`],
+    /// [`NetError::VirtioFeaturesRejected`], or [`NetError::VirtqueueTooSmall`] if initialization
+    /// fails.
+    pub fn init(transport: T, slot: u8, dma: &'a VirtioNetDma) -> Result<Self, NetError> {
         let base = u64::from(slot) * 0x200;
 
         // 1. Reset device
         transport
             .write32(base + REG_STATUS, 0)
-            .map_err(|_| "virtio reset failed")?;
+            .map_err(NetError::MmioFailed)?;
 
         // 2. Acknowledge + Driver
         transport
             .write32(base + REG_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER)
-            .map_err(|_| "virtio status ack failed")?;
+            .map_err(NetError::MmioFailed)?;
 
         // 3. Negotiate minimal VirtIO 1.0+ features: VIRTIO_NET_F_MAC (bit 5) + VIRTIO_F_VERSION_1 (bit 32)
         transport
             .write32(base + REG_DRIVER_FEATURES_SEL, 0)
-            .map_err(|_| "features sel 0 failed")?;
+            .map_err(NetError::MmioFailed)?;
         transport
             .write32(base + REG_DRIVER_FEATURES, 1 << 5)
-            .map_err(|_| "features 0 write failed")?;
+            .map_err(NetError::MmioFailed)?;
         transport
             .write32(base + REG_DRIVER_FEATURES_SEL, 1)
-            .map_err(|_| "features sel 1 failed")?;
+            .map_err(NetError::MmioFailed)?;
         transport
             .write32(base + REG_DRIVER_FEATURES, 1 << 0) // bit 32 = VIRTIO_F_VERSION_1
-            .map_err(|_| "features 1 write failed")?;
+            .map_err(NetError::MmioFailed)?;
 
         // 4. FEATURES_OK handshake
         transport
@@ -259,12 +300,12 @@ impl<'a, T: MmioDmaTransport> VirtioNetDevice<'a, T> {
                 base + REG_STATUS,
                 STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK,
             )
-            .map_err(|_| "features ok write failed")?;
+            .map_err(NetError::MmioFailed)?;
         let status = transport
             .read32(base + REG_STATUS)
-            .map_err(|_| "status read failed")?;
+            .map_err(NetError::MmioFailed)?;
         if (status & STATUS_FEATURES_OK) == 0 {
-            return Err("virtio device rejected FEATURES_OK");
+            return Err(NetError::VirtioFeaturesRejected);
         }
 
         // 5. Configure Queue 0 (RX) and Queue 1 (TX)
@@ -294,22 +335,23 @@ impl<'a, T: MmioDmaTransport> VirtioNetDevice<'a, T> {
         fence(Ordering::SeqCst);
 
         // 6. Populate all RX buffers and publish to RX avail ring
-        for i in 0..QUEUE_SIZE {
+        for i_u16 in 0..QUEUE_SIZE_U16 {
+            let i = usize::from(i_u16);
             let paddr = transport
                 .virt_to_phys(&dma.rx_bufs[i])
-                .map_err(|_| "rx buf virt_to_phys failed")?;
+                .map_err(NetError::DmaTranslateFailed)?;
             dma.rx_desc.0[i].addr.store(paddr, Ordering::Relaxed);
             dma.rx_desc.0[i]
                 .len
-                .store(PKT_BUF_SIZE as u32, Ordering::Relaxed);
+                .store(PKT_BUF_SIZE_U32, Ordering::Relaxed);
             dma.rx_desc.0[i]
                 .flags
                 .store(DESC_F_WRITE, Ordering::Relaxed);
             dma.rx_desc.0[i].next.store(0, Ordering::Relaxed);
-            dma.rx_avail.ring[i].store(i as u16, Ordering::Relaxed);
+            dma.rx_avail.ring[i].store(i_u16, Ordering::Relaxed);
         }
         fence(Ordering::Release);
-        dma.rx_avail.idx.store(QUEUE_SIZE as u16, Ordering::Release);
+        dma.rx_avail.idx.store(QUEUE_SIZE_U16, Ordering::Release);
 
         // 7. DRIVER_OK -> device is live!
         transport
@@ -317,7 +359,7 @@ impl<'a, T: MmioDmaTransport> VirtioNetDevice<'a, T> {
                 base + REG_STATUS,
                 STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
             )
-            .map_err(|_| "driver ok failed")?;
+            .map_err(NetError::MmioFailed)?;
 
         // Kick RX queue so device can begin DMA'ing incoming frames immediately
         let _ = transport.write32(base + REG_QUEUE_NOTIFY, 0);
@@ -335,7 +377,7 @@ impl<'a, T: MmioDmaTransport> VirtioNetDevice<'a, T> {
         })
     }
 
-    /// Acknowledge and clear pending VirtIO-MMIO interrupt status bits.
+    /// Acknowledge and clear pending `VirtIO`-MMIO interrupt status bits.
     pub fn ack_interrupts(&self) {
         if let Ok(isr) = self.transport.read32(self.slot_base + REG_INTERRUPT_STATUS)
             && isr != 0
@@ -360,56 +402,76 @@ fn setup_queue<T: MmioDmaTransport>(
     desc: &DescTable,
     avail: &AvailRing,
     used: &UsedRing,
-) -> Result<(), &'static str> {
+) -> Result<(), NetError> {
     transport
         .write32(base + REG_QUEUE_SEL, queue_idx)
-        .map_err(|_| "queue sel failed")?;
+        .map_err(NetError::MmioFailed)?;
     let max = transport
         .read32(base + REG_QUEUE_NUM_MAX)
-        .map_err(|_| "queue max read failed")?;
-    if max < QUEUE_SIZE as u32 {
-        return Err("virtqueue max size too small");
+        .map_err(NetError::MmioFailed)?;
+    if max < QUEUE_SIZE_U32 {
+        return Err(NetError::VirtqueueTooSmall);
     }
     transport
-        .write32(base + REG_QUEUE_NUM, QUEUE_SIZE as u32)
-        .map_err(|_| "queue num write failed")?;
+        .write32(base + REG_QUEUE_NUM, QUEUE_SIZE_U32)
+        .map_err(NetError::MmioFailed)?;
 
     let desc_pa = transport
         .virt_to_phys(desc)
-        .map_err(|_| "desc virt_to_phys failed")?;
+        .map_err(NetError::DmaTranslateFailed)?;
     let avail_pa = transport
         .virt_to_phys(avail)
-        .map_err(|_| "avail virt_to_phys failed")?;
+        .map_err(NetError::DmaTranslateFailed)?;
     let used_pa = transport
         .virt_to_phys(used)
-        .map_err(|_| "used virt_to_phys failed")?;
+        .map_err(NetError::DmaTranslateFailed)?;
 
     transport
-        .write32(base + REG_QUEUE_DESC_LOW, desc_pa as u32)
-        .map_err(|_| "desc low failed")?;
+        .write32(base + REG_QUEUE_DESC_LOW, phys_lo32(desc_pa))
+        .map_err(NetError::MmioFailed)?;
     transport
-        .write32(base + REG_QUEUE_DESC_HIGH, (desc_pa >> 32) as u32)
-        .map_err(|_| "desc high failed")?;
+        .write32(base + REG_QUEUE_DESC_HIGH, phys_hi32(desc_pa))
+        .map_err(NetError::MmioFailed)?;
     transport
-        .write32(base + REG_QUEUE_DRIVER_LOW, avail_pa as u32)
-        .map_err(|_| "driver low failed")?;
+        .write32(base + REG_QUEUE_DRIVER_LOW, phys_lo32(avail_pa))
+        .map_err(NetError::MmioFailed)?;
     transport
-        .write32(base + REG_QUEUE_DRIVER_HIGH, (avail_pa >> 32) as u32)
-        .map_err(|_| "driver high failed")?;
+        .write32(base + REG_QUEUE_DRIVER_HIGH, phys_hi32(avail_pa))
+        .map_err(NetError::MmioFailed)?;
     transport
-        .write32(base + REG_QUEUE_DEVICE_LOW, used_pa as u32)
-        .map_err(|_| "device low failed")?;
+        .write32(base + REG_QUEUE_DEVICE_LOW, phys_lo32(used_pa))
+        .map_err(NetError::MmioFailed)?;
     transport
-        .write32(base + REG_QUEUE_DEVICE_HIGH, (used_pa >> 32) as u32)
-        .map_err(|_| "device high failed")?;
+        .write32(base + REG_QUEUE_DEVICE_HIGH, phys_hi32(used_pa))
+        .map_err(NetError::MmioFailed)?;
     transport
         .write32(base + REG_QUEUE_READY, 1)
-        .map_err(|_| "queue ready failed")?;
+        .map_err(NetError::MmioFailed)?;
     Ok(())
+}
+
+fn wait_tx_slot_free(dma: &VirtioNetDma) -> bool {
+    let avail_idx = dma.tx_avail.idx.load(Ordering::Acquire);
+    for _ in 0..100_000u32 {
+        let used_idx = dma.tx_used.idx.load(Ordering::Acquire);
+        if (avail_idx.wrapping_sub(used_idx) as usize) < QUEUE_SIZE {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
 }
 
 pub struct VirtioRxToken<'a> {
     frame: &'a [u8],
+}
+
+impl core::fmt::Debug for VirtioRxToken<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VirtioRxToken")
+            .field("frame_len", &self.frame.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RxToken for VirtioRxToken<'_> {
@@ -430,6 +492,15 @@ pub struct VirtioTxToken<'a, T: MmioDmaTransport> {
     tx_packets: &'a mut u64,
 }
 
+impl<T: MmioDmaTransport> core::fmt::Debug for VirtioTxToken<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VirtioTxToken")
+            .field("slot_base", &self.slot_base)
+            .field("desc_idx", &self.desc_idx)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T: MmioDmaTransport> TxToken for VirtioTxToken<'_, T> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
@@ -438,22 +509,13 @@ impl<T: MmioDmaTransport> TxToken for VirtioTxToken<'_, T> {
         let frame_len = len.min(self.scratch.len());
         let res = f(&mut self.scratch[..frame_len]);
 
-        let idx = (self.desc_idx as usize) % QUEUE_SIZE;
+        let idx_u16 = self.desc_idx % QUEUE_SIZE_U16;
+        let idx = usize::from(idx_u16);
         let tx_buf = &self.dma.tx_bufs[idx];
 
         // Wait (bounded) if all TX ring slots are still in flight so we never overwrite a
         // buffer owned by the VirtIO device (`M9`). Drop packet instead of corrupting DMA if still full.
-        let avail_idx = self.dma.tx_avail.idx.load(Ordering::Acquire);
-        let mut slot_free = false;
-        for _ in 0..100_000u32 {
-            let used_idx = self.dma.tx_used.idx.load(Ordering::Acquire);
-            if (avail_idx.wrapping_sub(used_idx) as usize) < QUEUE_SIZE {
-                slot_free = true;
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        if !slot_free {
+        if !wait_tx_slot_free(self.dma) {
             return res;
         }
 
@@ -461,16 +523,18 @@ impl<T: MmioDmaTransport> TxToken for VirtioTxToken<'_, T> {
         tx_buf.write_virtio_tx(&self.scratch[..frame_len]);
 
         if let Ok(paddr) = self.transport.virt_to_phys(tx_buf) {
+            let total_len =
+                u32::try_from(VIRTIO_NET_HDR_LEN + frame_len).unwrap_or(PKT_BUF_SIZE_U32);
             self.dma.tx_desc.0[idx].addr.store(paddr, Ordering::Relaxed);
             self.dma.tx_desc.0[idx]
                 .len
-                .store((VIRTIO_NET_HDR_LEN + frame_len) as u32, Ordering::Relaxed);
+                .store(total_len, Ordering::Relaxed);
             self.dma.tx_desc.0[idx].flags.store(0, Ordering::Relaxed);
             self.dma.tx_desc.0[idx].next.store(0, Ordering::Relaxed);
 
             let avail_idx = self.dma.tx_avail.idx.load(Ordering::Relaxed);
             self.dma.tx_avail.ring[(avail_idx as usize) % QUEUE_SIZE]
-                .store(idx as u16, Ordering::Relaxed);
+                .store(idx_u16, Ordering::Relaxed);
             fence(Ordering::Release);
             self.dma
                 .tx_avail
@@ -515,8 +579,9 @@ impl<T: MmioDmaTransport> Device for VirtioNetDevice<'_, T> {
 
         // Immediately recycle RX descriptor back to the device
         let avail_idx = self.dma.rx_avail.idx.load(Ordering::Relaxed);
+        let desc_slot_u16 = u16::try_from(desc_id % QUEUE_SIZE).unwrap_or(0);
         self.dma.rx_avail.ring[(avail_idx as usize) % QUEUE_SIZE]
-            .store((desc_id % QUEUE_SIZE) as u16, Ordering::Relaxed);
+            .store(desc_slot_u16, Ordering::Relaxed);
         fence(Ordering::Release);
         self.dma
             .rx_avail
@@ -598,7 +663,7 @@ mod tests {
         }
 
         fn virt_to_phys<T>(&self, r: &T) -> Result<u64, SysError> {
-            Ok((r as *const T as usize) as u64)
+            Ok(core::ptr::from_ref::<T>(r) as usize as u64)
         }
     }
 
@@ -608,7 +673,7 @@ mod tests {
         for len in [0usize, 1, 4, 7, 13, 60, 127, 512, 1514] {
             let mut frame = [0u8; 1514];
             for (i, b) in frame[..len].iter_mut().enumerate() {
-                *b = ((i * 31 + 17) & 0xFF) as u8;
+                *b = (i * 31 + 17).to_le_bytes()[0];
             }
             buf.write_virtio_tx(&frame[..len]);
             let mut out = [0u8; 1514];
@@ -625,11 +690,14 @@ mod tests {
             queue_max: 4,
             status: AtomicU32::new(0),
         };
-        assert!(VirtioNetDevice::init(bad_transport, 0, &dma).is_err());
+        assert_eq!(
+            VirtioNetDevice::init(bad_transport, 0, &dma).err(),
+            Some(NetError::VirtqueueTooSmall)
+        );
 
         // Valid init
         let transport = MockVirtioTransport {
-            queue_max: QUEUE_SIZE as u32,
+            queue_max: QUEUE_SIZE_U32,
             status: AtomicU32::new(0),
         };
         let mut dev = VirtioNetDevice::init(transport, 0, &dma).expect("virtio init");
@@ -639,7 +707,7 @@ mod tests {
         // Fill all QUEUE_SIZE TX descriptors -> next transmit returns None
         for i in 0..QUEUE_SIZE {
             let tx = dev.transmit(Instant::ZERO).expect("tx slot available");
-            tx.consume(64, |b| b.fill(i as u8));
+            tx.consume(64, |b| b.fill(i.to_le_bytes()[0]));
         }
         assert!(dev.transmit(Instant::ZERO).is_none());
 
@@ -652,7 +720,7 @@ mod tests {
         dma.rx_bufs[0].write_virtio_tx(&payload);
         dma.rx_used.ring[0].id.store(0, Ordering::Relaxed);
         dma.rx_used.ring[0].len.store(
-            (VIRTIO_NET_HDR_LEN + payload.len()) as u32,
+            u32::try_from(VIRTIO_NET_HDR_LEN + payload.len()).expect("rx len fits in u32"),
             Ordering::Relaxed,
         );
         dma.rx_used.idx.store(1, Ordering::Release);
@@ -661,5 +729,44 @@ mod tests {
         rx.consume(|bytes| {
             assert_eq!(bytes, &payload[..]);
         });
+    }
+
+    #[test]
+    fn virtio_init_returns_structured_errors() {
+        struct RejectFeaturesTransport;
+        impl MmioDmaTransport for RejectFeaturesTransport {
+            fn read32(&self, _offset: u64) -> Result<u32, SysError> {
+                Ok(STATUS_ACKNOWLEDGE | STATUS_DRIVER)
+            }
+            fn write32(&self, _offset: u64, _val: u32) -> Result<(), SysError> {
+                Ok(())
+            }
+            fn virt_to_phys<T>(&self, r: &T) -> Result<u64, SysError> {
+                Ok(core::ptr::from_ref::<T>(r) as usize as u64)
+            }
+        }
+
+        struct FailMmioTransport;
+        impl MmioDmaTransport for FailMmioTransport {
+            fn read32(&self, _offset: u64) -> Result<u32, SysError> {
+                Err(SysError::InvalidCapability)
+            }
+            fn write32(&self, _offset: u64, _val: u32) -> Result<(), SysError> {
+                Err(SysError::InvalidCapability)
+            }
+            fn virt_to_phys<T>(&self, _r: &T) -> Result<u64, SysError> {
+                Err(SysError::InvalidCapability)
+            }
+        }
+
+        let dma = VirtioNetDma::new();
+        assert_eq!(
+            VirtioNetDevice::init(RejectFeaturesTransport, 0, &dma).err(),
+            Some(NetError::VirtioFeaturesRejected)
+        );
+        assert_eq!(
+            VirtioNetDevice::init(FailMmioTransport, 0, &dma).err(),
+            Some(NetError::MmioFailed(SysError::InvalidCapability))
+        );
     }
 }

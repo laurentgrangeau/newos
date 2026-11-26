@@ -6,7 +6,7 @@
 //! (16 GB) is provided via two complementary paths:
 //! - [`compute`]: Auto-vectorized ARMv8.2-A Cortex-A76 `NEON` + `FEAT_DotProd` (`sdot`) quantized
 //!   `i8` & `f32` inference kernels (cache-blocked for 64 B lines).
-//! - [`hailo`]: External PCIe 2.0 x1 FFC **Raspberry Pi AI HAT+ / AI Kit** NPU driver
+//! - [`hailo`]: External `PCIe` 2.0 `x1` FFC **Raspberry Pi AI HAT+ / AI Kit** NPU driver
 //!   (**Hailo-8** 26 TOPS, **Hailo-8L** 13 TOPS, and **Hailo-10H**).
 
 #[cfg(feature = "compute")]

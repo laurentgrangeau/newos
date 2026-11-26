@@ -72,6 +72,76 @@ fn t4_scenario1_full_multicommand_shell_session() {
     assert!(matches!(count_stream.first(), Some(Record::Count(n)) if n >= 3));
 }
 
+struct SimWorkerCaps {
+    ep: CapId,
+    root_frame: CapId,
+    worker_frame: CapId,
+    phys: PhysAddr,
+}
+
+fn bootstrap_sim_worker(
+    idx: usize,
+    ipc: &mut KernelIpcState,
+    inv: &mut UntypedInventory,
+    tracker: &mut FrameMappingTracker<32>,
+) -> SimWorkerCaps {
+    let pid = idx + 1;
+    ipc.init_worker_pd_bootstrap_caps(pid).unwrap();
+    let (_, cnode_cap) = ipc.register_child_caps_in_root(pid).unwrap();
+
+    // Mint a unique badged endpoint and a dedicated frame for each worker
+    let ep_root = ipc
+        .untyped_retype_for(
+            0,
+            CapId::BOOTSTRAP_UNTYPED,
+            ObjectType::Endpoint,
+            30 + idx,
+            inv,
+        )
+        .unwrap();
+    let ep = ipc
+        .cap_grant_between(
+            0,
+            cnode_cap,
+            ep_root,
+            Rights::READ.union(Rights::WRITE),
+            Some((pid as u64) << 8),
+        )
+        .unwrap();
+
+    let root_frame = ipc
+        .untyped_retype_for(
+            0,
+            CapId::BOOTSTRAP_UNTYPED,
+            ObjectType::Frame,
+            40 + idx,
+            inv,
+        )
+        .unwrap();
+    let phys = ipc.validate_frame_for(0, root_frame, Rights::READ).unwrap();
+    let worker_frame = ipc
+        .cap_grant_between(
+            0,
+            cnode_cap,
+            root_frame,
+            Rights::READ.union(Rights::WRITE),
+            None,
+        )
+        .unwrap();
+
+    let vs = PhysAddr::new_aligned(0x1000_0000 + (pid as u64) * PAGE_SIZE).unwrap();
+    tracker
+        .record(vs, VirtAddr::new_page_aligned(0x4000_0000).unwrap(), phys)
+        .unwrap();
+
+    SimWorkerCaps {
+        ep,
+        root_frame,
+        worker_frame,
+        phys,
+    }
+}
+
 #[test]
 fn t4_scenario2_multiprocess_microkernel_simulation() {
     let mut inv = UntypedInventory::new();
@@ -82,79 +152,26 @@ fn t4_scenario2_multiprocess_microkernel_simulation() {
     let (_, _, fault_notif) = ipc.init_bootstrap_caps(None).unwrap();
 
     // Bootstrap 3 isolated workers (PIDs 1, 2, 3)
-    let mut worker_cnodes = [CapId::NULL; 3];
-    let mut worker_eps = [CapId::NULL; 3];
-    let mut root_frames = [CapId::NULL; 3];
-    let mut worker_frames = [CapId::NULL; 3];
-    let mut worker_phys = [PhysAddr::new(0); 3];
-
-    for idx in 0..3usize {
-        let pid = idx + 1;
-        ipc.init_worker_pd_bootstrap_caps(pid).unwrap();
-        let (_, cnode_cap) = ipc.register_child_caps_in_root(pid).unwrap();
-        worker_cnodes[idx] = cnode_cap;
-
-        // Mint a unique badged endpoint and a dedicated frame for each worker
-        let ep_root = ipc
-            .untyped_retype_for(
-                0,
-                CapId::BOOTSTRAP_UNTYPED,
-                ObjectType::Endpoint,
-                30 + idx,
-                &mut inv,
-            )
-            .unwrap();
-        worker_eps[idx] = ipc
-            .cap_grant_between(
-                0,
-                cnode_cap,
-                ep_root,
-                Rights::READ.union(Rights::WRITE),
-                Some((pid as u64) << 8),
-            )
-            .unwrap();
-
-        let frame_root = ipc
-            .untyped_retype_for(
-                0,
-                CapId::BOOTSTRAP_UNTYPED,
-                ObjectType::Frame,
-                40 + idx,
-                &mut inv,
-            )
-            .unwrap();
-        root_frames[idx] = frame_root;
-        let phys = ipc.validate_frame_for(0, frame_root, Rights::READ).unwrap();
-        worker_phys[idx] = phys;
-        worker_frames[idx] = ipc
-            .cap_grant_between(
-                0,
-                cnode_cap,
-                frame_root,
-                Rights::READ.union(Rights::WRITE),
-                None,
-            )
-            .unwrap();
-
-        let vs = PhysAddr::new_aligned(0x1000_0000 + (pid as u64) * PAGE_SIZE).unwrap();
-        tracker
-            .record(vs, VirtAddr::new_page_aligned(0x4000_0000).unwrap(), phys)
-            .unwrap();
-    }
+    let workers = [
+        bootstrap_sim_worker(0, &mut ipc, &mut inv, &mut tracker),
+        bootstrap_sim_worker(1, &mut ipc, &mut inv, &mut tracker),
+        bootstrap_sim_worker(2, &mut ipc, &mut inv, &mut tracker),
+    ];
 
     // Schedule across 4-CPU SMP scheduler with load balancing & work stealing
     let mut smp = SmpScheduler::<4, 8>::new(4);
     let mut worker_cpus = [0usize; 3];
-    for idx in 0..3usize {
-        let (cpu, _tid) = smp.spawn_balanced(16 + idx as u8).unwrap();
-        worker_cpus[idx] = cpu;
+    for (idx, cpu_slot) in worker_cpus.iter_mut().enumerate() {
+        let prio = 16 + u8::try_from(idx).expect("idx < 3");
+        let (cpu, _tid) = smp.spawn_balanced(prio).unwrap();
+        *cpu_slot = cpu;
     }
 
     // Healthy IPC call from each worker
-    for idx in 0..3usize {
+    for (idx, w) in workers.iter().enumerate() {
         let pid = idx + 1;
         let reply = ipc
-            .ipc_call_for(pid, worker_eps[idx], 0x1000 + pid as u64, |m| IpcMessage {
+            .ipc_call_for(pid, w.ep, 0x1000 + pid as u64, |m| IpcMessage {
                 badge: m.badge,
                 payload: m.payload ^ 0xFF,
             })
@@ -173,24 +190,24 @@ fn t4_scenario2_multiprocess_microkernel_simulation() {
     assert_eq!(bad_cpu.tcb(0).unwrap().state, ThreadState::Exited);
 
     // Revoke worker 2's delegated frame cap across processes via `cap_revoke_for`
-    assert_eq!(ipc.cap_revoke_for(0, root_frames[1]).unwrap(), 1);
+    assert_eq!(ipc.cap_revoke_for(0, workers[1].root_frame).unwrap(), 1);
     assert_eq!(
-        ipc.validate_frame_for(2, worker_frames[1], Rights::READ),
+        ipc.validate_frame_for(2, workers[1].worker_frame, Rights::READ),
         Err(SysError::InvalidCapability)
     );
     let mut drained = [None; 4];
-    assert_eq!(tracker.drain_for_phys(worker_phys[1], &mut drained), 1);
-    assert!(inv.reclaim_frame(PhysFrame::from_aligned(worker_phys[1]).unwrap()));
+    assert_eq!(tracker.drain_for_phys(workers[1].phys, &mut drained), 1);
+    assert!(inv.reclaim_frame(PhysFrame::from_aligned(workers[1].phys).unwrap()));
 
     // Workers 1 and 3 continue uninterrupted
     for idx in [0usize, 2usize] {
         let pid = idx + 1;
         assert_eq!(
-            ipc.validate_frame_for(pid, worker_frames[idx], Rights::READ),
-            Ok(worker_phys[idx])
+            ipc.validate_frame_for(pid, workers[idx].worker_frame, Rights::READ),
+            Ok(workers[idx].phys)
         );
         let reply = ipc
-            .ipc_call_for(pid, worker_eps[idx], 0x777, |m| IpcMessage {
+            .ipc_call_for(pid, workers[idx].ep, 0x777, |m| IpcMessage {
                 badge: m.badge,
                 payload: m.payload + 1,
             })
@@ -252,14 +269,16 @@ fn t4_scenario4_multithreaded_spsc_ring_100k_streaming() {
             let mut next = 0u64;
             let mut batch = [0u64; 17]; // odd prime size to exercise wraparound boundaries
             while next < TOTAL_WORDS {
-                if next % 19 == 0 {
+                if next.is_multiple_of(19) {
                     // Mix single-item push
                     while ring.try_push(next).is_err() {
                         thread::yield_now();
                     }
                     next += 1;
                 } else {
-                    let count = ((TOTAL_WORDS - next) as usize).min(batch.len());
+                    let count = usize::try_from(TOTAL_WORDS - next)
+                        .unwrap_or(usize::MAX)
+                        .min(batch.len());
                     for (i, slot) in batch[..count].iter_mut().enumerate() {
                         *slot = next + i as u64;
                     }
@@ -282,7 +301,7 @@ fn t4_scenario4_multithreaded_spsc_ring_100k_streaming() {
             let mut expected = 0u64;
             let mut buf = [0u64; 13]; // another prime size
             while expected < TOTAL_WORDS {
-                if expected % 23 == 0 {
+                if expected.is_multiple_of(23) {
                     if let Some(v) = ring.try_pop() {
                         assert_eq!(v, expected, "FIFO mismatch on single pop");
                         expected += 1;
@@ -424,11 +443,7 @@ fn t4_scenario5_full_workspace_safety_and_unsafe_budget_audit() {
     );
 }
 
-#[test]
-fn t4_scenario6_deterministic_adversarial_fuzz_stress_1024() {
-    let mut rng = Xorshift64::new(0x5EED_C0DE_2026_0001);
-
-    // 1. 1,024+ adversarial shell command lines (zero panics)
+fn fuzz_shell_1024(rng: &mut Xorshift64) -> Shell<MockShellHost> {
     let mut sh = Shell::new(MockShellHost::new());
     let fragments = [
         "put \"hello | world\"",
@@ -471,7 +486,7 @@ fn t4_scenario6_deterministic_adversarial_fuzz_stress_1024() {
             let frag = fragments[rng.next_usize(fragments.len())];
             cmd.push_str(frag);
         }
-        if i % 17 == 0 {
+        if i.is_multiple_of(17) {
             // Append multi-byte UTF-8 near 128-byte boundary
             cmd.push_str(&"x".repeat(rng.next_usize(140)));
             cmd.push('🦀');
@@ -485,8 +500,10 @@ fn t4_scenario6_deterministic_adversarial_fuzz_stress_1024() {
     let mut snap = [0u8; 4096];
     let n = sh.store().encode_snapshot(&mut snap).unwrap();
     let _ = ObjectStore::decode_snapshot(&snap[..n]).unwrap();
+    sh
+}
 
-    // 2. 1,024+ adversarial CAOS snapshot mutations (zero panics)
+fn fuzz_caos_1024(rng: &mut Xorshift64) {
     let mut base_store = ObjectStore::new();
     let h = base_store.put(b"seed-blob").unwrap();
     base_store.set_ref("@seed", h).unwrap();
@@ -494,14 +511,14 @@ fn t4_scenario6_deterministic_adversarial_fuzz_stress_1024() {
     let valid_len = base_store.encode_snapshot(&mut valid_snap).unwrap();
 
     for i in 0..1024usize {
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             let mut mutated = valid_snap[..valid_len].to_vec();
             let flips = 1 + rng.next_usize(6);
             for _ in 0..flips {
                 let idx = rng.next_usize(mutated.len());
-                mutated[idx] ^= (rng.next_u64() as u8) | 1;
+                mutated[idx] ^= rng.next_u64().to_le_bytes()[0] | 1;
             }
-            if i % 6 == 0 && mutated.len() > 16 {
+            if i.is_multiple_of(6) && mutated.len() > 16 {
                 // Recompute CRC so parser reaches deep structural validation
                 let body = mutated.len() - 8;
                 let crc = ObjHash::hash_bytes(&mutated[..body]).0;
@@ -515,8 +532,9 @@ fn t4_scenario6_deterministic_adversarial_fuzz_stress_1024() {
             let _ = ObjectStore::decode_snapshot(&raw);
         }
     }
+}
 
-    // 3. 1,024+ adversarial ELF64 mutations (zero panics)
+fn fuzz_elf_1024(rng: &mut Xorshift64) {
     let valid_elf = build_elf64(
         0x40_0000,
         56,
@@ -528,13 +546,14 @@ fn t4_scenario6_deterministic_adversarial_fuzz_stress_1024() {
             data: vec![0xD5; 16],
         }],
     );
+    let mut mutated = Vec::with_capacity(valid_elf.len());
     for i in 0..1024usize {
-        if i % 2 == 0 {
-            let mut mutated = valid_elf.clone();
+        if i.is_multiple_of(2) {
+            mutated.clone_from(&valid_elf);
             let flips = 1 + rng.next_usize(8);
             for _ in 0..flips {
                 let idx = rng.next_usize(mutated.len());
-                mutated[idx] ^= (rng.next_u64() as u8) | 1;
+                mutated[idx] ^= rng.next_u64().to_le_bytes()[0] | 1;
             }
             let _ = parse_elf64(&mutated);
         } else {
@@ -544,8 +563,9 @@ fn t4_scenario6_deterministic_adversarial_fuzz_stress_1024() {
             let _ = parse_elf64(&raw);
         }
     }
+}
 
-    // 4. 1,024+ randomized KernelIpcState & CSpace ops (zero panics)
+fn fuzz_ipc_1024(rng: &mut Xorshift64) {
     let mut inv = UntypedInventory::new();
     assert!(inv.push_raw_region(0x6000_0000, PAGE_SIZE * 32));
     let mut ipc = KernelIpcState::new();
@@ -565,7 +585,7 @@ fn t4_scenario6_deterministic_adversarial_fuzz_stress_1024() {
             3 => CapId::BOOTSTRAP_NET_MMIO,
             _ => CapId::new(rng.next_u64()),
         };
-        let rights = Rights::from_bits_truncate(rng.next_u64() as u8);
+        let rights = Rights::from_bits_truncate(rng.next_u64().to_le_bytes()[0]);
         match op {
             0 => {
                 let _ = ipc.ipc_send_for(pid, raw_cap, rng.next_u64());
@@ -599,20 +619,21 @@ fn t4_scenario6_deterministic_adversarial_fuzz_stress_1024() {
             }
         }
     }
+}
 
-    // 5. 1,024+ randomized SpscRing<64> ops with shadow VecDeque verification (zero panics)
-    let ring = SpscRing::<64>::new();
+fn fuzz_ring_1024(rng: &mut Xorshift64) {
+    let spsc_ring = SpscRing::<64>::new();
     let mut ring_shadow = std::collections::VecDeque::new();
     for _ in 0..1024usize {
         match rng.next_usize(4) {
             0 => {
                 let w = rng.next_u64();
-                if ring.try_push(w).is_ok() {
+                if spsc_ring.try_push(w).is_ok() {
                     ring_shadow.push_back(w);
                 }
             }
             1 => {
-                if let Some(w) = ring.try_pop() {
+                if let Some(w) = spsc_ring.try_pop() {
                     assert_eq!(ring_shadow.pop_front(), Some(w));
                 } else {
                     assert!(ring_shadow.is_empty());
@@ -621,7 +642,7 @@ fn t4_scenario6_deterministic_adversarial_fuzz_stress_1024() {
             2 => {
                 let count = rng.next_usize(20);
                 let src: Vec<u64> = (0..count).map(|_| rng.next_u64()).collect();
-                let pushed = ring.try_push_slice(&src);
+                let pushed = spsc_ring.try_push_slice(&src);
                 for &w in &src[..pushed] {
                     ring_shadow.push_back(w);
                 }
@@ -629,7 +650,7 @@ fn t4_scenario6_deterministic_adversarial_fuzz_stress_1024() {
             _ => {
                 let count = rng.next_usize(20);
                 let mut dst = vec![0u64; count];
-                let popped = ring.try_pop_slice(&mut dst);
+                let popped = spsc_ring.try_pop_slice(&mut dst);
                 for &w in &dst[..popped] {
                     assert_eq!(ring_shadow.pop_front(), Some(w));
                 }
@@ -638,10 +659,20 @@ fn t4_scenario6_deterministic_adversarial_fuzz_stress_1024() {
     }
 
     // Drain remaining ring items and verify exact FIFO match
-    while let Some(w) = ring.try_pop() {
+    while let Some(w) = spsc_ring.try_pop() {
         assert_eq!(ring_shadow.pop_front(), Some(w));
     }
     assert!(ring_shadow.is_empty());
+}
+
+#[test]
+fn t4_scenario6_deterministic_adversarial_fuzz_stress_1024() {
+    let mut rng = Xorshift64::new(0x5EED_C0DE_2026_0001);
+    let mut sh = fuzz_shell_1024(&mut rng);
+    fuzz_caos_1024(&mut rng);
+    fuzz_elf_1024(&mut rng);
+    fuzz_ipc_1024(&mut rng);
+    fuzz_ring_1024(&mut rng);
 
     // Final sanity check: `Record` stream still works cleanly
     let s = sh.eval_pipeline("objects | count");

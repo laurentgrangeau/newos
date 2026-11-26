@@ -139,8 +139,8 @@ fn tier2_cspace_rejects_null_oob_and_stale_generation() {
         cnode.lookup(CapId::NULL, Rights::NONE),
         Err(SysError::InvalidCapability)
     );
-    // Out-of-bounds slot index (99 >= 8) with generation 1.
-    let oob = CapId::new((1u64 << 32) | 99);
+    // Out-of-bounds slot index (99 / 0x63 >= 8) with generation 1.
+    let oob = CapId::new((1u64 << 32) | 0x63);
     assert_eq!(
         cnode.lookup(oob, Rights::NONE),
         Err(SysError::InvalidCapability)
@@ -265,25 +265,25 @@ fn tier2_cspace_retype_frame_wrong_type_no_write_or_oom() {
         Err(SysError::InvalidArgument)
     );
 
-    let ro_untyped = cnode
+    let readonly_untyped = cnode
         .insert_root(Capability::new(
             CapObject::Untyped { region_index: 0 },
             Rights::READ,
         ))
         .unwrap();
     assert_eq!(
-        cnode.retype_frame_from(ro_untyped, &mut inv),
+        cnode.retype_frame_from(readonly_untyped, &mut inv),
         Err(SysError::InsufficientRights)
     );
 
-    let rw_untyped = cnode
+    let all_rights_untyped = cnode
         .insert_root(Capability::new(
             CapObject::Untyped { region_index: 0 },
             Rights::ALL,
         ))
         .unwrap();
     assert_eq!(
-        cnode.retype_frame_from(rw_untyped, &mut inv),
+        cnode.retype_frame_from(all_rights_untyped, &mut inv),
         Err(SysError::InvalidArgument)
     );
 }

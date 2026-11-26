@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+# Note: `unsafe_code = "forbid"` cannot be enabled here because `libfuzzer_sys::fuzz_target!`
+# expands inside each target binary to an `#[unsafe(no_mangle)] extern "C"` entry point calling
+# `core::slice::from_raw_parts`. All fuzz target bodies themselves remain 100% safe Rust.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+all = "warn"
+
 [package.metadata]
 cargo-fuzz = true
 

@@ -1,16 +1,17 @@
 //! Priority + round-robin microkernel scheduler
 //! with preemptive time-slice accounting and per-CPU SMP runqueues with work-stealing.
 
+use core::fmt;
 use newos_abi::SysError;
 
 /// Default preemptive time slice in timer ticks before round-robin preemption.
 pub const DEFAULT_TIME_SLICE: u32 = 4;
 
-/// Default priority assigned to normal userspace processes.
+/// Default priority assigned to normal userspace protection domains.
 pub const DEFAULT_PRIORITY: u8 = 16;
 
 /// Compile-time selectable EL1 microkernel scheduling policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SchedPolicyKind {
     /// Preemptive strict-priority scheduler with round-robin within equal priorities.
     PriorityRoundRobin,
@@ -22,12 +23,19 @@ pub enum SchedPolicyKind {
 
 impl SchedPolicyKind {
     #[inline]
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::PriorityRoundRobin => "priority-rr",
             Self::RoundRobin => "round-robin",
             Self::Fifo => "fifo",
         }
+    }
+}
+
+impl fmt::Display for SchedPolicyKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -62,11 +70,45 @@ pub const ACTIVE_SCHED_POLICY: SchedPolicyKind = SchedPolicyKind::RoundRobin;
 pub const ACTIVE_SCHED_POLICY: SchedPolicyKind = SchedPolicyKind::PriorityRoundRobin;
 
 /// Unique kernel thread identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct ThreadId(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl ThreadId {
+    #[inline]
+    #[must_use]
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "tid:{}", self.0)
+    }
+}
+
+impl From<u32> for ThreadId {
+    #[inline]
+    fn from(raw: u32) -> Self {
+        Self(raw)
+    }
+}
+
+impl From<ThreadId> for u32 {
+    #[inline]
+    fn from(id: ThreadId) -> Self {
+        id.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThreadState {
     Ready,
     Running,
@@ -94,6 +136,17 @@ pub struct Scheduler<const MAX_THREADS: usize> {
     next_id: u32,
 }
 
+impl<const MAX_THREADS: usize> fmt::Debug for Scheduler<MAX_THREADS> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Scheduler")
+            .field("max_threads", &MAX_THREADS)
+            .field("current", &self.current)
+            .field("ready_count", &self.ready_count())
+            .field("next_id", &self.next_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<const MAX_THREADS: usize> Default for Scheduler<MAX_THREADS> {
     fn default() -> Self {
         Self::new()
@@ -101,6 +154,7 @@ impl<const MAX_THREADS: usize> Default for Scheduler<MAX_THREADS> {
 }
 
 impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             threads: [None; MAX_THREADS],
@@ -112,16 +166,25 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
     }
 
     /// Spawn a new runnable thread on CPU 0 with `priority` (higher value = higher priority).
+    ///
+    /// # Errors
+    /// Returns [`SysError::OutOfMemory`] if all `MAX_THREADS` slots are occupied.
     pub fn spawn(&mut self, priority: u8) -> Result<ThreadId, SysError> {
         self.spawn_on_cpu(priority, 0)
     }
 
     /// Spawn a new runnable thread with `priority` and preferred `cpu_affinity`.
+    ///
+    /// # Errors
+    /// Returns [`SysError::OutOfMemory`] if all `MAX_THREADS` slots are occupied.
     pub fn spawn_on_cpu(&mut self, priority: u8, cpu_affinity: u8) -> Result<ThreadId, SysError> {
         for (idx, slot) in self.threads.iter_mut().enumerate() {
             if slot.is_none() {
                 let id = ThreadId(self.next_id);
                 self.next_id = self.next_id.wrapping_add(1);
+                if self.next_id == 0 {
+                    self.next_id = 1;
+                }
                 *slot = Some(ThreadControlBlock {
                     id,
                     priority,
@@ -143,17 +206,20 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
 
     /// Return the currently executing slot index, if any.
     #[inline]
+    #[must_use]
     pub const fn current_slot(&self) -> Option<usize> {
         self.current
     }
 
     /// Inspect a thread control block by slot index.
     #[inline]
+    #[must_use]
     pub fn tcb(&self, slot: usize) -> Option<&ThreadControlBlock> {
         self.threads.get(slot)?.as_ref()
     }
 
     /// Count active (non-exited) threads managed by this runqueue.
+    #[must_use]
     pub fn active_count(&self) -> usize {
         self.threads
             .iter()
@@ -163,6 +229,7 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
 
     /// Count currently `Ready` (runnable, not running) threads.
     #[inline]
+    #[must_use]
     pub fn ready_count(&self) -> usize {
         if MAX_THREADS <= 64 {
             self.ready_mask.count_ones() as usize
@@ -175,6 +242,9 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
     }
 
     /// Update the priority of the thread at `slot`.
+    ///
+    /// # Errors
+    /// Returns [`SysError::InvalidArgument`] if `slot` is out of bounds or empty.
     pub fn set_priority(&mut self, slot: usize, priority: u8) -> Result<(), SysError> {
         let tcb = self
             .threads
@@ -187,6 +257,9 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
     }
 
     /// Transition `slot` to `Blocked` (e.g., waiting on synchronous IPC) and remove from `ready_mask`.
+    ///
+    /// # Errors
+    /// Returns [`SysError::InvalidArgument`] if `slot` is out of bounds or empty.
     #[inline]
     pub fn block_slot(&mut self, slot: usize) -> Result<(), SysError> {
         let tcb = self
@@ -205,6 +278,9 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
     }
 
     /// Wake a `Blocked` thread at `slot` back to `Ready` and mark it runnable in `ready_mask`.
+    ///
+    /// # Errors
+    /// Returns [`SysError::InvalidArgument`] if `slot` is out of bounds or empty.
     #[inline]
     pub fn wake_slot(&mut self, slot: usize) -> Result<(), SysError> {
         let tcb = self
@@ -222,6 +298,9 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
     }
 
     /// Mark `slot` as `Exited` and remove it from scheduling.
+    ///
+    /// # Errors
+    /// Returns [`SysError::InvalidArgument`] if `slot` is out of bounds or empty.
     #[inline]
     pub fn exit_slot(&mut self, slot: usize) -> Result<(), SysError> {
         let tcb = self
@@ -239,7 +318,7 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
         Ok(())
     }
 
-    /// Reclaim an `Exited` thread slot so a new process can reuse it (`M4`).
+    /// Reclaim an `Exited` thread slot so a new protection domain can reuse it (`M4`).
     #[inline]
     pub fn reclaim_slot(&mut self, slot: usize) {
         if slot < MAX_THREADS {
@@ -282,6 +361,32 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
         }
     }
 
+    #[inline]
+    fn pick_from_ready_mask(&self, rm: u64, start: usize) -> usize {
+        if rm.is_power_of_two() {
+            return rm.trailing_zeros() as usize;
+        }
+        let rot = u32::try_from(start).unwrap_or(0);
+        let mut mask = rm.rotate_right(rot);
+        let first_off = mask.trailing_zeros() as usize;
+        let mut best_idx = (start + first_off) & 63;
+        if matches!(ACTIVE_SCHED_POLICY, SchedPolicyKind::PriorityRoundRobin) {
+            mask &= mask - 1;
+            let mut best_prio = self.priorities[best_idx];
+            while mask != 0 {
+                let off = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                let idx = (start + off) & 63;
+                let prio = self.priorities[idx];
+                if prio > best_prio {
+                    best_idx = idx;
+                    best_prio = prio;
+                }
+            }
+        }
+        best_idx
+    }
+
     /// SMP-safe lookup of the next `Ready` thread slot without mutating `self.current`
     /// or demoting any thread currently `Running` on another CPU.
     ///
@@ -289,42 +394,22 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
     /// respecting [`ACTIVE_SCHED_POLICY`]. The caller transitions the chosen slot to
     /// `Running` via [`Self::mark_running`].
     #[inline]
+    #[must_use]
     pub fn pick_next_ready(&self, after_slot: usize) -> Option<usize> {
         if MAX_THREADS == 0 {
             return None;
         }
-        let start = if after_slot + 1 < MAX_THREADS {
-            after_slot + 1
-        } else {
-            0
-        };
+        let start = after_slot
+            .checked_add(1)
+            .filter(|&next| next < MAX_THREADS)
+            .unwrap_or(0);
 
         if MAX_THREADS <= 64 {
             let rm = self.ready_mask;
             if rm == 0 {
                 return None;
             }
-            if rm.is_power_of_two() {
-                return Some(rm.trailing_zeros() as usize);
-            }
-            let mut mask = rm.rotate_right(start as u32);
-            let first_off = mask.trailing_zeros() as usize;
-            let mut best_idx = (start + first_off) & 63;
-            if matches!(ACTIVE_SCHED_POLICY, SchedPolicyKind::PriorityRoundRobin) {
-                mask &= mask - 1;
-                let mut best_prio = self.priorities[best_idx];
-                while mask != 0 {
-                    let off = mask.trailing_zeros() as usize;
-                    mask &= mask - 1;
-                    let idx = (start + off) & 63;
-                    let prio = self.priorities[idx];
-                    if prio > best_prio {
-                        best_idx = idx;
-                        best_prio = prio;
-                    }
-                }
-            }
-            return Some(best_idx);
+            return Some(self.pick_from_ready_mask(rm, start));
         }
 
         let mut best: Option<(usize, u8)> = None;
@@ -417,36 +502,7 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
     /// to preempt it under [`ACTIVE_SCHED_POLICY`].
     #[inline]
     pub fn on_timer_tick(&mut self) -> bool {
-        if matches!(ACTIVE_SCHED_POLICY, SchedPolicyKind::Fifo) {
-            return false;
-        }
-        let Some(cur) = self.current else {
-            return false;
-        };
-        let cur_prio = {
-            let Some(tcb) = &mut self.threads[cur] else {
-                return false;
-            };
-            if tcb.state != ThreadState::Running {
-                return false;
-            }
-            if tcb.quantum_remaining > 1 {
-                tcb.quantum_remaining -= 1;
-                return false;
-            }
-            tcb.quantum_remaining = DEFAULT_TIME_SLICE;
-            tcb.priority
-        };
-
-        let has_preemptor = match ACTIVE_SCHED_POLICY {
-            SchedPolicyKind::PriorityRoundRobin => self.has_ready_with_min_priority(cur_prio),
-            SchedPolicyKind::RoundRobin => self.ready_count() > 0,
-            SchedPolicyKind::Fifo => false,
-        };
-        if has_preemptor && let Some(tcb) = &mut self.threads[cur] {
-            tcb.preemptions = tcb.preemptions.saturating_add(1);
-        }
-        has_preemptor
+        self.current.is_some_and(|cur| self.on_timer_tick_for(cur))
     }
 
     #[inline]
@@ -494,6 +550,9 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
     }
 
     /// Enqueue a stolen/migrated `ThreadControlBlock` onto this CPU's runqueue.
+    ///
+    /// # Errors
+    /// Returns [`SysError::OutOfMemory`] if this runqueue has no empty thread slots.
     pub fn enqueue_migrated(
         &mut self,
         mut tcb: ThreadControlBlock,
@@ -521,13 +580,10 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
         if MAX_THREADS == 0 {
             return None;
         }
-        let start = match self.current {
-            Some(c) => {
-                let next = c + 1;
-                if next == MAX_THREADS { 0 } else { next }
-            }
-            None => 0,
-        };
+        let start = self.current.map_or(0, |c| {
+            let next = c + 1;
+            if next == MAX_THREADS { 0 } else { next }
+        });
 
         if let Some(cur) = self.current
             && let Some(tcb) = &mut self.threads[cur]
@@ -544,28 +600,7 @@ impl<const MAX_THREADS: usize> Scheduler<MAX_THREADS> {
             if rm == 0 {
                 return None;
             }
-            let best_idx = if rm.is_power_of_two() {
-                rm.trailing_zeros() as usize
-            } else {
-                let mut mask = rm.rotate_right(start as u32);
-                let first_off = mask.trailing_zeros() as usize;
-                let mut best_idx = (start + first_off) & 63;
-                if matches!(ACTIVE_SCHED_POLICY, SchedPolicyKind::PriorityRoundRobin) {
-                    mask &= mask - 1;
-                    let mut best_prio = self.priorities[best_idx];
-                    while mask != 0 {
-                        let off = mask.trailing_zeros() as usize;
-                        mask &= mask - 1;
-                        let idx = (start + off) & 63;
-                        let prio = self.priorities[idx];
-                        if prio > best_prio {
-                            best_idx = idx;
-                            best_prio = prio;
-                        }
-                    }
-                }
-                best_idx
-            };
+            let best_idx = self.pick_from_ready_mask(rm, start);
             self.current = Some(best_idx);
             self.ready_mask = rm & !(1u64 << best_idx);
             if let Some(tcb) = &mut self.threads[best_idx] {
@@ -632,9 +667,31 @@ pub struct SmpScheduler<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize>
 }
 
 #[cfg(feature = "smp")]
+impl<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize> fmt::Debug
+    for SmpScheduler<MAX_CPUS, MAX_THREADS_PER_CPU>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SmpScheduler")
+            .field("max_cpus", &MAX_CPUS)
+            .field("online_cpus", &self.online_cpus)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "smp")]
+impl<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize> Default
+    for SmpScheduler<MAX_CPUS, MAX_THREADS_PER_CPU>
+{
+    fn default() -> Self {
+        Self::new(MAX_CPUS)
+    }
+}
+
+#[cfg(feature = "smp")]
 impl<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize>
     SmpScheduler<MAX_CPUS, MAX_THREADS_PER_CPU>
 {
+    #[must_use]
     pub const fn new(online_cpus: usize) -> Self {
         let clamped = if MAX_CPUS == 0 {
             0
@@ -652,12 +709,13 @@ impl<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize>
     }
 
     #[inline]
+    #[must_use]
     pub const fn online_cpus(&self) -> usize {
         self.online_cpus
     }
 
     #[inline]
-    pub fn cpu_mut(&mut self, cpu_id: usize) -> Option<&mut Scheduler<MAX_THREADS_PER_CPU>> {
+    pub const fn cpu_mut(&mut self, cpu_id: usize) -> Option<&mut Scheduler<MAX_THREADS_PER_CPU>> {
         if cpu_id < self.online_cpus {
             Some(&mut self.per_cpu[cpu_id])
         } else {
@@ -666,6 +724,10 @@ impl<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize>
     }
 
     /// Spawn a thread on the least-loaded online CPU core, returning `(cpu_id, thread_id)`.
+    ///
+    /// # Errors
+    /// - [`SysError::OutOfMemory`] if `online_cpus == 0` or the chosen CPU's runqueue is full.
+    /// - [`SysError::InvalidArgument`] if the selected CPU index exceeds `u8::MAX`.
     pub fn spawn_balanced(&mut self, priority: u8) -> Result<(usize, ThreadId), SysError> {
         if self.online_cpus == 0 {
             return Err(SysError::OutOfMemory);
@@ -679,7 +741,8 @@ impl<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize>
                 best_cpu = cpu;
             }
         }
-        let tid = self.per_cpu[best_cpu].spawn_on_cpu(priority, best_cpu as u8)?;
+        let best_cpu_u8 = u8::try_from(best_cpu).map_err(|_| SysError::InvalidArgument)?;
+        let tid = self.per_cpu[best_cpu].spawn_on_cpu(priority, best_cpu_u8)?;
         Ok((best_cpu, tid))
     }
 
@@ -705,15 +768,17 @@ impl<const MAX_CPUS: usize, const MAX_THREADS_PER_CPU: usize>
         }
 
         let (victim_cpu, _) = busiest?;
+        let cpu_u8 = u8::try_from(cpu_id).ok()?;
+        let victim_u8 = u8::try_from(victim_cpu).ok()?;
         let stolen = self.per_cpu[victim_cpu].steal_ready()?;
         if self.per_cpu[cpu_id]
-            .enqueue_migrated(stolen, cpu_id as u8)
+            .enqueue_migrated(stolen, cpu_u8)
             .is_ok()
         {
             self.per_cpu[cpu_id].schedule_next()
         } else {
             // Restore stolen thread back to victim CPU so it is never lost.
-            let _ = self.per_cpu[victim_cpu].enqueue_migrated(stolen, victim_cpu as u8);
+            let _ = self.per_cpu[victim_cpu].enqueue_migrated(stolen, victim_u8);
             None
         }
     }
@@ -878,6 +943,9 @@ mod tests {
         assert!(!sched.on_timer_tick());
         sched.select_slot(99);
         assert_eq!(sched.current_slot(), None);
+        assert_eq!(sched.pick_next_ready(usize::MAX), None);
+        let _ = sched.spawn(10).unwrap();
+        assert_eq!(sched.pick_next_ready(usize::MAX), Some(0));
     }
 
     #[test]
@@ -1018,6 +1086,69 @@ mod tests {
         }
         assert_eq!(sched.ready_count(), 1);
         assert_eq!(sched.pick_next_ready(0), Some(1));
+    }
+
+    #[test]
+    fn scheduler_traits_debug_display_from_ord_and_smp_default() {
+        use core::fmt::Write as _;
+
+        struct Buf([u8; 160], usize);
+        impl core::fmt::Write for Buf {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let n = bytes.len().min(self.0.len() - self.1);
+                self.0[self.1..self.1 + n].copy_from_slice(&bytes[..n]);
+                self.1 += n;
+                Ok(())
+            }
+        }
+
+        // ThreadId From/Ord/Display/new/raw
+        let t1 = ThreadId::new(1);
+        let t2 = ThreadId::from(2u32);
+        assert!(t1 < t2);
+        assert_eq!(t1.raw(), 1);
+        assert_eq!(u32::from(t2), 2);
+        let mut buf = Buf([0; 160], 0);
+        write!(&mut buf, "{t2}").expect("format tid");
+        assert_eq!(&buf.0[..buf.1], b"tid:2");
+
+        // SchedPolicyKind Display
+        for (policy, expected) in [
+            (SchedPolicyKind::PriorityRoundRobin, "priority-rr"),
+            (SchedPolicyKind::RoundRobin, "round-robin"),
+            (SchedPolicyKind::Fifo, "fifo"),
+        ] {
+            let mut pbuf = Buf([0; 160], 0);
+            write!(&mut pbuf, "{policy}").expect("format policy");
+            assert_eq!(
+                core::str::from_utf8(&pbuf.0[..pbuf.1]).expect("utf8"),
+                expected
+            );
+        }
+
+        // Scheduler Debug
+        let mut sched = Scheduler::<8>::new();
+        let _ = sched.spawn(DEFAULT_PRIORITY).expect("spawn");
+        let mut sbuf = Buf([0; 160], 0);
+        write!(&mut sbuf, "{sched:?}").expect("format sched");
+        let rendered = core::str::from_utf8(&sbuf.0[..sbuf.1]).expect("utf8");
+        assert!(rendered.contains("Scheduler"));
+        assert!(rendered.contains("max_threads: 8"));
+        assert!(rendered.contains("ready_count: 1"));
+        assert!(rendered.contains(".."));
+
+        #[cfg(feature = "smp")]
+        {
+            let smp = SmpScheduler::<4, 8>::default();
+            assert_eq!(smp.online_cpus(), 4);
+            let mut smp_buf = Buf([0; 160], 0);
+            write!(&mut smp_buf, "{smp:?}").expect("format smp");
+            let smp_rendered = core::str::from_utf8(&smp_buf.0[..smp_buf.1]).expect("utf8");
+            assert!(smp_rendered.contains("SmpScheduler"));
+            assert!(smp_rendered.contains("online_cpus: 4"));
+            assert!(smp_rendered.contains(".."));
+        }
     }
 }
 

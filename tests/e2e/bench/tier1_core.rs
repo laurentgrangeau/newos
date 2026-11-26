@@ -2,8 +2,8 @@
 //! 15 tests covering the 16-metric schema, METRIC & markdown parsing, comparison logic, Cargo, and xtask.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
 use std::process::Command;
 
 use crate::bench_parser::{
@@ -14,38 +14,39 @@ use crate::bench_parser::{
 
 fn sample_full_metric_output() -> String {
     let mut s = String::new();
-    for (i, k) in KERNEL_SPEED_KEYS.iter().enumerate() {
-        s.push_str(&format!(
-            "METRIC {k} {:.2} ns/op\n",
-            50.0 + (i as f64) * 5.0
-        ));
+    for (i, k) in (0u32..).zip(KERNEL_SPEED_KEYS) {
+        let _ = writeln!(s, "METRIC {k} {:.2} ns/op", f64::from(i).mul_add(5.0, 50.0));
     }
-    for (i, k) in SHELL_SPEED_KEYS.iter().enumerate() {
-        s.push_str(&format!(
-            "METRIC {k} {:.2} ns/op\n",
-            500.0 + (i as f64) * 100.0
-        ));
+    for (i, k) in (0u32..).zip(SHELL_SPEED_KEYS) {
+        let _ = writeln!(
+            s,
+            "METRIC {k} {:.2} ns/op",
+            f64::from(i).mul_add(100.0, 500.0)
+        );
     }
     for (i, k) in IPC_CONSUMPTION_KEYS.iter().enumerate() {
-        s.push_str(&format!("METRIC {k} {} syscalls\n", 10 + i * 5));
+        let _ = writeln!(s, "METRIC {k} {} syscalls", 10 + i * 5);
     }
     s
 }
 
 fn sample_maps(factor_speed: f64, factor_ipc: f64) -> BTreeMap<String, f64> {
     let mut m = BTreeMap::new();
-    for (i, k) in KERNEL_SPEED_KEYS.iter().enumerate() {
-        m.insert((*k).to_string(), (100.0 + (i as f64) * 10.0) * factor_speed);
-    }
-    for (i, k) in SHELL_SPEED_KEYS.iter().enumerate() {
+    for (i, k) in (0u32..).zip(KERNEL_SPEED_KEYS) {
         m.insert(
             (*k).to_string(),
-            (1000.0 + (i as f64) * 100.0) * factor_speed,
+            f64::from(i).mul_add(10.0, 100.0) * factor_speed,
+        );
+    }
+    for (i, k) in (0u32..).zip(SHELL_SPEED_KEYS) {
+        m.insert(
+            (*k).to_string(),
+            f64::from(i).mul_add(100.0, 1000.0) * factor_speed,
         );
     }
     let mut ipc_sum = 0.0;
-    for (i, k) in IPC_CONSUMPTION_KEYS[..5].iter().enumerate() {
-        let v = ((20 + i * 10) as f64 * factor_ipc).round();
+    for (i, k) in (0u32..).zip(&IPC_CONSUMPTION_KEYS[..5]) {
+        let v = (f64::from(20 + i * 10) * factor_ipc).round();
         m.insert((*k).to_string(), v);
         ipc_sum += v;
     }
@@ -60,7 +61,7 @@ fn tier1_bench_schema_has_exact_16_unique_metric_keys() {
     assert_eq!(IPC_CONSUMPTION_KEYS.len(), 6);
     let all = all_metric_keys();
     assert_eq!(all.len(), 16);
-    let mut dedup = all.clone();
+    let mut dedup = all;
     dedup.sort_unstable();
     dedup.dedup();
     assert_eq!(dedup.len(), 16);
@@ -117,7 +118,7 @@ fn tier1_bench_parse_markdown_baseline_only_section() {
     );
     for k in all_metric_keys() {
         let unit = if is_speed_metric(k) { "ns/op" } else { "count" };
-        md.push_str(&format!("| `{k}` | 42 | {unit} |\n"));
+        let _ = writeln!(md, "| `{k}` | 42 | {unit} |");
     }
     let report = parse_benchmark_results_md(&md).unwrap();
     assert_eq!(report.baseline.len(), 16);
@@ -131,7 +132,7 @@ fn tier1_bench_parse_markdown_unified_comparison_table() {
     );
     for k in all_metric_keys() {
         let unit = if is_speed_metric(k) { "ns/op" } else { "count" };
-        md.push_str(&format!("| `{k}` | {unit} | 100.0 | 40.0 | -60% |\n"));
+        let _ = writeln!(md, "| `{k}` | {unit} | 100.0 | 40.0 | -60% |");
     }
     let report = parse_benchmark_results_md(&md).unwrap();
     assert_eq!(report.baseline.len(), 16);
@@ -157,9 +158,9 @@ fn tier1_bench_parse_markdown_handles_commas_and_bold_numbers() {
     let mut md = String::from("## Comparison\n| Metric | Baseline | Post-Opt |\n|---|---|---|\n");
     for k in all_metric_keys() {
         if is_ipc_metric(k) {
-            md.push_str(&format!("| `{k}` | **1,250** | `625` |\n"));
+            let _ = writeln!(md, "| `{k}` | **1,250** | `625` |");
         } else {
-            md.push_str(&format!("| `{k}` | **1,250.5** | `625.25` |\n"));
+            let _ = writeln!(md, "| `{k}` | **1,250.5** | `625.25` |");
         }
     }
     let report = parse_benchmark_results_md(&md).unwrap();
@@ -233,7 +234,7 @@ fn tier1_bench_xtask_compiles_offline_with_rustc() {
         .arg(&out_bin)
         .status()
         .expect("invoke rustc on xtask/src/main.rs");
-    let exists = Path::new(&out_bin).exists();
+    let exists = out_bin.exists();
     let _ = fs::remove_file(&out_bin);
     assert!(
         status.success(),
@@ -255,7 +256,7 @@ fn tier1_bench_parse_markdown_4col_category_metric_table_without_raw_lines() {
         } else {
             ("IPC Consumption", "42", "syscalls")
         };
-        md.push_str(&format!("| {cat} | `{k}` | {val} | {unit} |\n"));
+        let _ = writeln!(md, "| {cat} | `{k}` | {val} | {unit} |");
     }
     let report = parse_benchmark_results_md(&md).unwrap();
     assert_eq!(report.baseline.len(), 16);
@@ -278,9 +279,7 @@ fn tier1_bench_parse_markdown_6col_category_metric_comparison_table() {
         } else {
             ("IPC Consumption", "100", "25", "syscalls")
         };
-        md.push_str(&format!(
-            "| {cat} | `{k}` | {base} | {post} | -60% | {unit} |\n"
-        ));
+        let _ = writeln!(md, "| {cat} | `{k}` | {base} | {post} | -60% | {unit} |");
     }
     let report = parse_benchmark_results_md(&md).unwrap();
     assert_eq!(report.baseline.len(), 16);
@@ -301,13 +300,9 @@ fn tier1_bench_parse_markdown_bold_backtick_cells_and_inline_units() {
     );
     for k in all_metric_keys() {
         if is_ipc_metric(k) {
-            md.push_str(&format!(
-                "| IPC | **`{k}`** | **`100`** | **40** syscalls |\n"
-            ));
+            let _ = writeln!(md, "| IPC | **`{k}`** | **`100`** | **40** syscalls |");
         } else {
-            md.push_str(&format!(
-                "| Speed | **`{k}`** | **`50`** | **25** ns/op |\n"
-            ));
+            let _ = writeln!(md, "| Speed | **`{k}`** | **`50`** | **25** ns/op |");
         }
     }
     let report = parse_benchmark_results_md(&md).unwrap();
@@ -329,7 +324,7 @@ fn tier1_bench_parse_markdown_post_opt_comparison_heading_routes_metric_lines() 
         } else {
             ("1.79", "ns/op")
         };
-        md.push_str(&format!("| Cat | `{k}` | {val} | {unit} |\n"));
+        let _ = writeln!(md, "| Cat | `{k}` | {val} | {unit} |");
     }
     md.push_str("\n## Post-Optimization (M4) & Delta Comparison\n\n");
     for k in all_metric_keys() {
@@ -338,7 +333,7 @@ fn tier1_bench_parse_markdown_post_opt_comparison_heading_routes_metric_lines() 
         } else {
             ("0.85", "ns/op")
         };
-        md.push_str(&format!("METRIC {k} {val} {unit}\n"));
+        let _ = writeln!(md, "METRIC {k} {val} {unit}");
     }
 
     let report = parse_benchmark_results_md(&md).unwrap();

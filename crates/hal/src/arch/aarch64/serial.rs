@@ -1,10 +1,10 @@
-//! ARM PL011 UART driver via HHDM MMIO (QEMU `virt` `0x0900_0000`, Pi 5 BCM2712 `0x10_7D00_1000`).
+//! ARM `PL011` UART driver via HHDM MMIO (QEMU `virt` `0x0900_0000`, Pi 5 `BCM2712` `0x10_7D00_1000`).
 
 use core::fmt::{self, Write};
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use newos_abi::timestamp::{
-    LineTimestampState, MAX_PREFIX_LEN, format_prefix, ticks_to_secs_nanos,
+    LinePosition, LineTimestampState, MAX_PREFIX_LEN, format_prefix, ticks_to_secs_nanos,
 };
 
 use super::syscall::{IrqSpinLock, read_cntfrq, read_cntvct};
@@ -14,11 +14,40 @@ const UART_FR_OFF: usize = 0x18;
 const UART_FR_RXFE: u32 = 1 << 4;
 const UART_FR_TXFF: u32 = 1 << 5;
 
-static PL011_VIRT_BASE: AtomicU64 = AtomicU64::new(0);
+const LINE_POS_START: u8 = 0;
+const LINE_POS_MID: u8 = 1;
+
+struct AtomicLinePosition(AtomicU8);
+
+impl AtomicLinePosition {
+    const fn new(pos: LinePosition) -> Self {
+        Self(AtomicU8::new(Self::encode(pos)))
+    }
+
+    const fn encode(pos: LinePosition) -> u8 {
+        match pos {
+            LinePosition::LineStart => LINE_POS_START,
+            LinePosition::MidLine => LINE_POS_MID,
+        }
+    }
+
+    fn load(&self) -> LinePosition {
+        match self.0.load(Ordering::Relaxed) {
+            LINE_POS_START => LinePosition::LineStart,
+            _ => LinePosition::MidLine,
+        }
+    }
+
+    fn store(&self, pos: LinePosition) {
+        self.0.store(Self::encode(pos), Ordering::Relaxed);
+    }
+}
+
+static PL011_VIRT_BASE: AtomicUsize = AtomicUsize::new(0);
 static BOOT_COUNTER_START: AtomicU64 = AtomicU64::new(0);
 static BOOT_COUNTER_FREQ: AtomicU64 = AtomicU64::new(0);
 static PL011_LOCK: IrqSpinLock<LineTimestampState> = IrqSpinLock::new(LineTimestampState::new());
-static UNLOCKED_AT_LINE_START: AtomicBool = AtomicBool::new(true);
+static UNLOCKED_LINE_POS: AtomicLinePosition = AtomicLinePosition::new(LinePosition::LineStart);
 
 /// Capture the monotonic ARM Generic Virtual Counter (`CNTVCT_EL0`) and frequency
 /// (`CNTFRQ_EL0`) at kernel entry (`_start`) as the `0.000000000s` boot clock origin.
@@ -28,6 +57,7 @@ pub fn init_boot_clock() {
 }
 
 /// Elapsed monotonic `(whole_seconds, subsec_nanoseconds)` since `init_boot_clock()`.
+#[must_use]
 #[inline]
 pub fn boot_elapsed_secs_nanos() -> (u64, u32) {
     let start = BOOT_COUNTER_START.load(Ordering::Acquire);
@@ -36,15 +66,20 @@ pub fn boot_elapsed_secs_nanos() -> (u64, u32) {
     ticks_to_secs_nanos(elapsed, freq)
 }
 
-/// Initialize PL011 virtual MMIO base address.
-pub fn init_virt(virt_base: u64) {
+/// Initialize `PL011` virtual MMIO base address.
+///
+/// # Safety
+/// `virt_base` must be a valid, page-aligned Device-nGnRnE MMIO mapping in `TTBR1_EL1`
+/// covering the `PL011` UART register block (`DR` at `+0x00`, `FR` at `+0x18`).
+pub(super) unsafe fn init_virt(virt_base: usize) {
     PL011_VIRT_BASE.store(virt_base, Ordering::Release);
 }
 
-/// Non-blocking 1-byte read from PL011 RX FIFO (SMP-synchronized via `PL011_LOCK`).
+/// Non-blocking 1-byte read from `PL011` RX FIFO (SMP-synchronized via `PL011_LOCK`).
+#[must_use]
 pub fn try_read_byte() -> Option<u8> {
     let _guard = PL011_LOCK.lock();
-    let base = PL011_VIRT_BASE.load(Ordering::Acquire) as usize;
+    let base = PL011_VIRT_BASE.load(Ordering::Acquire);
     if base == 0 {
         return None;
     }
@@ -55,24 +90,21 @@ pub fn try_read_byte() -> Option<u8> {
             return None;
         }
         let dr = (base + UART_DR_OFF) as *const u32;
-        Some((read_volatile(dr) & 0xFF) as u8)
+        u8::try_from(read_volatile(dr) & 0xFF).ok()
     }
 }
 
+/// SMP-synchronized `PL011` UART console writer.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Pl011;
 
-/// Lock-bypassing PL011 writer reserved strictly for fatal EL1 panic/exception paths
+/// Lock-bypassing `PL011` writer reserved strictly for fatal EL1 panic/exception paths
 /// so a crash while holding `PL011_LOCK` never deadlocks.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct UnlockedPl011;
 
-impl Default for Pl011 {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Pl011 {
+    #[must_use]
     #[inline]
     pub const fn new() -> Self {
         Self
@@ -89,8 +121,8 @@ impl Pl011 {
         }
     }
 
-    fn write_str_with_state(&self, s: &str, state: &mut LineTimestampState) {
-        let base = PL011_VIRT_BASE.load(Ordering::Acquire) as usize;
+    fn write_str_with_state(s: &str, state: &mut LineTimestampState) {
+        let base = PL011_VIRT_BASE.load(Ordering::Acquire);
         if base == 0 {
             return;
         }
@@ -112,26 +144,31 @@ impl Pl011 {
         }
     }
 
-    /// Write `s` directly to PL011 without acquiring `PL011_LOCK` (fatal panic/exception path only).
-    pub fn write_str_unlocked(&self, s: &str) {
-        let mut state =
-            LineTimestampState::with_at_line_start(UNLOCKED_AT_LINE_START.load(Ordering::Relaxed));
-        self.write_str_with_state(s, &mut state);
-        UNLOCKED_AT_LINE_START.store(state.at_line_start(), Ordering::Relaxed);
+    /// Write `s` directly to `PL011` without acquiring `PL011_LOCK` (fatal panic/exception path only).
+    pub fn write_str_unlocked(s: &str) {
+        let initial = UNLOCKED_LINE_POS.load();
+        let mut state = LineTimestampState::with_position(initial);
+        Self::write_str_with_state(s, &mut state);
+        let next_pos = if state.at_line_start() {
+            LinePosition::LineStart
+        } else {
+            LinePosition::MidLine
+        };
+        UNLOCKED_LINE_POS.store(next_pos);
     }
 }
 
 impl Write for Pl011 {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         let mut state = PL011_LOCK.lock();
-        self.write_str_with_state(s, &mut state);
+        Self::write_str_with_state(s, &mut state);
         Ok(())
     }
 }
 
 impl Write for UnlockedPl011 {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        Pl011::new().write_str_unlocked(s);
+        Pl011::write_str_unlocked(s);
         Ok(())
     }
 }

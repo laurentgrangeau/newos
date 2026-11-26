@@ -2,7 +2,8 @@
 
 use newos_rng::{EntropySource, RngError};
 
-/// Deterministic SplitMix64 entropy source shared by host E2E and regression tests.
+/// Deterministic `SplitMix64` entropy source shared by host E2E and regression tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeterministicTestEntropy(pub u64);
 
 impl EntropySource for DeterministicTestEntropy {
@@ -12,7 +13,7 @@ impl EntropySource for DeterministicTestEntropy {
             let mut z = self.0;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            *b = (z ^ (z >> 31)) as u8;
+            *b = (z ^ (z >> 31)).to_le_bytes()[0];
         }
         Ok(())
     }

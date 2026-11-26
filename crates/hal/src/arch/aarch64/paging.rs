@@ -1,13 +1,40 @@
-//! Minimal audited 64-bit ARMv8 4-level 4 KiB paging (`TTBR1_EL1` kernel & `TTBR0_EL1` user).
+//! Minimal audited 64-bit `ARMv8` 4-level 4 KiB paging (`TTBR1_EL1` kernel & `TTBR0_EL1` user).
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_bytes, write_volatile};
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use newos_abi::SysError;
 use newos_kernel_core::memory::{
-    HUGE_PAGE_MASK_2M, PAGE_SIZE, PageFlags, PhysAddr, PhysFrame, PhysFrame2M, UntypedInventory,
-    VSpaceMapper, VirtAddr,
+    HUGE_PAGE_MASK_2M, PAGE_SIZE, PageAccess, PageCachePolicy, PageFlags, PagePrivilege, PhysAddr,
+    PhysFrame, PhysFrame2M, UntypedInventory, VSpaceMapper, VirtAddr,
 };
+
+/// Physical backing kind of a newly unmapped 4 KiB leaf PTE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnmappedFrameKind {
+    /// Normal RAM frame eligible for zeroing and untyped reclamation.
+    Ram,
+    /// Device MMIO frame (`MmioMap`) that must never be zeroed or reclaimed as RAM.
+    DeviceMmio,
+}
+
+/// Kind of physical frame yielded during full user `VSpace` teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimedFrameKind {
+    /// Non-device 4 KiB user leaf RAM frame.
+    LeafRam,
+    /// Intermediate L3/L2/L1 or root L0 page-table frame (already zeroed).
+    PageTable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeafGranule {
+    Page4K,
+    Block2M,
+}
+
+const PAGE_SIZE_USIZE: usize = 4096;
+const _: () = assert!(PAGE_SIZE_USIZE as u64 == PAGE_SIZE);
 
 const DESC_VALID: u64 = 1 << 0;
 const DESC_TABLE_OR_PAGE: u64 = 1 << 1;
@@ -26,7 +53,7 @@ static CACHED_DEVICE_MAIR_IDX: AtomicU8 = AtomicU8::new(u8::MAX);
 static CACHED_NORMAL_NC_MAIR_IDX: AtomicU8 = AtomicU8::new(u8::MAX);
 static DCACHE_LINE_BYTES: AtomicU64 = AtomicU64::new(64);
 
-/// Record the probed architectural D-cache minimum line size (`CTR_EL0.DminLine`, 64 B on Cortex-A76).
+/// Record the probed architectural D-cache minimum line size (`CTR_EL0.DminLine`, 64 B on `Cortex-A76`).
 pub fn set_dcache_line_bytes(bytes: u64) {
     if bytes.is_power_of_two() && (16..=256).contains(&bytes) {
         DCACHE_LINE_BYTES.store(bytes, Ordering::Release);
@@ -34,10 +61,10 @@ pub fn set_dcache_line_bytes(bytes: u64) {
 }
 
 #[inline]
-fn device_mair_index() -> u64 {
+fn device_mair_index() -> u8 {
     let cached = CACHED_DEVICE_MAIR_IDX.load(Ordering::Relaxed);
     if cached != u8::MAX {
-        return u64::from(cached);
+        return cached;
     }
     let mair: u64;
     // SAFETY: Reading `MAIR_EL1` in EL1 inspects Limine's immutable boot memory attributes.
@@ -47,7 +74,7 @@ fn device_mair_index() -> u64 {
     let mut found = 0u8;
     let mut fallback = None;
     for idx in 0..8u8 {
-        let attr = ((mair >> (u64::from(idx) * 8)) & 0xFF) as u8;
+        let attr = u8::try_from((mair >> (u64::from(idx) * 8)) & 0xFF).unwrap_or(0);
         if attr == 0x00 {
             found = idx;
             fallback = None;
@@ -61,14 +88,14 @@ fn device_mair_index() -> u64 {
         found = fb;
     }
     CACHED_DEVICE_MAIR_IDX.store(found, Ordering::Relaxed);
-    u64::from(found)
+    found
 }
 
 #[inline]
-fn normal_nc_mair_index() -> u64 {
+fn normal_nc_mair_index() -> u8 {
     let cached = CACHED_NORMAL_NC_MAIR_IDX.load(Ordering::Relaxed);
     if cached != u8::MAX {
-        return u64::from(cached);
+        return cached;
     }
     let mair: u64;
     // SAFETY: Reading `MAIR_EL1` in EL1 inspects Limine's boot memory attributes.
@@ -77,16 +104,16 @@ fn normal_nc_mair_index() -> u64 {
     }
     // Look for Normal Outer+Inner Non-Cacheable (`0x44`) in `MAIR_EL1`.
     for idx in 0..8u8 {
-        let attr = ((mair >> (u64::from(idx) * 8)) & 0xFF) as u8;
+        let attr = u8::try_from((mair >> (u64::from(idx) * 8)) & 0xFF).unwrap_or(0);
         if attr == 0x44 {
             CACHED_NORMAL_NC_MAIR_IDX.store(idx, Ordering::Relaxed);
-            return u64::from(idx);
+            return idx;
         }
     }
     // Fallback to Device-nGnRnE index if bootloader did not populate a Normal-NC slot.
-    let fb = device_mair_index() as u8;
+    let fb = device_mair_index();
     CACHED_NORMAL_NC_MAIR_IDX.store(fb, Ordering::Relaxed);
-    u64::from(fb)
+    fb
 }
 
 #[inline]
@@ -189,13 +216,15 @@ pub fn ensure_ttbr0_asid_enabled() {
     }
 }
 
-/// 4-level 4 KiB ARMv8 `VSpace` (kernel `TTBR1_EL1` or isolated EL0 `TTBR0_EL1`).
+/// 4-level 4 KiB `ARMv8` `VSpace` (kernel `TTBR1_EL1` or isolated EL0 `TTBR0_EL1`).
+#[derive(Debug)]
 pub struct Aarch64VSpace {
     l0_phys: u64,
     hhdm_offset: u64,
 }
 
 impl Aarch64VSpace {
+    #[must_use]
     pub fn from_current_ttbr1(hhdm_offset: u64) -> Self {
         Self {
             l0_phys: read_ttbr1_phys(),
@@ -204,6 +233,7 @@ impl Aarch64VSpace {
     }
 
     /// Wrap an existing L0 page-table root physical address (e.g. active `TTBR0_EL1`).
+    #[must_use]
     pub const fn from_root_phys(l0_phys: u64, hhdm_offset: u64) -> Self {
         Self {
             l0_phys: l0_phys & DESC_ADDR_MASK,
@@ -212,6 +242,9 @@ impl Aarch64VSpace {
     }
 
     /// Allocate a brand-new, empty EL0 `TTBR0_EL1` root L0 table (hardware-isolated from `TTBR1_EL1`).
+    ///
+    /// # Errors
+    /// Returns [`SysError::OutOfMemory`] if `untyped` cannot supply a 4 KiB physical frame.
     pub fn new_user_vspace(&self, untyped: &mut UntypedInventory) -> Result<Self, SysError> {
         let l0_frame = untyped.retype_frame()?;
         self.zero_frame(&l0_frame);
@@ -222,7 +255,7 @@ impl Aarch64VSpace {
     }
 
     #[inline]
-    fn table_ptr(&self, phys: u64) -> *mut u64 {
+    const fn table_ptr(&self, phys: u64) -> *mut u64 {
         self.hhdm_offset.wrapping_add(phys) as *mut u64
     }
 
@@ -247,7 +280,8 @@ impl Aarch64VSpace {
         Ok(())
     }
 
-    fn indices(virt: VirtAddr) -> [usize; 4] {
+    #[allow(clippy::cast_possible_truncation)] // Masked to 9 bits (`0..512`), always fits in `usize`.
+    const fn indices(virt: VirtAddr) -> [usize; 4] {
         let v = virt.raw();
         [
             ((v >> 39) & 0x1FF) as usize, // L0
@@ -257,11 +291,12 @@ impl Aarch64VSpace {
         ]
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)] // Exclusive `&mut self` enforces single-writer access to raw page tables.
     fn unmap_4k_leaf(
         &mut self,
         virt: VirtAddr,
         asid: Option<u16>,
-    ) -> Result<(PhysFrame, bool, [u64; 3], [usize; 3]), SysError> {
+    ) -> Result<(PhysFrame, UnmappedFrameKind, [u64; 3], [usize; 3]), SysError> {
         let [i0, i1, i2, i3] = Self::indices(virt);
         let l1 = self
             .next_table_existing(self.l0_phys, i0)
@@ -278,9 +313,13 @@ impl Aarch64VSpace {
             return Err(SysError::InvalidArgument);
         }
 
-        let dev_idx = device_mair_index();
+        let dev_idx = u64::from(device_mair_index());
         let attr_idx = (pte >> 2) & 0x7;
-        let is_device = attr_idx == dev_idx && dev_idx != 0;
+        let kind = if attr_idx == dev_idx && dev_idx != 0 {
+            UnmappedFrameKind::DeviceMmio
+        } else {
+            UnmappedFrameKind::Ram
+        };
 
         self.write_desc(l3, i3, 0)?;
         if let Some(a) = asid {
@@ -289,9 +328,10 @@ impl Aarch64VSpace {
             tlbi_va(virt);
         }
         let frame = PhysFrame::from_aligned(PhysAddr::new(pte & DESC_ADDR_MASK))?;
-        Ok((frame, is_device, [l1, l2, l3], [i0, i1, i2]))
+        Ok((frame, kind, [l1, l2, l3], [i0, i1, i2]))
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)] // Exclusive `&mut self` enforces single-writer access to raw page tables.
     fn try_reclaim_empty_table(
         &mut self,
         parent_phys: u64,
@@ -311,15 +351,18 @@ impl Aarch64VSpace {
     }
 
     /// Unmap a 4 KiB page using targeted `tlbi vae1is` when `asid` is provided (or `tlbi vaae1is`
-    /// otherwise), returning `(frame, is_device)` where `is_device` is `true` if the leaf PTE
-    /// carried the `Device` MAIR index (`MmioMap` pages must never be zeroed or reclaimed as RAM).
+    /// otherwise), returning `(frame, kind)` so device MMIO pages (`MmioMap`) are never zeroed or
+    /// reclaimed as RAM.
+    ///
+    /// # Errors
+    /// Returns [`SysError::InvalidArgument`] if `virt` is not currently mapped as a valid 4 KiB leaf.
     pub fn unmap_4k_asid(
         &mut self,
         virt: VirtAddr,
         asid: Option<u16>,
-    ) -> Result<(PhysFrame, bool), SysError> {
-        let (frame, is_device, _, _) = self.unmap_4k_leaf(virt, asid)?;
-        Ok((frame, is_device))
+    ) -> Result<(PhysFrame, UnmappedFrameKind), SysError> {
+        let (frame, kind, _, _) = self.unmap_4k_leaf(virt, asid)?;
+        Ok((frame, kind))
     }
 
     /// Mark a page-aligned EL1 virtual address range (`start_va..end_va`) read-only + NX
@@ -341,10 +384,10 @@ impl Aarch64VSpace {
                     tlbi_va(va);
                 }
             }
-            match cur.checked_add(PAGE_SIZE) {
-                Some(next) => cur = next,
-                None => break,
-            }
+            let Some(next) = cur.checked_add(PAGE_SIZE) else {
+                break;
+            };
+            cur = next;
         }
     }
 
@@ -362,13 +405,16 @@ impl Aarch64VSpace {
 
     /// Unmap a 4 KiB page and prune/reclaim any intermediate L3/L2/L1 page-table pages that
     /// become completely empty (zero page-table memory leaks on `UnmapPage`).
+    ///
+    /// # Errors
+    /// Returns [`SysError::InvalidArgument`] if `virt` is not currently mapped as a valid 4 KiB leaf.
     pub fn unmap_4k_asid_reclaim(
         &mut self,
         virt: VirtAddr,
         asid: Option<u16>,
         untyped: &mut UntypedInventory,
-    ) -> Result<(PhysFrame, bool), SysError> {
-        let (frame, is_device, [l1, l2, l3], [i0, i1, i2]) = self.unmap_4k_leaf(virt, asid)?;
+    ) -> Result<(PhysFrame, UnmappedFrameKind), SysError> {
+        let (frame, kind, [l1, l2, l3], [i0, i1, i2]) = self.unmap_4k_leaf(virt, asid)?;
         if self.try_reclaim_empty_table(l2, i2, l3, untyped) {
             if self.try_reclaim_empty_table(l1, i1, l2, untyped) {
                 let _ = self.try_reclaim_empty_table(self.l0_phys, i0, l1, untyped);
@@ -377,17 +423,21 @@ impl Aarch64VSpace {
                 tlbi_asid(a);
             }
         }
-        Ok((frame, is_device))
+        Ok((frame, kind))
     }
 
     /// Walk the entire user-half (`L0[0..256]`) 4-level page-table hierarchy, clearing every
-    /// entry and invoking `on_frame(frame, is_table)` for every non-device 4 KiB leaf frame
-    /// (`is_table = false`) and every L3/L2/L1/L0 page-table frame (`is_table = true`, already zeroed).
+    /// entry and invoking `on_frame(frame, kind)` for every non-device 4 KiB leaf frame
+    /// ([`ReclaimedFrameKind::LeafRam`]) and every L3/L2/L1/L0 page-table frame
+    /// ([`ReclaimedFrameKind::PageTable`], already zeroed).
     ///
     /// Caller MUST ensure no CPU is actively executing with this `VSpace` loaded in `TTBR0_EL1`
     /// and MUST follow up with `tlbi_asid(asid)`.
-    pub fn reclaim_all_user_frames(&mut self, mut on_frame: impl FnMut(PhysFrame, bool)) {
-        let dev_idx = device_mair_index();
+    pub fn reclaim_all_user_frames(
+        &mut self,
+        mut on_frame: impl FnMut(PhysFrame, ReclaimedFrameKind),
+    ) {
+        let dev_idx = u64::from(device_mair_index());
         for i0 in 0..256usize {
             let Ok(l0_desc) = self.read_desc(self.l0_phys, i0) else {
                 continue;
@@ -432,31 +482,31 @@ impl Aarch64VSpace {
                             && let Ok(frame) =
                                 PhysFrame::from_aligned(PhysAddr::new(pte & DESC_ADDR_MASK))
                         {
-                            on_frame(frame, false);
+                            on_frame(frame, ReclaimedFrameKind::LeafRam);
                         }
                     }
 
                     if let Ok(l3_fr) = PhysFrame::from_aligned(PhysAddr::new(l3_phys)) {
                         self.zero_frame(&l3_fr);
-                        on_frame(l3_fr, true);
+                        on_frame(l3_fr, ReclaimedFrameKind::PageTable);
                     }
                 }
 
                 if let Ok(l2_fr) = PhysFrame::from_aligned(PhysAddr::new(l2_phys)) {
                     self.zero_frame(&l2_fr);
-                    on_frame(l2_fr, true);
+                    on_frame(l2_fr, ReclaimedFrameKind::PageTable);
                 }
             }
 
             if let Ok(l1_fr) = PhysFrame::from_aligned(PhysAddr::new(l1_phys)) {
                 self.zero_frame(&l1_fr);
-                on_frame(l1_fr, true);
+                on_frame(l1_fr, ReclaimedFrameKind::PageTable);
             }
         }
 
         if let Ok(l0_fr) = PhysFrame::from_aligned(PhysAddr::new(self.l0_phys)) {
             self.zero_frame(&l0_fr);
-            on_frame(l0_fr, true);
+            on_frame(l0_fr, ReclaimedFrameKind::PageTable);
         }
     }
 
@@ -486,58 +536,84 @@ impl Aarch64VSpace {
         Ok(next_phys)
     }
 
-    fn encode_leaf_attrs(flags: PageFlags, allow_dma_nc: bool) -> u64 {
+    fn encode_leaf_attrs(flags: PageFlags, granule: LeafGranule) -> u64 {
         let mut bits = DESC_VALID | DESC_AF | DESC_SH_INNER;
-        if flags.no_cache {
-            bits |= device_mair_index() << 2;
-        } else if allow_dma_nc && flags.dma_nc {
-            bits |= normal_nc_mair_index() << 2;
+        match flags.cache_policy() {
+            PageCachePolicy::NormalCacheable => {}
+            PageCachePolicy::DeviceNoCache => {
+                bits |= u64::from(device_mair_index()) << 2;
+            }
+            PageCachePolicy::NormalNonCacheable => {
+                if granule == LeafGranule::Page4K {
+                    bits |= u64::from(normal_nc_mair_index()) << 2;
+                }
+            }
         }
-        match (flags.user, flags.writable) {
+
+        let is_user = flags.privilege() == PagePrivilege::User;
+        let is_writable = flags.access() == PageAccess::ReadWrite;
+        match (is_user, is_writable) {
             (false, true) => {} // AP=00: EL1 RW (Global)
             (false, false) => bits |= DESC_AP_EL1_RO,
             (true, true) => bits |= DESC_AP_EL0_RW | DESC_NG,
             (true, false) => bits |= DESC_AP_EL0_RO | DESC_NG,
         }
-        if !flags.executable {
-            bits |= DESC_PXN | DESC_UXN;
-        } else if flags.user {
-            // EL0 executable pages are NEVER executable by EL1 (hardware PXN)
-            bits |= DESC_PXN;
-        } else {
-            bits |= DESC_UXN;
+
+        match (flags.access(), flags.privilege()) {
+            (PageAccess::ReadExecute, PagePrivilege::User) => {
+                // EL0 executable pages are NEVER executable by EL1 (hardware PXN)
+                bits |= DESC_PXN;
+            }
+            (PageAccess::ReadExecute, PagePrivilege::Kernel) => {
+                bits |= DESC_UXN;
+            }
+            (PageAccess::ReadOnly | PageAccess::ReadWrite, _) => {
+                bits |= DESC_PXN | DESC_UXN;
+            }
         }
         bits
     }
 
-    fn decode_leaf_flags(desc: u64, dev_idx: u64) -> PageFlags {
+    fn decode_leaf_flags(desc: u64, dev_idx: u8) -> PageFlags {
         let ap = (desc >> 6) & 0b11;
-        let user = (ap & 0b01) != 0;
-        let writable = (ap & 0b10) == 0;
-        let executable = if user {
-            (desc & DESC_UXN) == 0
+        let privilege = if (ap & 0b01) != 0 {
+            PagePrivilege::User
         } else {
-            (desc & DESC_PXN) == 0
+            PagePrivilege::Kernel
         };
+        let writable = (ap & 0b10) == 0;
+        let executable = match privilege {
+            PagePrivilege::User => (desc & DESC_UXN) == 0,
+            PagePrivilege::Kernel => (desc & DESC_PXN) == 0,
+        };
+        let access = if writable {
+            PageAccess::ReadWrite
+        } else if executable {
+            PageAccess::ReadExecute
+        } else {
+            PageAccess::ReadOnly
+        };
+
         let attr_idx = (desc >> 2) & 0x7;
-        let no_cache = attr_idx == dev_idx && dev_idx != 0;
-        let nc_idx = normal_nc_mair_index();
-        let dma_nc = !no_cache && attr_idx == nc_idx && nc_idx != 0;
-        PageFlags {
-            writable,
-            executable,
-            user,
-            no_cache,
-            dma_nc,
-        }
+        let dev_u64 = u64::from(dev_idx);
+        let nc_u64 = u64::from(normal_nc_mair_index());
+        let cache = if attr_idx == dev_u64 && dev_u64 != 0 {
+            PageCachePolicy::DeviceNoCache
+        } else if attr_idx == nc_u64 && nc_u64 != 0 {
+            PageCachePolicy::NormalNonCacheable
+        } else {
+            PageCachePolicy::NormalCacheable
+        };
+
+        PageFlags::new(access, privilege, cache)
     }
 
     fn next_table_existing(&self, table_phys: u64, index: usize) -> Option<u64> {
         let entry = self.read_desc(table_phys, index).ok()?;
-        if (entry & (DESC_VALID | DESC_TABLE_OR_PAGE)) != (DESC_VALID | DESC_TABLE_OR_PAGE) {
-            None
-        } else {
+        if (entry & (DESC_VALID | DESC_TABLE_OR_PAGE)) == (DESC_VALID | DESC_TABLE_OR_PAGE) {
             Some(entry & DESC_ADDR_MASK)
+        } else {
+            None
         }
     }
 }
@@ -554,9 +630,6 @@ impl VSpaceMapper for Aarch64VSpace {
         flags: PageFlags,
         untyped: &mut UntypedInventory,
     ) -> Result<(), SysError> {
-        if flags.writable && flags.executable {
-            return Err(SysError::InvalidArgument);
-        }
         if !virt.is_page_aligned() {
             return Err(SysError::InvalidArgument);
         }
@@ -572,7 +645,7 @@ impl VSpaceMapper for Aarch64VSpace {
 
         let pte = (frame.start_addr().raw() & DESC_ADDR_MASK)
             | DESC_TABLE_OR_PAGE
-            | Self::encode_leaf_attrs(flags, true);
+            | Self::encode_leaf_attrs(flags, LeafGranule::Page4K);
 
         self.write_desc(l3, i3, pte)?;
         tlbi_va(virt);
@@ -606,7 +679,7 @@ impl VSpaceMapper for Aarch64VSpace {
     }
 
     fn unmap_4k(&mut self, virt: VirtAddr) -> Result<PhysFrame, SysError> {
-        let (frame, _is_device) = self.unmap_4k_asid(virt, None)?;
+        let (frame, _kind) = self.unmap_4k_asid(virt, None)?;
         Ok(frame)
     }
 
@@ -617,9 +690,6 @@ impl VSpaceMapper for Aarch64VSpace {
         flags: PageFlags,
         untyped: &mut UntypedInventory,
     ) -> Result<(), SysError> {
-        if flags.writable && flags.executable {
-            return Err(SysError::InvalidArgument);
-        }
         if (virt.raw() & HUGE_PAGE_MASK_2M) != 0 {
             return Err(SysError::InvalidArgument);
         }
@@ -633,8 +703,8 @@ impl VSpaceMapper for Aarch64VSpace {
         }
 
         // L2 Block descriptor: bit 0 = 1 (Valid), bit 1 = 0 (Block, not Table).
-        let desc =
-            (frame.start_addr().raw() & DESC_2M_ADDR_MASK) | Self::encode_leaf_attrs(flags, false);
+        let desc = (frame.start_addr().raw() & DESC_2M_ADDR_MASK)
+            | Self::encode_leaf_attrs(flags, LeafGranule::Block2M);
 
         self.write_desc(l2, i2, desc)?;
         tlbi_va(virt);
@@ -667,7 +737,7 @@ impl VSpaceMapper for Aarch64VSpace {
         let ptr = self.hhdm_offset.wrapping_add(frame.start_addr().raw()) as *mut u8;
         // SAFETY: `frame` is a newly retyped, exclusively owned 4 KiB physical frame mapped via HHDM.
         unsafe {
-            write_bytes(ptr, 0, PAGE_SIZE as usize);
+            write_bytes(ptr, 0, PAGE_SIZE_USIZE);
         }
     }
 
@@ -680,7 +750,7 @@ impl VSpaceMapper for Aarch64VSpace {
         let end = offset
             .checked_add(src.len())
             .ok_or(SysError::InvalidArgument)?;
-        if end > PAGE_SIZE as usize {
+        if end > PAGE_SIZE_USIZE {
             return Err(SysError::InvalidArgument);
         }
         let dst = self.hhdm_offset.wrapping_add(frame.start_addr().raw()) as *mut u8;
@@ -722,6 +792,11 @@ pub fn dma_invalidate_range(start_va: u64, len: usize) {
     }
 }
 
+/// Write and read back a 64-bit `pattern` at page-aligned EL1-writable virtual address `virt`.
+///
+/// # Errors
+/// - [`SysError::InvalidArgument`] if `virt` is not 4 KiB-aligned or not mapped in `vspace`.
+/// - [`SysError::InsufficientRights`] if the mapping is not EL1 `ReadWrite`.
 pub fn probe_mapped_u64(
     vspace: &Aarch64VSpace,
     virt: VirtAddr,
@@ -731,7 +806,7 @@ pub fn probe_mapped_u64(
         return Err(SysError::InvalidArgument);
     }
     let (_, flags) = vspace.translate(virt).ok_or(SysError::InvalidArgument)?;
-    if !flags.writable || flags.user {
+    if flags.access() != PageAccess::ReadWrite || flags.privilege() != PagePrivilege::Kernel {
         return Err(SysError::InsufficientRights);
     }
     let ptr = virt.raw() as *mut u64;

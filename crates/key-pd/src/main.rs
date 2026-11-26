@@ -27,6 +27,8 @@ include!(concat!(env!("OUT_DIR"), "/authorized_keys.rs"));
 /// Static EL0 DMA buffer for QEMU `VirtioRngDevice` (`Sync` via atomics, zero `unsafe`).
 static VIRTIO_RNG_DMA: VirtioRngDma = VirtioRngDma::new();
 
+const SSH_KEY_RING_VADDR: u64 = 0x0000_6000_0001_0000;
+
 struct CapRngTransport;
 
 impl RngTransport for CapRngTransport {
@@ -41,6 +43,37 @@ impl RngTransport for CapRngTransport {
     fn virt_to_phys<T>(&self, r: &T) -> Result<u64, SysError> {
         newos_user_rt::virt_to_phys(r)
     }
+}
+
+fn deliver_auth_gate_signal(sig: u64) -> bool {
+    for _ in 0..256 {
+        match newos_user_rt::ipc_send(CapId::BOOTSTRAP_AUTH_GATE_EP, sig) {
+            Ok(()) => return true,
+            Err(SysError::WouldBlock) => {
+                let _ = newos_user_rt::sleep_ms(1);
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+fn handle_peer_reset<E: EntropySource>(
+    server: &mut KeyVaultServer<E>,
+    out: &mut IpcLogConsole<256>,
+) {
+    // Fail-closed: `ssh-pd` exited or faulted; immediately close the auth gate (`M13`).
+    let _ = server.handle_ipc_word(
+        newos_abi::key_ipc::BADGE_SSH,
+        newos_abi::key_ipc::encode_word_req(newos_abi::key_ipc::OP_CLOSE_SESSION, 0),
+        0,
+    );
+    let _ = deliver_auth_gate_signal(newos_abi::auth_gate_ipc::SESSION_CLOSE);
+    let _ = writeln!(
+        out,
+        "[key-pd] peer reset signal received; closed auth gate & cleared state"
+    );
+    out.flush();
 }
 
 fn serve_vault<E: EntropySource>(
@@ -78,7 +111,6 @@ fn serve_vault<E: EntropySource>(
     );
     out.flush();
 
-    const SSH_KEY_RING_VADDR: u64 = 0x0000_6000_0001_0000;
     let _ssh_key_ring = newos_user_rt::map_shared_ring_pair(
         CapId::BOOTSTRAP_VSPACE,
         CapId::BOOTSTRAP_SSH_KEY_RING,
@@ -87,70 +119,35 @@ fn serve_vault<E: EntropySource>(
     .ok();
 
     let mut server = KeyVaultServer::new(vault);
-    let mut has_reply = false;
-    let mut reply_payload = 0u64;
+    let mut pending_reply: Option<u64> = None;
 
     loop {
-        match newos_user_rt::ipc_reply_recv(CapId::BOOTSTRAP_KEY_EP, reply_payload, has_reply) {
+        match newos_user_rt::ipc_reply_recv(
+            CapId::BOOTSTRAP_KEY_EP,
+            pending_reply.unwrap_or(0),
+            pending_reply.is_some(),
+        ) {
             Ok((badge, req)) => {
                 let now_cycles = newos_user_rt::read_cycles().unwrap_or(start_cycles);
-                let now_ms = (now_cycles.saturating_sub(start_cycles) / cycles_per_ms) as i64;
+                let now_ms = i64::try_from(now_cycles.saturating_sub(start_cycles) / cycles_per_ms)
+                    .unwrap_or(i64::MAX);
                 let (mut reply, gate_signal) = server.handle_ipc_word(badge, req, now_ms);
                 if let Some(sig) = gate_signal {
                     // Fail-closed auth-gate delivery (`N7`): if `supervisor-pd` cannot be notified,
                     // refuse to report `REPLY_OK` to `ssh-pd` so auth state never diverges.
-                    let mut delivered = false;
-                    for _ in 0..256 {
-                        match newos_user_rt::ipc_send(CapId::BOOTSTRAP_AUTH_GATE_EP, sig) {
-                            Ok(()) => {
-                                delivered = true;
-                                break;
-                            }
-                            Err(SysError::WouldBlock) => {
-                                let _ = newos_user_rt::sleep_ms(1);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    if !delivered && reply == newos_abi::key_ipc::REPLY_OK {
+                    if !deliver_auth_gate_signal(sig) && reply == newos_abi::key_ipc::REPLY_OK {
                         reply = newos_abi::key_ipc::REPLY_DENIED;
                     }
                 }
-                reply_payload = reply;
-                has_reply = true;
+                pending_reply = Some(reply);
             }
             Err(SysError::WouldBlock) => {
-                has_reply = false;
+                pending_reply = None;
                 if let Ok((bits, _)) =
                     newos_user_rt::notify_wait(CapId::BOOTSTRAP_KEY_NOTIF, u64::MAX, 5_000_000)
                     && (bits & newos_abi::RING_PEER_RESET_BIT) != 0
                 {
-                    // Fail-closed: `ssh-pd` exited or faulted; immediately close the auth gate (`M13`).
-                    let _ = server.handle_ipc_word(
-                        newos_abi::key_ipc::BADGE_SSH,
-                        newos_abi::key_ipc::encode_word_req(
-                            newos_abi::key_ipc::OP_CLOSE_SESSION,
-                            0,
-                        ),
-                        0,
-                    );
-                    for _ in 0..256 {
-                        match newos_user_rt::ipc_send(
-                            CapId::BOOTSTRAP_AUTH_GATE_EP,
-                            newos_abi::auth_gate_ipc::SESSION_CLOSE,
-                        ) {
-                            Ok(()) => break,
-                            Err(SysError::WouldBlock) => {
-                                let _ = newos_user_rt::sleep_ms(1);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    let _ = writeln!(
-                        out,
-                        "[key-pd] peer reset signal received; closed auth gate & cleared state"
-                    );
-                    out.flush();
+                    handle_peer_reset(&mut server, out);
                 }
             }
             Err(err) => {

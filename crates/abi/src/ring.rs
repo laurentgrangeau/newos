@@ -1,6 +1,6 @@
 //! Userspace-only, lock-free SPSC shared-memory ring buffer.
 //!
-//! EL1 never parses ring buffers. Two EL0 processes share a mapped
+//! EL1 never parses ring buffers. Two EL0 protection domains share a mapped
 //! `Frame` containing an `SpscRing` and use a 64-bit kernel `Notification` capability for wakeups.
 //!
 //! ```
@@ -44,14 +44,34 @@ impl<const N: usize> Default for SpscRing<N> {
     }
 }
 
+impl<const N: usize> core::fmt::Debug for SpscRing<N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SpscRing")
+            .field("capacity", &self.capacity())
+            .field("len", &self.len())
+            .field(
+                "head",
+                &(self.consumer.head.load(Ordering::Acquire) & (N - 1)),
+            )
+            .field(
+                "tail",
+                &(self.producer.tail.load(Ordering::Acquire) & (N - 1)),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 impl<const N: usize> SpscRing<N> {
-    const _ASSERT_POW2: () = assert!(
-        N >= 2 && (N & (N - 1)) == 0,
+    const ASSERT_POW2: () = assert!(
+        N >= 2 && N.is_power_of_two(),
         "SpscRing capacity must be power of two >= 2"
     );
 
+    const FRAME_MAGIC: u64 = 0x5249_4E47;
+
+    #[must_use]
     pub const fn new() -> Self {
-        let () = Self::_ASSERT_POW2;
+        let () = Self::ASSERT_POW2;
         Self {
             consumer: ConsumerLine {
                 head: AtomicUsize::new(0),
@@ -66,11 +86,16 @@ impl<const N: usize> SpscRing<N> {
     }
 
     #[inline]
+    #[must_use]
     pub const fn capacity(&self) -> usize {
         N - 1
     }
 
     /// Push one 64-bit word into the ring without blocking (`Release` publish).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::WouldBlock`] if the ring is full.
     #[inline]
     pub fn try_push(&self, word: u64) -> Result<(), SysError> {
         let tail = self.producer.tail.load(Ordering::Relaxed) & (N - 1);
@@ -189,6 +214,7 @@ impl<const N: usize> SpscRing<N> {
     }
 
     #[inline]
+    #[must_use]
     pub fn len(&self) -> usize {
         let head = self.consumer.head.load(Ordering::Acquire);
         let tail = self.producer.tail.load(Ordering::Acquire);
@@ -196,6 +222,7 @@ impl<const N: usize> SpscRing<N> {
     }
 
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         let head = self.consumer.head.load(Ordering::Acquire) & (N - 1);
         let tail = self.producer.tail.load(Ordering::Acquire) & (N - 1);
@@ -203,6 +230,7 @@ impl<const N: usize> SpscRing<N> {
     }
 
     #[inline]
+    #[must_use]
     pub fn is_full(&self) -> bool {
         let head = self.consumer.head.load(Ordering::Acquire) & (N - 1);
         let tail = self.producer.tail.load(Ordering::Acquire) & (N - 1);
@@ -212,13 +240,16 @@ impl<const N: usize> SpscRing<N> {
     /// Push a length-prefixed byte frame into the word ring with a single `Release` tail commit.
     ///
     /// Format: 1 header word `((0x5249_4E47 << 32) | byte_len)` followed by `ceil(byte_len / 8)`
-    /// little-endian 64-bit payload words. Returns `Err(SysError::WouldBlock)` if the ring does
-    /// not have space for the entire frame (no partial writes), or `Err(SysError::InvalidArgument)`
-    /// if `data` exceeds the ring's maximum frame capacity.
+    /// little-endian 64-bit payload words.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::WouldBlock`] if the ring does not have space for the entire frame
+    /// (no partial writes), or [`SysError::InvalidArgument`] if `data` exceeds the ring's
+    /// maximum frame capacity or `u32::MAX` bytes.
     pub fn try_push_bytes(&self, data: &[u8]) -> Result<usize, SysError> {
-        const MAGIC_SHIFTED: u64 = 0x5249_4E47u64 << 32;
         let payload_words = data.len().div_ceil(8);
-        let total_words = 1 + payload_words;
+        let total_words = 1usize.saturating_add(payload_words);
         if total_words > self.capacity() || data.len() > u32::MAX as usize {
             return Err(SysError::InvalidArgument);
         }
@@ -237,7 +268,7 @@ impl<const N: usize> SpscRing<N> {
             }
         }
 
-        let header = MAGIC_SHIFTED | (data.len() as u64);
+        let header = (Self::FRAME_MAGIC << 32) | (data.len() as u64);
         self.slots[tail].store(header, Ordering::Relaxed);
         let mut idx = (tail + 1) & (N - 1);
         let mut off = 0usize;
@@ -260,7 +291,6 @@ impl<const N: usize> SpscRing<N> {
     /// to tail on corrupted peer headers without panicking). Truncates to `out.len()` if `out` is
     /// smaller than the framed payload while still consuming the full frame from the ring.
     pub fn try_pop_bytes(&self, out: &mut [u8]) -> Option<usize> {
-        const MAGIC: u64 = 0x5249_4E47;
         let head = self.consumer.head.load(Ordering::Relaxed) & (N - 1);
         let mut tail = self.consumer.cached_tail.load(Ordering::Relaxed) & (N - 1);
         if head == tail {
@@ -273,7 +303,7 @@ impl<const N: usize> SpscRing<N> {
 
         let avail = tail.wrapping_sub(head) & (N - 1);
         let header = self.slots[head].load(Ordering::Relaxed);
-        if (header >> 32) != MAGIC {
+        if (header >> 32) != Self::FRAME_MAGIC {
             // Corrupted peer header: drop ring contents safely without panicking.
             self.consumer.head.store(tail, Ordering::Release);
             return None;
@@ -342,6 +372,72 @@ mod tests {
         // Corrupted peer header is safely dropped without panicking
         assert_eq!(ring.try_push(0xDEAD_BEEF_0000_0010), Ok(()));
         assert_eq!(ring.try_pop_bytes(&mut [0u8; 32]), None);
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn spsc_ring_debug_format_includes_metadata() {
+        use core::fmt::Write as _;
+
+        struct StackWriter {
+            buf: [u8; 128],
+            len: usize,
+        }
+
+        impl core::fmt::Write for StackWriter {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let avail = self.buf.len().saturating_sub(self.len);
+                let copy = bytes.len().min(avail);
+                self.buf[self.len..self.len + copy].copy_from_slice(&bytes[..copy]);
+                self.len += copy;
+                Ok(())
+            }
+        }
+
+        let ring = SpscRing::<8>::new();
+        assert_eq!(ring.try_push(42), Ok(()));
+        assert_eq!(ring.try_push(99), Ok(()));
+
+        let mut writer = StackWriter {
+            buf: [0u8; 128],
+            len: 0,
+        };
+        assert!(write!(&mut writer, "{ring:?}").is_ok());
+        let formatted = core::str::from_utf8(&writer.buf[..writer.len]).unwrap_or("");
+        assert!(formatted.contains("SpscRing"));
+        assert!(formatted.contains("capacity: 7"));
+        assert!(formatted.contains("len: 2"));
+        assert!(formatted.contains("head: 0"));
+        assert!(formatted.contains("tail: 2"));
+    }
+
+    #[test]
+    fn spsc_ring_bytes_empty_truncation_wouldblock_and_bogus_len() {
+        let ring = SpscRing::<8>::new();
+        // Empty byte frame roundtrip
+        assert_eq!(ring.try_push_bytes(&[]), Ok(0));
+        let mut out = [0xFFu8; 8];
+        assert_eq!(ring.try_pop_bytes(&mut out), Some(0));
+        assert!(ring.is_empty());
+
+        // Fill ring nearly full (capacity = 7 words); a 16-byte frame needs 3 words.
+        assert_eq!(ring.try_push_bytes(&[1u8; 24]), Ok(24)); // 1 + 3 = 4 words
+        assert_eq!(ring.len(), 4);
+        // Remaining free = 3 words; a 24-byte frame needs 4 words -> WouldBlock with no partial write.
+        assert_eq!(ring.try_push_bytes(&[2u8; 24]), Err(SysError::WouldBlock));
+        assert_eq!(ring.len(), 4);
+
+        // Truncated pop: out.len() < byte_len copies out.len() bytes and consumes the full frame.
+        let mut small = [0u8; 5];
+        assert_eq!(ring.try_pop_bytes(&mut small), Some(5));
+        assert_eq!(small, [1u8; 5]);
+        assert!(ring.is_empty());
+
+        // Valid magic with bogus length exceeding available words triggers safe resync.
+        let bogus_header = (SpscRing::<8>::FRAME_MAGIC << 32) | 0x28;
+        assert_eq!(ring.try_push(bogus_header), Ok(()));
+        assert_eq!(ring.try_pop_bytes(&mut out), None);
         assert!(ring.is_empty());
     }
 

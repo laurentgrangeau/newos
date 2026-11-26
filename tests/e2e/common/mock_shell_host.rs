@@ -5,6 +5,7 @@ use newos_abi::{CapId, SysError};
 use newos_shell_core::shell::{ShellHost, SysInfo};
 
 /// Deterministic host-side `ShellHost` simulating EL0 `init` + `worker` IPC responder.
+#[derive(Debug)]
 pub struct MockShellHost {
     pub sys_info_val: SysInfo,
     pub output: String,

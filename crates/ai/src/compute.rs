@@ -7,6 +7,9 @@ use newos_abi::SysError;
 
 /// Quantized `i8` dot product (`sum(a[i] * b[i])`), structured in 4-element chunks so LLVM
 /// emits Cortex-A76 `sdot` (`FEAT_DotProd`) instructions without any `unsafe` intrinsics.
+///
+/// # Errors
+/// Returns [`SysError::InvalidArgument`] if `a.len() != b.len()`.
 #[inline]
 pub fn dot_i8(a: &[i8], b: &[i8]) -> Result<i32, SysError> {
     if a.len() != b.len() {
@@ -29,6 +32,10 @@ pub fn dot_i8(a: &[i8], b: &[i8]) -> Result<i32, SysError> {
 }
 
 /// Quantized `i8` matrix-vector multiply: `out[r] = dot_i8(weights[r*cols..(r+1)*cols], input)`.
+///
+/// # Errors
+/// Returns [`SysError::InvalidArgument`] if `cols == 0`, `input.len() != cols`, `out.len() != rows`,
+/// or `rows.checked_mul(cols) != Some(weights.len())`.
 pub fn matvec_i8(
     weights: &[i8],
     input: &[i8],
@@ -39,7 +46,7 @@ pub fn matvec_i8(
     if cols == 0
         || input.len() != cols
         || out.len() != rows
-        || weights.len() != rows.saturating_mul(cols)
+        || rows.checked_mul(cols) != Some(weights.len())
     {
         return Err(SysError::InvalidArgument);
     }
@@ -51,6 +58,10 @@ pub fn matvec_i8(
 }
 
 /// `f32` matrix-vector multiply (`out = W * x`) for NEON `fmla` auto-vectorization.
+///
+/// # Errors
+/// Returns [`SysError::InvalidArgument`] if `cols == 0`, `input.len() != cols`, `out.len() != rows`,
+/// or `rows.checked_mul(cols) != Some(weights.len())`.
 pub fn matvec_f32(
     weights: &[f32],
     input: &[f32],
@@ -61,7 +72,7 @@ pub fn matvec_f32(
     if cols == 0
         || input.len() != cols
         || out.len() != rows
-        || weights.len() != rows.saturating_mul(cols)
+        || rows.checked_mul(cols) != Some(weights.len())
     {
         return Err(SysError::InvalidArgument);
     }
@@ -76,7 +87,7 @@ pub fn matvec_f32(
     Ok(())
 }
 
-/// In-place ReLU activation (`x = max(0, x)`).
+/// In-place `ReLU` activation (`x = max(0, x)`).
 #[inline]
 pub fn relu_inplace(data: &mut [f32]) {
     for x in data.iter_mut() {
@@ -102,16 +113,23 @@ fn inv_sqrt_f32(x: f32) -> f32 {
     y
 }
 
-/// In-place RMSNorm (`x[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)`), standard in modern LLMs.
+/// In-place `RMSNorm` (`x[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)`), standard in modern LLMs.
+///
+/// # Errors
+/// Returns [`SysError::InvalidArgument`] if `x` is empty, `x.len() != weight.len()`, or `eps` is
+/// negative or non-finite (`NaN`/`Inf`).
 pub fn rms_norm_inplace(x: &mut [f32], weight: &[f32], eps: f32) -> Result<(), SysError> {
-    if x.is_empty() || x.len() != weight.len() {
+    if x.is_empty() || x.len() != weight.len() || !eps.is_finite() || eps < 0.0 {
         return Err(SysError::InvalidArgument);
     }
     let mut ss = 0.0f32;
     for &v in x.iter() {
         ss += v * v;
     }
-    let scale = inv_sqrt_f32(ss / (x.len() as f32) + eps);
+    // Intentional: RMSNorm operates in f32 precision; tensor lengths <= 2^24 are exact in f32.
+    #[allow(clippy::cast_precision_loss)]
+    let denom = x.len() as f32;
+    let scale = inv_sqrt_f32(ss / denom + eps);
     for (v, &w) in x.iter_mut().zip(weight.iter()) {
         *v *= scale * w;
     }
@@ -119,6 +137,7 @@ pub fn rms_norm_inplace(x: &mut [f32], weight: &[f32], eps: f32) -> Result<(), S
 }
 
 /// Return the index of the maximum element in `logits` (or `None` if empty).
+#[must_use]
 pub fn argmax_f32(logits: &[f32]) -> Option<usize> {
     let mut best_idx = 0usize;
     let mut best_val = *logits.first()?;
@@ -146,7 +165,7 @@ mod tests {
         let weights = [1i8, 2, 3, 4, -1, 0, 1, 2];
         let input = [2i8, 1, 0, -1];
         let mut out = [0i32; 2];
-        matvec_i8(&weights, &input, 2, 4, &mut out).unwrap();
+        matvec_i8(&weights, &input, 2, 4, &mut out).expect("matvec_i8");
         // row0: 2+2+0-4 = 0; row1: -2+0+0-2 = -4
         assert_eq!(out, [0, -4]);
     }
@@ -156,7 +175,7 @@ mod tests {
         let w = [1.0f32, -2.0, 3.0, 4.0];
         let x = [1.0f32, 2.0];
         let mut out = [0.0f32; 2];
-        matvec_f32(&w, &x, 2, 2, &mut out).unwrap();
+        matvec_f32(&w, &x, 2, 2, &mut out).expect("matvec_f32");
         assert_eq!(out, [-3.0, 11.0]);
         relu_inplace(&mut out);
         assert_eq!(out, [0.0, 11.0]);
@@ -164,8 +183,51 @@ mod tests {
 
         let mut v = [3.0f32, 4.0];
         let gain = [1.0f32, 1.0];
-        rms_norm_inplace(&mut v, &gain, 1e-6).unwrap();
+        rms_norm_inplace(&mut v, &gain, 1e-6).expect("rms_norm_inplace");
         // rms = sqrt((9+16)/2) = sqrt(12.5) ~= 3.535534 -> v[1] ~= 1.13137
         assert!((v[1] - 1.13137).abs() < 0.001);
+    }
+
+    #[test]
+    fn compute_kernels_validate_dimensions_eps_and_empty_inputs() {
+        let mut int_out = [0i32; 2];
+        assert_eq!(
+            matvec_i8(&[1, 2], &[1], 2, 0, &mut int_out),
+            Err(SysError::InvalidArgument)
+        );
+        assert_eq!(
+            matvec_i8(&[1, 2, 3], &[1, 2], 2, 2, &mut int_out),
+            Err(SysError::InvalidArgument)
+        );
+
+        let mut float_out = [0.0f32; 2];
+        assert_eq!(
+            matvec_f32(&[1.0, 2.0], &[1.0], 2, 0, &mut float_out),
+            Err(SysError::InvalidArgument)
+        );
+        assert_eq!(
+            matvec_f32(&[1.0, 2.0], &[1.0, 2.0], 2, 2, &mut float_out),
+            Err(SysError::InvalidArgument)
+        );
+
+        let mut v = [1.0f32, 2.0];
+        let gain = [1.0f32, 1.0];
+        assert_eq!(
+            rms_norm_inplace(&mut [], &[], 1e-6),
+            Err(SysError::InvalidArgument)
+        );
+        assert_eq!(
+            rms_norm_inplace(&mut v, &[1.0], 1e-6),
+            Err(SysError::InvalidArgument)
+        );
+        assert_eq!(
+            rms_norm_inplace(&mut v, &gain, -0.1),
+            Err(SysError::InvalidArgument)
+        );
+        assert_eq!(
+            rms_norm_inplace(&mut v, &gain, f32::NAN),
+            Err(SysError::InvalidArgument)
+        );
+        assert_eq!(argmax_f32(&[]), None);
     }
 }

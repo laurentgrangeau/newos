@@ -700,8 +700,8 @@ fn t2_sched_full_64_wraparound_and_80_slot_fallback() {
     }
 
     let mut s80 = Scheduler::<80>::new();
-    for i in 0..80 {
-        s80.spawn((i % 5) as u8).unwrap();
+    for i in 0u8..80 {
+        s80.spawn(i % 5).unwrap();
     }
     assert_eq!(s80.active_count(), 80);
     assert!(s80.schedule_next().is_some());
@@ -783,7 +783,7 @@ fn t2_elf_truncated_magic_class_endian_type_machine_rejected() {
     bad_type[16..18].copy_from_slice(&1u16.to_le_bytes()); // ET_REL (unsupported)
     assert_eq!(parse_elf64(&bad_type), Err(SysError::Unsupported));
 
-    let mut bad_mach = base.clone();
+    let mut bad_mach = base;
     bad_mach[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
     assert_eq!(parse_elf64(&bad_mach), Err(SysError::Unsupported));
 }
@@ -1142,11 +1142,10 @@ fn t2_shell_malformed_commands_stages_args_and_fatal_read_error() {
     match res {
         Ok(_) => unreachable!("run_interactive returns !"),
         Err(payload) => {
-            if payload.downcast_ref::<YieldLimitExceeded>().is_some() {
-                panic!(
-                    "run_interactive spun >32 yields on fatal read_debug_byte error instead of exiting cleanly"
-                );
-            }
+            assert!(
+                payload.downcast_ref::<YieldLimitExceeded>().is_none(),
+                "run_interactive spun >32 yields on fatal read_debug_byte error instead of exiting cleanly"
+            );
             assert!(
                 payload.downcast_ref::<ExitSentinel>().is_some(),
                 "expected clean host.exit() on fatal read_debug_byte error"
@@ -1206,8 +1205,7 @@ fn t2_bench_emits_all_12_m1_extended_metrics() {
     }
     assert!(
         missing.is_empty(),
-        "missing M1 extended METRIC lines: {:?}",
-        missing
+        "missing M1 extended METRIC lines: {missing:?}"
     );
 }
 
@@ -1260,9 +1258,9 @@ fn t2_safety_every_unsafe_in_hal_and_user_rt_has_safety_comment() {
             let prod = strip_cfg_test(&sf.tokens);
             for line_num in find_unsafe_sites(&prod) {
                 if !has_safety_comment(&sf.lines, line_num) {
-                    let snippet = sf.lines.get(line_num - 1).map(|s| s.trim()).unwrap_or("");
+                    let snippet = sf.lines.get(line_num - 1).map_or("", |s| s.trim());
                     let rel = file.strip_prefix(&root).unwrap_or(&file);
-                    violations.push(format!("{}:{}: {}", rel.display(), line_num, snippet));
+                    violations.push(format!("{}:{line_num}: {snippet}", rel.display()));
                 }
             }
         }

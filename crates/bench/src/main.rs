@@ -6,7 +6,10 @@
 //! - IPC consumption (10 metrics, exact syscall counts & payload/chunk bytes)
 //! - IPC footprint (6 metrics, exact `size_of` bytes for IPC & shell data structures)
 
+use std::fmt;
 use std::hint::black_box;
+use std::io::{self, Write as _};
+use std::process::ExitCode;
 use std::time::Instant;
 
 use newos_abi::ring::SpscRing;
@@ -15,9 +18,9 @@ use newos_kernel_core::cspace::{CNode, CapObject, Capability};
 use newos_kernel_core::ipc::{IpcMessage, KernelIpcState};
 use newos_kernel_core::memory::{PAGE_SIZE, UntypedInventory};
 use newos_kernel_core::sched::Scheduler;
-use newos_shell_core::caos::ObjectStore;
+use newos_shell_core::caos::{ObjectStore, StoreError};
 use newos_shell_core::shell::{
-    ExecOutcome, LINE_BUF_SIZE, Record, RecordStream, Shell, ShellHost, SysInfo,
+    ExecOutcome, LINE_BUF_SIZE, Record, RecordStream, Shell, ShellHost, ShellSelfTestError, SysInfo,
 };
 
 const SAMPLES: usize = 5;
@@ -39,17 +42,81 @@ const SESSION_COMMANDS: [&str; 14] = [
     "history",
 ];
 
+#[derive(Debug)]
+enum BenchError {
+    Sys(SysError),
+    Store(StoreError),
+    SelfTest(ShellSelfTestError),
+    UnexpectedPingMetric,
+    CliUnknownArg(String),
+    CliExtraArg(String),
+    Io(io::Error),
+}
+
+impl fmt::Display for BenchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sys(e) => write!(f, "kernel syscall error: {e}"),
+            Self::Store(e) => write!(f, "CAOS object store error: {e}"),
+            Self::SelfTest(e) => write!(f, "newos-shell-core run_self_test failed: {e}"),
+            Self::UnexpectedPingMetric => f.write_str("unexpected ping metric output"),
+            Self::CliUnknownArg(flag) => write!(f, "unknown argument `{flag}`"),
+            Self::CliExtraArg(extra) => write!(f, "unexpected extra argument `{extra}`"),
+            Self::Io(e) => write!(f, "output write error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for BenchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Sys(e) => Some(e),
+            Self::Store(e) => Some(e),
+            Self::SelfTest(e) => Some(e),
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<SysError> for BenchError {
+    fn from(e: SysError) -> Self {
+        Self::Sys(e)
+    }
+}
+
+impl From<StoreError> for BenchError {
+    fn from(e: StoreError) -> Self {
+        Self::Store(e)
+    }
+}
+
+impl From<io::Error> for BenchError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputFormat {
     Default,
     Markdown,
     Json,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliAction {
+    Run(OutputFormat),
+    Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum MetricValue {
     Float(f64),
     Int(u64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Metric {
     category: &'static str,
     name: &'static str,
@@ -69,15 +136,16 @@ where
 {
     black_box(f(warmup_iters));
     let mut samples = [0.0f64; SAMPLES];
-    let total_ops = (measured_iters * ops_per_iter) as f64;
+    let total_ops =
+        f64::from(u32::try_from(measured_iters * ops_per_iter).expect("total_ops fits in u32"));
     for sample in &mut samples {
         let start = Instant::now();
         let sink = f(measured_iters);
-        let elapsed_ns = start.elapsed().as_nanos() as f64;
+        let elapsed_ns = start.elapsed().as_secs_f64() * 1e9;
         black_box(sink);
         *sample = elapsed_ns / total_ops;
     }
-    samples.sort_by(|a, b| a.total_cmp(b));
+    samples.sort_by(f64::total_cmp);
     samples[SAMPLES / 2]
 }
 
@@ -85,46 +153,41 @@ where
 // Kernel Speed Benchmarks (9 metrics)
 // ---------------------------------------------------------------------------
 
-fn bench_kernel_cnode_lookup() -> f64 {
+fn bench_kernel_cnode_lookup() -> Result<f64, BenchError> {
     let mut cnode = CNode::<64>::new();
     let mut caps = [CapId::NULL; 32];
-    for (i, slot) in caps.iter_mut().enumerate() {
-        *slot = cnode
-            .insert_root(Capability::new(
-                CapObject::Endpoint { id: i as u32 },
-                Rights::ALL,
-            ))
-            .unwrap();
+    for (id, slot) in (0u32..).zip(&mut caps) {
+        *slot = cnode.insert_root(Capability::new(CapObject::Endpoint { id }, Rights::ALL))?;
     }
     let required = Rights::READ.union(Rights::WRITE);
-    bench_median_ns_per_op(10_000, 1_000_000, 1, |iters| {
+    Ok(bench_median_ns_per_op(10_000, 1_000_000, 1, |iters| {
         let mut acc = 0u64;
         for i in 0..iters {
             let cap = cnode
                 .lookup(black_box(caps[i & 31]), black_box(required))
-                .unwrap();
-            acc = acc.wrapping_add(cap.badge ^ (cap.rights.bits() as u64));
+                .expect("inserted root cap with Rights::ALL satisfies READ|WRITE");
+            acc = acc.wrapping_add(cap.badge ^ u64::from(cap.rights.bits()));
         }
         acc
-    })
+    }))
 }
 
-fn bench_kernel_cnode_mint_revoke() -> f64 {
+fn bench_kernel_cnode_mint_revoke() -> Result<f64, BenchError> {
     let mut cnode = CNode::<64>::new();
     let mut root_cap = CapId::NULL;
     for i in 0..32u32 {
-        let cap = cnode
-            .insert_root(Capability::new(CapObject::Endpoint { id: i }, Rights::ALL))
-            .unwrap();
+        let cap = cnode.insert_root(Capability::new(CapObject::Endpoint { id: i }, Rights::ALL))?;
         if i == 0 {
             root_cap = cap;
         }
     }
     let child_rights = Rights::READ.union(Rights::GRANT);
-    bench_median_ns_per_op(2_000, 100_000, 1, |iters| {
+    Ok(bench_median_ns_per_op(2_000, 100_000, 1, |iters| {
         let mut total_revoked = 0u64;
         for i in 0..iters {
-            let child_slot = cnode.find_free_slot().unwrap();
+            let child_slot = cnode
+                .find_free_slot()
+                .expect("CNode<64> has 32 free slots after setup");
             let child = cnode
                 .mint(
                     black_box(root_cap),
@@ -132,100 +195,121 @@ fn bench_kernel_cnode_mint_revoke() -> f64 {
                     child_rights,
                     Some((i as u64) | 1),
                 )
-                .unwrap();
-            let grandchild_slot = cnode.find_free_slot().unwrap();
-            let grandchild = cnode.copy(child, grandchild_slot).unwrap();
+                .expect("root_cap has Rights::ALL and child_slot is free");
+            let grandchild_slot = cnode
+                .find_free_slot()
+                .expect("CNode<64> has 31 free slots after mint");
+            let grandchild = cnode
+                .copy(child, grandchild_slot)
+                .expect("child has Rights::GRANT and grandchild_slot is free");
             black_box(grandchild);
-            let revoked = cnode.revoke(black_box(root_cap)).unwrap();
+            let revoked = cnode
+                .revoke(black_box(root_cap))
+                .expect("root_cap is a valid root capability");
             total_revoked += revoked as u64;
         }
         assert_eq!(total_revoked, (iters as u64) * 2);
         total_revoked
-    })
+    }))
 }
 
-fn bench_kernel_ipc_send_recv() -> f64 {
+fn bench_kernel_ipc_send_recv() -> Result<f64, BenchError> {
     let mut ipc = KernelIpcState::new();
-    let (_notif, ep, _fault) = ipc.init_bootstrap_caps(None).unwrap();
-    bench_median_ns_per_op(10_000, 500_000, 1, |iters| {
+    let (_notif, ep, _fault) = ipc.init_bootstrap_caps(None)?;
+    Ok(bench_median_ns_per_op(10_000, 500_000, 1, |iters| {
         let mut acc = 0u64;
         for i in 0..iters {
-            ipc.ipc_send(black_box(ep), black_box(i as u64)).unwrap();
-            let msg = ipc.ipc_recv(black_box(ep)).unwrap();
+            ipc.ipc_send(black_box(ep), black_box(i as u64))
+                .expect("bootstrap endpoint accepts ipc_send when queue is empty");
+            let msg = ipc
+                .ipc_recv(black_box(ep))
+                .expect("message was just enqueued on bootstrap endpoint");
             acc = acc.wrapping_add(msg.payload ^ msg.badge);
         }
         acc
-    })
+    }))
 }
 
-fn bench_kernel_ipc_notify_signal_poll() -> f64 {
+fn bench_kernel_ipc_notify_signal_poll() -> Result<f64, BenchError> {
     let mut ipc = KernelIpcState::new();
-    let (notif, _ep, _fault) = ipc.init_bootstrap_caps(None).unwrap();
-    bench_median_ns_per_op(10_000, 500_000, 1, |iters| {
+    let (notif, _ep, _fault) = ipc.init_bootstrap_caps(None)?;
+    Ok(bench_median_ns_per_op(10_000, 500_000, 1, |iters| {
         let mut acc = 0u64;
         for i in 0..iters {
             let badge = 1u64 << (i & 63);
             ipc.notify_signal(black_box(notif), black_box(badge))
-                .unwrap();
-            let bits = ipc.notify_poll(black_box(notif)).unwrap();
+                .expect("bootstrap notification cap has WRITE right");
+            let bits = ipc
+                .notify_poll(black_box(notif))
+                .expect("bootstrap notification cap has READ right");
             acc = acc.wrapping_add(bits);
         }
         acc
-    })
+    }))
 }
 
-fn bench_kernel_sched_schedule_next() -> f64 {
+fn bench_kernel_sched_schedule_next() -> Result<f64, BenchError> {
     let mut sched = Scheduler::<64>::new();
-    let _ = sched.spawn(1).unwrap();
-    let _ = sched.spawn(5).unwrap();
-    let _ = sched.spawn(10).unwrap();
-    let _ = sched.spawn(10).unwrap();
-    bench_median_ns_per_op(10_000, 500_000, 1, |iters| {
+    let _ = sched.spawn(1)?;
+    let _ = sched.spawn(5)?;
+    let _ = sched.spawn(10)?;
+    let _ = sched.spawn(10)?;
+    Ok(bench_median_ns_per_op(10_000, 500_000, 1, |iters| {
         let mut acc = 0u64;
         for _ in 0..iters {
-            let tid = sched.schedule_next().unwrap();
-            acc = acc.wrapping_add(tid.0 as u64);
+            let tid = sched
+                .schedule_next()
+                .expect("4 spawned threads remain runnable");
+            acc = acc.wrapping_add(u64::from(tid.0));
         }
         acc
-    })
+    }))
 }
 
-fn bench_kernel_memory_retype_frame() -> f64 {
+fn bench_kernel_memory_retype_frame() -> Result<f64, BenchError> {
+    const MEASURED_ITERS: u32 = 500_000;
+
     let mut prewarmed_inv = UntypedInventory::new();
     for r in 0..15u64 {
         assert!(prewarmed_inv.push_raw_region(0x0010_0000 + r * 0x0010_0000, PAGE_SIZE * 2));
     }
     assert!(prewarmed_inv.push_raw_region(0x1000_0000, PAGE_SIZE * 1_000_000));
     for _ in 0..64 {
-        black_box(prewarmed_inv.retype_frame().unwrap().start_addr().raw());
+        let frame = prewarmed_inv.retype_frame()?;
+        black_box(frame.start_addr().raw());
     }
 
-    // Warmup on a copy
+    // Warmup on an independent clone so every measured sample starts from identical allocator state.
     {
         let mut inv = prewarmed_inv.clone();
         let mut acc = 0u64;
         for _ in 0..10_000 {
-            acc = acc.wrapping_add(inv.retype_frame().unwrap().start_addr().raw());
+            let frame = inv
+                .retype_frame()
+                .expect("1M-frame untyped region covers 10k warmup retypes");
+            acc = acc.wrapping_add(frame.start_addr().raw());
         }
         black_box(acc);
     }
 
     let mut samples = [0.0f64; SAMPLES];
-    let measured_iters = 500_000usize;
     for sample in &mut samples {
+        // Clone prewarmed inventory per sample for repeatable, isolated allocator state.
         let mut inv = prewarmed_inv.clone();
         let start = Instant::now();
         let mut acc = 0u64;
-        for _ in 0..measured_iters {
-            let frame = inv.retype_frame().unwrap();
+        for _ in 0..MEASURED_ITERS {
+            let frame = inv
+                .retype_frame()
+                .expect("1M-frame untyped region covers 500k measured retypes");
             acc = acc.wrapping_add(frame.start_addr().raw());
         }
-        let elapsed_ns = start.elapsed().as_nanos() as f64;
+        let elapsed_ns = start.elapsed().as_secs_f64() * 1e9;
         black_box(acc);
-        *sample = elapsed_ns / (measured_iters as f64);
+        *sample = elapsed_ns / f64::from(MEASURED_ITERS);
     }
-    samples.sort_by(|a, b| a.total_cmp(b));
-    samples[SAMPLES / 2]
+    samples.sort_by(f64::total_cmp);
+    Ok(samples[SAMPLES / 2])
 }
 
 fn bench_kernel_ring_spsc_transfer() -> f64 {
@@ -236,10 +320,11 @@ fn bench_kernel_ring_spsc_transfer() -> f64 {
         for b in 0..batches {
             let base = (b as u64) << 5;
             for j in 0..BURST {
-                ring.try_push(black_box(base + j as u64)).unwrap();
+                ring.try_push(black_box(base + j as u64))
+                    .expect("SpscRing<64> has capacity >= BURST(32)");
             }
             for _ in 0..BURST {
-                acc = acc.wrapping_add(ring.try_pop().unwrap());
+                acc = acc.wrapping_add(ring.try_pop().expect("BURST(32) items were just pushed"));
             }
         }
         acc
@@ -248,9 +333,9 @@ fn bench_kernel_ring_spsc_transfer() -> f64 {
     ns
 }
 
-fn bench_kernel_ipc_call_reply() -> f64 {
+fn bench_kernel_ipc_call_reply() -> Result<f64, BenchError> {
     let mut ipc = KernelIpcState::new();
-    let (_notif, ep, _fault) = ipc.init_bootstrap_caps(None).unwrap();
+    let (_notif, ep, _fault) = ipc.init_bootstrap_caps(None)?;
     let ns = bench_median_ns_per_op(10_000, 500_000, 1, |iters| {
         let mut acc = 0u64;
         for i in 0..iters {
@@ -259,13 +344,13 @@ fn bench_kernel_ipc_call_reply() -> f64 {
                     badge: req.badge,
                     payload: req.payload.wrapping_add(1),
                 })
-                .unwrap();
+                .expect("bootstrap endpoint handles synchronous ipc_call");
             acc = acc.wrapping_add(reply.payload ^ reply.badge);
         }
         acc
     });
     assert_eq!(ipc.stats().would_blocks, 0);
-    ns
+    Ok(ns)
 }
 
 fn bench_kernel_ring_spsc_slice_transfer() -> f64 {
@@ -418,17 +503,17 @@ struct PingBenchHost {
 }
 
 impl PingBenchHost {
-    fn new() -> Self {
+    fn try_new() -> Result<Self, SysError> {
         let mut ipc = KernelIpcState::new();
-        let _ = ipc.init_bootstrap_caps(None).unwrap();
-        Self {
+        let _ = ipc.init_bootstrap_caps(None)?;
+        Ok(Self {
             ipc,
             worker_reply_recvs: 0,
             replies_verified: 0,
-        }
+        })
     }
 
-    fn total_syscalls(&self) -> u64 {
+    const fn total_syscalls(&self) -> u64 {
         let stats = self.ipc.stats();
         stats.ipc_calls + stats.ipc_sends + stats.ipc_recvs + self.worker_reply_recvs
     }
@@ -475,22 +560,45 @@ fn bench_shell_caos_put_get_ref() -> f64 {
             let p3 = b"beta-telemetry-blob-001";
             let p4 = b"gamma-snapshot-record";
 
-            let h1 = store.put(black_box(p1)).unwrap();
-            let h1_dup = store.put(black_box(p1)).unwrap();
+            let h1 = store
+                .put(black_box(p1))
+                .expect("fresh ObjectStore fits 4 benchmark payloads");
+            let h1_dup = store
+                .put(black_box(p1))
+                .expect("deduplicated put succeeds on existing payload");
             assert_eq!(h1, h1_dup);
-            let h2 = store.put(black_box(p2)).unwrap();
-            let h3 = store.put(black_box(p3)).unwrap();
-            let h4 = store.put(black_box(p4)).unwrap();
+            let h2 = store
+                .put(black_box(p2))
+                .expect("fresh ObjectStore fits payload 2");
+            let h3 = store
+                .put(black_box(p3))
+                .expect("fresh ObjectStore fits payload 3");
+            let h4 = store
+                .put(black_box(p4))
+                .expect("fresh ObjectStore fits payload 4");
 
-            store.set_ref("@cfg", h1).unwrap();
-            store.set_ref("@cfg", h2).unwrap();
-            store.set_ref("@tel", h3).unwrap();
-            store.set_ref("@snap", h4).unwrap();
+            store
+                .set_ref("@cfg", h1)
+                .expect("fresh ObjectStore accepts @cfg ref");
+            store
+                .set_ref("@cfg", h2)
+                .expect("@cfg ref is writable for update");
+            store
+                .set_ref("@tel", h3)
+                .expect("fresh ObjectStore accepts @tel ref");
+            store
+                .set_ref("@snap", h4)
+                .expect("fresh ObjectStore accepts @snap ref");
 
-            let (rh, rb) = store.get_any("@cfg").unwrap();
+            let (rh, rb) = store.get_any("@cfg").expect("@cfg ref was just set");
             let rb_len = rb.len() as u64;
-            let by_hash_len = store.get_by_hash(h3).unwrap().len() as u64;
-            let rolled = store.rollback_ref("@cfg").unwrap();
+            let by_hash_len = store
+                .get_by_hash(h3)
+                .expect("h3 object was just stored")
+                .len() as u64;
+            let rolled = store
+                .rollback_ref("@cfg")
+                .expect("@cfg has prior version h1 to roll back to");
             let count = store.object_count();
 
             acc = acc
@@ -505,7 +613,7 @@ fn bench_shell_caos_put_get_ref() -> f64 {
     })
 }
 
-fn bench_shell_pipeline_eval() -> f64 {
+fn bench_shell_pipeline_eval() -> Result<f64, BenchError> {
     let mut sh = Shell::new(BenchmarkHost::new());
     let payloads: [&[u8]; 8] = [
         b"short-1",
@@ -519,9 +627,9 @@ fn bench_shell_pipeline_eval() -> f64 {
     ];
     let ref_names = ["@r1", "@r2", "@r3", "@r4"];
     for (idx, payload) in payloads.iter().enumerate() {
-        let h = sh.store_mut().put(payload).unwrap();
+        let h = sh.store_mut().put(payload)?;
         if idx < ref_names.len() {
-            sh.store_mut().set_ref(ref_names[idx], h).unwrap();
+            sh.store_mut().set_ref(ref_names[idx], h)?;
         }
     }
 
@@ -532,24 +640,29 @@ fn bench_shell_pipeline_eval() -> f64 {
         "objects | where size >= 10 | where size <= 100 | first 4",
     ];
 
-    bench_median_ns_per_op(500, 5_000, pipelines.len(), |iters| {
-        let mut acc = 0u64;
-        for _ in 0..iters {
-            for &cmd in &pipelines {
-                let stream = sh.eval_pipeline(black_box(cmd));
-                let val = match stream.first() {
-                    Some(Record::Count(c)) => c as u64,
-                    Some(Record::Object(m)) => m.hash.0,
-                    Some(Record::Ref(m)) => m.target.0,
-                    Some(Record::Domain { id, .. }) => id,
-                    Some(Record::Metric { value, .. }) => value,
-                    None => 0,
-                };
-                acc = acc.wrapping_add(val ^ (stream.len() as u64));
+    Ok(bench_median_ns_per_op(
+        500,
+        5_000,
+        pipelines.len(),
+        |iters| {
+            let mut acc = 0u64;
+            for _ in 0..iters {
+                for &cmd in &pipelines {
+                    let stream = sh.eval_pipeline(black_box(cmd));
+                    let val = match stream.first() {
+                        Some(Record::Count(c)) => c as u64,
+                        Some(Record::Object(m)) => m.hash.0,
+                        Some(Record::Ref(m)) => m.target.0,
+                        Some(Record::Domain { id, .. }) => id,
+                        Some(Record::Metric { value, .. }) => value,
+                        None => 0,
+                    };
+                    acc = acc.wrapping_add(val ^ (stream.len() as u64));
+                }
             }
-        }
-        acc
-    })
+            acc
+        },
+    ))
 }
 
 fn run_canonical_session(sh: &mut Shell<BenchmarkHost>) -> u64 {
@@ -578,6 +691,7 @@ fn bench_shell_session_full() -> f64 {
 // IPC Consumption Benchmarks (10 metrics, exact production syscall & byte counts)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ShellSessionIpcStats {
     debug_write_syscalls: u64,
     sys_info_syscalls: u64,
@@ -621,9 +735,9 @@ fn measure_repl_line_ipc() -> (u64, u64) {
     (syscalls, payload_bytes)
 }
 
-fn measure_ping_roundtrip_syscalls_per_op() -> u64 {
+fn measure_ping_roundtrip_syscalls_per_op() -> Result<u64, BenchError> {
     const ROUNDTRIPS: u64 = 100;
-    let mut sh = Shell::new(PingBenchHost::new());
+    let mut sh = Shell::new(PingBenchHost::try_new()?);
     for _ in 0..ROUNDTRIPS {
         let stream = sh.eval_pipeline("ping 0xA110C0DE");
         assert_eq!(stream.len(), 2);
@@ -633,7 +747,7 @@ fn measure_ping_roundtrip_syscalls_per_op() -> u64 {
                 value: 0x5E14,
                 ..
             }) => {}
-            _ => panic!("unexpected ping metric output"),
+            _ => return Err(BenchError::UnexpectedPingMetric),
         }
     }
     let stats = sh.host().ipc.stats();
@@ -642,14 +756,14 @@ fn measure_ping_roundtrip_syscalls_per_op() -> u64 {
     assert_eq!(stats.ipc_recvs, 0);
     assert_eq!(sh.host().worker_reply_recvs, ROUNDTRIPS);
     assert_eq!(sh.host().replies_verified, ROUNDTRIPS);
-    sh.host().total_syscalls() / ROUNDTRIPS
+    Ok(sh.host().total_syscalls() / ROUNDTRIPS)
 }
 
-fn measure_ring_burst_32w_notify_syscalls() -> u64 {
+fn measure_ring_burst_32w_notify_syscalls() -> Result<u64, BenchError> {
     const WORDS: usize = 32;
     let ring = SpscRing::<64>::new();
     let mut ipc = KernelIpcState::new();
-    let (notif, _ep, _fault) = ipc.init_bootstrap_caps(None).unwrap();
+    let (notif, _ep, _fault) = ipc.init_bootstrap_caps(None)?;
 
     let mut src = [0u64; WORDS];
     for (i, slot) in src.iter_mut().enumerate() {
@@ -659,10 +773,10 @@ fn measure_ring_burst_32w_notify_syscalls() -> u64 {
     // Batched producer push + single coalesced notification
     let pushed = ring.try_push_slice(&src);
     assert_eq!(pushed, WORDS);
-    ipc.notify_signal(notif, 1).unwrap();
+    ipc.notify_signal(notif, 1)?;
 
     // Single coalesced consumer poll + batched drain
-    let bits = ipc.notify_poll(notif).unwrap();
+    let bits = ipc.notify_poll(notif)?;
     assert_eq!(bits, 1);
     let mut dst = [0u64; WORDS];
     let popped = ring.try_pop_slice(&mut dst);
@@ -673,10 +787,10 @@ fn measure_ring_burst_32w_notify_syscalls() -> u64 {
     let stats = ipc.stats();
     assert_eq!(stats.notify_signals, 1);
     assert_eq!(stats.notify_polls, 1);
-    stats.notify_signals + stats.notify_polls
+    Ok(stats.notify_signals + stats.notify_polls)
 }
 
-fn measure_idle_poll_100_wasted_worker_ipc() -> u64 {
+fn measure_idle_poll_100_wasted_worker_ipc() -> Result<u64, BenchError> {
     const IDLE_YIELDS: u64 = 100;
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum WorkerState {
@@ -685,7 +799,7 @@ fn measure_idle_poll_100_wasted_worker_ipc() -> u64 {
     }
 
     let mut ipc = KernelIpcState::new();
-    let (_notif, ep, _fault) = ipc.init_bootstrap_caps(None).unwrap();
+    let (_notif, ep, _fault) = ipc.init_bootstrap_caps(None)?;
     let mut worker_state = WorkerState::WaitingRecv;
 
     // Across 100 idle scheduler ticks with no incoming message, a worker blocked in
@@ -705,26 +819,27 @@ fn measure_idle_poll_100_wasted_worker_ipc() -> u64 {
     assert_eq!(worker_state, WorkerState::WaitingRecv);
 
     // Sanity check: a genuine message wakes the blocked worker and delivers cleanly.
-    ipc.ipc_send(ep, black_box(0xBEEF)).unwrap();
+    ipc.ipc_send(ep, black_box(0xBEEF))?;
     worker_state = WorkerState::Running;
-    let msg = ipc.ipc_recv(ep).unwrap();
+    let msg = ipc.ipc_recv(ep)?;
     assert_eq!(msg.payload, 0xBEEF);
     assert_eq!(worker_state, WorkerState::Running);
 
-    idle_stats.would_blocks
+    Ok(idle_stats.would_blocks)
 }
 
 // ---------------------------------------------------------------------------
 // IPC Footprint Benchmarks (6 metrics, exact struct sizes in bytes)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IpcFootprintStats {
-    cap_slot_bytes: u64,
-    cnode64_bytes: u64,
-    kernel_ipc_state_bytes: u64,
-    spsc_ring64_bytes: u64,
-    record_stream_bytes: u64,
-    shell_bytes: u64,
+    cap_slot: u64,
+    cnode64: u64,
+    kernel_ipc_state: u64,
+    spsc_ring64: u64,
+    record_stream: u64,
+    shell: u64,
 }
 
 fn measure_ipc_footprint() -> IpcFootprintStats {
@@ -732,17 +847,17 @@ fn measure_ipc_footprint() -> IpcFootprintStats {
     let cnode32 = core::mem::size_of::<CNode<32>>();
     let cnode_diff = cnode64 - cnode32;
     assert_eq!(cnode_diff % 32, 0);
-    let cap_slot_bytes = (cnode_diff / 32) as u64;
+    let cap_slot = (cnode_diff / 32) as u64;
 
     assert_eq!(core::mem::size_of::<ZeroSizedHost>(), 0);
 
     IpcFootprintStats {
-        cap_slot_bytes,
-        cnode64_bytes: cnode64 as u64,
-        kernel_ipc_state_bytes: core::mem::size_of::<KernelIpcState>() as u64,
-        spsc_ring64_bytes: core::mem::size_of::<SpscRing<64>>() as u64,
-        record_stream_bytes: core::mem::size_of::<RecordStream>() as u64,
-        shell_bytes: core::mem::size_of::<Shell<ZeroSizedHost>>() as u64,
+        cap_slot,
+        cnode64: cnode64 as u64,
+        kernel_ipc_state: core::mem::size_of::<KernelIpcState>() as u64,
+        spsc_ring64: core::mem::size_of::<SpscRing<64>>() as u64,
+        record_stream: core::mem::size_of::<RecordStream>() as u64,
+        shell: core::mem::size_of::<Shell<ZeroSizedHost>>() as u64,
     }
 }
 
@@ -750,301 +865,465 @@ fn measure_ipc_footprint() -> IpcFootprintStats {
 // CLI & Reporting
 // ---------------------------------------------------------------------------
 
-fn print_usage() {
-    println!("Usage: newos_bench [--markdown | --json | --help]");
-    println!();
-    println!("Options:");
-    println!("  (default)   Print machine-parseable `METRIC <name> <value> <unit>` lines");
-    println!("  --markdown  Print GitHub-flavored Markdown table");
-    println!("  --json      Print JSON object with all 28 benchmark metrics");
-    println!("  -h, --help  Show this help message and exit");
+fn write_usage(w: &mut impl io::Write) -> io::Result<()> {
+    writeln!(w, "Usage: newos_bench [--markdown | --json | --help]")?;
+    writeln!(w)?;
+    writeln!(w, "Options:")?;
+    writeln!(
+        w,
+        "  (default)   Print machine-parseable `METRIC <name> <value> <unit>` lines"
+    )?;
+    writeln!(w, "  --markdown  Print GitHub-flavored Markdown table")?;
+    writeln!(
+        w,
+        "  --json      Print JSON object with all 28 benchmark metrics"
+    )?;
+    writeln!(w, "  -h, --help  Show this help message and exit")
 }
 
-fn parse_args() -> OutputFormat {
-    let mut args = std::env::args().skip(1);
-    let format = match args.next().as_deref() {
-        None => OutputFormat::Default,
-        Some("--markdown") => OutputFormat::Markdown,
-        Some("--json") => OutputFormat::Json,
-        Some("--help" | "-h") => {
-            if let Some(extra) = args.next() {
-                eprintln!("error: unexpected extra argument `{extra}`");
-                eprintln!("Run with `--help` for usage.");
-                std::process::exit(2);
-            }
-            print_usage();
-            std::process::exit(0);
-        }
-        Some(flag) => {
-            eprintln!("error: unknown argument `{flag}`");
-            eprintln!("Run with `--help` for usage.");
-            std::process::exit(2);
-        }
+fn parse_args_from<I, S>(args: I) -> Result<CliAction, BenchError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut iter = args.into_iter();
+    let action = match iter.next().as_ref().map(AsRef::as_ref) {
+        None => CliAction::Run(OutputFormat::Default),
+        Some("--markdown") => CliAction::Run(OutputFormat::Markdown),
+        Some("--json") => CliAction::Run(OutputFormat::Json),
+        Some("--help" | "-h") => CliAction::Help,
+        Some(flag) => return Err(BenchError::CliUnknownArg(flag.to_string())),
     };
-    if let Some(extra) = args.next() {
-        eprintln!("error: unexpected extra argument `{extra}`");
-        eprintln!("Run with `--help` for usage.");
-        std::process::exit(2);
+    if let Some(extra) = iter.next() {
+        return Err(BenchError::CliExtraArg(extra.as_ref().to_string()));
     }
-    format
+    Ok(action)
 }
 
-fn main() {
-    let format = parse_args();
+impl Metric {
+    const fn float(
+        category: &'static str,
+        name: &'static str,
+        value: f64,
+        unit: &'static str,
+    ) -> Self {
+        Self {
+            category,
+            name,
+            value: MetricValue::Float(value),
+            unit,
+        }
+    }
 
-    // Correctness gate: run production shell self-test before benchmarking
-    let mut self_test_shell = Shell::new(BenchmarkHost::new());
-    self_test_shell
-        .run_self_test()
-        .expect("newos-shell-core run_self_test failed");
-    assert_eq!(self_test_shell.host().debug_write_syscalls, 0);
+    const fn int(
+        category: &'static str,
+        name: &'static str,
+        value: u64,
+        unit: &'static str,
+    ) -> Self {
+        Self {
+            category,
+            name,
+            value: MetricValue::Int(value),
+            unit,
+        }
+    }
+}
 
-    // 1. Kernel Speed (9 metrics)
-    let k_cnode_lookup = bench_kernel_cnode_lookup();
-    let k_cnode_mint_revoke = bench_kernel_cnode_mint_revoke();
-    let k_ipc_send_recv = bench_kernel_ipc_send_recv();
-    let k_ipc_notify = bench_kernel_ipc_notify_signal_poll();
-    let k_sched_next = bench_kernel_sched_schedule_next();
-    let k_mem_retype = bench_kernel_memory_retype_frame();
-    let k_ring_spsc = bench_kernel_ring_spsc_transfer();
-    let k_ipc_call_reply = bench_kernel_ipc_call_reply();
-    let k_ring_spsc_slice = bench_kernel_ring_spsc_slice_transfer();
+fn collect_speed_metrics() -> Result<[Metric; 12], BenchError> {
+    Ok([
+        Metric::float(
+            "Kernel Speed",
+            "kernel.cnode.lookup",
+            bench_kernel_cnode_lookup()?,
+            "ns/op",
+        ),
+        Metric::float(
+            "Kernel Speed",
+            "kernel.cnode.mint_revoke",
+            bench_kernel_cnode_mint_revoke()?,
+            "ns/op",
+        ),
+        Metric::float(
+            "Kernel Speed",
+            "kernel.ipc.send_recv",
+            bench_kernel_ipc_send_recv()?,
+            "ns/op",
+        ),
+        Metric::float(
+            "Kernel Speed",
+            "kernel.ipc.notify_signal_poll",
+            bench_kernel_ipc_notify_signal_poll()?,
+            "ns/op",
+        ),
+        Metric::float(
+            "Kernel Speed",
+            "kernel.sched.schedule_next",
+            bench_kernel_sched_schedule_next()?,
+            "ns/op",
+        ),
+        Metric::float(
+            "Kernel Speed",
+            "kernel.memory.retype_frame",
+            bench_kernel_memory_retype_frame()?,
+            "ns/op",
+        ),
+        Metric::float(
+            "Kernel Speed",
+            "kernel.ring.spsc_transfer",
+            bench_kernel_ring_spsc_transfer(),
+            "ns/op",
+        ),
+        Metric::float(
+            "Kernel Speed",
+            "kernel.ipc.call_reply",
+            bench_kernel_ipc_call_reply()?,
+            "ns/op",
+        ),
+        Metric::float(
+            "Kernel Speed",
+            "kernel.ring.spsc_slice_transfer",
+            bench_kernel_ring_spsc_slice_transfer(),
+            "ns/op",
+        ),
+        Metric::float(
+            "Shell Speed",
+            "shell.caos.put_get_ref",
+            bench_shell_caos_put_get_ref(),
+            "ns/op",
+        ),
+        Metric::float(
+            "Shell Speed",
+            "shell.pipeline.eval",
+            bench_shell_pipeline_eval()?,
+            "ns/op",
+        ),
+        Metric::float(
+            "Shell Speed",
+            "shell.session.full",
+            bench_shell_session_full(),
+            "ns/op",
+        ),
+    ])
+}
 
-    // 2. Shell Speed (3 metrics)
-    let s_caos = bench_shell_caos_put_get_ref();
-    let s_pipeline = bench_shell_pipeline_eval();
-    let s_session = bench_shell_session_full();
-
-    // 3. IPC Consumption (10 metrics)
+fn collect_ipc_consumption_metrics() -> Result<[Metric; 10], BenchError> {
     let session_ipc = measure_shell_session_ipc();
     let ipc_debug_writes = session_ipc.debug_write_syscalls;
     let ipc_sys_info = session_ipc.sys_info_syscalls;
-    let ipc_ping_per_op = measure_ping_roundtrip_syscalls_per_op();
-    let ipc_ring_notify = measure_ring_burst_32w_notify_syscalls();
-    let ipc_idle_wasted = measure_idle_poll_100_wasted_worker_ipc();
+    let ipc_ping_per_op = measure_ping_roundtrip_syscalls_per_op()?;
+    let ipc_ring_notify = measure_ring_burst_32w_notify_syscalls()?;
+    let ipc_idle_wasted = measure_idle_poll_100_wasted_worker_ipc()?;
     let ipc_total =
         ipc_debug_writes + ipc_sys_info + ipc_ping_per_op + ipc_ring_notify + ipc_idle_wasted;
     let (ipc_repl_syscalls, ipc_repl_payload_bytes) = measure_repl_line_ipc();
 
-    // 4. IPC Footprint (6 metrics)
+    Ok([
+        Metric::int(
+            "IPC Consumption",
+            "ipc.shell_session.debug_write_syscalls",
+            ipc_debug_writes,
+            "syscalls",
+        ),
+        Metric::int(
+            "IPC Consumption",
+            "ipc.shell_session.sys_info_syscalls",
+            ipc_sys_info,
+            "syscalls",
+        ),
+        Metric::int(
+            "IPC Consumption",
+            "ipc.ping_roundtrip.syscalls_per_op",
+            ipc_ping_per_op,
+            "syscalls/op",
+        ),
+        Metric::int(
+            "IPC Consumption",
+            "ipc.ring_burst_32w.notify_syscalls",
+            ipc_ring_notify,
+            "syscalls",
+        ),
+        Metric::int(
+            "IPC Consumption",
+            "ipc.idle_poll_100.wasted_worker_ipc",
+            ipc_idle_wasted,
+            "syscalls",
+        ),
+        Metric::int(
+            "IPC Consumption",
+            "ipc.total_consumption",
+            ipc_total,
+            "syscalls",
+        ),
+        Metric::int(
+            "IPC Consumption",
+            "ipc.shell_session.debug_write_bytes",
+            session_ipc.debug_write_bytes,
+            "bytes",
+        ),
+        Metric::int(
+            "IPC Consumption",
+            "ipc.shell_session.max_chunk_bytes",
+            session_ipc.max_chunk_bytes,
+            "bytes",
+        ),
+        Metric::int(
+            "IPC Consumption",
+            "ipc.repl_line.syscalls",
+            ipc_repl_syscalls,
+            "syscalls",
+        ),
+        Metric::int(
+            "IPC Consumption",
+            "ipc.repl_line.payload_bytes",
+            ipc_repl_payload_bytes,
+            "bytes",
+        ),
+    ])
+}
+
+fn collect_ipc_footprint_metrics() -> [Metric; 6] {
     let footprint = measure_ipc_footprint();
+    [
+        Metric::int(
+            "IPC Footprint",
+            "ipc.footprint.cap_slot_bytes",
+            footprint.cap_slot,
+            "bytes",
+        ),
+        Metric::int(
+            "IPC Footprint",
+            "ipc.footprint.cnode64_bytes",
+            footprint.cnode64,
+            "bytes",
+        ),
+        Metric::int(
+            "IPC Footprint",
+            "ipc.footprint.kernel_ipc_state_bytes",
+            footprint.kernel_ipc_state,
+            "bytes",
+        ),
+        Metric::int(
+            "IPC Footprint",
+            "ipc.footprint.spsc_ring64_bytes",
+            footprint.spsc_ring64,
+            "bytes",
+        ),
+        Metric::int(
+            "IPC Footprint",
+            "ipc.footprint.record_stream_bytes",
+            footprint.record_stream,
+            "bytes",
+        ),
+        Metric::int(
+            "IPC Footprint",
+            "ipc.footprint.shell_bytes",
+            footprint.shell,
+            "bytes",
+        ),
+    ]
+}
 
-    let metrics = [
-        Metric {
-            category: "Kernel Speed",
-            name: "kernel.cnode.lookup",
-            value: MetricValue::Float(k_cnode_lookup),
-            unit: "ns/op",
-        },
-        Metric {
-            category: "Kernel Speed",
-            name: "kernel.cnode.mint_revoke",
-            value: MetricValue::Float(k_cnode_mint_revoke),
-            unit: "ns/op",
-        },
-        Metric {
-            category: "Kernel Speed",
-            name: "kernel.ipc.send_recv",
-            value: MetricValue::Float(k_ipc_send_recv),
-            unit: "ns/op",
-        },
-        Metric {
-            category: "Kernel Speed",
-            name: "kernel.ipc.notify_signal_poll",
-            value: MetricValue::Float(k_ipc_notify),
-            unit: "ns/op",
-        },
-        Metric {
-            category: "Kernel Speed",
-            name: "kernel.sched.schedule_next",
-            value: MetricValue::Float(k_sched_next),
-            unit: "ns/op",
-        },
-        Metric {
-            category: "Kernel Speed",
-            name: "kernel.memory.retype_frame",
-            value: MetricValue::Float(k_mem_retype),
-            unit: "ns/op",
-        },
-        Metric {
-            category: "Kernel Speed",
-            name: "kernel.ring.spsc_transfer",
-            value: MetricValue::Float(k_ring_spsc),
-            unit: "ns/op",
-        },
-        Metric {
-            category: "Kernel Speed",
-            name: "kernel.ipc.call_reply",
-            value: MetricValue::Float(k_ipc_call_reply),
-            unit: "ns/op",
-        },
-        Metric {
-            category: "Kernel Speed",
-            name: "kernel.ring.spsc_slice_transfer",
-            value: MetricValue::Float(k_ring_spsc_slice),
-            unit: "ns/op",
-        },
-        Metric {
-            category: "Shell Speed",
-            name: "shell.caos.put_get_ref",
-            value: MetricValue::Float(s_caos),
-            unit: "ns/op",
-        },
-        Metric {
-            category: "Shell Speed",
-            name: "shell.pipeline.eval",
-            value: MetricValue::Float(s_pipeline),
-            unit: "ns/op",
-        },
-        Metric {
-            category: "Shell Speed",
-            name: "shell.session.full",
-            value: MetricValue::Float(s_session),
-            unit: "ns/op",
-        },
-        Metric {
-            category: "IPC Consumption",
-            name: "ipc.shell_session.debug_write_syscalls",
-            value: MetricValue::Int(ipc_debug_writes),
-            unit: "syscalls",
-        },
-        Metric {
-            category: "IPC Consumption",
-            name: "ipc.shell_session.sys_info_syscalls",
-            value: MetricValue::Int(ipc_sys_info),
-            unit: "syscalls",
-        },
-        Metric {
-            category: "IPC Consumption",
-            name: "ipc.ping_roundtrip.syscalls_per_op",
-            value: MetricValue::Int(ipc_ping_per_op),
-            unit: "syscalls/op",
-        },
-        Metric {
-            category: "IPC Consumption",
-            name: "ipc.ring_burst_32w.notify_syscalls",
-            value: MetricValue::Int(ipc_ring_notify),
-            unit: "syscalls",
-        },
-        Metric {
-            category: "IPC Consumption",
-            name: "ipc.idle_poll_100.wasted_worker_ipc",
-            value: MetricValue::Int(ipc_idle_wasted),
-            unit: "syscalls",
-        },
-        Metric {
-            category: "IPC Consumption",
-            name: "ipc.total_consumption",
-            value: MetricValue::Int(ipc_total),
-            unit: "syscalls",
-        },
-        Metric {
-            category: "IPC Consumption",
-            name: "ipc.shell_session.debug_write_bytes",
-            value: MetricValue::Int(session_ipc.debug_write_bytes),
-            unit: "bytes",
-        },
-        Metric {
-            category: "IPC Consumption",
-            name: "ipc.shell_session.max_chunk_bytes",
-            value: MetricValue::Int(session_ipc.max_chunk_bytes),
-            unit: "bytes",
-        },
-        Metric {
-            category: "IPC Consumption",
-            name: "ipc.repl_line.syscalls",
-            value: MetricValue::Int(ipc_repl_syscalls),
-            unit: "syscalls",
-        },
-        Metric {
-            category: "IPC Consumption",
-            name: "ipc.repl_line.payload_bytes",
-            value: MetricValue::Int(ipc_repl_payload_bytes),
-            unit: "bytes",
-        },
-        Metric {
-            category: "IPC Footprint",
-            name: "ipc.footprint.cap_slot_bytes",
-            value: MetricValue::Int(footprint.cap_slot_bytes),
-            unit: "bytes",
-        },
-        Metric {
-            category: "IPC Footprint",
-            name: "ipc.footprint.cnode64_bytes",
-            value: MetricValue::Int(footprint.cnode64_bytes),
-            unit: "bytes",
-        },
-        Metric {
-            category: "IPC Footprint",
-            name: "ipc.footprint.kernel_ipc_state_bytes",
-            value: MetricValue::Int(footprint.kernel_ipc_state_bytes),
-            unit: "bytes",
-        },
-        Metric {
-            category: "IPC Footprint",
-            name: "ipc.footprint.spsc_ring64_bytes",
-            value: MetricValue::Int(footprint.spsc_ring64_bytes),
-            unit: "bytes",
-        },
-        Metric {
-            category: "IPC Footprint",
-            name: "ipc.footprint.record_stream_bytes",
-            value: MetricValue::Int(footprint.record_stream_bytes),
-            unit: "bytes",
-        },
-        Metric {
-            category: "IPC Footprint",
-            name: "ipc.footprint.shell_bytes",
-            value: MetricValue::Int(footprint.shell_bytes),
-            unit: "bytes",
-        },
-    ];
+fn collect_metrics() -> Result<Vec<Metric>, BenchError> {
+    // Correctness gate: run production shell self-test before benchmarking
+    let mut self_test_shell = Shell::new(BenchmarkHost::new());
+    self_test_shell
+        .run_self_test()
+        .map_err(BenchError::SelfTest)?;
+    assert_eq!(self_test_shell.host().debug_write_syscalls, 0);
 
+    let mut metrics = Vec::with_capacity(28);
+    metrics.extend_from_slice(&collect_speed_metrics()?);
+    metrics.extend_from_slice(&collect_ipc_consumption_metrics()?);
+    metrics.extend_from_slice(&collect_ipc_footprint_metrics());
+    Ok(metrics)
+}
+
+fn format_metrics(
+    format: OutputFormat,
+    metrics: &[Metric],
+    w: &mut impl io::Write,
+) -> io::Result<()> {
     match format {
         OutputFormat::Default => {
-            for m in &metrics {
+            for m in metrics {
                 match m.value {
-                    MetricValue::Float(v) => println!("METRIC {} {:.2} {}", m.name, v, m.unit),
-                    MetricValue::Int(v) => println!("METRIC {} {} {}", m.name, v, m.unit),
+                    MetricValue::Float(v) => writeln!(w, "METRIC {} {v:.2} {}", m.name, m.unit)?,
+                    MetricValue::Int(v) => writeln!(w, "METRIC {} {v} {}", m.name, m.unit)?,
                 }
             }
         }
         OutputFormat::Markdown => {
-            println!("| Category | Metric | Value | Unit |");
-            println!("|---|---|---|---|");
-            for m in &metrics {
+            writeln!(w, "| Category | Metric | Value | Unit |")?;
+            writeln!(w, "|---|---|---|---|")?;
+            for m in metrics {
                 match m.value {
                     MetricValue::Float(v) => {
-                        println!("| {} | `{}` | {:.2} | {} |", m.category, m.name, v, m.unit);
+                        writeln!(w, "| {} | `{}` | {v:.2} | {} |", m.category, m.name, m.unit)?;
                     }
                     MetricValue::Int(v) => {
-                        println!("| {} | `{}` | {} | {} |", m.category, m.name, v, m.unit);
+                        writeln!(w, "| {} | `{}` | {v} | {} |", m.category, m.name, m.unit)?;
                     }
                 }
             }
         }
         OutputFormat::Json => {
-            print!("{{\"metrics\":[");
+            write!(w, "{{\"metrics\":[")?;
             for (i, m) in metrics.iter().enumerate() {
                 if i > 0 {
-                    print!(",");
+                    write!(w, ",")?;
                 }
                 match m.value {
                     MetricValue::Float(v) => {
-                        print!(
-                            "{{\"category\":\"{}\",\"name\":\"{}\",\"value\":{:.2},\"unit\":\"{}\"}}",
-                            m.category, m.name, v, m.unit
-                        );
+                        write!(
+                            w,
+                            "{{\"category\":\"{}\",\"name\":\"{}\",\"value\":{v:.2},\"unit\":\"{}\"}}",
+                            m.category, m.name, m.unit
+                        )?;
                     }
                     MetricValue::Int(v) => {
-                        print!(
-                            "{{\"category\":\"{}\",\"name\":\"{}\",\"value\":{},\"unit\":\"{}\"}}",
-                            m.category, m.name, v, m.unit
-                        );
+                        write!(
+                            w,
+                            "{{\"category\":\"{}\",\"name\":\"{}\",\"value\":{v},\"unit\":\"{}\"}}",
+                            m.category, m.name, m.unit
+                        )?;
                     }
                 }
             }
-            println!("]}}");
+            writeln!(w, "]}}")?;
         }
+    }
+    Ok(())
+}
+
+fn run(args: impl IntoIterator<Item = String>) -> Result<(), BenchError> {
+    let mut stdout = io::stdout().lock();
+    match parse_args_from(args)? {
+        CliAction::Help => {
+            write_usage(&mut stdout)?;
+        }
+        CliAction::Run(format) => {
+            let metrics = collect_metrics()?;
+            format_metrics(format, &metrics, &mut stdout)?;
+            stdout.flush()?;
+        }
+    }
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    match run(std::env::args().skip(1)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err @ (BenchError::CliUnknownArg(_) | BenchError::CliExtraArg(_))) => {
+            eprintln!("error: {err}");
+            eprintln!("Run with `--help` for usage.");
+            ExitCode::from(2)
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn parse_args_from_handles_valid_and_invalid_cli_flags() {
+        assert_eq!(
+            parse_args_from(Vec::<&str>::new()).ok(),
+            Some(CliAction::Run(OutputFormat::Default))
+        );
+        assert_eq!(
+            parse_args_from(["--markdown"]).ok(),
+            Some(CliAction::Run(OutputFormat::Markdown))
+        );
+        assert_eq!(
+            parse_args_from(["--json"]).ok(),
+            Some(CliAction::Run(OutputFormat::Json))
+        );
+        assert_eq!(parse_args_from(["--help"]).ok(), Some(CliAction::Help));
+        assert_eq!(parse_args_from(["-h"]).ok(), Some(CliAction::Help));
+
+        assert!(matches!(
+            parse_args_from(["--bogus"]),
+            Err(BenchError::CliUnknownArg(ref s)) if s == "--bogus"
+        ));
+        assert!(matches!(
+            parse_args_from(["--json", "--extra"]),
+            Err(BenchError::CliExtraArg(ref s)) if s == "--extra"
+        ));
+        assert!(matches!(
+            parse_args_from(["--help", "extra"]),
+            Err(BenchError::CliExtraArg(ref s)) if s == "extra"
+        ));
+    }
+
+    #[test]
+    fn format_metrics_emits_expected_default_markdown_and_json() {
+        let sample = [
+            Metric {
+                category: "Kernel Speed",
+                name: "kernel.cnode.lookup",
+                value: MetricValue::Float(12.345),
+                unit: "ns/op",
+            },
+            Metric {
+                category: "IPC Footprint",
+                name: "ipc.footprint.cap_slot_bytes",
+                value: MetricValue::Int(48),
+                unit: "bytes",
+            },
+        ];
+
+        let mut default_out = Vec::new();
+        format_metrics(OutputFormat::Default, &sample, &mut default_out).expect("format default");
+        assert_eq!(
+            String::from_utf8(default_out).expect("utf8"),
+            "METRIC kernel.cnode.lookup 12.35 ns/op\nMETRIC ipc.footprint.cap_slot_bytes 48 bytes\n"
+        );
+
+        let mut md_out = Vec::new();
+        format_metrics(OutputFormat::Markdown, &sample, &mut md_out).expect("format markdown");
+        let md = String::from_utf8(md_out).expect("utf8");
+        assert!(md.starts_with("| Category | Metric | Value | Unit |\n|---|---|---|---|\n"));
+        assert!(md.contains("| Kernel Speed | `kernel.cnode.lookup` | 12.35 | ns/op |"));
+        assert!(md.contains("| IPC Footprint | `ipc.footprint.cap_slot_bytes` | 48 | bytes |"));
+
+        let mut json_out = Vec::new();
+        format_metrics(OutputFormat::Json, &sample, &mut json_out).expect("format json");
+        assert_eq!(
+            String::from_utf8(json_out).expect("utf8"),
+            "{\"metrics\":[{\"category\":\"Kernel Speed\",\"name\":\"kernel.cnode.lookup\",\"value\":12.35,\"unit\":\"ns/op\"},{\"category\":\"IPC Footprint\",\"name\":\"ipc.footprint.cap_slot_bytes\",\"value\":48,\"unit\":\"bytes\"}]}\n"
+        );
+    }
+
+    #[test]
+    fn measure_ipc_footprint_reports_nonzero_sizes() {
+        let fp = measure_ipc_footprint();
+        assert!(fp.cap_slot > 0);
+        assert!(fp.cnode64 >= fp.cap_slot * 64);
+        assert!(fp.kernel_ipc_state > 0);
+        assert!(fp.spsc_ring64 > 0);
+        assert!(fp.record_stream > 0);
+        assert!(fp.shell > 0);
+    }
+
+    #[test]
+    fn bench_error_display_and_source_work() {
+        let sys_err = BenchError::from(SysError::WouldBlock);
+        assert!(sys_err.source().is_some());
+        assert!(sys_err.to_string().contains("syscall"));
+
+        let io_err = BenchError::from(io::Error::other("broken pipe"));
+        assert!(io_err.source().is_some());
+        assert!(io_err.to_string().contains("broken pipe"));
+
+        let cli_err = BenchError::CliUnknownArg("--bad".into());
+        assert!(cli_err.source().is_none());
+        assert_eq!(cli_err.to_string(), "unknown argument `--bad`");
     }
 }

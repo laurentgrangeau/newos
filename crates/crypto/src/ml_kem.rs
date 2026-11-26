@@ -13,6 +13,7 @@ pub const CT_BYTES: usize = 1568;
 pub const SS_BYTES: usize = 32;
 
 /// Marker type implementing [`Kem`] for NIST Level 5 ML-KEM-1024.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MlKem1024Scheme;
 
 impl Kem for MlKem1024Scheme {
@@ -28,6 +29,12 @@ mod tests {
 
     #[test]
     fn kem_trait_constants_match_fips203() {
+        fn assert_std_traits<T: core::fmt::Debug + Default + Copy + Eq + core::hash::Hash>(
+            expected: T,
+        ) {
+            assert_eq!(T::default(), expected);
+        }
+        assert_std_traits(MlKem1024Scheme);
         assert_eq!(MlKem1024Scheme::NAME, "ml-kem-1024");
         assert_eq!(MlKem1024Scheme::EK_BYTES, 1568);
         assert_eq!(MlKem1024Scheme::CT_BYTES, 1568);

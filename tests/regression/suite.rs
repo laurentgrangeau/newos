@@ -30,9 +30,10 @@ fn regression_h3_n6_m12_key_vault_rate_limit_and_unflushable_replay_guard() {
         Some(VaultError::RateLimited)
     );
     for i in 10u64..80 {
+        let now_ms = 2_000 + i64::try_from(i).expect("index 10..80 fits i64") * 500;
         assert!(
             vault
-                .sign_kex_hash(&sha3_512(&i.to_le_bytes()), 2_000 + (i as i64) * 500)
+                .sign_kex_hash(&sha3_512(&i.to_le_bytes()), now_ms)
                 .is_ok()
         );
     }
@@ -47,7 +48,7 @@ fn regression_h3_n6_m12_key_vault_rate_limit_and_unflushable_replay_guard() {
 fn regression_n12_linear_counter_trng_rejected() {
     let mut counter = [0u8; 64];
     for (i, b) in counter.iter_mut().enumerate() {
-        *b = i as u8;
+        *b = u8::try_from(i).expect("index 0..64 fits u8");
     }
     assert_eq!(
         verify_entropy_health(&counter),
@@ -69,6 +70,8 @@ fn regression_spsc_ring_corrupted_frame_header_no_panic() {
 /// its corresponding parser in standard `cargo test` so fuzz crashes become permanent regressions.
 #[test]
 fn regression_replay_all_fuzz_corpus_seeds() {
+    type CorpusRunner = (&'static str, fn(&[u8]));
+
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root");
@@ -77,7 +80,6 @@ fn regression_replay_all_fuzz_corpus_seeds() {
         return;
     }
 
-    type CorpusRunner = (&'static str, fn(&[u8]));
     let targets: &[CorpusRunner] = &[
         ("fuzz_ssh_wire", |data| {
             let mut r = WireReader::new(data);

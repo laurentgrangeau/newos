@@ -1,4 +1,4 @@
-//! Broadcom VideoCore VII (V3D 7.1) GPU Probe & Compute Shader Dispatch.
+//! Broadcom `VideoCore` VII (V3D 7.1) GPU Probe & Compute Shader Dispatch.
 //!
 //! Physical MMIO layout on Raspberry Pi 5 (BCM2712):
 //! - `V3D_HUB`:   `0x10_0200_0000` (offset `+0x0000`) — `IDENT0..3`, MMU control
@@ -31,7 +31,7 @@ pub const V3D_CSD_QUEUED_CFG6: u64 = V3D_CORE0_OFF + 0x91C;
 /// Expected ASCII magic in `V3D_HUB_IDENT0` (`"V3D\0"` -> `0x0044_3356` low 24 bits).
 pub const V3D_IDENT0_MAGIC: u32 = 0x0044_3356;
 
-/// Probed VideoCore VII (V3D 7.1) hardware topology.
+/// Probed `VideoCore` VII (V3D 7.1) hardware topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct V3dInfo {
     pub tech_version: u8,
@@ -42,7 +42,7 @@ pub struct V3dInfo {
 }
 
 /// V3D 7.1 Compute Shader Dispatch (`CSD`) job descriptor (`CFG0..CFG6`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CsdJobConfig {
     pub cfg0_wg_x: u32,
     pub cfg1_wg_y: u32,
@@ -53,17 +53,24 @@ pub struct CsdJobConfig {
     pub cfg6_uniform_addr: u32,
 }
 
-/// Capability-scoped EL0 VideoCore VII (V3D 7.1) driver (`CapId::BOOTSTRAP_V3D_MMIO`).
+/// Capability-scoped EL0 `VideoCore` VII (V3D 7.1) driver (`CapId::BOOTSTRAP_V3D_MMIO`).
+#[derive(Debug)]
 pub struct VideoCoreV3d<T: GpuMmioTransport> {
     transport: T,
 }
 
 impl<T: GpuMmioTransport> VideoCoreV3d<T> {
+    /// Construct a `VideoCore` VII (V3D 7.1) driver over `transport`.
+    #[must_use]
     pub const fn new(transport: T) -> Self {
         Self { transport }
     }
 
-    /// Probe `V3D_HUB_IDENT0/1` and `V3D_CORE_IDENT1`, returning `V3dInfo` if VideoCore VII is present.
+    /// Probe `V3D_HUB_IDENT0/1` and `V3D_CORE_IDENT1`, returning `V3dInfo` if `VideoCore` VII is present.
+    ///
+    /// # Errors
+    /// Returns [`SysError::Unsupported`] if the `V3D_HUB_IDENT0` magic does not match, or a
+    /// transport [`SysError`] if MMIO reads fail.
     pub fn probe(&self) -> Result<V3dInfo, SysError> {
         let hub0 = self.transport.read32(V3D_HUB_IDENT0)?;
         if (hub0 & 0x00FF_FFFF) != V3D_IDENT0_MAGIC {
@@ -90,6 +97,9 @@ impl<T: GpuMmioTransport> VideoCoreV3d<T> {
     /// Submit a Compute Shader Dispatch (`CSD`) job to V3D 7.1 Core 0.
     ///
     /// Writing `CFG6` commits the queued job to the V3D CSD hardware queue.
+    ///
+    /// # Errors
+    /// Returns a transport [`SysError`] if any MMIO write fails.
     pub fn dispatch_compute(&self, job: CsdJobConfig) -> Result<(), SysError> {
         self.transport.write32(V3D_CSD_QUEUED_CFG0, job.cfg0_wg_x)?;
         self.transport.write32(V3D_CSD_QUEUED_CFG1, job.cfg1_wg_y)?;
@@ -105,6 +115,9 @@ impl<T: GpuMmioTransport> VideoCoreV3d<T> {
     }
 
     /// Read `V3D_CSD_STATUS` (bit 0 = queue full, bits 11:4 = completed jobs).
+    ///
+    /// # Errors
+    /// Returns a transport [`SysError`] if the MMIO read fails.
     pub fn csd_status(&self) -> Result<u32, SysError> {
         self.transport.read32(V3D_CSD_STATUS)
     }
@@ -116,18 +129,19 @@ mod tests {
     use core::cell::RefCell;
 
     struct MockV3d {
+        magic: u32,
         dispatches: RefCell<u32>,
     }
 
     impl GpuMmioTransport for &MockV3d {
         fn read32(&self, offset: u64) -> Result<u32, SysError> {
             match offset {
-                V3D_HUB_IDENT0 => Ok(V3D_IDENT0_MAGIC),
+                V3D_HUB_IDENT0 => Ok(self.magic),
                 // V3D 7.1, 1 core
                 V3D_HUB_IDENT1 => Ok((1 << 8) | (7 << 4) | 1),
                 // 3 slices, 3 TMUs
                 V3D_CORE_IDENT1 => Ok((3 << 12) | (3 << 4)),
-                V3D_CSD_STATUS => Ok(0),
+                V3D_CSD_STATUS => Ok(*self.dispatches.borrow() << 4),
                 _ => Ok(0),
             }
         }
@@ -142,6 +156,7 @@ mod tests {
     #[test]
     fn v3d_probes_videocore7_and_dispatches_compute_job() {
         let mock = MockV3d {
+            magic: V3D_IDENT0_MAGIC,
             dispatches: RefCell::new(0),
         };
         let gpu = VideoCoreV3d::new(&mock);
@@ -162,5 +177,17 @@ mod tests {
         })
         .expect("dispatch compute");
         assert_eq!(*mock.dispatches.borrow(), 1);
+        assert_eq!(gpu.csd_status(), Ok(1 << 4));
+    }
+
+    #[test]
+    fn v3d_probe_rejects_invalid_magic() {
+        let bad = MockV3d {
+            magic: 0x00DE_AD00,
+            dispatches: RefCell::new(0),
+        };
+        let gpu = VideoCoreV3d::new(&bad);
+        assert_eq!(gpu.probe(), Err(SysError::Unsupported));
+        assert_eq!(CsdJobConfig::default().cfg0_wg_x, 0);
     }
 }

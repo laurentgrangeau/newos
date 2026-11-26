@@ -15,25 +15,44 @@ use newos_user_rt::{BufferedConsole, IpcLogAssembler};
 
 newos_user_rt::entry!(main);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputSource {
+    Console,
+    Ssh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SshAuthState {
+    Closed,
+    Authorized { active_source: InputSource },
+}
+
 struct StandaloneShellHost {
     log_rx: IpcLogAssembler<256>,
     ssh_in_buf: [u8; 7],
     ssh_in_pos: usize,
     ssh_in_len: usize,
-    ssh_session_authorized: bool,
-    last_input_from_ssh: bool,
+    ssh_auth: SshAuthState,
 }
 
 impl StandaloneShellHost {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             log_rx: IpcLogAssembler::new(),
             ssh_in_buf: [0; 7],
             ssh_in_pos: 0,
             ssh_in_len: 0,
-            ssh_session_authorized: false,
-            last_input_from_ssh: false,
+            ssh_auth: SshAuthState::Closed,
         }
+    }
+
+    const fn is_ssh_active(&self) -> bool {
+        matches!(
+            self.ssh_auth,
+            SshAuthState::Authorized {
+                active_source: InputSource::Ssh
+            }
+        )
     }
 
     fn poll_auth_gate(&mut self) {
@@ -42,10 +61,13 @@ impl StandaloneShellHost {
                 continue;
             }
             if payload == auth_gate_ipc::SESSION_OPEN {
-                self.ssh_session_authorized = true;
+                if matches!(self.ssh_auth, SshAuthState::Closed) {
+                    self.ssh_auth = SshAuthState::Authorized {
+                        active_source: InputSource::Console,
+                    };
+                }
             } else if payload == auth_gate_ipc::SESSION_CLOSE {
-                self.ssh_session_authorized = false;
-                self.last_input_from_ssh = false;
+                self.ssh_auth = SshAuthState::Closed;
                 self.ssh_in_pos = 0;
                 self.ssh_in_len = 0;
             }
@@ -55,7 +77,7 @@ impl StandaloneShellHost {
 
 impl ShellHost for StandaloneShellHost {
     fn write_debug(&mut self, s: &str) {
-        if self.ssh_session_authorized && self.last_input_from_ssh {
+        if self.is_ssh_active() {
             // Route SSH shell output exclusively to `ssh-pd` without leaking to serial console (`M14`).
             let bytes = s.as_bytes();
             let mut off = 0usize;
@@ -79,10 +101,12 @@ impl ShellHost for StandaloneShellHost {
         if self.ssh_in_pos < self.ssh_in_len {
             let b = self.ssh_in_buf[self.ssh_in_pos];
             self.ssh_in_pos += 1;
-            self.last_input_from_ssh = true;
+            if let SshAuthState::Authorized { active_source } = &mut self.ssh_auth {
+                *active_source = InputSource::Ssh;
+            }
             return Ok(b);
         }
-        if self.ssh_session_authorized
+        if let SshAuthState::Authorized { active_source } = &mut self.ssh_auth
             && let Ok((_badge, word)) = newos_user_rt::ipc_recv(CapId::BOOTSTRAP_SSH_SHELL_EP)
         {
             let (chunk, len) = log_ipc::decode_chunk(word);
@@ -90,13 +114,15 @@ impl ShellHost for StandaloneShellHost {
                 self.ssh_in_buf = chunk;
                 self.ssh_in_len = len;
                 self.ssh_in_pos = 1;
-                self.last_input_from_ssh = true;
+                *active_source = InputSource::Ssh;
                 return Ok(chunk[0]);
             }
         }
         let res = newos_user_rt::debug_read_byte();
-        if res.is_ok() {
-            self.last_input_from_ssh = false;
+        if res.is_ok()
+            && let SshAuthState::Authorized { active_source } = &mut self.ssh_auth
+        {
+            *active_source = InputSource::Console;
         }
         res
     }
@@ -106,7 +132,7 @@ impl ShellHost for StandaloneShellHost {
     }
 
     fn trigger_user_fault(&mut self) {
-        if self.last_input_from_ssh {
+        if self.is_ssh_active() {
             // Do not allow remote SSH users to deliberately fault the shell domain (`M14`).
             self.write_debug("[ssh] fault/crash command is disabled over SSH\n");
             return;

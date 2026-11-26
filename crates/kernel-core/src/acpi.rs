@@ -1,8 +1,8 @@
-//! ACPI table validators for AArch64 UEFI.
+//! ACPI table validators for `AArch64` UEFI.
 //!
 //! Validates ACPI 2.0+ RSDP, XSDT, FADT (`ARM_BOOT_ARCH`), SPCR (PL011 UART),
 //! MADT (GICv2/GICv3 GICD/GICC & CPU count), GTDT (Generic Timer GSIVs),
-//! and MCFG (PCIe ECAM base) directly from firmware tables.
+//! and MCFG (`PCIe` ECAM base) directly from firmware tables.
 
 const RSDP_SIGNATURE: [u8; 8] = *b"RSD PTR ";
 const FADT_SIGNATURE: [u8; 4] = *b"FACP";
@@ -14,9 +14,9 @@ const MCFG_SIGNATURE: [u8; 4] = *b"MCFG";
 /// ACPI SPCR `interface_type` value for ARM PL011 UART.
 pub const SPCR_INTERFACE_PL011: u8 = 0x03;
 
-/// ARM_BOOT_ARCH bit 0: PSCI is implemented.
+/// `ARM_BOOT_ARCH` bit 0: PSCI is implemented.
 pub const ARM_BOOT_PSCI_COMPLIANT: u16 = 1 << 0;
-/// ARM_BOOT_ARCH bit 1: Use `HVC` instead of `SMC` as the PSCI conduit.
+/// `ARM_BOOT_ARCH` bit 1: Use `HVC` instead of `SMC` as the PSCI conduit.
 pub const ARM_BOOT_PSCI_USE_HVC: u16 = 1 << 1;
 
 /// Validated ACPI RSDP descriptor.
@@ -59,7 +59,7 @@ pub struct ParsedGtdt {
     pub el1_virt_timer_gsiv: u32,
 }
 
-/// Validated ACPI MCFG (PCIe ECAM) first allocation entry.
+/// Validated ACPI MCFG (`PCIe` ECAM) first allocation entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParsedMcfg {
     pub ecam_base: u64,
@@ -78,6 +78,7 @@ fn checksum_valid(bytes: &[u8]) -> bool {
 }
 
 /// Validate an ACPI 1.0 (20-byte) or ACPI 2.0+ (36-byte) RSDP structure.
+#[must_use]
 pub fn parse_rsdp(bytes: &[u8]) -> Option<ParsedRsdp> {
     if bytes.len() < 20 || bytes[0..8] != RSDP_SIGNATURE {
         return None;
@@ -114,6 +115,7 @@ pub fn parse_rsdp(bytes: &[u8]) -> Option<ParsedRsdp> {
 }
 
 /// Validate an ACPI SDT header (36 bytes minimum) and verify its full table checksum.
+#[must_use]
 pub fn validate_sdt(bytes: &[u8], expected_sig: &[u8; 4]) -> Option<usize> {
     if bytes.len() < 36 || &bytes[0..4] != expected_sig {
         return None;
@@ -126,6 +128,7 @@ pub fn validate_sdt(bytes: &[u8], expected_sig: &[u8; 4]) -> Option<usize> {
 }
 
 /// Parse `ARM_BOOT_ARCH` (offset 129, 2 bytes) from a validated ACPI 5.1+ FADT (`FACP`) table.
+#[must_use]
 pub fn parse_fadt_arm_boot_arch(bytes: &[u8]) -> Option<ArmBootArch> {
     let len = validate_sdt(bytes, &FADT_SIGNATURE)?;
     // `ARM_BOOT_ARCH` is a 16-bit field at byte offset 129..131 (ACPI 5.1+).
@@ -140,6 +143,7 @@ pub fn parse_fadt_arm_boot_arch(bytes: &[u8]) -> Option<ArmBootArch> {
 }
 
 /// Parse serial console MMIO base and GSIV from a validated ACPI `SPCR` table.
+#[must_use]
 pub fn parse_spcr(bytes: &[u8]) -> Option<ParsedSpcr> {
     let len = validate_sdt(bytes, &SPCR_SIGNATURE)?;
     if len < 58 {
@@ -158,21 +162,25 @@ pub fn parse_spcr(bytes: &[u8]) -> Option<ParsedSpcr> {
 }
 
 /// Parse GIC Distributor/CPU Interface bases, GIC version, and enabled CPU count from ACPI `MADT` (`APIC`).
+#[must_use]
 pub fn parse_madt(bytes: &[u8]) -> Option<ParsedMadt> {
     let len = validate_sdt(bytes, &MADT_SIGNATURE)?;
     if len < 44 {
         return None;
     }
-    let mut gicd_base = 0u64;
-    let mut gicc_base = 0u64;
+    let mut distributor_base = 0u64;
+    let mut cpu_iface_base = 0u64;
     let mut gic_version = 0u8;
     let mut cpu_count = 0usize;
 
     let mut off = 44usize;
-    while off + 2 <= len {
+    while off.checked_add(2).is_some_and(|hdr_end| hdr_end <= len) {
         let entry_type = bytes[off];
         let entry_len = bytes[off + 1] as usize;
-        if entry_len < 2 || off + entry_len > len {
+        let Some(entry_end) = off.checked_add(entry_len) else {
+            break;
+        };
+        if entry_len < 2 || entry_end > len {
             break;
         }
         match entry_type {
@@ -197,8 +205,8 @@ pub fn parse_madt(bytes: &[u8]) -> Option<ParsedMadt> {
                     bytes[off + 38],
                     bytes[off + 39],
                 ]);
-                if gicc_base == 0 && base != 0 {
-                    gicc_base = base;
+                if cpu_iface_base == 0 && base != 0 {
+                    cpu_iface_base = base;
                 }
             }
             // GICD (GIC Distributor Structure, ACPI 6.x Table 5.37)
@@ -213,25 +221,26 @@ pub fn parse_madt(bytes: &[u8]) -> Option<ParsedMadt> {
                     bytes[off + 14],
                     bytes[off + 15],
                 ]);
-                if gicd_base == 0 && base != 0 {
-                    gicd_base = base;
+                if distributor_base == 0 && base != 0 {
+                    distributor_base = base;
                 }
                 gic_version = bytes[off + 20];
             }
             _ => {}
         }
-        off += entry_len;
+        off = entry_end;
     }
 
     Some(ParsedMadt {
-        gicd_base,
-        gicc_base,
+        gicd_base: distributor_base,
+        gicc_base: cpu_iface_base,
         gic_version,
         cpu_count,
     })
 }
 
 /// Parse ARM Generic Timer GSIV interrupt IDs from a validated ACPI `GTDT` table.
+#[must_use]
 pub fn parse_gtdt(bytes: &[u8]) -> Option<ParsedGtdt> {
     let len = validate_sdt(bytes, &GTDT_SIGNATURE)?;
     if len < 72 {
@@ -245,7 +254,8 @@ pub fn parse_gtdt(bytes: &[u8]) -> Option<ParsedGtdt> {
     })
 }
 
-/// Parse the first PCIe ECAM allocation from a validated ACPI `MCFG` table.
+/// Parse the first `PCIe` ECAM allocation from a validated ACPI `MCFG` table.
+#[must_use]
 pub fn parse_mcfg(bytes: &[u8]) -> Option<ParsedMcfg> {
     let len = validate_sdt(bytes, &MCFG_SIGNATURE)?;
     if len < 60 {

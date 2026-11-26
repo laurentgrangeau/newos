@@ -294,7 +294,7 @@ fn t5_shell_syntax_error_in_later_stage_causes_no_side_effects() {
         r#"put "leak4" | first 1 | first 1 | first 1 | first 1 | first 1 | count"#,
         r#"put "leak5" | where a b c d e f g h i j k l"#,
         r#"put "leak6" | save @leakref |"#,
-        r#"ping 0x10 |"#,
+        "ping 0x10 |",
     ];
 
     for cmd in bad_cmds {
@@ -353,6 +353,7 @@ fn t5_shell_failed_transform_clears_eval_pipeline_stream() {
 // 6. BufferedWriter, read_line, and ObjectStore Full-Dedup / Snapshot Edges
 // ============================================================================
 
+#[derive(Debug)]
 struct RecordingWriter {
     out: String,
     calls: usize,
@@ -360,7 +361,7 @@ struct RecordingWriter {
 }
 
 impl RecordingWriter {
-    fn new(fail_on_call: Option<usize>) -> Self {
+    const fn new(fail_on_call: Option<usize>) -> Self {
         Self {
             out: String::new(),
             calls: 0,
@@ -380,6 +381,7 @@ impl Write for RecordingWriter {
     }
 }
 
+#[derive(Debug)]
 struct EdgeReadLineHost {
     reads: VecDeque<Result<u8, SysError>>,
     yield_res: Result<u64, SysError>,
@@ -430,9 +432,7 @@ impl ShellHost for EdgeReadLineHost {
     }
 }
 
-#[test]
-fn t5_shell_buffered_writer_readline_and_caos_full_dedup_edges() {
-    // --- Group A: BufferedWriter<0>, <1>, <1024> UTF-8 boundary + error propagation ---
+fn check_buffered_writer_edges() {
     {
         let mut inner = RecordingWriter::new(None);
         {
@@ -474,8 +474,9 @@ fn t5_shell_buffered_writer_readline_and_caos_full_dedup_edges() {
         let mut bw8 = BufferedWriter::<8, _>::new(&mut inner8);
         assert!(bw8.write_str("0123456789").is_err());
     }
+}
 
-    // --- Group B: Shell::read_line edge paths ---
+fn check_readline_edges() {
     // B1: Fatal yield_now() error on WouldBlock breaks cleanly after 1 yield.
     {
         let host = EdgeReadLineHost::new(&[Err(SysError::WouldBlock)], Err(SysError::Unsupported));
@@ -526,15 +527,16 @@ fn t5_shell_buffered_writer_readline_and_caos_full_dedup_edges() {
         let n = sh.read_line(&mut buf);
         assert_eq!(&buf[..n], b"ok");
     }
+}
 
-    // --- Group C: ObjectStore full-table dedup (24/24), max snapshot, and empty snapshot + gc ---
+fn check_caos_full_dedup_edges() {
     let mut store = ObjectStore::new();
     let existing_count = store.object_count();
     let mut first_new_hash = None;
     let mut first_new_payload = [0u8; MAX_BLOB_SIZE];
     for i in existing_count..MAX_OBJECTS {
-        let mut blob = [i as u8; MAX_BLOB_SIZE];
-        blob[0] = (i & 0xFF) as u8;
+        let tag = u8::try_from(i).expect("MAX_OBJECTS <= 255");
+        let mut blob = [tag; MAX_BLOB_SIZE];
         blob[1] = 0xA5;
         let h = store.put(&blob).expect("fill object slot");
         if first_new_hash.is_none() {
@@ -591,4 +593,11 @@ fn t5_shell_buffered_writer_readline_and_caos_full_dedup_edges() {
     assert_eq!(empty_store.object_count(), 0);
     assert_eq!(count_refs(&empty_store), 0);
     assert_eq!(empty_store.gc(), 0);
+}
+
+#[test]
+fn t5_shell_buffered_writer_readline_and_caos_full_dedup_edges() {
+    check_buffered_writer_edges();
+    check_readline_edges();
+    check_caos_full_dedup_edges();
 }

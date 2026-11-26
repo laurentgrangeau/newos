@@ -137,10 +137,10 @@ fn run_e2e_full_pq_ssh() {
     // 1. Generate client ML-DSA-87 identity
     let mut user_seed = B32::default();
     user_seed.as_mut_slice().fill(0x5A);
-    let user_sk = SigningKey::<MlDsa87>::from_seed(&user_seed);
-    let mut user_pk = [0u8; MLDSA87_PK_BYTES];
-    user_pk.copy_from_slice(user_sk.verifying_key().encode().as_slice());
-    let authorized: &'static [[u8; MLDSA87_PK_BYTES]] = Box::leak(Box::new([user_pk]));
+    let client_signing_key = SigningKey::<MlDsa87>::from_seed(&user_seed);
+    let mut client_public_key = [0u8; MLDSA87_PK_BYTES];
+    client_public_key.copy_from_slice(client_signing_key.verifying_key().encode().as_slice());
+    let authorized: &'static [[u8; MLDSA87_PK_BYTES]] = Box::leak(Box::new([client_public_key]));
 
     // 2. Initialize real KeyVault backed by NIST SP 800-90B conditioned CSPRNG
     let vault = KeyVault::new(SplitMixHwTrng(0xDEAD_BEEF_1234), b"e2e-ssh-net", authorized)
@@ -152,7 +152,7 @@ fn run_e2e_full_pq_ssh() {
     let mut server = Box::new(SshServer::new());
     let mut client = Box::new(SshClient::new(
         "newos",
-        user_sk,
+        client_signing_key,
         Some(expected_fp),
         [0x33u8; 64],
     ));
@@ -198,8 +198,8 @@ fn run_e2e_full_pq_ssh() {
     let cmd = core::str::from_utf8(&s_shell_in[..in_len]).unwrap().trim();
     shell.exec_line(cmd);
 
-    let reply = shell.host_mut().output.clone();
-    assert!(!reply.is_empty());
+    let reply = shell.host_mut().output.as_str();
+    assert_ne!(reply, "");
     server.send_shell_output(reply.as_bytes()).unwrap();
     let s_wire = server.pending_tx().to_vec();
     server.consume_tx(s_wire.len());

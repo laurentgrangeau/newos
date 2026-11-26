@@ -110,7 +110,7 @@ fn crypto_fips202_kat_and_aead_sequence_boundaries() {
     // ChaCha20-Poly1305 at extreme sequence numbers (0, 1, u32::MAX, u64::MAX)
     let key = [0x37u8; 64];
     let cipher = OpenSshChaCha20Poly1305::new(&key);
-    for seq in [0u64, 1, u32::MAX as u64, u64::MAX] {
+    for seq in [0u64, 1, u64::from(u32::MAX), u64::MAX] {
         let mut pkt = [0u8; 20];
         pkt[..4].copy_from_slice(&16u32.to_be_bytes());
         pkt[4..].fill(0xA5);
@@ -137,7 +137,7 @@ fn abi_repr_c_layout_contract_stability() {
     assert_eq!(align_of::<SpscRing<64>>(), 64);
 }
 
-/// OOM & Resource-Exhaustion Stress: Drives UntypedInventory, CNode, SpscRing, and CAOS
+/// OOM & Resource-Exhaustion Stress: Drives `UntypedInventory`, `CNode`, `SpscRing`, and CAOS
 /// to 100% capacity, verifying zero panics, deterministic errors, and full recovery.
 #[test]
 fn stress_oom_and_resource_exhaustion_recovery() {
@@ -217,7 +217,8 @@ fn crypto_tag_verification_rejects_every_byte_position_and_wrong_key() {
     let mut pkt = [0u8; 36];
     pkt[..4].copy_from_slice(&32u32.to_be_bytes());
     for (i, b) in pkt[4..].iter_mut().enumerate() {
-        *b = (i as u8).wrapping_mul(13).wrapping_add(7);
+        let idx = u8::try_from(i).expect("index 0..32 fits u8");
+        *b = idx.wrapping_mul(13).wrapping_add(7);
     }
     let tag = cipher_a.seal_in_place(7, &mut pkt);
 

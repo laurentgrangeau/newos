@@ -1,4 +1,4 @@
-//! PCIe ECAM Configuration Space Enumerator, BAR Decoder & MSI-X Capability Walker.
+//! `PCIe` ECAM Configuration Space Enumerator, BAR Decoder & MSI-X Capability Walker.
 //!
 //! Runs in EL0 via `CapId::BOOTSTRAP_PCIE_ECAM_MMIO`.
 
@@ -17,12 +17,16 @@ pub const PCI_CMD_BUS_MASTER: u32 = 1 << 2;
 pub const PCI_STATUS_CAP_LIST: u32 = 1 << 20;
 pub const PCI_CAP_ID_MSIX: u8 = 0x11;
 
-/// Well-known PCI class/subclass for NVMe controllers (`01:08:02`).
+/// Well-known PCI class/subclass for `NVMe` controllers (`01:08:02`).
 pub const PCI_CLASS_MASS_STORAGE: u8 = 0x01;
 pub const PCI_SUBCLASS_NVM: u8 = 0x08;
 pub const PCI_PROGIF_NVME: u8 = 0x02;
 
-/// Compute the PCIe ECAM byte offset for `(bus, dev, func, reg_offset)`.
+/// Compute the `PCIe` ECAM byte offset for `(bus, dev, func, reg_offset)`.
+///
+/// # Errors
+/// Returns [`SysError::InvalidArgument`] if `dev >= 32`, `func >= 8`, `reg_offset >= 4096`,
+/// or `reg_offset` is not 4-byte aligned.
 #[inline]
 pub const fn ecam_offset(bus: u8, dev: u8, func: u8, reg_offset: u16) -> Result<u64, SysError> {
     if dev >= 32 || func >= 8 || reg_offset >= 4096 || (reg_offset & 3) != 0 {
@@ -31,7 +35,7 @@ pub const fn ecam_offset(bus: u8, dev: u8, func: u8, reg_offset: u16) -> Result<
     Ok(((bus as u64) << 20) | ((dev as u64) << 15) | ((func as u64) << 12) | (reg_offset as u64))
 }
 
-/// Discovered PCIe function metadata.
+/// Discovered `PCIe` function metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PcieDeviceInfo {
     pub bus: u8,
@@ -47,7 +51,9 @@ pub struct PcieDeviceInfo {
 }
 
 impl PcieDeviceInfo {
+    /// Return `true` if this `PCIe` function advertises the `NVMe` class/subclass/prog-if (`01:08:02`).
     #[inline]
+    #[must_use]
     pub const fn is_nvme(&self) -> bool {
         self.class_code == PCI_CLASS_MASS_STORAGE
             && self.subclass == PCI_SUBCLASS_NVM
@@ -55,20 +61,33 @@ impl PcieDeviceInfo {
     }
 }
 
-/// Capability-scoped EL0 PCIe ECAM enumerator.
+/// Capability-scoped EL0 `PCIe` ECAM enumerator.
+#[derive(Debug)]
 pub struct PcieEcam<T: StorageMmioTransport> {
     transport: T,
 }
 
 impl<T: StorageMmioTransport> PcieEcam<T> {
+    /// Construct a `PCIe` ECAM enumerator over `transport`.
+    #[must_use]
     pub const fn new(transport: T) -> Self {
         Self { transport }
     }
 
+    /// Read a 32-bit `PCIe` configuration register at `(bus, dev, func, reg)`.
+    ///
+    /// # Errors
+    /// Returns [`SysError::InvalidArgument`] if the coordinates are out of range or misaligned,
+    /// or a transport [`SysError`].
     pub fn read_u32(&self, bus: u8, dev: u8, func: u8, reg: u16) -> Result<u32, SysError> {
         self.transport.read32(ecam_offset(bus, dev, func, reg)?)
     }
 
+    /// Write a 32-bit `PCIe` configuration register at `(bus, dev, func, reg)`.
+    ///
+    /// # Errors
+    /// Returns [`SysError::InvalidArgument`] if the coordinates are out of range or misaligned,
+    /// or a transport [`SysError`].
     pub fn write_u32(
         &self,
         bus: u8,
@@ -82,6 +101,8 @@ impl<T: StorageMmioTransport> PcieEcam<T> {
     }
 
     /// Probe a single `(bus, dev, func)` slot, decoding 32/64-bit BAR0 and MSI-X capability offset.
+    ///
+    /// Fails closed (returns `None`) if the slot is empty or if any ECAM read returns a transport error.
     pub fn probe_function(&self, bus: u8, dev: u8, func: u8) -> Option<PcieDeviceInfo> {
         let vd = self.read_u32(bus, dev, func, PCI_REG_VENDOR_DEVICE).ok()?;
         let vendor_id = (vd & 0xFFFF) as u16;
@@ -94,28 +115,25 @@ impl<T: StorageMmioTransport> PcieEcam<T> {
         let subclass = ((class_rev >> 16) & 0xFF) as u8;
         let class_code = ((class_rev >> 24) & 0xFF) as u8;
 
-        // Decode BAR0 (supports 32-bit and 64-bit memory BARs)
-        let bar0_lo = self.read_u32(bus, dev, func, PCI_REG_BAR0).unwrap_or(0);
+        // Decode BAR0 (supports 32-bit and 64-bit memory BARs); fail closed on transport error.
+        let bar0_lo = self.read_u32(bus, dev, func, PCI_REG_BAR0).ok()?;
         let bar0_phys = if (bar0_lo & 1) == 0 && ((bar0_lo >> 1) & 0x3) == 0b10 {
-            let bar0_hi = self.read_u32(bus, dev, func, PCI_REG_BAR0 + 4).unwrap_or(0);
+            let bar0_hi = self.read_u32(bus, dev, func, PCI_REG_BAR0 + 4).ok()?;
             u64::from(bar0_lo & !0xF) | (u64::from(bar0_hi) << 32)
         } else {
             u64::from(bar0_lo & !0xF)
         };
 
-        // Walk PCI capability list for MSI-X (`cap_id == 0x11`)
-        let cmd_status = self
-            .read_u32(bus, dev, func, PCI_REG_COMMAND_STATUS)
-            .unwrap_or(0);
+        // Walk PCI capability list for MSI-X (`cap_id == 0x11`); fail closed on transport error.
+        let cmd_status = self.read_u32(bus, dev, func, PCI_REG_COMMAND_STATUS).ok()?;
         let mut msix_cap_offset = None;
         if (cmd_status & PCI_STATUS_CAP_LIST) != 0 {
-            let mut ptr =
-                (self.read_u32(bus, dev, func, PCI_REG_CAP_PTR).unwrap_or(0) & 0xFC) as u8;
+            let mut ptr = (self.read_u32(bus, dev, func, PCI_REG_CAP_PTR).ok()? & 0xFC) as u8;
             for _ in 0..48u8 {
                 if ptr < 0x40 {
                     break;
                 }
-                let cap = self.read_u32(bus, dev, func, u16::from(ptr)).unwrap_or(0);
+                let cap = self.read_u32(bus, dev, func, u16::from(ptr)).ok()?;
                 let cap_id = (cap & 0xFF) as u8;
                 let next = ((cap >> 8) & 0xFC) as u8;
                 if cap_id == PCI_CAP_ID_MSIX {
@@ -143,7 +161,10 @@ impl<T: StorageMmioTransport> PcieEcam<T> {
         })
     }
 
-    /// Enable Memory Space + Bus Mastering on `(bus, dev, func)` for DMA-capable devices (NVMe/Hailo).
+    /// Enable Memory Space + Bus Mastering on `(bus, dev, func)` for DMA-capable devices (`NVMe`/Hailo).
+    ///
+    /// # Errors
+    /// Returns [`SysError`] if ECAM reads/writes fail or coordinates are invalid.
     pub fn enable_bus_master(&self, bus: u8, dev: u8, func: u8) -> Result<(), SysError> {
         let cur = self.read_u32(bus, dev, func, PCI_REG_COMMAND_STATUS)?;
         self.write_u32(
@@ -221,5 +242,39 @@ mod tests {
             *mock.cmd_written.borrow() & (PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER),
             0
         );
+    }
+
+    #[test]
+    fn ecam_probe_fails_closed_on_bar_or_cap_transport_error() {
+        struct FaultingEcam {
+            fail_offset: u64,
+        }
+        impl StorageMmioTransport for FaultingEcam {
+            fn read32(&self, offset: u64) -> Result<u32, SysError> {
+                if offset == self.fail_offset {
+                    return Err(SysError::InvalidArgument);
+                }
+                match offset {
+                    0x00 => Ok(0x5016_144D),
+                    0x04 => Ok(PCI_STATUS_CAP_LIST),
+                    0x08 => Ok((0x01 << 24) | (0x08 << 16) | (0x02 << 8)),
+                    0x10 => Ok(0x0000_0004),
+                    0x14 => Ok(0x0000_001B),
+                    0x34 => Ok(0x50),
+                    0x50 => Ok(u32::from(PCI_CAP_ID_MSIX)),
+                    _ => Ok(0xFFFF_FFFF),
+                }
+            }
+            fn write32(&self, _offset: u64, _val: u32) -> Result<(), SysError> {
+                Ok(())
+            }
+        }
+
+        for fail_off in [0x10u64, 0x14, 0x04, 0x34, 0x50] {
+            let ecam = PcieEcam::new(FaultingEcam {
+                fail_offset: fail_off,
+            });
+            assert_eq!(ecam.probe_function(0, 0, 0), None);
+        }
     }
 }

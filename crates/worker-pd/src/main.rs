@@ -13,6 +13,8 @@ use newos_user_rt::IpcLogConsole;
 
 newos_user_rt::entry!(main);
 
+const CHAOS_FAULT_TRIGGER: u64 = 0xDEAD_C0DE;
+
 fn main() -> ! {
     let mut out = IpcLogConsole::<256>::new(CapId::BOOTSTRAP_LOG_EP);
     let _ = writeln!(
@@ -21,21 +23,23 @@ fn main() -> ! {
     );
     out.flush();
 
-    let mut has_reply = false;
-    let mut reply_payload: u64 = 0;
+    let mut pending_reply: Option<u64> = None;
 
     loop {
-        match newos_user_rt::ipc_reply_recv(CapId::BOOTSTRAP_EP, reply_payload, has_reply) {
+        match newos_user_rt::ipc_reply_recv(
+            CapId::BOOTSTRAP_EP,
+            pending_reply.unwrap_or(0),
+            pending_reply.is_some(),
+        ) {
             Ok((_badge, payload)) => {
-                if payload == 0xDEAD_C0DE {
+                if payload == CHAOS_FAULT_TRIGGER {
                     // Deliberate EL0 hardware fault used by Phase 2 chaos-respawn self-tests.
                     newos_user_rt::trigger_user_fault();
                 }
-                reply_payload = payload.wrapping_add(1);
-                has_reply = true;
+                pending_reply = Some(payload.wrapping_add(1));
             }
             Err(SysError::WouldBlock) => {
-                has_reply = false;
+                pending_reply = None;
                 let _ = newos_user_rt::yield_now();
             }
             Err(err) => {

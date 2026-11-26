@@ -121,7 +121,8 @@ proptest! {
         let cipher = OpenSshChaCha20Poly1305::new(&full_key);
 
         let mut packet = vec![0u8; 4 + payload.len()];
-        packet[..4].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        let payload_len = u32::try_from(payload.len()).expect("payload <= 160 fits u32");
+        packet[..4].copy_from_slice(&payload_len.to_be_bytes());
         packet[4..].copy_from_slice(&payload);
         let tag = cipher.seal_in_place(seq, &mut packet);
 
@@ -135,7 +136,7 @@ proptest! {
         // Flipping any single bit in header, ciphertext, or tag MUST fail authentication
         let total = packet.len() + tag.len();
         let idx = flip_idx % total;
-        let mut t_pkt = packet.clone();
+        let mut t_pkt = packet;
         let mut t_tag = tag;
         if idx < t_pkt.len() {
             t_pkt[idx] ^= 1u8 << flip_bit;
@@ -208,8 +209,9 @@ proptest! {
         for (op, a, dst_slot) in ops {
             match op {
                 0 => {
+                    let ep_id = u32::try_from(a).expect("slot index 0..8 fits u32");
                     if let Ok(cid) = cnode.insert_root(Capability::new(
-                        CapObject::Endpoint { id: a as u32 },
+                        CapObject::Endpoint { id: ep_id },
                         Rights::ALL,
                     )) {
                         caps[a] = Some(cid);

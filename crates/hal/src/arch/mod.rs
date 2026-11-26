@@ -8,11 +8,13 @@ pub fn early_serial_init() {
     aarch64::serial::init_boot_clock();
 }
 
-pub fn early_serial() -> aarch64::serial::Pl011 {
+#[must_use]
+pub const fn early_serial() -> aarch64::serial::Pl011 {
     aarch64::serial::Pl011::new()
 }
 
-pub fn early_serial_unlocked() -> aarch64::serial::UnlockedPl011 {
+#[must_use]
+pub const fn early_serial_unlocked() -> aarch64::serial::UnlockedPl011 {
     aarch64::serial::UnlockedPl011
 }
 

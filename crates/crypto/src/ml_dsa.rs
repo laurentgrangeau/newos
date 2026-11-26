@@ -12,6 +12,7 @@ pub const PK_BYTES: usize = 2592;
 pub const SIG_BYTES: usize = 4627;
 
 /// Marker type implementing [`SignatureScheme`] for NIST Level 5 ML-DSA-87.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MlDsa87Scheme;
 
 impl SignatureScheme for MlDsa87Scheme {
@@ -26,6 +27,12 @@ mod tests {
 
     #[test]
     fn signature_trait_constants_match_fips204() {
+        fn assert_std_traits<T: core::fmt::Debug + Default + Copy + Eq + core::hash::Hash>(
+            expected: T,
+        ) {
+            assert_eq!(T::default(), expected);
+        }
+        assert_std_traits(MlDsa87Scheme);
         assert_eq!(MlDsa87Scheme::NAME, "ml-dsa-87");
         assert_eq!(MlDsa87Scheme::PK_BYTES, 2592);
         assert_eq!(MlDsa87Scheme::SIG_BYTES, 4627);

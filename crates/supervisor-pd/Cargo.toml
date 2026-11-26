@@ -25,7 +25,7 @@ newos-abi = { workspace = true, default-features = false }
 newos-net = { workspace = true, default-features = false, features = ["driver-gem", "driver-virtio"], optional = true }
 newos-shell-core = { workspace = true, default-features = false, optional = true }
 newos-user-rt = { workspace = true }
-newos-wdt = { path = "../wdt", optional = true }
+newos-wdt = { workspace = true, optional = true }
 
 [lints]
 workspace = true

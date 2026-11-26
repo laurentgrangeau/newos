@@ -7,7 +7,7 @@ publish = false
 
 [features]
 default = ["compute", "hailo"]
-compute = []
+compute = ["dep:newos-abi"]
 hailo = ["dep:newos-abi"]
 
 [dependencies]
