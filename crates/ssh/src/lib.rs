@@ -440,7 +440,12 @@ impl Default for SshServer {
 impl SshServer {
     #[must_use]
     // Intentional: `#![no_std]` zero-heap state machine owns fixed 12 KiB wire buffers inline.
-    #[allow(unknown_lints, clippy::large_unopt_stack_frames)]
+    #[allow(
+        unknown_lints,
+        renamed_and_removed_lints,
+        clippy::large_stack_frames,
+        clippy::large_unopt_stack_frames
+    )]
     pub fn new() -> Self {
         let mut s = Self {
             state: ServerState::AwaitBanner,
@@ -1093,7 +1098,12 @@ impl SshClient {
     /// Construct an `SshClient` with an explicit [`HostKeyPolicy`] (preferred safe constructor).
     #[must_use]
     // Intentional: `#![no_std]` zero-heap client owns fixed 12 KiB wire buffers + ML-DSA-87/ML-KEM-1024 keys inline.
-    #[allow(unknown_lints, clippy::large_unopt_stack_frames)]
+    #[allow(
+        unknown_lints,
+        renamed_and_removed_lints,
+        clippy::large_stack_frames,
+        clippy::large_unopt_stack_frames
+    )]
     pub fn new_with_policy(
         username: &str,
         user_sk: SigningKey<MlDsa87>,
@@ -1111,6 +1121,7 @@ impl SshClient {
     // Intentional: `#![no_std]` zero-heap client owns fixed 12 KiB wire buffers + ML-DSA-87/ML-KEM-1024 keys inline.
     #[allow(
         unknown_lints,
+        renamed_and_removed_lints,
         clippy::large_stack_frames,
         clippy::large_unopt_stack_frames
     )]
